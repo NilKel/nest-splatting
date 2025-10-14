@@ -12,6 +12,7 @@ build/
 *.egg
 *.manifest
 *.spec
+.DS_Store
 
 # -----------------------------
 # Environment
