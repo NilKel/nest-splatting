@@ -1,0 +1,9 @@
+optim:
+  type: Adam
+  params:
+      feat_lr: 1e-2
+      mlp_lr: 1e-2
+
+K_limit:
+  init: 20
+  final: 20

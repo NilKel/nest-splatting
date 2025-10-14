@@ -1,0 +1,105 @@
+EXP_COMMENTS: "nerfsyn01,mask 0.1,10k-10k-35k(30k),4e-4,6in[7,9]-3k,2**19;0,0,5k;SH4,256,5e-4"
+
+training_cfg:
+  iterations: 30_000
+  densify_from_iter: 500
+  densify_until_iter: 25_000
+  opacity_reset_interval: 3_000
+  reset_until_iter: 25_000
+
+  densification_interval: 100
+  ingp_densification_interval: 100
+  ingp_opacity_reset_interval: 3000
+  opacity_reset_protect: 2
+
+  densify_grad_threshold: 0.0002
+  ingp_densify_threshold: 0.0004
+
+  opacity_cull: 0.05
+  sh_degree: 3
+
+  pixel_densify_from_iter: 1000
+
+settings:
+  if_ingp: True
+  gaussian_init: False
+  white_background: False
+  random_background: False
+  floater_backgroud: False
+  gt_alpha: True
+  gs_alpha: False
+  time_analysis: False
+  resolution: 1
+  depth_ratio: 0
+  contract: False
+  pixel_densify_enhance: False
+
+  save_interval: 1000
+
+ingp_stage:
+  initialize: 10_000
+  switch_iter: 10_000
+  keep_geometry: 1000
+
+  XYZ_TYPE: "UV"
+  time_analysis: False
+
+appearance_level:
+  if_ap_level: False
+  init_level: 6
+  appearance_update_threshold: 5e-6
+
+loss:
+  lambda_normal: 0.05
+  lambda_dist: 1000
+  lambda_mask: 0.1
+  lambda_floater: 0
+
+  normal_iter: 7_000
+  dist_iter: 3_000
+  mask_iter: 0
+
+surfel:
+  base_beta: 0
+  base_opacity: 0
+  tg_beta: 0.0
+  tg_base_alpha: 0.0
+  update_interval: 500
+  update_interations: 5_000
+
+encoding:
+  type: hashgrid
+  levels: 6
+  hashgrid:
+      min_logres: 7
+      max_logres: 9
+      dict_size: 19
+      dim: 4
+      range: [-1.5, 1.5]
+  coarse2fine:
+      enabled: True
+      init_active_level: 2
+      step: 3000
+  warm_up: 1000
+  
+rgb:
+  mlp:
+      num_layers: 2
+      hidden_dim: 256
+      skip: []
+      activ: relu_
+      activ_params: {}
+      weight_norm: True
+  mode: idr
+  view_dep: True
+  encoding_view:
+      type: SphericalHarmonics
+      degree: 4
+
+optim:
+  type: Adam
+  params:
+      feat_lr: 2e-2
+      view_lr: 2e-2
+      mlp_lr: 5e-4
+      spec_lr: 2e-4

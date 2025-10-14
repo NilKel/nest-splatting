@@ -1,0 +1,68 @@
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+*.manifest
+*.spec
+
+# -----------------------------
+# Environment
+# -----------------------------
+.env
+.venv/
+env/
+venv/
+*.conda
+*.ipynb_checkpoints
+
+# -----------------------------
+# Docker
+# -----------------------------
+docker-compose.override.yml
+*.log
+
+
+# -----------------------------
+# Output / cache
+# -----------------------------
+output/
+checkpoints/
+logs/
+tmp/
+cache/
+*.cache
+*.npz
+*.pth
+*.pt
+*.safetensors
+*.npy
+
+# -----------------------------
+# System files
+# -----------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# -----------------------------
+# IDE / editor
+# -----------------------------
+.vscode/
+.idea/
+*.iml
+
+# -----------------------------
+# Misc
+# -----------------------------
+*.zip
+*.tar.gz
+*.rar
