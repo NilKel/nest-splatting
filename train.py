@@ -48,8 +48,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_list = []
 
     scene_name = args.scene_name
-    tb_writer = prepare_output_and_logger(dataset, scene_name, args.yaml)
-    args.model_path = dataset.model_path
+    tb_writer = prepare_output_and_logger(args, scene_name, args.yaml)
+    dataset.model_path = args.model_path
 
     first_iter = 0
     gaussians = GaussianModel(dataset.sh_degree)
