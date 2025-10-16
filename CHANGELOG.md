@@ -9,7 +9,9 @@
 - Automatically renders test views at end of training
 - Saves concatenated images: GT | Rendered | Normals (side-by-side)
 - Also saves individual components separately
-- Location: `train.py` lines 354-415
+- **Computes and reports PSNR, SSIM, and L1 metrics**
+- **Saves per-image and average metrics to `metrics.txt`**
+- Location: `train.py` lines 354-462
 - Output directory: `<model_path>/final_test_renders/`
 
 **Usage:**
@@ -18,6 +20,11 @@ python train.py ... --test_render_stride 25  # Every 25th test image
 python train.py ... --test_render_stride 5   # Every 5th test image
 python train.py ... --test_render_stride 1   # All test images
 ```
+
+**Output files:**
+- `*_concat.png` - GT | Rendered | Normal (side-by-side)
+- `*_gt.png`, `*_render.png`, `*_normal.png` - Individual components
+- `metrics.txt` - PSNR, SSIM, L1 metrics (per-image and average)
 
 #### Method Selection
 - **New CLI argument**: `--method {baseline,surface}` (default: baseline)

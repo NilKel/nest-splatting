@@ -33,12 +33,21 @@ python train.py -s <scene> -m <output> --yaml ./configs/nerfsyn.yaml --test_rend
 ```
 
 **Implementation Location**: `train.py` line 537-538  
-**Function**: `render_test_images_with_normals()` at line 354-415  
+**Function**: `render_test_images_with_normals()` at line 354-462  
 **Output**: `<model_path>/final_test_renders/` containing:
 - `*_concat.png` - GT | Rendered | Normal (side-by-side)
 - `*_gt.png` - Ground truth image
 - `*_render.png` - Rendered image
 - `*_normal.png` - Rendered normals
+- `metrics.txt` - PSNR, SSIM, L1 metrics (per-image + average)
+
+**Metrics Computed**:
+- PSNR (Peak Signal-to-Noise Ratio) in dB
+- SSIM (Structural Similarity Index)
+- L1 Loss
+- Printed per-image during rendering
+- Average metrics displayed at end
+- All saved to `metrics.txt`
 
 ## Next Steps: Implementing Surface Potential Mode
 

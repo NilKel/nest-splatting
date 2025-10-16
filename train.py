@@ -354,6 +354,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 def render_test_images_with_normals(dataset, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, stride=25):
     """
     Render test images at the end of training with GT, rendered image, and normals.
+    Also computes and reports PSNR and SSIM metrics.
     
     Args:
         stride: Render every Nth test image (default: 25)
@@ -370,6 +371,11 @@ def render_test_images_with_normals(dataset, gaussians, pipe, background, ingp, 
         print("[FINAL] No test cameras available, skipping final rendering")
         return
     
+    # Metrics accumulation
+    psnr_values = []
+    ssim_values = []
+    l1_values = []
+    
     with torch.no_grad():
         for idx, viewpoint in enumerate(test_cameras):
             # Only render every 'stride' images
@@ -383,6 +389,15 @@ def render_test_images_with_normals(dataset, gaussians, pipe, background, ingp, 
             rendered_image = torch.clamp(render_pkg["render"], 0.0, 1.0)
             gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
             rendered_normal = render_pkg["rend_normal"]
+            
+            # Compute metrics
+            psnr_value = psnr(rendered_image, gt_image).mean().item()
+            ssim_value = ssim(rendered_image, gt_image).mean().item()
+            l1_value = l1_loss(rendered_image, gt_image).mean().item()
+            
+            psnr_values.append(psnr_value)
+            ssim_values.append(ssim_value)
+            l1_values.append(l1_value)
             
             # Convert to numpy for saving
             rendered_np = rendered_image.permute(1, 2, 0).detach().cpu().numpy()
@@ -409,9 +424,42 @@ def render_test_images_with_normals(dataset, gaussians, pipe, background, ingp, 
             normal_name = os.path.join(final_output_dir, f"{cam_name}_normal.png")
             save_img_u8(normal_np, normal_name)
             
-            print(f"[FINAL] Rendered test view {idx}/{len(test_cameras)}: {cam_name}")
+            print(f"[FINAL] View {idx}/{len(test_cameras)} ({cam_name}): PSNR={psnr_value:.2f} SSIM={ssim_value:.4f}")
     
-    print(f"[FINAL] Test rendering complete! Saved to: {final_output_dir}")
+    # Compute and display average metrics
+    avg_psnr = np.mean(psnr_values)
+    avg_ssim = np.mean(ssim_values)
+    avg_l1 = np.mean(l1_values)
+    
+    print(f"\n[FINAL] ═══════════════════════════════════════")
+    print(f"[FINAL] Test Set Metrics ({len(psnr_values)} images):")
+    print(f"[FINAL]   Average PSNR: {avg_psnr:.2f} dB")
+    print(f"[FINAL]   Average SSIM: {avg_ssim:.4f}")
+    print(f"[FINAL]   Average L1:   {avg_l1:.6f}")
+    print(f"[FINAL] ═══════════════════════════════════════")
+    print(f"[FINAL] Images saved to: {final_output_dir}\n")
+    
+    # Save metrics to file
+    metrics_file = os.path.join(final_output_dir, "metrics.txt")
+    with open(metrics_file, 'w') as f:
+        f.write(f"Final Test Set Evaluation\n")
+        f.write(f"═══════════════════════════════════════\n")
+        f.write(f"Number of test images: {len(psnr_values)}\n")
+        f.write(f"Stride: {stride}\n")
+        f.write(f"Iteration: {iteration}\n\n")
+        f.write(f"Average Metrics:\n")
+        f.write(f"  PSNR: {avg_psnr:.2f} dB\n")
+        f.write(f"  SSIM: {avg_ssim:.4f}\n")
+        f.write(f"  L1:   {avg_l1:.6f}\n\n")
+        f.write(f"Per-Image Metrics:\n")
+        f.write(f"{'Image':<30} {'PSNR':>10} {'SSIM':>10} {'L1':>12}\n")
+        f.write(f"{'-'*64}\n")
+        
+        for i, (idx, viewpoint) in enumerate((idx, cam) for idx, cam in enumerate(test_cameras) if idx % stride == 0):
+            cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
+            f.write(f"{cam_name:<30} {psnr_values[i]:>10.2f} {ssim_values[i]:>10.4f} {l1_values[i]:>12.6f}\n")
+    
+    print(f"[FINAL] Metrics saved to: {metrics_file}")
 
 def prepare_output_and_logger(args, scene_name, yaml_file = ""):    
     if not args.model_path:
