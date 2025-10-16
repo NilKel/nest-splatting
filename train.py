@@ -349,23 +349,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         torch.cuda.empty_cache()
     
     # Final test rendering with stride
-    render_test_images_with_normals(dataset, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, stride=args.test_render_stride)
+    render_test_images_with_normals(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, stride=args.test_render_stride)
 
-def render_test_images_with_normals(dataset, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, stride=25):
+def render_test_images_with_normals(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, stride=25):
     """
     Render test images at the end of training with GT, rendered image, and normals.
     Also computes and reports PSNR and SSIM metrics.
     
     Args:
+        scene: Scene object containing cameras and model path
         stride: Render every Nth test image (default: 25)
     """
     print(f"\n[FINAL] Rendering test images with stride {stride}...")
     
     # Create output directory
-    final_output_dir = os.path.join(dataset.model_path, 'final_test_renders')
+    final_output_dir = os.path.join(scene.model_path, 'final_test_renders')
     os.makedirs(final_output_dir, exist_ok=True)
     
-    test_cameras = dataset.getTestCameras()
+    test_cameras = scene.getTestCameras()
     
     if len(test_cameras) == 0:
         print("[FINAL] No test cameras available, skipping final rendering")
