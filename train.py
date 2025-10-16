@@ -68,11 +68,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("║              ✓ PRE-TRAINED 2DGS CHECKPOINT FOUND                ║")
         print("╚══════════════════════════════════════════════════════════════════╝")
         print(f"[2DGS] Checkpoint location: {gaussian_checkpoint_path}")
-        checkpoint_data = torch.load(gaussian_checkpoint_path, weights_only=False)
+        checkpoint_data = torch.load(gaussian_checkpoint_path, weights_only=False, map_location='cuda')
         print(f"[2DGS] Checkpoint was saved at iteration: {checkpoint_data['iteration']}")
-        gaussians.restore(checkpoint_data['gaussians'], opt)
+        
+        # Move all tensors in the checkpoint to CUDA explicitly
+        gaussian_data = checkpoint_data['gaussians']
+        gaussian_data_cuda = tuple(
+            item.cuda() if isinstance(item, torch.Tensor) else item 
+            for item in gaussian_data
+        )
+        
+        gaussians.restore(gaussian_data_cuda, opt)
         first_iter = cfg_model.ingp_stage.initialize + 1  # Start right after 2DGS phase
         loaded_pretrained = True
+        
+        # Validate loaded Gaussians
+        xyz = gaussians.get_xyz
+        print(f"[2DGS] Loaded {len(xyz)} Gaussians")
+        if torch.isnan(xyz).any() or torch.isinf(xyz).any():
+            print(f"[2DGS] ⚠️ ERROR: Checkpoint contains NaN/Inf values!")
+            print(f"[2DGS] ⚠️ Please delete {gaussian_checkpoint_path} and retrain from scratch")
+            exit(1)
+        
         # Clear CUDA cache after loading checkpoint to avoid memory issues
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
