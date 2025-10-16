@@ -41,11 +41,11 @@ for method in methods_to_train:
     
     for scene in scenes_to_train:
         source = f'{dataset_dir}/{scene}'
-        save_dir = f'./output/{scene}_{method}_{iterations}'
+        run_name = f'iter{iterations}'  # Will be organized as: outputs/method/dataset/scene/iter{iterations}
         
         cmd = (f'python train.py '
                f'-s {source} '
-               f'-m {save_dir} '
+               f'-m {run_name} '
                f'--yaml {yaml_file} '
                f'--method {method} '
                f'--eval '
@@ -72,7 +72,7 @@ if not args.skip_metrics:
         print("-" * 40)
         
         for method in methods_to_train:
-            save_dir = f'./output/{scene}_{method}_{iterations}'
+            save_dir = f'outputs/{method}/nerf_synthetic/{scene}/iter{iterations}'
             metrics_file = f'{save_dir}/final_test_renders/metrics.txt'
             
             if os.path.exists(metrics_file):

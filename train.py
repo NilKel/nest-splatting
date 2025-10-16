@@ -528,19 +528,31 @@ def render_test_images_with_normals(scene, gaussians, pipe, background, ingp, be
     print(f"[FINAL] Metrics saved to: {metrics_file}")
 
 def prepare_output_and_logger(args, scene_name, yaml_file = ""):    
+    # Organize outputs: outputs/method/dataset/scene/name
+    # Extract dataset name from source path
+    source_parts = args.source_path.rstrip('/').split('/')
+    scene_name_from_path = source_parts[-1]  # e.g., "drums"
+    dataset_name = source_parts[-2] if len(source_parts) > 1 else "unknown"  # e.g., "nerf_synthetic"
+    
     if not args.model_path:
+        # If no model_path specified, create default name with timestamp
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-
         now = datetime.datetime.now()
         time_str = now.strftime("-%m%d-%H%M")
         exp_name = scene_name + time_str 
         if yaml_file != "":
             exp_name += '-' + yaml_file
-        
         args.model_path = os.path.join("./output/", exp_name)
+    else:
+        # User specified -m flag: treat it as the run name and organize into structure
+        run_name = args.model_path
+        # Check if it already has the full path structure (starts with outputs/)
+        if not run_name.startswith('outputs/') and not run_name.startswith('./outputs/'):
+            # Build organized path: outputs/method/dataset/scene/name
+            args.model_path = os.path.join("outputs", args.method, dataset_name, scene_name_from_path, run_name)
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
