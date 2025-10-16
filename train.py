@@ -75,7 +75,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loaded_pretrained = True
         print(f"[2DGS] ➤ Skipping 2DGS training phase (iterations 0-{cfg_model.ingp_stage.initialize})")
         print(f"[2DGS] ➤ Starting directly at iteration {first_iter} (INGP training)")
-        print(f"[2DGS] ➤ Will train for {opt.iterations - first_iter + 1} iterations with INGP")
+        ingp_iters = opt.iterations - first_iter + 1
+        print(f"[2DGS] ➤ Will train for {ingp_iters} iterations with INGP")
+        if ingp_iters <= 0:
+            print(f"[2DGS] ⚠ WARNING: No INGP training will occur!")
+            print(f"[2DGS] ⚠ Requested iterations ({opt.iterations}) <= checkpoint ({cfg_model.ingp_stage.initialize})")
+            print(f"[2DGS] ⚠ Use --iterations {cfg_model.ingp_stage.initialize + 1000} or higher")
         print("╚══════════════════════════════════════════════════════════════════╝\n")
     elif cfg_model.settings.if_ingp:
         print("\n╔══════════════════════════════════════════════════════════════════╗")
@@ -115,6 +120,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
 
     ingp_model = None
+    ingp = None  # Initialize ingp variable for final test rendering
     if cfg_model.settings.if_ingp:
         ingp_model = INGP(cfg_model, method=args.method).to('cuda')
         print(f"[INGP] Initialized with method='{args.method}'")
