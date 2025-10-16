@@ -705,22 +705,26 @@ renderCUDAsurfelForward(
 				bool contract = if_contract;
 				
 				// hashgrid feature interpolation
-				switch (l_dim){
-					case 2: 
-						query_feature<false, CHANNELS, 2>(feat, xyz, voxel_min, voxel_max, collec_offsets, 
-							appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug);
-						break;
-					case 4: 
-						query_feature<false, CHANNELS, 4>(feat, xyz, voxel_min, voxel_max, collec_offsets, 
-							appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug);
-						break;
-					case 8: 
-						query_feature<false, CHANNELS, 8>(feat, xyz, voxel_min, voxel_max, collec_offsets, 
-							appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug);
-						break;
-					default: printf("FW unsupported level dim : %d\n", l_dim);
-						break;
-				}
+			switch (l_dim){
+				case 2: 
+					query_feature<false, CHANNELS, 2>(feat, xyz, voxel_min, voxel_max, collec_offsets, 
+						appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug);
+					break;
+				case 4: 
+					query_feature<false, CHANNELS, 4>(feat, xyz, voxel_min, voxel_max, collec_offsets, 
+						appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug);
+					break;
+				case 8: 
+					query_feature<false, CHANNELS, 8>(feat, xyz, voxel_min, voxel_max, collec_offsets, 
+						appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug);
+					break;
+				case 12: 
+					query_feature<false, CHANNELS, 12>(feat, xyz, voxel_min, voxel_max, collec_offsets, 
+						appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug);
+					break;
+				default: printf("FW unsupported level dim : %d\n", l_dim);
+					break;
+			}
 
 				for (int ch = 0; ch < CHANNELS; ch++)
 					C[ch] += feat[ch] * w;

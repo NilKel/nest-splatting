@@ -56,16 +56,23 @@ class INGP(nn.Module):
         
         view_enc_dir = 0 if not self.view_dep else self.encoder_dir.n_output_dims
 
-        self.build_encoding(cfg_model.encoding)
-        
-        # For surface potential mode, we need 3x more features (for 3D vectors)
-        base_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim
+        # For surface mode, create 3 separate hash grids (one per vector component)
         if method == 'surface':
-            self.feat_dim = base_dim  # MLP input is still base_dim (after dot product)
-            self.hash_output_dim = base_dim * 3  # Hash grid outputs 3D vectors
+            print(f"[INGP] Surface mode: Creating 3 separate hash grids for vector potentials (x, y, z)")
+            self.build_encoding(cfg_model.encoding, name_suffix='_x')
+            self.hash_encoding_x = self.hash_encoding
+            self.build_encoding(cfg_model.encoding, name_suffix='_y')
+            self.hash_encoding_y = self.hash_encoding
+            self.build_encoding(cfg_model.encoding, name_suffix='_z')
+            self.hash_encoding_z = self.hash_encoding
+            # Keep reference to the last one for compatibility
         else:
-            self.feat_dim = base_dim
-            self.hash_output_dim = base_dim
+            self.build_encoding(cfg_model.encoding)
+        
+        # Hash grid always outputs base_dim features
+        base_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim
+        self.feat_dim = base_dim
+        self.hash_output_dim = base_dim
         
         self.mlp_rgb = self.build_mlp(cfg_model.rgb, input_dim=self.feat_dim + view_enc_dir, output_dim = 3)
         
@@ -88,13 +95,20 @@ class INGP(nn.Module):
         lr_spec = training_args.params.spec_lr
 
         l = [
-            {'params': self.hash_encoding.parameters(), 'lr': lr_encoding, "name": "hash_encoding"},  # Separate LR for encoding
             {'params': self.mlp_rgb.parameters(), 'lr': lr_mlp_rgb, "name": "rgb_mlp"}, # Separate LR for MLP
         ]
+        
+        # Add hash encoding parameters (3 grids for surface mode, 1 for baseline)
+        if self.method == 'surface':
+            l.append({'params': self.hash_encoding_x.parameters(), 'lr': lr_encoding, "name": "hash_encoding_x"})
+            l.append({'params': self.hash_encoding_y.parameters(), 'lr': lr_encoding, "name": "hash_encoding_y"})
+            l.append({'params': self.hash_encoding_z.parameters(), 'lr': lr_encoding, "name": "hash_encoding_z"})
+        else:
+            l.append({'params': self.hash_encoding.parameters(), 'lr': lr_encoding, "name": "hash_encoding"})
 
         self.optimizer = torch.optim.Adam(l, betas=(0.9, 0.99), eps=1e-15)
 
-    def build_encoding(self, cfg_encoding):
+    def build_encoding(self, cfg_encoding, name_suffix=''):
         assert(cfg_encoding.type == "hashgrid")
         self.voxel_range = cfg_encoding.hashgrid.range
         self.gridrange = torch.tensor(self.voxel_range).cuda().float()
@@ -104,11 +118,7 @@ class INGP(nn.Module):
         num_levels = cfg_encoding.levels
         self.growth_rate = np.exp((np.log(r_max) - np.log(r_min)) / (num_levels - 1))
         
-        # For surface mode, use 3x features per level (for 3D vector potentials)
         features_per_level = cfg_encoding.hashgrid.dim
-        if self.method == 'surface':
-            features_per_level *= 3
-            print(f"[INGP] Surface mode: using {features_per_level} features per level (3x for vector potentials)")
         
         tcnn_config = dict(
             otype="HashGrid",
@@ -132,11 +142,12 @@ class INGP(nn.Module):
             range=self.voxel_range,
         )
         
-        print('hash config:', config)
-        print(f'init activate level {cfg_encoding.coarse2fine.init_active_level}')
+        if not name_suffix:  # Only print once
+            print('hash config:', config)
+            print(f'init activate level {cfg_encoding.coarse2fine.init_active_level}')
 
         self.level_dim = features_per_level  # Store the actual features per level
-        self.base_level_dim = cfg_encoding.hashgrid.dim  # Store the base dimension (before 3x)
+        self.base_level_dim = cfg_encoding.hashgrid.dim  # Store the base dimension
         self.levels = cfg_encoding.levels
 
         self.hash_encoding = register_GridEncoder(config)
@@ -263,9 +274,17 @@ class INGP(nn.Module):
 
         xyz_input = points_3D_normalized.view(-1, 3)
 
-        feat_output = self.hash_encoding(xyz_input)#, eps = self.level_eps)
+        if self.method == 'surface':
+            # Query all 3 hash grids and stack
+            feat_x = self.hash_encoding_x(xyz_input)  # (N, feat_dim)
+            feat_y = self.hash_encoding_y(xyz_input)  # (N, feat_dim)
+            feat_z = self.hash_encoding_z(xyz_input)  # (N, feat_dim)
+            # Stack as (N, feat_dim, 3) for vector potentials
+            feat_output = torch.stack([feat_x, feat_y, feat_z], dim=-1)  # (N, feat_dim, 3)
+        else:
+            feat_output = self.hash_encoding(xyz_input)  # (N, feat_dim)
 
-        points_enc = feat_output.view(*points_3D_normalized.shape[:-1], feat_output.shape[-1])
+        points_enc = feat_output.view(*points_3D_normalized.shape[:-1], -1)
         return points_enc
 
     def _encode_view(self, d):

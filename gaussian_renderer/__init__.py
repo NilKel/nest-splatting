@@ -82,14 +82,21 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             hash_in_CUDA = False
         if iteration < cfg.ingp_stage.switch_iter:
             hash_in_CUDA = False
+        # Disable hash-in-CUDA for surface mode (need to query 3 grids separately)
+        if ingp is not None and ingp.method == 'surface':
+            hash_in_CUDA = False
     except:
         pass
     
 
     if ingp is not None and hash_in_CUDA == False:
-        ### warm-up
+        ### warm-up (or surface mode)
         override_color = ingp(points_3D = means3D, with_xyz = False).float()
-        feat_dim = ingp.active_levels * ingp.level_dim
+        if ingp.method == 'surface':
+            # override_color shape: (N_gaussians, feat_dim * 3) for vector potentials
+            feat_dim = ingp.active_levels * ingp.level_dim * 3
+        else:
+            feat_dim = ingp.active_levels * ingp.level_dim
     
     if override_color is None:
         if pipe.convert_SHs_python:
@@ -241,12 +248,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # Surface potential mode: apply dot product with normals before MLP
         if ingp.method == 'surface':
             if iteration is not None and iteration % 1000 == 0:
-                print(f"[SURFACE] Iteration {iteration}: Applying dot product - feat_dim={feat_dim}, F={feat_dim//3}")
-            # rendered_image shape: (feat_dim, H, W) where feat_dim = F*3
-            # Reshape to (H, W, F, 3) then flatten to (H*W, F, 3)
-            F = feat_dim // 3
-            vector_potentials = rendered_image.view(F, 3, H, W).permute(2, 3, 0, 1)  # (H, W, F, 3)
-            vector_potentials = vector_potentials.reshape(-1, F, 3)  # (H*W, F, 3)
+                print(f"[SURFACE] Iteration {iteration}: Applying dot product, feat_dim={feat_dim}")
+            
+            # rendered_image shape: (feat_dim, H, W) where feat_dim = base_feat_dim * 3
+            # Reshape to (base_feat_dim, 3, H, W) then to (H*W, base_feat_dim, 3)
+            base_feat_dim = feat_dim // 3
+            vector_potentials = rendered_image.view(base_feat_dim, 3, H, W).permute(2, 3, 0, 1)  # (H, W, base_feat_dim, 3)
+            vector_potentials = vector_potentials.reshape(-1, base_feat_dim, 3)  # (H*W, base_feat_dim, 3)
             
             # Get normals from rendered normal map (already computed)
             render_normal = allmap[2:5]  # (3, H, W)
@@ -254,8 +262,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             pixel_normals = render_normal.permute(1, 2, 0).reshape(-1, 3)  # (H*W, 3)
             
             # Compute dot product: surface_features = -Φ · n
-            # vector_potentials: (H*W, F, 3), pixel_normals: (H*W, 3) -> (H*W, F)
-            surface_features = -torch.sum(vector_potentials * pixel_normals.unsqueeze(1), dim=-1)  # (H*W, F)
+            # vector_potentials: (H*W, base_feat_dim, 3), pixel_normals: (H*W, 3) -> (H*W, base_feat_dim)
+            surface_features = -torch.sum(vector_potentials * pixel_normals.unsqueeze(1), dim=-1)  # (H*W, base_feat_dim)
             
             # Pass through MLP
             rendered_image = ingp.rgb_decode(surface_features, rays_dir)
