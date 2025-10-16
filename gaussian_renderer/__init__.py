@@ -238,7 +238,28 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
         feature_vis = rendered_image[:3].detach().abs()
         
-        rendered_image = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), rays_dir)
+        # Surface potential mode: apply dot product with normals before MLP
+        if ingp.method == 'surface':
+            # rendered_image shape: (feat_dim, H, W) where feat_dim = F*3
+            # Reshape to (H, W, F, 3) then flatten to (H*W, F, 3)
+            F = feat_dim // 3
+            vector_potentials = rendered_image.view(F, 3, H, W).permute(2, 3, 0, 1)  # (H, W, F, 3)
+            vector_potentials = vector_potentials.reshape(-1, F, 3)  # (H*W, F, 3)
+            
+            # Get normals from rendered normal map (already computed)
+            render_normal = allmap[2:5]  # (3, H, W)
+            render_normal = (render_normal.permute(1,2,0) @ (viewpoint_camera.world_view_transform[:3,:3].T)).permute(2,0,1)  # (3, H, W)
+            pixel_normals = render_normal.permute(1, 2, 0).reshape(-1, 3)  # (H*W, 3)
+            
+            # Compute dot product: surface_features = -Φ · n
+            # vector_potentials: (H*W, F, 3), pixel_normals: (H*W, 3) -> (H*W, F)
+            surface_features = -torch.sum(vector_potentials * pixel_normals.unsqueeze(1), dim=-1)  # (H*W, F)
+            
+            # Pass through MLP
+            rendered_image = ingp.rgb_decode(surface_features, rays_dir)
+        else:
+            # Baseline mode: direct MLP decode
+            rendered_image = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), rays_dir)
 
         rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
         rendered_image = rendered_image * render_mask

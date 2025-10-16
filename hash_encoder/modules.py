@@ -46,9 +46,10 @@ def register_GridEncoder(cfg_encoding):
 
 class INGP(nn.Module):
 
-    def __init__(self, cfg_model):
+    def __init__(self, cfg_model, method='baseline'):
         super().__init__()  
 
+        self.method = method  # 'baseline' or 'surface'
         self.view_dep = cfg_model.rgb.view_dep
         if self.view_dep:
             self.build_view_enc(cfg_model.rgb.encoding_view)
@@ -56,7 +57,15 @@ class INGP(nn.Module):
         view_enc_dir = 0 if not self.view_dep else self.encoder_dir.n_output_dims
 
         self.build_encoding(cfg_model.encoding)
-        self.feat_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim # + 3
+        
+        # For surface potential mode, we need 3x more features (for 3D vectors)
+        base_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim
+        if method == 'surface':
+            self.feat_dim = base_dim  # MLP input is still base_dim (after dot product)
+            self.hash_output_dim = base_dim * 3  # Hash grid outputs 3D vectors
+        else:
+            self.feat_dim = base_dim
+            self.hash_output_dim = base_dim
         
         self.mlp_rgb = self.build_mlp(cfg_model.rgb, input_dim=self.feat_dim + view_enc_dir, output_dim = 3)
         
@@ -94,10 +103,17 @@ class INGP(nn.Module):
         r_min, r_max = 2 ** l_min, 2 ** l_max
         num_levels = cfg_encoding.levels
         self.growth_rate = np.exp((np.log(r_max) - np.log(r_min)) / (num_levels - 1))
+        
+        # For surface mode, use 3x features per level (for 3D vector potentials)
+        features_per_level = cfg_encoding.hashgrid.dim
+        if self.method == 'surface':
+            features_per_level *= 3
+            print(f"[INGP] Surface mode: using {features_per_level} features per level (3x for vector potentials)")
+        
         tcnn_config = dict(
             otype="HashGrid",
             n_levels=cfg_encoding.levels,
-            n_features_per_level=cfg_encoding.hashgrid.dim,
+            n_features_per_level=features_per_level,
             log2_hashmap_size=cfg_encoding.hashgrid.dict_size,
             base_resolution=2 ** cfg_encoding.hashgrid.min_logres,
             per_level_scale=self.growth_rate,
@@ -107,7 +123,7 @@ class INGP(nn.Module):
             device="cuda",
             otype="HashGrid",
             n_levels=cfg_encoding.levels,
-            n_features_per_level=cfg_encoding.hashgrid.dim,
+            n_features_per_level=features_per_level,
             log2_hashmap_size=cfg_encoding.hashgrid.dict_size,
             base_resolution=2**cfg_encoding.hashgrid.min_logres,
             finest_resolution=2**cfg_encoding.hashgrid.max_logres,
@@ -119,7 +135,8 @@ class INGP(nn.Module):
         print('hash config:', config)
         print(f'init activate level {cfg_encoding.coarse2fine.init_active_level}')
 
-        self.level_dim = cfg_encoding.hashgrid.dim
+        self.level_dim = features_per_level  # Store the actual features per level
+        self.base_level_dim = cfg_encoding.hashgrid.dim  # Store the base dimension (before 3x)
         self.levels = cfg_encoding.levels
 
         self.hash_encoding = register_GridEncoder(config)

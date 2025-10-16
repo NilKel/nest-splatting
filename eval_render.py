@@ -59,7 +59,8 @@ if __name__ == "__main__":
     cfg_model = Config(yaml_file)
     merge_cfg_to_args(args, cfg_model)
 
-    ingp_model = INGP(cfg_model).to('cuda')
+    # Default to baseline for eval (can add --method arg if needed)
+    ingp_model = INGP(cfg_model, method='baseline').to('cuda')
     ingp_model.load_model(exp_path, iteration)
 
     dataset, pipe = model.extract(args), pipeline.extract(args)

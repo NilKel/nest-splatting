@@ -84,7 +84,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     ingp_model = None
     if cfg_model.settings.if_ingp:
-        ingp_model = INGP(cfg_model).to('cuda')
+        ingp_model = INGP(cfg_model, method=args.method).to('cuda')
+        print(f"[INGP] Initialized with method='{args.method}'")
 
     opacity_reset_protect = cfg_model.training_cfg.opacity_reset_protect
     if_pixel_densify_enhance = cfg_model.settings.pixel_densify_enhance
