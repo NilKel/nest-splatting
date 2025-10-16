@@ -64,13 +64,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
     elif cfg_model.settings.if_ingp and os.path.exists(gaussian_checkpoint_path):
-        print(f"\n[2DGS] Found pre-trained Gaussians at {gaussian_checkpoint_path}")
-        print(f"[2DGS] Loading pre-trained Gaussians and skipping to INGP training...")
+        print("\n╔══════════════════════════════════════════════════════════════════╗")
+        print("║              ✓ PRE-TRAINED 2DGS CHECKPOINT FOUND                ║")
+        print("╚══════════════════════════════════════════════════════════════════╝")
+        print(f"[2DGS] Checkpoint location: {gaussian_checkpoint_path}")
         checkpoint_data = torch.load(gaussian_checkpoint_path)
+        print(f"[2DGS] Checkpoint was saved at iteration: {checkpoint_data['iteration']}")
         gaussians.restore(checkpoint_data['gaussians'], opt)
         first_iter = cfg_model.ingp_stage.initialize + 1  # Start right after 2DGS phase
         loaded_pretrained = True
-        print(f"[2DGS] Starting from iteration {first_iter}")
+        print(f"[2DGS] ➤ Skipping 2DGS training phase (iterations 0-{cfg_model.ingp_stage.initialize})")
+        print(f"[2DGS] ➤ Starting directly at iteration {first_iter} (INGP training)")
+        print(f"[2DGS] ➤ Will train for {opt.iterations - first_iter + 1} iterations with INGP")
+        print("╚══════════════════════════════════════════════════════════════════╝\n")
+    elif cfg_model.settings.if_ingp:
+        print("\n╔══════════════════════════════════════════════════════════════════╗")
+        print("║           ⚠ NO PRE-TRAINED 2DGS CHECKPOINT FOUND                ║")
+        print("╚══════════════════════════════════════════════════════════════════╝")
+        print(f"[2DGS] Checkpoint path: {gaussian_checkpoint_path}")
+        print(f"[2DGS] ➤ Will train 2DGS from scratch (iterations 0-{cfg_model.ingp_stage.initialize})")
+        print(f"[2DGS] ➤ Checkpoint will be saved at iteration {cfg_model.ingp_stage.initialize}")
+        print(f"[2DGS] ➤ Then continue with INGP training (iterations {cfg_model.ingp_stage.initialize + 1}-{opt.iterations})")
+        print(f"[2DGS] ➤ Future runs will load this checkpoint and skip 2DGS phase")
+        print("╚══════════════════════════════════════════════════════════════════╝\n")
     
     # Store whether we need to save Gaussians at initialize iteration
     save_gaussian_init = cfg_model.settings.if_ingp and not loaded_pretrained
@@ -254,14 +270,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             # Save Gaussians at the end of 2DGS phase (before INGP starts)
             if save_gaussian_init and iteration == cfg_model.ingp_stage.initialize:
-                print(f"\n[2DGS] Saving pre-trained Gaussians to {gaussian_checkpoint_path}")
+                print("\n╔══════════════════════════════════════════════════════════════════╗")
+                print("║                  💾 SAVING 2DGS CHECKPOINT                       ║")
+                print("╚══════════════════════════════════════════════════════════════════╝")
+                print(f"[2DGS] Iteration: {iteration}")
+                print(f"[2DGS] Number of Gaussians: {len(gaussians.get_xyz)}")
+                print(f"[2DGS] Saving to: {gaussian_checkpoint_path}")
                 checkpoint_data = {
                     'gaussians': gaussians.capture(),
                     'iteration': iteration,
                     'args': vars(args)
                 }
                 torch.save(checkpoint_data, gaussian_checkpoint_path)
-                print(f"[2DGS] Gaussians saved! Future runs will load from this checkpoint.")
+                print(f"[2DGS] ✓ Checkpoint saved successfully!")
+                print(f"[2DGS] ➤ Future runs will load this checkpoint")
+                print(f"[2DGS] ➤ Next: Starting INGP training at iteration {iteration + 1}")
+                print("╚══════════════════════════════════════════════════════════════════╝\n")
             
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
