@@ -411,7 +411,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         torch.cuda.empty_cache()
     
     # Final test rendering with stride
-    render_test_images_with_normals(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, stride=args.test_render_stride)
+    # Ensure ingp is set for final rendering (in case last iteration didn't use it)
+    final_ingp = ingp_model if ingp_model is not None else ingp
+    render_test_images_with_normals(scene, gaussians, pipe, background, final_ingp, beta, iteration, cfg_model, args, stride=args.test_render_stride)
 
 def render_test_images_with_normals(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, stride=25):
     """
@@ -549,8 +551,14 @@ def prepare_output_and_logger(args, scene_name, yaml_file = ""):
     else:
         # User specified -m flag: treat it as the run name and organize into structure
         run_name = args.model_path
-        # Check if it already has the full path structure (starts with outputs/)
-        if not run_name.startswith('outputs/') and not run_name.startswith('./outputs/'):
+        # Check if user wants to use the old flat structure (starts with ./ or /)
+        if run_name.startswith('./') or run_name.startswith('/'):
+            # Keep the user's explicit path as-is (backward compatibility)
+            pass
+        elif run_name.startswith('outputs/'):
+            # Already has the full organized path structure
+            pass
+        else:
             # Build organized path: outputs/method/dataset/scene/name
             args.model_path = os.path.join("outputs", args.method, dataset_name, scene_name_from_path, run_name)
         
