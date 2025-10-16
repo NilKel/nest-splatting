@@ -409,23 +409,25 @@ def render_test_images_with_normals(scene, gaussians, pipe, background, ingp, be
             concat_image = np.concatenate([gt_np, rendered_np, normal_np], axis=1)
             
             # Save individual images
+            # Use test index for clearer stride visualization, keep original name for reference
             cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
+            filename = f"test_{idx:03d}_{cam_name}"  # e.g., "test_000_r_11" or "test_025_r_47"
             
             # Save concatenated
-            concat_name = os.path.join(final_output_dir, f"{cam_name}_concat.png")
+            concat_name = os.path.join(final_output_dir, f"{filename}_concat.png")
             save_img_u8(concat_image, concat_name)
             
             # Also save individual components
-            gt_name = os.path.join(final_output_dir, f"{cam_name}_gt.png")
+            gt_name = os.path.join(final_output_dir, f"{filename}_gt.png")
             save_img_u8(gt_np, gt_name)
             
-            render_name = os.path.join(final_output_dir, f"{cam_name}_render.png")
+            render_name = os.path.join(final_output_dir, f"{filename}_render.png")
             save_img_u8(rendered_np, render_name)
             
-            normal_name = os.path.join(final_output_dir, f"{cam_name}_normal.png")
+            normal_name = os.path.join(final_output_dir, f"{filename}_normal.png")
             save_img_u8(normal_np, normal_name)
             
-            print(f"[FINAL] View {idx}/{len(test_cameras)} ({cam_name}): PSNR={psnr_value:.2f} SSIM={ssim_value:.4f}")
+            print(f"[FINAL] Test idx {idx:3d} ({cam_name}): PSNR={psnr_value:.2f} SSIM={ssim_value:.4f}")
     
     # Compute and display average metrics
     avg_psnr = np.mean(psnr_values)
@@ -453,12 +455,13 @@ def render_test_images_with_normals(scene, gaussians, pipe, background, ingp, be
         f.write(f"  SSIM: {avg_ssim:.4f}\n")
         f.write(f"  L1:   {avg_l1:.6f}\n\n")
         f.write(f"Per-Image Metrics:\n")
-        f.write(f"{'Image':<30} {'PSNR':>10} {'SSIM':>10} {'L1':>12}\n")
-        f.write(f"{'-'*64}\n")
+        f.write(f"{'Image':<40} {'PSNR':>10} {'SSIM':>10} {'L1':>12}\n")
+        f.write(f"{'-'*74}\n")
         
         for i, (idx, viewpoint) in enumerate((idx, cam) for idx, cam in enumerate(test_cameras) if idx % stride == 0):
             cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
-            f.write(f"{cam_name:<30} {psnr_values[i]:>10.2f} {ssim_values[i]:>10.4f} {l1_values[i]:>12.6f}\n")
+            filename = f"test_{idx:03d}_{cam_name}"
+            f.write(f"{filename:<40} {psnr_values[i]:>10.2f} {ssim_values[i]:>10.4f} {l1_values[i]:>12.6f}\n")
     
     print(f"[FINAL] Metrics saved to: {metrics_file}")
 
