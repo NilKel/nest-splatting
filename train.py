@@ -568,16 +568,10 @@ def prepare_output_and_logger(args, scene_name, yaml_file = ""):
     else:
         # User specified -m flag: treat it as the run name and organize into structure
         run_name = args.model_path
-        # Check if user wants to use the old flat structure (starts with ./ or /)
-        if run_name.startswith('./') or run_name.startswith('/'):
-            # Keep the user's explicit path as-is (backward compatibility)
-            pass
-        elif run_name.startswith('outputs/'):
-            # Already has the full organized path structure
-            pass
-        else:
-            # Build organized path: outputs/method/dataset/scene/name
-            args.model_path = os.path.join("outputs", args.method, dataset_name, scene_name_from_path, run_name)
+        # Strip any leading ./ or / to get just the name
+        run_name = run_name.lstrip('./').lstrip('/')
+        # Build organized path: outputs/method/dataset/scene/name
+        args.model_path = os.path.join("outputs", args.method, dataset_name, scene_name_from_path, run_name)
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
