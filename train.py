@@ -73,6 +73,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.restore(checkpoint_data['gaussians'], opt)
         first_iter = cfg_model.ingp_stage.initialize + 1  # Start right after 2DGS phase
         loaded_pretrained = True
+        # Clear CUDA cache after loading checkpoint to avoid memory issues
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         print(f"[2DGS] ➤ Skipping 2DGS training phase (iterations 0-{cfg_model.ingp_stage.initialize})")
         print(f"[2DGS] ➤ Starting directly at iteration {first_iter} (INGP training)")
         ingp_iters = opt.iterations - first_iter + 1
