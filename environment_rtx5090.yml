@@ -1,0 +1,41 @@
+name: nest_splatting
+channels:
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy=1.24
+  - scipy
+  - matplotlib
+  - pyyaml
+  - scikit-image
+  - scikit-learn
+  - pillow
+  - tqdm
+  - ffmpeg
+  - cmake
+  - ninja
+  - git
+  - glm
+  - libgl
+  - libglib
+  - xorg-libxrandr
+  - xorg-libxinerama
+  - xorg-libxcursor
+  - xorg-libxi
+  - open3d
+  - setuptools
+  - wheel
+  - pip
+  - pip:
+      - mediapy
+      - lpips
+      - trimesh
+      - plyfile
+      - opencv-python
+      - pyrender
+      - imageio
+      - tensorboard
+      # NOTE: PyTorch and tiny-cuda-nn will be installed manually
+      # See install_rtx5090.sh for installation instructions

@@ -422,20 +422,27 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
         
         torch.cuda.empty_cache()
 
-def merge_cfg_to_args(args, cfg):
+def merge_cfg_to_args(args, cfg, cli_args):
     """Merge specific sections from config into args
     Args:
         args: ArgumentParser args
         cfg: Config object from yaml
+        cli_args: Raw CLI arguments to check what was explicitly set
     """
     # Only flatten training_cfg, settings and loss sections
     target_sections = ['training_cfg', 'settings', 'loss']
+    
+    # Check if iterations was explicitly set via CLI
+    iterations_set_via_cli = '--iterations' in cli_args
     
     for section in target_sections:
         if hasattr(cfg, section):
             section_dict = getattr(cfg, section)
             if isinstance(section_dict, dict):
                 for k, v in section_dict.items():
+                    # Don't override iterations if it was explicitly set via CLI
+                    if k == 'iterations' and iterations_set_via_cli:
+                        continue
                     setattr(args, k, v)
 
 if __name__ == "__main__":
@@ -460,13 +467,16 @@ if __name__ == "__main__":
     parser.add_argument("--time_analysis", action="store_true")
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
+    parser.add_argument("--method", type=str, default="baseline", choices=["baseline", "surface"],
+                        help="Rendering method: 'baseline' (default NeST) or 'surface' (surface potential)")
 
     args = parser.parse_args(sys.argv[1:])
     
     print("Optimizing " + args.model_path)
+    print(f"Method: {args.method.upper()}")
 
     cfg_model = Config(args.yaml)
-    merge_cfg_to_args(args, cfg_model)
+    merge_cfg_to_args(args, cfg_model, sys.argv[1:])
 
     print("args: ", args)
 

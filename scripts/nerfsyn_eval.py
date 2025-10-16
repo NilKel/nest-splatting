@@ -4,7 +4,7 @@ from argparse import ArgumentParser
 scenes = ["ship", "drums", "ficus", "hotdog", "lego", "materials", "mic", "chair"]
 exp_name = "nerfsyn"
 output_dir = f"./output/{exp_name}"
-dataset_dir = "/workspace/DATA/nerf_synthetic"
+dataset_dir = "/home/nilkel/Projects/data/nest_synthetic/nerf_synthetic"
 
 parser = ArgumentParser(description="Full evaluation script parameters")
 parser.add_argument("--skip_training", action="store_true")
