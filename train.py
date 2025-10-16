@@ -55,9 +55,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    
+    # Check for pre-trained 2DGS Gaussians (for INGP training)
+    gaussian_checkpoint_path = os.path.join(dataset.source_path, "gaussian_init.pth")
+    loaded_pretrained = False
+    
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    elif cfg_model.settings.if_ingp and os.path.exists(gaussian_checkpoint_path):
+        print(f"\n[2DGS] Found pre-trained Gaussians at {gaussian_checkpoint_path}")
+        print(f"[2DGS] Loading pre-trained Gaussians and skipping to INGP training...")
+        checkpoint_data = torch.load(gaussian_checkpoint_path)
+        gaussians.restore(checkpoint_data['gaussians'], opt)
+        first_iter = cfg_model.ingp_stage.initialize + 1  # Start right after 2DGS phase
+        loaded_pretrained = True
+        print(f"[2DGS] Starting from iteration {first_iter}")
+    
+    # Store whether we need to save Gaussians at initialize iteration
+    save_gaussian_init = cfg_model.settings.if_ingp and not loaded_pretrained
 
     surfel_cfg = cfg_model.surfel
     gaussians.base_opacity = surfel_cfg.base_opacity
@@ -235,6 +251,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), \
                 ingp_model=ingp, beta = beta, args = args, cfg_model = cfg_model, test_psnr = test_psnr, train_psnr = train_psnr, iter_list = iter_list)
+            
+            # Save Gaussians at the end of 2DGS phase (before INGP starts)
+            if save_gaussian_init and iteration == cfg_model.ingp_stage.initialize:
+                print(f"\n[2DGS] Saving pre-trained Gaussians to {gaussian_checkpoint_path}")
+                checkpoint_data = {
+                    'gaussians': gaussians.capture(),
+                    'iteration': iteration,
+                    'args': vars(args)
+                }
+                torch.save(checkpoint_data, gaussian_checkpoint_path)
+                print(f"[2DGS] Gaussians saved! Future runs will load from this checkpoint.")
+            
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)

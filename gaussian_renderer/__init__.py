@@ -210,6 +210,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     render_gs_nums = allmap[7:8]
 
     if ingp is not None:
+        print(f"[DEBUG] Line 212: ingp is not None, method={ingp.method}")
         # if hash_in_CUDA:
         rays_d, rays_o = cam2rays(viewpoint_camera)
         W, H = viewpoint_camera.image_width, viewpoint_camera.image_height
@@ -237,9 +238,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         ray_map = ray_map * render_mask
 
         feature_vis = rendered_image[:3].detach().abs()
+        print(f"[DEBUG] Line 239: About to check surface mode, rendered_image.shape={rendered_image.shape}")
         
         # Surface potential mode: apply dot product with normals before MLP
         if ingp.method == 'surface':
+            print(f"[DEBUG] Line 242: ENTERING SURFACE MODE!")
+            if iteration is not None and iteration % 1000 == 0:
+                print(f"[SURFACE] Iteration {iteration}: Applying dot product - feat_dim={feat_dim}, F={feat_dim//3}")
             # rendered_image shape: (feat_dim, H, W) where feat_dim = F*3
             # Reshape to (H, W, F, 3) then flatten to (H*W, F, 3)
             F = feat_dim // 3
