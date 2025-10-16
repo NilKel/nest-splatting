@@ -68,7 +68,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("║              ✓ PRE-TRAINED 2DGS CHECKPOINT FOUND                ║")
         print("╚══════════════════════════════════════════════════════════════════╝")
         print(f"[2DGS] Checkpoint location: {gaussian_checkpoint_path}")
-        checkpoint_data = torch.load(gaussian_checkpoint_path)
+        checkpoint_data = torch.load(gaussian_checkpoint_path, weights_only=False)
         print(f"[2DGS] Checkpoint was saved at iteration: {checkpoint_data['iteration']}")
         gaussians.restore(checkpoint_data['gaussians'], opt)
         first_iter = cfg_model.ingp_stage.initialize + 1  # Start right after 2DGS phase
