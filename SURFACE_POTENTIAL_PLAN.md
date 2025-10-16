@@ -6,9 +6,9 @@
 - **Remote**: https://github.com/NilKel/nest-splatting.git
 - **Status**: Initial commit pushed
 
-## CLI Argument Added ✅
+## CLI Arguments Added ✅
 
-### Usage:
+### --method: Rendering method
 ```bash
 # Baseline mode (default NeST behavior)
 python train.py -s <scene> -m <output> --yaml ./configs/nerfsyn.yaml --method baseline
@@ -17,9 +17,28 @@ python train.py -s <scene> -m <output> --yaml ./configs/nerfsyn.yaml --method ba
 python train.py -s <scene> -m <output> --yaml ./configs/nerfsyn.yaml --method surface
 ```
 
-### Implementation Location:
-- **File**: `train.py` line 470-471
-- **Variable**: `args.method` (accessible throughout training)
+**Implementation Location**: `train.py` line 535-536  
+**Variable**: `args.method` (accessible throughout training)
+
+### --test_render_stride: Final test rendering ✅ NEW!
+```bash
+# Render every 25th test image (default)
+python train.py -s <scene> -m <output> --yaml ./configs/nerfsyn.yaml --test_render_stride 25
+
+# Render every 5th test image (more images)
+python train.py -s <scene> -m <output> --yaml ./configs/nerfsyn.yaml --test_render_stride 5
+
+# Render every test image
+python train.py -s <scene> -m <output> --yaml ./configs/nerfsyn.yaml --test_render_stride 1
+```
+
+**Implementation Location**: `train.py` line 537-538  
+**Function**: `render_test_images_with_normals()` at line 354-415  
+**Output**: `<model_path>/final_test_renders/` containing:
+- `*_concat.png` - GT | Rendered | Normal (side-by-side)
+- `*_gt.png` - Ground truth image
+- `*_render.png` - Rendered image
+- `*_normal.png` - Rendered normals
 
 ## Next Steps: Implementing Surface Potential Mode
 

@@ -348,6 +348,70 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         torch.cuda.empty_cache()
     
+    # Final test rendering with stride
+    render_test_images_with_normals(dataset, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, stride=args.test_render_stride)
+
+def render_test_images_with_normals(dataset, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, stride=25):
+    """
+    Render test images at the end of training with GT, rendered image, and normals.
+    
+    Args:
+        stride: Render every Nth test image (default: 25)
+    """
+    print(f"\n[FINAL] Rendering test images with stride {stride}...")
+    
+    # Create output directory
+    final_output_dir = os.path.join(dataset.model_path, 'final_test_renders')
+    os.makedirs(final_output_dir, exist_ok=True)
+    
+    test_cameras = dataset.getTestCameras()
+    
+    if len(test_cameras) == 0:
+        print("[FINAL] No test cameras available, skipping final rendering")
+        return
+    
+    with torch.no_grad():
+        for idx, viewpoint in enumerate(test_cameras):
+            # Only render every 'stride' images
+            if idx % stride != 0:
+                continue
+            
+            # Render the image
+            render_pkg = render(viewpoint, gaussians, pipe, background, 
+                              ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
+            
+            rendered_image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+            gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+            rendered_normal = render_pkg["rend_normal"]
+            
+            # Convert to numpy for saving
+            rendered_np = rendered_image.permute(1, 2, 0).detach().cpu().numpy()
+            gt_np = gt_image.permute(1, 2, 0).detach().cpu().numpy()
+            normal_np = rendered_normal.permute(1, 2, 0).cpu().numpy() * 0.5 + 0.5  # Map to [0, 1]
+            
+            # Create concatenated image: GT | Rendered | Normal
+            concat_image = np.concatenate([gt_np, rendered_np, normal_np], axis=1)
+            
+            # Save individual images
+            cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
+            
+            # Save concatenated
+            concat_name = os.path.join(final_output_dir, f"{cam_name}_concat.png")
+            save_img_u8(concat_image, concat_name)
+            
+            # Also save individual components
+            gt_name = os.path.join(final_output_dir, f"{cam_name}_gt.png")
+            save_img_u8(gt_np, gt_name)
+            
+            render_name = os.path.join(final_output_dir, f"{cam_name}_render.png")
+            save_img_u8(rendered_np, render_name)
+            
+            normal_name = os.path.join(final_output_dir, f"{cam_name}_normal.png")
+            save_img_u8(normal_np, normal_name)
+            
+            print(f"[FINAL] Rendered test view {idx}/{len(test_cameras)}: {cam_name}")
+    
+    print(f"[FINAL] Test rendering complete! Saved to: {final_output_dir}")
 
 def prepare_output_and_logger(args, scene_name, yaml_file = ""):    
     if not args.model_path:
@@ -469,6 +533,8 @@ if __name__ == "__main__":
     parser.add_argument("--yaml", type=str, default = "tiny")
     parser.add_argument("--method", type=str, default="baseline", choices=["baseline", "surface"],
                         help="Rendering method: 'baseline' (default NeST) or 'surface' (surface potential)")
+    parser.add_argument("--test_render_stride", type=int, default=25,
+                        help="Stride for final test rendering (render every Nth test image, default: 25)")
 
     args = parser.parse_args(sys.argv[1:])
     
