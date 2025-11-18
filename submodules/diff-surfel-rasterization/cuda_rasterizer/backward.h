@@ -55,7 +55,13 @@ namespace BACKWARD
 		float* dL_dnormal3D,
 		float* dL_dopacity,
 		float* dL_dcolors,
-		float* dL_gradsum);
+		float* dL_gradsum,
+		const uint32_t D_diffuse = 0,
+		const float* hash_features_diffuse = nullptr,
+		const int* level_offsets_diffuse = nullptr,
+		const float* gridrange_diffuse = nullptr,
+		float* dL_dfeatures_diffuse = nullptr,
+		const int render_mode = 0);
 
 	void preprocess(
 		int P, int D, int M,

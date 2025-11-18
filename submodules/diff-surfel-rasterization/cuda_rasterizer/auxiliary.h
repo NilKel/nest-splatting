@@ -29,6 +29,7 @@
 #define NUM_OFFSET 7
 #define POS_OFFSET 8
 #define VIS_OFFSET 11
+#define DIFFUSE_RGB_OFFSET 14
 // #define MEDIAN_WEIGHT_OFFSET 7
 
 // distortion helper macros

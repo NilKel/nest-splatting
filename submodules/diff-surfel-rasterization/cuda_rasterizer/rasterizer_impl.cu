@@ -287,7 +287,12 @@ int CudaRasterizer::Rasterizer::forward(
 	float* cover_pixels,
 	float* trans_avg,
 	bool debug,
-	const float beta)
+	const float beta,
+	const uint32_t D_diffuse,
+	const float* hash_features_diffuse,
+	const int* level_offsets_diffuse,
+	const float* gridrange_diffuse,
+	const int render_mode)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -418,7 +423,12 @@ int CudaRasterizer::Rasterizer::forward(
 		out_others,
 		out_index,
 		cover_pixels,
-		trans_avg), debug)
+		trans_avg,
+		D_diffuse,
+		hash_features_diffuse,
+		level_offsets_diffuse,
+		gridrange_diffuse,
+		render_mode), debug)
 
 	return num_rendered;
 }
@@ -469,7 +479,13 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_drot,
 	float* dL_gradsum,
 	bool debug,
-	const float beta)
+	const float beta,
+	const uint32_t D_diffuse,
+	const float* hash_features_diffuse,
+	const int* level_offsets_diffuse,
+	const float* gridrange_diffuse,
+	float* dL_dfeatures_diffuse,
+	const int render_mode)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -526,7 +542,13 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dnormal,
 		dL_dopacity,
 		dL_dcolor,
-		dL_gradsum), debug)
+		dL_gradsum,
+		D_diffuse,
+		hash_features_diffuse,
+		level_offsets_diffuse,
+		gridrange_diffuse,
+		dL_dfeatures_diffuse,
+		render_mode), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,

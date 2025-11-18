@@ -375,8 +375,10 @@ void kernel_grid_wrapper(const float *inputs, const scalar_t *embeddings, const 
         case 2: kernel_grid<scalar_t, D, 2><<<blocks_hashgrid, N_THREAD>>>(inputs, embeddings, offsets, outputs, B, L, S, H, dy_dx, gridtype, align_corners, interp); break;
         case 4: kernel_grid<scalar_t, D, 4><<<blocks_hashgrid, N_THREAD>>>(inputs, embeddings, offsets, outputs, B, L, S, H, dy_dx, gridtype, align_corners, interp); break;
         case 8: kernel_grid<scalar_t, D, 8><<<blocks_hashgrid, N_THREAD>>>(inputs, embeddings, offsets, outputs, B, L, S, H, dy_dx, gridtype, align_corners, interp); break;
+        case 12: kernel_grid<scalar_t, D, 12><<<blocks_hashgrid, N_THREAD>>>(inputs, embeddings, offsets, outputs, B, L, S, H, dy_dx, gridtype, align_corners, interp); break;
+        case 15: kernel_grid<scalar_t, D, 15><<<blocks_hashgrid, N_THREAD>>>(inputs, embeddings, offsets, outputs, B, L, S, H, dy_dx, gridtype, align_corners, interp); break;
         case 16: kernel_grid<scalar_t, D, 16><<<blocks_hashgrid, N_THREAD>>>(inputs, embeddings, offsets, outputs, B, L, S, H, dy_dx, gridtype, align_corners, interp); break;
-        default: throw std::runtime_error{"GridEncoding: C must be 1, 2, 4, or 8, or 16."};
+        default: throw std::runtime_error{"GridEncoding: C must be 1, 2, 4, 8, 12, 15, or 16."};
     }
 }
 
@@ -419,11 +421,19 @@ void kernel_grid_backward_wrapper(const scalar_t *grad, const float *inputs, con
             kernel_grid_backward<scalar_t, D, 8, 2><<<blocks_hashgrid, N_THREAD>>>(grad, inputs, embeddings, offsets, grad_embeddings, B, L, S, H, gridtype, align_corners, interp);
             if (dy_dx) kernel_input_backward<scalar_t, D, 8><<<div_round_up(B * D, N_THREAD), N_THREAD>>>(grad, dy_dx, grad_inputs, B, L);
             break;
+        case 12: 
+            kernel_grid_backward<scalar_t, D, 12, 2><<<blocks_hashgrid, N_THREAD>>>(grad, inputs, embeddings, offsets, grad_embeddings, B, L, S, H, gridtype, align_corners, interp);
+            if (dy_dx) kernel_input_backward<scalar_t, D, 12><<<div_round_up(B * D, N_THREAD), N_THREAD>>>(grad, dy_dx, grad_inputs, B, L);
+            break;
+        case 15: 
+            kernel_grid_backward<scalar_t, D, 15, 2><<<blocks_hashgrid, N_THREAD>>>(grad, inputs, embeddings, offsets, grad_embeddings, B, L, S, H, gridtype, align_corners, interp);
+            if (dy_dx) kernel_input_backward<scalar_t, D, 15><<<div_round_up(B * D, N_THREAD), N_THREAD>>>(grad, dy_dx, grad_inputs, B, L);
+            break;
         case 16: 
             kernel_grid_backward<scalar_t, D, 16, 2><<<blocks_hashgrid, N_THREAD>>>(grad, inputs, embeddings, offsets, grad_embeddings, B, L, S, H, gridtype, align_corners, interp);
             if (dy_dx) kernel_input_backward<scalar_t, D, 16><<<div_round_up(B * D, N_THREAD), N_THREAD>>>(grad, dy_dx, grad_inputs, B, L);
             break;
-        default: throw std::runtime_error{"GridEncoding: C must be 1, 2, 4, or 8, or 16."};
+        default: throw std::runtime_error{"GridEncoding: C must be 1, 2, 4, 8, 12, 15, or 16."};
     }
 }
 

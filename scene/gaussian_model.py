@@ -62,6 +62,10 @@ class GaussianModel:
         self._appearance_level = torch.empty(0)
         self.feat_gradient_accum = torch.empty(0)
 
+        # Per-Gaussian features for hybrid_features mode
+        # Initialize as None - will be set to Parameter in train.py
+        self._gaussian_features = None
+
         self.setup_functions()
 
     def capture(self):
@@ -120,11 +124,15 @@ class GaussianModel:
     @property
     def get_appearance_level(self):
         return self._appearance_level
-    
+
     @property
-    def get_envmap(self): # 
+    def get_gaussian_features(self):
+        return self._gaussian_features
+
+    @property
+    def get_envmap(self): #
         return self.env_map
-    
+
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity) * (1.0 - self.base_opacity) + self.base_opacity
@@ -170,6 +178,22 @@ class GaussianModel:
         ap_level = init_level * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
         self._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
 
+        # Initialize N×D per-Gaussian features (for hybrid_features mode)
+        # Only create if hybrid_levels > 0 (hybrid_levels=0 means pure baseline)
+        if hasattr(args, 'hybrid_levels') and hasattr(args, 'method') and args.method == 'hybrid_features':
+            if args.hybrid_levels > 0:
+                # Per-Gaussian features: hybrid_levels × D dimensions
+                per_gaussian_dim = args.hybrid_levels * 4  # Assume D=4
+                gaussian_feats = torch.zeros((self.get_xyz.shape[0], per_gaussian_dim), device="cuda").float()
+                self._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+            else:
+                # hybrid_levels=0: pure baseline, no per-Gaussian features
+                self._gaussian_features = None
+        else:
+            # Default: 12D (3 levels × 4D) for other modes
+            gaussian_feats = torch.zeros((self.get_xyz.shape[0], 12), device="cuda").float()
+            self._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -186,6 +210,10 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             {'params': [self._appearance_level], 'lr': 0, "name": "ap_level"},
         ]
+        
+        # Only add gaussian_features to optimizer if it exists (hybrid_levels > 0)
+        if self._gaussian_features is not None:
+            l.append({'params': [self._gaussian_features], 'lr': training_args.feature_lr, "name": "gaussian_features"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -340,6 +368,9 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._appearance_level = optimizable_tensors["ap_level"]
+        # Only update gaussian_features if they exist (hybrid_levels > 0)
+        if "gaussian_features" in optimizable_tensors:
+            self._gaussian_features = optimizable_tensors["gaussian_features"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.feat_gradient_accum = self.feat_gradient_accum[valid_points_mask]
@@ -370,14 +401,18 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
-        "rotation" : new_rotation, 
+        "rotation" : new_rotation,
         "ap_level" : new_ap_level}
+        
+        # Only add gaussian_features if they exist (hybrid_levels > 0)
+        if new_gaussian_features is not None:
+            d["gaussian_features"] = new_gaussian_features
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -387,6 +422,9 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._appearance_level = optimizable_tensors["ap_level"]
+        # Only update gaussian_features if they exist
+        if "gaussian_features" in optimizable_tensors:
+            self._gaussian_features = optimizable_tensors["gaussian_features"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.feat_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -415,8 +453,9 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
         new_ap_level = self._appearance_level[selected_pts_mask].repeat(N,1)
+        new_gaussian_features = self._gaussian_features[selected_pts_mask].repeat(N,1) if self._gaussian_features is not None else None
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -435,8 +474,10 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
 
         new_ap_level = self._appearance_level[selected_pts_mask]
+        # Only clone gaussian_features if they exist (hybrid_levels > 0)
+        new_gaussian_features = self._gaussian_features[selected_pts_mask] if self._gaussian_features is not None else None
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, ap_update, act_level, densify_tag = True, prune_tag = True):
         

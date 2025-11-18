@@ -49,6 +49,10 @@ if __name__ == "__main__":
     parser.add_argument("--unbounded", action="store_true", help='Mesh: using unbounded mode for meshing')
     parser.add_argument("--mesh_res", default=1024, type=int, help='Mesh: resolution for unbounded mesh extraction')
     parser.add_argument("--yaml", type=str, default = "tiny")
+    parser.add_argument("--method", type=str, default="baseline", choices=["baseline", "surface", "surface_blend", "surface_depth", "surface_rgb", "baseline_double", "baseline_blend_double", "hybrid_features"],
+                        help="Rendering method: must match the method used for training")
+    parser.add_argument("--disable_coarse_to_fine", action="store_true",
+                        help="Disable coarse-to-fine hashgrid level annealing (use all levels)")
     args = get_combined_args(parser)
 
     exp_path = args.model_path
@@ -59,8 +63,13 @@ if __name__ == "__main__":
     cfg_model = Config(yaml_file)
     merge_cfg_to_args(args, cfg_model)
 
-    # Default to baseline for eval (can add --method arg if needed)
-    ingp_model = INGP(cfg_model, method='baseline').to('cuda')
+    # Override coarse-to-fine setting if CLI flag is provided
+    if args.disable_coarse_to_fine:
+        cfg_model.encoding.coarse2fine.enabled = False
+        print("\n[CLI Override] Coarse-to-fine disabled - using all hashgrid levels")
+
+    # Use specified method for eval (must match training method)
+    ingp_model = INGP(cfg_model, method=args.method).to('cuda')
     ingp_model.load_model(exp_path, iteration)
 
     dataset, pipe = model.extract(args), pipeline.extract(args)

@@ -11,6 +11,7 @@
 
 import os
 import torch
+import torch.nn as nn
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -59,6 +60,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Check for pre-trained 2DGS Gaussians (for INGP training)
     gaussian_checkpoint_path = os.path.join(dataset.source_path, "gaussian_init.pth")
     loaded_pretrained = False
+    ingp_model = None  # Initialize to None, will be created during checkpoint loading or in training loop
     
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -68,34 +70,124 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("║              ✓ PRE-TRAINED 2DGS CHECKPOINT FOUND                ║")
         print("╚══════════════════════════════════════════════════════════════════╝")
         print(f"[2DGS] Checkpoint location: {gaussian_checkpoint_path}")
-        checkpoint_data = torch.load(gaussian_checkpoint_path, weights_only=False, map_location='cuda')
-        print(f"[2DGS] Checkpoint was saved at iteration: {checkpoint_data['iteration']}")
+        # Load to CPU first to avoid any CUDA state issues
+        checkpoint_data = torch.load(gaussian_checkpoint_path, weights_only=False, map_location='cpu')
+        print(f"[2DGS] Checkpoint was saved at iteration: {checkpoint_data.get('iteration', 'unknown')}")
         
-        # Move all tensors in the checkpoint to CUDA explicitly
-        gaussian_data = checkpoint_data['gaussians']
-        gaussian_data_cuda = tuple(
-            item.cuda() if isinstance(item, torch.Tensor) else item 
-            for item in gaussian_data
-        )
-        
-        gaussians.restore(gaussian_data_cuda, opt)
-        first_iter = cfg_model.ingp_stage.initialize + 1  # Start right after 2DGS phase
+        # Check if this is the new format (dict) or old format (tuple)
+        if 'xyz' in checkpoint_data:
+            # New simplified format - just load the parameters directly
+            gaussians.active_sh_degree = checkpoint_data['active_sh_degree']
+            gaussians._xyz = nn.Parameter(checkpoint_data['xyz'].cuda().contiguous().requires_grad_(True))
+            gaussians._features_dc = nn.Parameter(checkpoint_data['features_dc'].cuda().contiguous().requires_grad_(True))
+            gaussians._features_rest = nn.Parameter(checkpoint_data['features_rest'].cuda().contiguous().requires_grad_(True))
+            gaussians._scaling = nn.Parameter(checkpoint_data['scaling'].cuda().contiguous().requires_grad_(True))
+            gaussians._rotation = nn.Parameter(checkpoint_data['rotation'].cuda().contiguous().requires_grad_(True))
+            gaussians._opacity = nn.Parameter(checkpoint_data['opacity'].cuda().contiguous().requires_grad_(True))
+            gaussians.max_radii2D = checkpoint_data['max_radii2D'].cuda()
+            gaussians.spatial_lr_scale = checkpoint_data['spatial_lr_scale']
+            
+            # Handle appearance_level (may not exist in old checkpoints)
+            if 'appearance_level' in checkpoint_data:
+                gaussians._appearance_level = nn.Parameter(checkpoint_data['appearance_level'].cuda().contiguous().requires_grad_(True))
+            else:
+                # Create appearance_level with correct size for loaded Gaussians
+                init_level = 6
+                ap_level = init_level * torch.ones((gaussians.get_xyz.shape[0], 1), device="cuda").float()
+                gaussians._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
+                print(f"[2DGS] Created appearance_level with shape {gaussians._appearance_level.shape}")
+            
+            # Handle gaussian_features (for hybrid_features mode)
+            # Always create fresh Parameters for training (checkpoint mainly loads point cloud)
+            if args.method == 'hybrid_features':
+                if args.hybrid_levels > 0:
+                    per_gaussian_dim = args.hybrid_levels * cfg_model.encoding.hashgrid.dim
+                    # Check if checkpoint has gaussian_features, otherwise initialize to zeros
+                    if 'gaussian_features' in checkpoint_data:
+                        gaussian_feats = checkpoint_data['gaussian_features'].cuda()
+                    else:
+                        gaussian_feats = torch.zeros((gaussians.get_xyz.shape[0], per_gaussian_dim), device="cuda")
+                    # Always wrap in Parameter with requires_grad=True
+                    gaussians._gaussian_features = nn.Parameter(gaussian_feats.float().contiguous().requires_grad_(True))
+                    print(f"[2DGS] Created gaussian_features with shape {gaussians._gaussian_features.shape}, requires_grad={gaussians._gaussian_features.requires_grad}")
+                else:
+                    # hybrid_levels=0: pure baseline mode, no per-Gaussian features
+                    gaussians._gaussian_features = None
+                    print(f"[2DGS] Skipping gaussian_features (hybrid_levels=0, pure baseline)")
+            else:
+                # Default for other modes
+                if 'gaussian_features' in checkpoint_data:
+                    gaussian_feats = checkpoint_data['gaussian_features'].cuda()
+                else:
+                    gaussian_feats = torch.zeros((gaussians.get_xyz.shape[0], 12), device="cuda")
+                gaussians._gaussian_features = nn.Parameter(gaussian_feats.float().contiguous().requires_grad_(True))
+                print(f"[2DGS] Created gaussian_features with shape {gaussians._gaussian_features.shape}, requires_grad={gaussians._gaussian_features.requires_grad}")
+            
+            # Initialize training state (optimizer will be created fresh)
+            gaussians.training_setup(opt)
+            print(f"[2DGS] ✓ Loaded simplified checkpoint format")
+        else:
+            # Old format with full capture() tuple - use restore()
+            gaussian_data = checkpoint_data['gaussians']
+            gaussian_data_cuda = tuple(
+                item.detach().clone().contiguous().cuda() if isinstance(item, torch.Tensor) else item 
+                for item in gaussian_data
+            )
+            gaussians.restore(gaussian_data_cuda, opt)
+            print(f"[2DGS] ✓ Loaded legacy checkpoint format")
+        # When loading from checkpoint, we've already completed 2DGS training
+        # So we can initialize INGP immediately and start INGP training
+        # Set to initialize-1 so that iteration 'initialize' runs to generate gs_alpha_mask
+        first_iter = cfg_model.ingp_stage.initialize - 1  # This allows iteration 10000 to run
         loaded_pretrained = True
+        
+        # Initialize INGP immediately when loading from checkpoint
+        if cfg_model.settings.if_ingp:
+            print(f"\n[INGP] Initializing immediately after checkpoint loading...")
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            
+            ingp_model = INGP(cfg_model, method=args.method, hybrid_levels=args.hybrid_levels).to('cuda')
+            print(f"[INGP] ✓ Initialized with method='{args.method}'" + (f", hybrid_levels={args.hybrid_levels}" if args.method == 'hybrid_features' else ""))
+            print(f"[INGP] ➤ Ready for INGP training from iteration {first_iter + 1}")
+            
+            # Set ingp immediately for checkpoint loading
+            ingp = ingp_model
         
         # Validate loaded Gaussians
         xyz = gaussians.get_xyz
         print(f"[2DGS] Loaded {len(xyz)} Gaussians")
-        if torch.isnan(xyz).any() or torch.isinf(xyz).any():
-            print(f"[2DGS] ⚠️ ERROR: Checkpoint contains NaN/Inf values!")
+        
+        # Check all Gaussian parameters for NaN/Inf
+        params_ok = True
+        for name in ['xyz', 'features_dc', 'features_rest', 'scaling', 'rotation', 'opacity']:
+            param = getattr(gaussians, f'get_{name}', getattr(gaussians, f'_{name}', None))
+            if param is not None and isinstance(param, torch.Tensor):
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    print(f"[2DGS] ⚠️ ERROR: {name} contains NaN/Inf values!")
+                    params_ok = False
+        
+        if not params_ok:
             print(f"[2DGS] ⚠️ Please delete {gaussian_checkpoint_path} and retrain from scratch")
             exit(1)
         
-        # Clear CUDA cache after loading checkpoint to avoid memory issues
+        # Clear CUDA cache and synchronize to ensure clean state
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        print(f"[2DGS] ➤ Skipping 2DGS training phase (iterations 0-{cfg_model.ingp_stage.initialize})")
-        print(f"[2DGS] ➤ Starting directly at iteration {first_iter} (INGP training)")
-        ingp_iters = opt.iterations - first_iter + 1
+        torch.cuda.reset_peak_memory_stats()  # Reset memory tracking
+        
+        # Force CUDA context reset to clear any corrupted state
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.ipc_collect()
+                torch.cuda.empty_cache()
+            except:
+                pass
+        
+        print(f"[2DGS] ➤ Skipping 2DGS training phase (iterations 0-{cfg_model.ingp_stage.initialize - 1})")
+        print(f"[2DGS] ➤ Will do 1 warmup iteration at {first_iter} (2DGS mode)")
+        print(f"[2DGS] ➤ Then switch to INGP training from iteration {first_iter + 1}")
+        ingp_iters = opt.iterations - first_iter
         print(f"[2DGS] ➤ Will train for {ingp_iters} iterations with INGP")
         if ingp_iters <= 0:
             print(f"[2DGS] ⚠ WARNING: No INGP training will occur!")
@@ -139,12 +231,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
-    ingp_model = None
-    ingp = None  # Initialize ingp variable for final test rendering
-    if cfg_model.settings.if_ingp:
-        ingp_model = INGP(cfg_model, method=args.method).to('cuda')
-        print(f"[INGP] Initialized with method='{args.method}'")
-
+    
+    # CRITICAL: Don't initialize INGP until we actually need it!
+    # This prevents CUDA state corruption when loading from checkpoint
+    ingp_needs_init = cfg_model.settings.if_ingp
+    
     opacity_reset_protect = cfg_model.training_cfg.opacity_reset_protect
     if_pixel_densify_enhance = cfg_model.settings.pixel_densify_enhance
     
@@ -157,26 +248,52 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         opacity_reset_interval = opt.opacity_reset_interval
         densification_interval = opt.densification_interval
+        # Initialize INGP on first iteration where we need it (only for training from scratch)
+        # When loading from checkpoint, INGP is already initialized above
+        if ingp_needs_init and ingp_model is None and not loaded_pretrained and iteration > cfg_model.ingp_stage.initialize + 1:
+            print(f"\n[INGP] Initializing at iteration {iteration}...")
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            
+            ingp_model = INGP(cfg_model, method=args.method, hybrid_levels=args.hybrid_levels).to('cuda')
+            print(f"[INGP] ✓ Initialized with method='{args.method}'" + (f", hybrid_levels={args.hybrid_levels}" if args.method == 'hybrid_features' else ""))
+        
+       
+        
         if ingp_model is None:
             ingp = None
             densify_grad_threshold = cfg_model.training_cfg.densify_grad_threshold
             appearance_update_threshold = 0.0
-        elif iteration <= cfg_model.ingp_stage.initialize:
+        elif iteration < cfg_model.ingp_stage.initialize:
+            # Before initialize iteration: use 2DGS only
             ingp = None
             densify_grad_threshold = cfg_model.training_cfg.densify_grad_threshold
             appearance_update_threshold = 0.0
+        elif iteration == cfg_model.ingp_stage.initialize:
+            # AT initialize iteration: 
+            if loaded_pretrained:
+                # Already have pre-trained Gaussians and alpha masks from checkpoint
+                # Use INGP for rendering (warmup phase)
+                ingp = ingp_model
+            else:
+                # Training from scratch: use 2DGS to generate alpha masks
+                ingp = None
+            densify_grad_threshold = cfg_model.training_cfg.densify_grad_threshold
+            appearance_update_threshold = 0.0
         elif iteration <= cfg_model.ingp_stage.switch_iter:
+            # After initialize, before switch_iter: warmup INGP
             ingp = ingp_model
             densify_grad_threshold = cfg_model.training_cfg.densify_grad_threshold
         else:
+            # After switch_iter: full INGP training
             ingp = ingp_model
             densify_grad_threshold = cfg_model.training_cfg.ingp_densify_threshold
             densification_interval = cfg_model.training_cfg.ingp_densification_interval
             opacity_reset_interval = cfg_model.training_cfg.ingp_opacity_reset_interval
-        
         optim_gaussian = True
         optim_ngp = False
         active_levels = None
+        beta_updated = False  # Track if beta changes this iteration
 
         if ingp is not None:
             active_levels = ingp.set_active_levels(iteration)
@@ -188,11 +305,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 update_times = (surfel_cfg.update_interations / surfel_cfg.update_interval)
                 gaussians.base_opacity += surfel_cfg.tg_base_alpha / update_times
                 beta += surfel_cfg.tg_beta / update_times
+                beta_updated = True  # Flag that beta was updated
 
-        # During warm up process, gaussians are fixed. 
-        for group in gaussians.optimizer.param_groups:
-            for param in group['params']:
-                param.requires_grad = optim_gaussian 
+        # # During warm up process, gaussians are fixed. 
+        # for group in gaussians.optimizer.param_groups:
+        #     for param in group['params']:
+        #         param.requires_grad = optim_gaussian 
         
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -204,10 +322,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         record_transmittance = if_pixel_densify_enhance & (iteration >= opt.pixel_densify_from_iter) & (iteration < opt.densify_until_iter)
+        
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, ingp = ingp, 
             beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance)
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+    
+        # Log Gaussian overlap statistics when beta changes
+        if beta_updated and 'gaussian_num' in render_pkg:
+            gaussian_nums = render_pkg['gaussian_num']
+            avg_gaussians = gaussian_nums.mean().item()
+            max_gaussians = gaussian_nums.max().item()
+            num_gaussians = gaussians.get_xyz.shape[0]
+            print(f"\n[Beta Update] Iter {iteration}: Beta={beta:.4f}, Total Gaussians={num_gaussians}, "
+                  f"Avg/pixel={avg_gaussians:.1f}, Max/pixel={max_gaussians:.0f}\n")
     
         gt_image = viewpoint_cam.original_image.cuda()
 
@@ -258,7 +386,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         total_loss = loss + dist_loss + normal_loss + mask_loss
 
         total_loss.backward()
-
+        breakpoint()
         iter_end.record()
         
         torch.cuda.synchronize()
@@ -302,13 +430,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print(f"[2DGS] Iteration: {iteration}")
                 print(f"[2DGS] Number of Gaussians: {len(gaussians.get_xyz)}")
                 print(f"[2DGS] Saving to: {gaussian_checkpoint_path}")
+                
+                # Save only essential Gaussian parameters (no optimizer state to avoid corruption)
                 checkpoint_data = {
-                    'gaussians': gaussians.capture(),
+                    'active_sh_degree': gaussians.active_sh_degree,
+                    'xyz': gaussians._xyz.detach().cpu(),
+                    'features_dc': gaussians._features_dc.detach().cpu(),
+                    'features_rest': gaussians._features_rest.detach().cpu(),
+                    'scaling': gaussians._scaling.detach().cpu(),
+                    'rotation': gaussians._rotation.detach().cpu(),
+                    'opacity': gaussians._opacity.detach().cpu(),
+                    'max_radii2D': gaussians.max_radii2D.detach().cpu(),
+                    'spatial_lr_scale': gaussians.spatial_lr_scale,
+                    'appearance_level': gaussians._appearance_level.detach().cpu(),
                     'iteration': iteration,
-                    'args': vars(args)
                 }
                 torch.save(checkpoint_data, gaussian_checkpoint_path)
                 print(f"[2DGS] ✓ Checkpoint saved successfully!")
+                print(f"[2DGS] ➤ Saved parameters: xyz, features, scaling, rotation, opacity")
                 print(f"[2DGS] ➤ Future runs will load this checkpoint")
                 print(f"[2DGS] ➤ Next: Starting INGP training at iteration {iteration + 1}")
                 print("╚══════════════════════════════════════════════════════════════════╝\n")
@@ -432,7 +571,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     final_ingp = ingp_model if ingp_model is not None else ingp
     render_test_images_with_normals(scene, gaussians, pipe, background, final_ingp, beta, iteration, cfg_model, args, stride=args.test_render_stride)
 
-def render_test_images_with_normals(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, stride=25):
+def render_test_images_with_normals(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, stride=1):
     """
     Render test images at the end of training with GT, rendered image, and normals.
     Also computes and reports PSNR and SSIM metrics.
@@ -666,6 +805,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--hybrid_levels", type=int, default=3, help="Number of finest hashgrid levels to use in hybrid_features mode (default: 3)")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
 
@@ -676,8 +816,10 @@ if __name__ == "__main__":
     parser.add_argument("--time_analysis", action="store_true")
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
-    parser.add_argument("--method", type=str, default="baseline", choices=["baseline", "surface"],
-                        help="Rendering method: 'baseline' (default NeST) or 'surface' (surface potential)")
+    parser.add_argument("--method", type=str, default="baseline", choices=["baseline", "surface", "surface_blend", "surface_depth", "surface_rgb", "baseline_double", "baseline_blend_double", "hybrid_features"],
+                        help="Rendering method: 'baseline' (default NeST), 'surface' (surface potential), 'surface_blend' (blend vectors, dot with rendered normals), 'surface_depth' (blend vectors, dot with depth gradient), 'surface_rgb' (surface potential + diffuse RGB), 'baseline_double' (dual 4D hashgrids: xyz + pk), 'baseline_blend_double' (dual 4D hashgrids: blended position + pk), or 'hybrid_features' (12D per-Gaussian + 12D from finest 3 hashgrid levels)")
+    parser.add_argument("--disable_coarse_to_fine", action="store_true",
+                        help="Disable coarse-to-fine hashgrid level annealing (use all levels from start)")
     parser.add_argument("--test_render_stride", type=int, default=25,
                         help="Stride for final test rendering (render every Nth test image, default: 25)")
 
@@ -688,6 +830,11 @@ if __name__ == "__main__":
 
     cfg_model = Config(args.yaml)
     merge_cfg_to_args(args, cfg_model, sys.argv[1:])
+
+    # Override coarse-to-fine setting if CLI flag is provided
+    if args.disable_coarse_to_fine:
+        cfg_model.encoding.coarse2fine.enabled = False
+        print("\n[CLI Override] Coarse-to-fine disabled - using all hashgrid levels from start")
 
     print("args: ", args)
 

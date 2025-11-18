@@ -48,7 +48,7 @@ def cam2rays(view):
 def depth_to_normal(view, depth):
     """
         view: view camera
-        depth: depthmap 
+        depth: depthmap
     """
     points, _, _ = depths_to_points(view, depth)
     points = points.reshape(*depth.shape[1:], 3)
@@ -57,6 +57,24 @@ def depth_to_normal(view, depth):
     dy = torch.cat([points[1:-1, 2:] - points[1:-1, :-2]], dim=1)
     normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
     output[1:-1, 1:-1, :] = normal_map
+    return output
+
+def depth_to_gradient_unnormalized(view, depth):
+    """
+    Compute unnormalized depth gradients (preserves magnitude for surface potential).
+    Returns cross product of spatial gradients without normalization.
+
+    view: view camera
+    depth: depthmap
+    """
+    points, _, _ = depths_to_points(view, depth)
+    points = points.reshape(*depth.shape[1:], 3)
+    output = torch.zeros_like(points)
+    dx = torch.cat([points[2:, 1:-1] - points[:-2, 1:-1]], dim=0)
+    dy = torch.cat([points[1:-1, 2:] - points[1:-1, :-2]], dim=1)
+    # Cross product WITHOUT normalization - preserves |∇f| magnitude
+    gradient_map = torch.cross(dx, dy, dim=-1)
+    output[1:-1, 1:-1, :] = gradient_map
     return output
 
 def save_points(points, save_path):

@@ -37,9 +37,9 @@ loss:
   lambda_dist: 1000
   lambda_mask: 0.1
 
-  normal_iter: 7_000
-  dist_iter: 3_000
-  mask_iter: 10_000
+  normal_iter: 7_000   # Activates at absolute iteration 7000 (during 2DGS warmup, but harmless)
+  dist_iter: 3_000     # Activates at absolute iteration 3000 (during 2DGS warmup, but harmless)
+  mask_iter: 10_000    # Activates at absolute iteration 10000 (right when INGP starts)
 
 ingp_stage:
   initialize: 10_000

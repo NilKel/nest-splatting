@@ -64,7 +64,12 @@ namespace CudaRasterizer
 			float* cover_pixels = nullptr,
 			float* trans_avg = nullptr,
 			bool debug = false,
-			const float beta = 0.0);
+			const float beta = 0.0,
+			const uint32_t D_diffuse = 0,
+			const float* hash_features_diffuse = nullptr,
+			const int* level_offsets_diffuse = nullptr,
+			const float* gridrange_diffuse = nullptr,
+			const int render_mode = 0);
 
 		static void backward(
 			const int P, int D, int M, int R,
@@ -110,7 +115,13 @@ namespace CudaRasterizer
 			float* dL_drot,
 			float* dL_gradsum,
 			bool debug,
-			const float beta);
+			const float beta,
+			const uint32_t D_diffuse = 0,
+			const float* hash_features_diffuse = nullptr,
+			const int* level_offsets_diffuse = nullptr,
+			const float* gridrange_diffuse = nullptr,
+			float* dL_dfeatures_diffuse = nullptr,
+			const int render_mode = 0);
 	};
 };
 
