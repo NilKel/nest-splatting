@@ -32,8 +32,10 @@ def rasterize_gaussians(
     features,
     offsets,
     gridrange,
+    gaussian_features,
     raster_settings,
-    hashgrid_settings
+    hashgrid_settings,
+    hybrid_levels
 ):
     return _RasterizeGaussians.apply(
         means3D,
@@ -49,8 +51,10 @@ def rasterize_gaussians(
         features,
         offsets,
         gridrange,
+        gaussian_features,
         raster_settings,
-        hashgrid_settings
+        hashgrid_settings,
+        hybrid_levels
     )
 
 class _RasterizeGaussians(torch.autograd.Function):
@@ -70,8 +74,10 @@ class _RasterizeGaussians(torch.autograd.Function):
         features,
         offsets,
         gridrange,
+        gaussian_features,
         raster_settings,
-        hashgrid_settings
+        hashgrid_settings,
+        hybrid_levels
     ):
 
         start_event = torch.cuda.Event(enable_timing=True)
@@ -80,8 +86,16 @@ class _RasterizeGaussians(torch.autograd.Function):
         start_event.record() 
 
         # Restructure arguments the way that the C++ lib expects them
+        # Convert render_mode to integer: 0 for "baseline", 1 for "add", 2 for "cat"
+        if raster_settings.render_mode == "add":
+            render_mode_int = 1
+        elif raster_settings.render_mode == "cat":
+            render_mode_int = 2
+        else:
+            render_mode_int = 0
+
         args = (
-            raster_settings.bg, 
+            raster_settings.bg,
             means3D,
             colors_precomp,
             opacities,
@@ -94,6 +108,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             features,
             offsets,
             gridrange,
+            gaussian_features,
             raster_settings.viewmatrix,
             raster_settings.projmatrix,
             raster_settings.tanfovx,
@@ -108,6 +123,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.beta,
             raster_settings.if_contract,
             raster_settings.record_transmittance,
+            render_mode_int,
+            hybrid_levels,
             hashgrid_settings.L,
             hashgrid_settings.S,
             hashgrid_settings.H,
@@ -131,8 +148,9 @@ class _RasterizeGaussians(torch.autograd.Function):
         ctx.raster_settings = raster_settings
         ctx.hashgrid_settings = hashgrid_settings
         ctx.num_rendered = num_rendered
-    
-        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, homotrans, ap_level, features, offsets, gridrange, \
+        ctx.hybrid_levels = hybrid_levels
+
+        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, homotrans, ap_level, features, offsets, gridrange, gaussian_features, \
             depth, out_index, radii, sh, geomBuffer, binningBuffer, imgBuffer)
 
         # if raster_settings.record_transmittance :
@@ -150,33 +168,43 @@ class _RasterizeGaussians(torch.autograd.Function):
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
         hashgrid_settings = ctx.hashgrid_settings
-        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, homotrans, ap_level, features, offsets, gridrange, \
+        hybrid_levels = ctx.hybrid_levels
+        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, homotrans, ap_level, features, offsets, gridrange, gaussian_features, \
             depth, out_index, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
+        # Convert render_mode to integer: 0 for "baseline", 1 for "add", 2 for "cat"
+        if raster_settings.render_mode == "add":
+            render_mode_int = 1
+        elif raster_settings.render_mode == "cat":
+            render_mode_int = 2
+        else:
+            render_mode_int = 0
+
         args = (raster_settings.bg,
-                means3D, 
+                means3D,
                 depth,
                 out_index,
-                radii, 
-                colors_precomp, 
-                scales, 
-                rotations, 
-                raster_settings.scale_modifier, 
-                cov3Ds_precomp, 
+                radii,
+                colors_precomp,
+                scales,
+                rotations,
+                raster_settings.scale_modifier,
+                cov3Ds_precomp,
                 homotrans,
                 ap_level,
                 features,
                 offsets,
                 gridrange,
-                raster_settings.viewmatrix, 
-                raster_settings.projmatrix, 
-                raster_settings.tanfovx, 
-                raster_settings.tanfovy, 
+                gaussian_features,
+                raster_settings.viewmatrix,
+                raster_settings.projmatrix,
+                raster_settings.tanfovx,
+                raster_settings.tanfovy,
                 grad_out_color,
                 grad_depth,
-                sh, 
-                raster_settings.sh_degree, 
+                sh,
+                raster_settings.sh_degree,
                 raster_settings.campos,
                 geomBuffer,
                 num_rendered,
@@ -185,6 +213,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.debug,
                 raster_settings.beta,
                 raster_settings.if_contract,
+                render_mode_int,
+                hybrid_levels,
                 hashgrid_settings.L,
                 hashgrid_settings.S,
                 hashgrid_settings.H,
@@ -195,13 +225,13 @@ class _RasterizeGaussians(torch.autograd.Function):
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum = _C.rasterize_gaussians_backward(*args)
+                grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum, grad_gaussian_features = _C.rasterize_gaussians_backward(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-            grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum = _C.rasterize_gaussians_backward(*args)
+            grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum, grad_gaussian_features = _C.rasterize_gaussians_backward(*args)
 
         grad_homotrans = None
 
@@ -219,15 +249,17 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_features,
             None,
             None,
+            grad_gaussian_features,
             None,
             None,
+            None,  # hybrid_levels
         )
 
         return grads
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
-    image_width: int 
+    image_width: int
     tanfovx : float
     tanfovy : float
     bg : torch.Tensor
@@ -241,6 +273,7 @@ class GaussianRasterizationSettings(NamedTuple):
     beta : float
     if_contract : bool
     record_transmittance : bool
+    render_mode : str  # "baseline" or "add"
 
 class HashGridSettings(NamedTuple):
     L: int
@@ -266,10 +299,10 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, 
+    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None,
         cov3D_precomp = None, \
         homotrans = None, ap_level = None, \
-        features = None, offsets = None, gridrange = None):
+        features = None, offsets = None, gridrange = None, gaussian_features = None, hybrid_levels = 0):
         
         raster_settings = self.raster_settings
         hashgrid_settings = self.hashgrid_settings
@@ -298,12 +331,20 @@ class GaussianRasterizer(nn.Module):
             ap_level = torch.Tensor([]).cuda()
         
         if features is None:
-            features = torch.Tensor([]).cuda()
+            # Empty features must be 2D (num_entries, feature_dim) not 1D
+            # CUDA code calls features.size(1), so we need dim 1 to exist
+            features = torch.empty((0, 0), dtype=torch.float32).cuda()
         if offsets is None:
-            offsets = torch.Tensor([]).int().cuda()
+            # offsets needs level+2 elements (accessed as offsets[0] through offsets[level+1])
+            # When hybrid_levels==total_levels, no hash query happens but buffer must exist
+            offsets = torch.zeros(hashgrid_settings.L + 2, dtype=torch.int32).cuda()
         if gridrange is None:
-            gridrange = torch.Tensor([]).cuda() 
-        
+            # gridrange needs 2 elements [min, max] even if unused
+            gridrange = torch.tensor([0.0, 0.0], dtype=torch.float32).cuda()
+        if gaussian_features is None:
+            # Empty gaussian features must be 2D (num_gaussians, feat_dim)
+            gaussian_features = torch.empty((0, 0), dtype=torch.float32).cuda()
+
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(
             means3D,
@@ -311,7 +352,7 @@ class GaussianRasterizer(nn.Module):
             shs,
             colors_precomp,
             opacities,
-            scales, 
+            scales,
             rotations,
             cov3D_precomp,
             homotrans,
@@ -319,7 +360,9 @@ class GaussianRasterizer(nn.Module):
             features,
             offsets,
             gridrange,
-            raster_settings, 
-            hashgrid_settings
+            gaussian_features,
+            raster_settings,
+            hashgrid_settings,
+            hybrid_levels
         )
 

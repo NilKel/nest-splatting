@@ -62,6 +62,9 @@ class GaussianModel:
         self._appearance_level = torch.empty(0)
         self.feat_gradient_accum = torch.empty(0)
 
+        # Per-Gaussian features for "add" mode (added to hashgrid features)
+        self._gaussian_features = torch.empty(0)
+
         self.setup_functions()
 
     def capture(self):
@@ -78,25 +81,56 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._gaussian_features,
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
+        (self.active_sh_degree,
+        self._xyz,
+        self._features_dc,
         self._features_rest,
-        self._scaling, 
-        self._rotation, 
+        self._scaling,
+        self._rotation,
         self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
+        self.max_radii2D,
+        xyz_gradient_accum,
         denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        opt_dict,
+        self.spatial_lr_scale,
+        self._gaussian_features) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+
+        # Load optimizer state (may not have gaussian_features if loading old checkpoint)
+        try:
+            self.optimizer.load_state_dict(opt_dict)
+        except:
+            # If loading fails (e.g., param_groups mismatch), load what we can
+            # Load the state dict for existing parameters
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                if i < len(opt_dict['param_groups']):
+                    # Copy over the parameter group settings (lr, etc) but not params list
+                    param_group['lr'] = opt_dict['param_groups'][i]['lr']
+            # Load state for existing params
+            for param_key in opt_dict['state'].keys():
+                if param_key in [id(p) for pg in self.optimizer.param_groups for p in pg['params']]:
+                    self.optimizer.state[param_key] = opt_dict['state'][param_key]
+
+        # Ensure gaussian_features has proper optimizer state initialized
+        # Find the param_group for gaussian_features and ensure it has state
+        for param_group in self.optimizer.param_groups:
+            if param_group["name"] == "gaussian_features":
+                param = param_group['params'][0]
+                # Initialize optimizer state for gaussian_features if not present
+                if param not in self.optimizer.state:
+                    # Adam optimizer state initialization
+                    self.optimizer.state[param] = {
+                        'step': torch.tensor(0.),
+                        'exp_avg': torch.zeros_like(param),
+                        'exp_avg_sq': torch.zeros_like(param)
+                    }
+                break
 
     
     @property
@@ -120,9 +154,13 @@ class GaussianModel:
     @property
     def get_appearance_level(self):
         return self._appearance_level
-    
+
     @property
-    def get_envmap(self): # 
+    def get_gaussian_features(self):
+        return self._gaussian_features
+
+    @property
+    def get_envmap(self): #
         return self.env_map
     
     @property
@@ -170,6 +208,19 @@ class GaussianModel:
         ap_level = init_level * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
         self._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
 
+        # Initialize per-Gaussian features (for "add" and "cat" modes)
+        # In "add" mode: gaussian_feat_dim = total_levels * per_level_dim = 6 * 4 = 24
+        # In "cat" mode: gaussian_feat_dim = hybrid_levels * per_level_dim
+        if hasattr(args, 'method') and args.method == "cat" and hasattr(args, 'hybrid_levels'):
+            gaussian_feat_dim = args.hybrid_levels * 4  # per_level_dim = 4
+        else:
+            gaussian_feat_dim = 24  # 6 levels * 4 dim (default)
+        
+        # Create Gaussian features parameter (even if 0D for hybrid_levels=0, for consistency)
+        # PyTorch handles 0D parameters gracefully
+        gaussian_feats = torch.zeros((self.get_xyz.shape[0], gaussian_feat_dim), device="cuda").float()
+        self._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -185,6 +236,7 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             {'params': [self._appearance_level], 'lr': 0, "name": "ap_level"},
+            {'params': [self._gaussian_features], 'lr': training_args.feature_lr, "name": "gaussian_features"},
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -216,7 +268,7 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
 
-    def save_ply(self, path):
+    def save_ply(self, path, save_gaussian_features=False):
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
@@ -238,6 +290,15 @@ class GaussianModel:
         if self.env_map is not None:
             save_path = path.replace('.ply', '.map')
             torch.save(self.env_map.state_dict(), save_path)
+        
+        # Save per-Gaussian features separately (for add/cat modes)
+        if save_gaussian_features and hasattr(self, '_gaussian_features') and self._gaussian_features.numel() > 0:
+            features_path = path.replace('.ply', '_gaussian_features.pth')
+            torch.save({
+                'gaussian_features': self._gaussian_features.detach().cpu(),
+                'shape': self._gaussian_features.shape,
+            }, features_path)
+            print(f"[Checkpoint] Saved per-Gaussian features ({self._gaussian_features.shape}) to {features_path}")
            
     def reset_opacity(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -265,6 +326,24 @@ class GaussianModel:
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        
+        # Load per-Gaussian features if available (for add/cat modes)
+        features_path = path.replace('.ply', '_gaussian_features.pth')
+        if os.path.exists(features_path):
+            checkpoint = torch.load(features_path, map_location='cpu')
+            gaussian_features = checkpoint['gaussian_features'].cuda()
+            self._gaussian_features = nn.Parameter(gaussian_features.requires_grad_(True))
+            print(f"[Checkpoint] Loaded per-Gaussian features {gaussian_features.shape} from {features_path}")
+        elif args and hasattr(args, 'method') and args.method in ['add', 'cat']:
+            # Initialize with zeros if not found but method requires it
+            if hasattr(args, 'method') and args.method == 'cat' and hasattr(args, 'hybrid_levels'):
+                gaussian_feat_dim = args.hybrid_levels * 4  # 4 = level_dim
+            else:
+                gaussian_feat_dim = 24  # Default: 6 levels * 4 dim
+            self._gaussian_features = nn.Parameter(
+                torch.zeros((xyz.shape[0], gaussian_feat_dim), device='cuda').requires_grad_(True)
+            )
+            print(f"[Checkpoint] Initialized per-Gaussian features to zeros ({gaussian_feat_dim}D) - features not found in checkpoint")
         # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
         features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
 
@@ -314,6 +393,19 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if group["name"] == "mlp" or group["name"] == "env": continue
+
+            # Special handling for empty tensors (e.g., gaussian_features with 0 dimensions)
+            param = group["params"][0]
+            if param.shape[1] == 0:  # Empty feature dimension
+                # For tensors with shape [N, 0], just update the first dimension
+                new_param = torch.zeros((mask.sum().item(), 0), device=param.device, dtype=param.dtype)
+                group["params"][0] = nn.Parameter(new_param.requires_grad_(True))
+                optimizable_tensors[group["name"]] = group["params"][0]
+                # Clear optimizer state for this param
+                if param in self.optimizer.state:
+                    del self.optimizer.state[param]
+                continue
+
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -340,6 +432,8 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._appearance_level = optimizable_tensors["ap_level"]
+        if "gaussian_features" in optimizable_tensors:
+            self._gaussian_features = optimizable_tensors["gaussian_features"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.feat_gradient_accum = self.feat_gradient_accum[valid_points_mask]
@@ -351,6 +445,9 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if group["name"] == "mlp" or group["name"] == "env": continue
+            # Skip param groups that aren't being updated (e.g., gaussian_features when hybrid_levels=0)
+            if group["name"] not in tensors_dict:
+                continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -370,14 +467,18 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
-        "rotation" : new_rotation, 
+        "rotation" : new_rotation,
         "ap_level" : new_ap_level}
+
+        # Add gaussian_features if available
+        if new_gaussian_features is not None:
+            d["gaussian_features"] = new_gaussian_features
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -387,6 +488,8 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._appearance_level = optimizable_tensors["ap_level"]
+        if "gaussian_features" in optimizable_tensors:
+            self._gaussian_features = optimizable_tensors["gaussian_features"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.feat_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -416,7 +519,13 @@ class GaussianModel:
 
         new_ap_level = self._appearance_level[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level)
+        # Clone gaussian features for split gaussians
+        if self._gaussian_features.numel() > 0:
+            new_gaussian_features = self._gaussian_features[selected_pts_mask].repeat(N,1)
+        else:
+            new_gaussian_features = None
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -436,10 +545,16 @@ class GaussianModel:
 
         new_ap_level = self._appearance_level[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level)
+        # Clone gaussian features for cloned gaussians
+        if self._gaussian_features.numel() > 0:
+            new_gaussian_features = self._gaussian_features[selected_pts_mask]
+        else:
+            new_gaussian_features = None
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, ap_update, act_level, densify_tag = True, prune_tag = True):
-        
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features)
+
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, ap_update, act_level, densify_tag = True, prune_tag = True, iteration=None):
+
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -453,21 +568,33 @@ class GaussianModel:
         if densify_tag == False:
             grads = grads * 0
 
+        num_before = self.get_xyz.shape[0]
+
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
-        
+
+        num_after_densify = self.get_xyz.shape[0]
+
         # prune_mask = (self.get_opacity < min_opacity).squeeze()
         prune_mask = (self.get_opacity < min_opacity * (1.0 - self.base_opacity) + self.base_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             # big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             big_points_ws = (self.get_scaling.max(dim=1).values > self.get_scaling.mean() * 10.)
-            
+
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+
+        num_to_prune = prune_mask.sum().item()
 
         if prune_tag:
             self.prune_points(prune_mask)
-        
+
+        num_after_prune = self.get_xyz.shape[0]
+
+        # Debug logging every 500 iterations
+        if iteration is not None and iteration % 500 == 0:
+            print(f"[Densify] Iter {iteration}: {num_before} -> +{num_after_densify - num_before} densify -> {num_after_densify} -> -{num_to_prune if prune_tag else 0} prune -> {num_after_prune} (prune_tag={prune_tag})")
+
         torch.cuda.empty_cache()
 
         assert(self._xyz.shape[0] == self._appearance_level.shape[0])

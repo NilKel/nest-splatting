@@ -81,11 +81,16 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"), args = args)
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, args = args)
+            # Check if Gaussians were already loaded from checkpoint (e.g., gaussian_init.pth)
+            # If so, skip point cloud initialization to preserve the loaded parameters
+            if hasattr(self.gaussians, '_loaded_from_checkpoint') and self.gaussians._loaded_from_checkpoint:
+                print("[Scene] Skipping point cloud initialization - using pre-loaded Gaussians from checkpoint")
+            else:
+                self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, args = args)
 
-    def save(self, iteration):
+    def save(self, iteration, save_gaussian_features=False):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"), save_gaussian_features=save_gaussian_features)
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

@@ -21,7 +21,7 @@ import time
 from utils.general_utils import MEM_PRINT
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
-    beta = 0, iteration = None, cfg = None, record_transmittance = False):
+    beta = 0, iteration = None, cfg = None, record_transmittance = False, render_mode = "baseline"):
     """
     Render the scene. 
     
@@ -85,7 +85,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     except:
         pass
     
-
     if ingp is not None and hash_in_CUDA == False:
         ### warm-up
         override_color = ingp(points_3D = means3D, with_xyz = False).float()
@@ -114,18 +113,42 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     contract = False
 
     if hash_in_CUDA:
-        features, offsets, levels, per_level_scale, base_resolution, align_corners, interpolation \
-            = ingp.hash_encoding.get_params()
-        gridrange = ingp.gridrange
+        # Edge case: if hybrid_levels >= total_levels in cat mode, disable hashgrid entirely
+        if hasattr(ingp, 'hashgrid_disabled') and ingp.hashgrid_disabled:
+            # No hashgrid - all features from per-Gaussian features
+            # IMPORTANT: Pass total levels so buffer size C = total_levels * l_dim is correct
+            # The CUDA kernel will skip hash queries based on effective_hash_levels = level - hybrid_levels
+            features = None
+            offsets = None
+            gridrange = None
+            levels = ingp.levels  # Total levels for correct buffer size (e.g., 6)
+            per_level_scale = 1
+            base_resolution = 0
+            align_corners = False
+            interpolation = 0
+        else:
+            # Normal case: hashgrid is enabled
+            features, offsets, levels, per_level_scale, base_resolution, align_corners, interpolation \
+                = ingp.hash_encoding.get_params()
+            gridrange = ingp.gridrange
 
-        levels = ingp.active_levels
-        
+            # In cat mode, always use total levels (rasterizer will compute actual hash levels)
+            # In baseline/add mode, use active_levels for coarse-to-fine training
+            if hasattr(ingp, 'is_cat_mode') and ingp.is_cat_mode:
+                levels = ingp.levels  # Total levels (e.g., 6)
+            else:
+                levels = ingp.active_levels  # Active levels for coarse-to-fine
+
         homotrans = pc.get_homotrans()
         ### ap level
         ap_level = pc.get_appearance_level
 
         contract = ingp.contract
     
+    # Only use "add" mode during INGP training (after 2DGS phase)
+    # If ingp is None, we're in 2DGS phase, use "baseline"
+    effective_render_mode = "baseline" if ingp is None else render_mode
+
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -142,6 +165,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         beta=beta,
         if_contract = contract,
         record_transmittance = record_transmittance,
+        render_mode = effective_render_mode,
         # pipe.debug
     )
 
@@ -154,7 +178,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
+
+    # Get per-Gaussian features (for "add" and "cat" modes)
+    gaussian_features = pc.get_gaussian_features if effective_render_mode in ["add", "cat"] else None
     
+    # Apply coarse-to-fine masking to Gaussian features in "add" mode
+    # Same masking strategy as baseline hashgrid c2f: zero out inactive high-frequency levels
+    if effective_render_mode == "add" and gaussian_features is not None and ingp is not None:
+        active_dim = ingp.active_levels * ingp.level_dim
+        # Create mask matching baseline c2f pattern
+        mask = torch.zeros_like(gaussian_features)
+        mask[:, :active_dim] = 1
+        gaussian_features = gaussian_features * mask
+
+    # Get hybrid_levels for cat mode (determines Gaussian vs hashgrid feature split)
+    hybrid_levels = ingp.hybrid_levels if (hasattr(ingp, 'hybrid_levels') and effective_render_mode == "cat") else 0
+
     rendered_image, radii, allmap, transmittance_avg, num_covered_pixels = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -169,8 +208,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         features = features,
         offsets = offsets,
         gridrange = gridrange,
+        gaussian_features = gaussian_features,
+        hybrid_levels = hybrid_levels,
     )
-    
     
     # additional regularizations
     render_alpha = allmap[1:2]

@@ -51,9 +51,10 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& features,
 	const torch::Tensor& offsets,
 	const torch::Tensor& gridrange,
+	const torch::Tensor& gaussian_features,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx, 
+	const float tan_fovx,
 	const float tan_fovy,
 	const int image_height,
 	const int image_width,
@@ -64,7 +65,9 @@ RasterizeGaussiansCUDA(
 	const bool debug,
 	const float beta,
 	const bool if_contract,
-	const bool record_transmittance, 
+	const bool record_transmittance,
+	const int render_mode,
+	const int hybrid_levels,
 	const uint32_t Level,
 	const float LevelScale,
 	const uint32_t Base,
@@ -99,14 +102,43 @@ RasterizeGaussiansCUDA(
   CHECK_INPUT(features);
   CHECK_INPUT(offsets);
   CHECK_INPUT(gridrange);
+  CHECK_INPUT(gaussian_features);
 
   uint32_t D = 0;
-  if(Level > 0){
+  uint32_t hash_levels = 0;
+  uint32_t effective_Level = Level;  // Level to pass to CUDA kernel
+
+  // Check if we actually have hashgrid features (not just Level > 0)
+  bool has_hashgrid = (Level > 0 && features.numel() > 0);
+  
+  if(has_hashgrid){
 	D = features.size(1);
-	C = (offsets.size(0) - 1) * D;
+	hash_levels = offsets.size(0) - 1;  // Actual number of hashgrid levels from encoder
+
+	// In cat mode, C is total output dimension (Gaussian + Hash features)
+	// In baseline/add mode, C is based on the actual hashgrid levels
+	if(render_mode == 2){
+		// Cat mode: effective_Level = Level - hybrid_levels (effective hashgrid levels)
+		// C = Level * D (total output always equals total_levels * D)
+		// Example: Level=6, hybrid_levels=5 → effective_Level=1, C=24
+		effective_Level = Level - hybrid_levels;  // Effective hashgrid levels
+		C = Level * D;  // Total output dimension (total_levels * per_level_dim)
+	} else {
+		// Baseline/add mode: output dimension is based on actual hashgrid levels
+		C = hash_levels * D;  // Hash feature dimension
+		effective_Level = Level;  // Use Level as-is for baseline/add mode
+	}
+
     // if (Level + 1 != offsets.size(0)) {
 	//   AT_ERROR("offsets shoud have same level with hash features.");
     // }
+  }
+  else if(render_mode == 2 && gaussian_features.numel() > 0){
+	// Cat mode with Level=0 or hybrid_levels >= Level (all features from Gaussians)
+	// This handles the case where there's no hashgrid at all
+	C = gaussian_features.size(1);  // e.g., 24D all from Gaussians
+	effective_Level = 0;  // No hashgrid levels
+	D = (C > 0 && Level > 0) ? (C / Level) : 0;  // Infer D from total dim
   }
   
   auto int_opts = means3D.options().dtype(torch::kInt32);
@@ -153,18 +185,19 @@ RasterizeGaussiansCUDA(
 		W, H, C, Level, D, LevelScale, Base, align_corners, interp, if_contract, record_transmittance,
 		means3D.contiguous().data<float>(),
 		sh.contiguous().data_ptr<float>(),
-		colors.contiguous().data<float>(), 
-		opacity.contiguous().data<float>(), 
+		colors.contiguous().data<float>(),
+		opacity.contiguous().data<float>(),
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
 		rotations.contiguous().data_ptr<float>(),
-		transMat_precomp.contiguous().data<float>(), 
+		transMat_precomp.contiguous().data<float>(),
 		homotrans.contiguous().data<float>(),
 		ap_level.contiguous().data<float>(),
-		features.contiguous().data<float>(), 
-		offsets.contiguous().data<int>(), 
-		gridrange.contiguous().data<float>(), 
-		viewmatrix.contiguous().data<float>(), 
+		features.contiguous().data<float>(),
+		offsets.contiguous().data<int>(),
+		gridrange.contiguous().data<float>(),
+		gaussian_features.contiguous().data<float>(),
+		viewmatrix.contiguous().data<float>(),
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
 		tan_fovx,
@@ -177,12 +210,14 @@ RasterizeGaussiansCUDA(
 		cover_pixels.contiguous().data<float>(),
 		trans_avg.contiguous().data<float>(),
 		debug,
-		beta);
+		beta,
+		render_mode,
+		hybrid_levels);
   }
   return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
 	 const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -199,6 +234,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& features,
 	const torch::Tensor& offsets,
 	const torch::Tensor& gridrange,
+	const torch::Tensor& gaussian_features,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
 	const float tan_fovx,
@@ -215,6 +251,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const bool debug,
 	const float beta,
 	const bool if_contract,
+	const int render_mode,
+	const int hybrid_levels,
 	const uint32_t Level,
 	const float LevelScale,
 	const uint32_t Base,
@@ -247,14 +285,40 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   
   uint32_t D = 0;
   uint32_t table_size = 0;
+  uint32_t hash_levels = 0;
+  uint32_t effective_Level = Level;  // Level to pass to CUDA kernel
 
-  if(Level > 0){
+  // Check if we actually have hashgrid features (not just Level > 0)
+  bool has_hashgrid = (Level > 0 && features.numel() > 0);
+  
+  if(has_hashgrid){
 	table_size = features.size(0);
 	D = features.size(1);
-	C = (offsets.size(0) - 1) * D;
+	hash_levels = offsets.size(0) - 1;  // Actual number of hashgrid levels from encoder
+
+	// In cat mode, C is total output dimension (Gaussian + Hash features)
+	// In baseline/add mode, C is based on the actual hashgrid levels
+	if(render_mode == 2){
+		// Cat mode: effective_Level = Level - hybrid_levels (effective hashgrid levels)
+		// C = Level * D (total output always equals total_levels * D)
+		// Example: Level=6, hybrid_levels=5 → effective_Level=1, C=24
+		effective_Level = Level - hybrid_levels;  // Effective hashgrid levels
+		C = Level * D;  // Total output dimension (total_levels * per_level_dim)
+	} else {
+		// Baseline/add mode: output dimension is based on actual hashgrid levels
+		C = hash_levels * D;
+		effective_Level = Level;  // Use Level as-is for baseline/add mode
+	}
     // if (Level + 1 != offsets.size(0)) {
 	//   AT_ERROR("offsets shoud have same level with hash features.");
     // }
+  }
+  else if(render_mode == 2 && gaussian_features.numel() > 0){
+	// Cat mode with Level=0 or hybrid_levels >= Level (all features from Gaussians)
+	// This handles the case where there's no hashgrid at all
+	C = gaussian_features.size(1);  // e.g., 24D all from Gaussians
+	effective_Level = 0;  // No hashgrid levels
+	D = (C > 0 && Level > 0) ? (C / Level) : 0;  // Infer D from total dim
   }
   
   
@@ -280,12 +344,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dfeatures = torch::zeros({table_size, D}, means3D.options());
 
   torch::Tensor dL_gradsum = torch::zeros({P, 1}, means3D.options());
+
+  // Initialize gradient for per-Gaussian features
+  uint32_t gaussian_feat_dim = 0;
+  if(gaussian_features.numel() > 0){
+    gaussian_feat_dim = gaussian_features.size(1);
+  }
+  torch::Tensor dL_dgaussian_features = torch::zeros({P, gaussian_feat_dim}, means3D.options());
   
   if(P != 0)
   {  
 	  CudaRasterizer::Rasterizer::backward(P, degree, M, R,
 	  background.contiguous().data<float>(),
-	  W, H, C, Level, D, LevelScale, Base, align_corners, interp, if_contract, 
+	  W, H, C, Level, D, LevelScale, Base, align_corners, interp, if_contract,
 	  means3D.contiguous().data<float>(),
 	  sh.contiguous().data<float>(),
 	  colors.contiguous().data<float>(),
@@ -295,9 +366,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  transMat_precomp.contiguous().data<float>(),
 	  homotrans.contiguous().data<float>(),
 	  ap_level.contiguous().data<float>(),
-	  features.contiguous().data<float>(), 
-	  offsets.contiguous().data<int>(), 
-	  gridrange.contiguous().data<float>(), 
+	  features.contiguous().data<float>(),
+	  offsets.contiguous().data<int>(),
+	  gridrange.contiguous().data<float>(),
+	  gaussian_features.contiguous().data<float>(),
 	  viewmatrix.contiguous().data<float>(),
 	  projmatrix.contiguous().data<float>(),
 	  campos.contiguous().data<float>(),
@@ -313,7 +385,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dout_others.contiguous().data<float>(),
 	  dL_dfeatures.contiguous().data<float>(),
 	  dL_dmeans2D.contiguous().data<float>(),
-	  dL_dnormal.contiguous().data<float>(),  
+	  dL_dnormal.contiguous().data<float>(),
 	  dL_dopacity.contiguous().data<float>(),
 	  dL_dcolors.contiguous().data<float>(),
 	  dL_dmeans3D.contiguous().data<float>(),
@@ -323,11 +395,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dscales.contiguous().data<float>(),
 	  dL_drotations.contiguous().data<float>(),
 	  dL_gradsum.contiguous().data<float>(),
+	  dL_dgaussian_features.contiguous().data<float>(),
 	  debug,
-	  beta);
+	  beta,
+	  render_mode,
+	  hybrid_levels);
   }
 
-  return std::make_tuple(dL_dfeatures, dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dtransMat, dL_dsh, dL_dscales, dL_drotations, dL_gradsum);
+  return std::make_tuple(dL_dfeatures, dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dtransMat, dL_dsh, dL_dscales, dL_drotations, dL_gradsum, dL_dgaussian_features);
 }
 
 torch::Tensor markVisible(

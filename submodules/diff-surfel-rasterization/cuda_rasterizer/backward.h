@@ -43,6 +43,9 @@ namespace BACKWARD
 		const float* hash_features,
 		const int* level_offsets,
 		const float* gridrange,
+		const float* gaussian_features,
+		const int render_mode,
+		const int hybrid_levels,
 		const float* depths,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
@@ -55,6 +58,7 @@ namespace BACKWARD
 		float* dL_dnormal3D,
 		float* dL_dopacity,
 		float* dL_dcolors,
+		float* dL_dgaussian_features,
 		float* dL_gradsum);
 
 	void preprocess(

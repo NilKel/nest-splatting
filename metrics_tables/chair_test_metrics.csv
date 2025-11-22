@@ -1,0 +1,9 @@
+Method,Experiment_Name,PSNR_dB,SSIM,L1,Num_Images
+add,comprehensive_add,34.98,0.9873,0.004684,200
+baseline,comprehensive_baseline,35.26,0.9873,0.004556,200
+cat,comprehensive_cat1_1level,34.92,0.9867,0.004701,200
+cat,comprehensive_cat2_2level,35.09,0.9869,0.004564,200
+cat,comprehensive_cat3_3level,35.15,0.9869,0.004570,200
+cat,comprehensive_cat4_4level,34.99,0.9867,0.004758,200
+cat,comprehensive_cat5_5level,35.28,0.9871,0.004506,200
+cat,comprehensive_cat6_6level,35.10,0.9861,0.004684,200

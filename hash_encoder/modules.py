@@ -46,7 +46,7 @@ def register_GridEncoder(cfg_encoding):
 
 class INGP(nn.Module):
 
-    def __init__(self, cfg_model):
+    def __init__(self, cfg_model, args=None):
         super().__init__()  
 
         self.view_dep = cfg_model.rgb.view_dep
@@ -55,9 +55,17 @@ class INGP(nn.Module):
         
         view_enc_dir = 0 if not self.view_dep else self.encoder_dir.n_output_dims
 
-        self.build_encoding(cfg_model.encoding)
-        self.feat_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim # + 3
+        # Store args for cat mode
+        self.args = args
+        self.is_cat_mode = args is not None and hasattr(args, 'method') and args.method == "cat"
+        self.hybrid_levels = args.hybrid_levels if self.is_cat_mode and hasattr(args, 'hybrid_levels') else 0
+        self.cat_coarse2fine = args.cat_coarse2fine if self.is_cat_mode and hasattr(args, 'cat_coarse2fine') else False
         
+        self.build_encoding(cfg_model.encoding)
+        # In cat mode, MLP input is still total_levels * dim (to match baseline architecture)
+        # But hashgrid only outputs (total_levels - hybrid_levels) * dim
+        self.feat_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim # + 3
+
         self.mlp_rgb = self.build_mlp(cfg_model.rgb, input_dim=self.feat_dim + view_enc_dir, output_dim = 3)
         
         self.training_setup(cfg_model.optim)
@@ -78,10 +86,13 @@ class INGP(nn.Module):
 
         lr_spec = training_args.params.spec_lr
 
-        l = [
-            {'params': self.hash_encoding.parameters(), 'lr': lr_encoding, "name": "hash_encoding"},  # Separate LR for encoding
-            {'params': self.mlp_rgb.parameters(), 'lr': lr_mlp_rgb, "name": "rgb_mlp"}, # Separate LR for MLP
-        ]
+        l = []
+        
+        # Only add hash_encoding parameters if it exists (not disabled)
+        if self.hash_encoding is not None:
+            l.append({'params': self.hash_encoding.parameters(), 'lr': lr_encoding, "name": "hash_encoding"})
+        
+        l.append({'params': self.mlp_rgb.parameters(), 'lr': lr_mlp_rgb, "name": "rgb_mlp"})
 
         self.optimizer = torch.optim.Adam(l, betas=(0.9, 0.99), eps=1e-15)
 
@@ -92,44 +103,102 @@ class INGP(nn.Module):
 
         l_min, l_max = cfg_encoding.hashgrid.min_logres, cfg_encoding.hashgrid.max_logres
         r_min, r_max = 2 ** l_min, 2 ** l_max
-        num_levels = cfg_encoding.levels
-        self.growth_rate = np.exp((np.log(r_max) - np.log(r_min)) / (num_levels - 1))
-        tcnn_config = dict(
-            otype="HashGrid",
-            n_levels=cfg_encoding.levels,
-            n_features_per_level=cfg_encoding.hashgrid.dim,
-            log2_hashmap_size=cfg_encoding.hashgrid.dict_size,
-            base_resolution=2 ** cfg_encoding.hashgrid.min_logres,
-            per_level_scale=self.growth_rate,
-        )
-
-        config = SimpleNamespace(
-            device="cuda",
-            otype="HashGrid",
-            n_levels=cfg_encoding.levels,
-            n_features_per_level=cfg_encoding.hashgrid.dim,
-            log2_hashmap_size=cfg_encoding.hashgrid.dict_size,
-            base_resolution=2**cfg_encoding.hashgrid.min_logres,
-            finest_resolution=2**cfg_encoding.hashgrid.max_logres,
-            init_mode='uniform',
-            per_level_scale=self.growth_rate,
-            range=self.voxel_range,
-        )
+        num_levels_total = cfg_encoding.levels
+        self.growth_rate = np.exp((np.log(r_max) - np.log(r_min)) / (num_levels_total - 1))
         
-        print('hash config:', config)
-        print(f'init activate level {cfg_encoding.coarse2fine.init_active_level}')
-
-        self.level_dim = cfg_encoding.hashgrid.dim
-        self.levels = cfg_encoding.levels
-
-        self.hash_encoding = register_GridEncoder(config)
-
-        self.resolutions = []
-        for lv in range(0, num_levels):
+        # Calculate all resolutions first (for both baseline and cat mode)
+        all_resolutions = []
+        for lv in range(0, num_levels_total):
             size = np.floor(r_min * self.growth_rate ** lv).astype(int) + 1
-            self.resolutions.append(size)
+            all_resolutions.append(size)
         
-        print(f'hash resolution : {self.resolutions}')
+        print(f'Baseline hash resolution : {all_resolutions}')
+        
+        # In cat mode, use only higher-frequency levels (skip first hybrid_levels)
+        if self.is_cat_mode:
+            num_hashgrid_levels = num_levels_total - self.hybrid_levels
+            
+            # Edge case: hybrid_levels = 0 means all hashgrid (like baseline)
+            if self.hybrid_levels == 0:
+                print('[CAT MODE] hybrid_levels=0: Using all hashgrid levels (no per-Gaussian features)')
+                num_hashgrid_levels = num_levels_total
+                selected_resolutions = all_resolutions
+                base_res = 2 ** cfg_encoding.hashgrid.min_logres
+                finest_res = selected_resolutions[-1]
+                hash_growth_rate = self.growth_rate
+            # Edge case: hybrid_levels = total_levels means all Gaussian features (no hashgrid)
+            elif self.hybrid_levels >= num_levels_total:
+                print(f'[CAT MODE] hybrid_levels={self.hybrid_levels}: Using all per-Gaussian features (no hashgrid)')
+                # No hashgrid needed - will skip creation below
+                num_hashgrid_levels = 0
+                selected_resolutions = []
+                base_res = 0
+                finest_res = 0
+                hash_growth_rate = 1.0
+            else:
+                # Normal case: split between Gaussian and hashgrid
+                # Use resolutions from [hybrid_levels:] (e.g., if hybrid_levels=2, use levels 2,3,4,5)
+                selected_resolutions = all_resolutions[self.hybrid_levels:]
+                base_res = selected_resolutions[0]
+                finest_res = selected_resolutions[-1]
+                # Recalculate growth rate for the selected levels
+                hash_growth_rate = np.exp((np.log(finest_res) - np.log(base_res)) / (num_hashgrid_levels - 1)) if num_hashgrid_levels > 1 else 1.0
+            
+            print(f'[CAT MODE] Using {num_hashgrid_levels} hashgrid levels (skipping first {self.hybrid_levels})')
+            print(f'[CAT MODE] Per-Gaussian features: {self.hybrid_levels} levels × 4 dim = {self.hybrid_levels * 4}D')
+            print(f'[CAT MODE] Hashgrid features: {num_hashgrid_levels} levels × 4 dim = {num_hashgrid_levels * 4}D')
+            print(f'[CAT MODE] Selected hash resolutions: {selected_resolutions}')
+        else:
+            # Baseline/add mode: use all levels
+            num_hashgrid_levels = num_levels_total
+            base_res = 2 ** cfg_encoding.hashgrid.min_logres
+            finest_res = all_resolutions[-1]
+            hash_growth_rate = self.growth_rate
+            selected_resolutions = all_resolutions
+        
+        self.level_dim = cfg_encoding.hashgrid.dim
+        self.levels = cfg_encoding.levels  # Keep original total levels for compatibility
+        self.actual_hash_levels = num_hashgrid_levels  # Actual hashgrid levels
+
+        # Track if hashgrid should be ignored (when hybrid_levels >= total_levels)
+        self.hashgrid_disabled = self.is_cat_mode and self.hybrid_levels >= cfg_encoding.levels
+
+        # Only create hashgrid if we actually need it
+        if num_hashgrid_levels > 0:
+            tcnn_config = dict(
+                otype="HashGrid",
+                n_levels=num_hashgrid_levels,
+                n_features_per_level=cfg_encoding.hashgrid.dim,
+                log2_hashmap_size=cfg_encoding.hashgrid.dict_size,
+                base_resolution=base_res,
+                per_level_scale=hash_growth_rate,
+            )
+
+            config = SimpleNamespace(
+                device="cuda",
+                otype="HashGrid",
+                n_levels=num_hashgrid_levels,
+                n_features_per_level=cfg_encoding.hashgrid.dim,
+                log2_hashmap_size=cfg_encoding.hashgrid.dict_size,
+                base_resolution=base_res,
+                finest_resolution=finest_res,
+                init_mode='uniform',
+                per_level_scale=hash_growth_rate,
+                range=self.voxel_range,
+            )
+
+            print('hash config:', config)
+            print(f'init activate level {cfg_encoding.coarse2fine.init_active_level}')
+
+            self.hash_encoding = register_GridEncoder(config)
+            self.resolutions = selected_resolutions
+        else:
+            # No hashgrid - create a dummy None encoder
+            print('[CAT MODE] Skipping hashgrid creation - using only per-Gaussian features')
+            self.hash_encoding = None
+            self.resolutions = []
+        
+        print(f'Active hash resolution : {self.resolutions}')
         
         encoding_dim = cfg_encoding.hashgrid.dim * cfg_encoding.levels
 
@@ -181,23 +250,60 @@ class INGP(nn.Module):
         if self.encoder_dir :
             enc_dir = self._encode_view(ray_unit)
             feat = torch.cat([feat, enc_dir], dim=-1)
-        
+
         h = self.mlp_rgb(feat).float()
         rgb = torch.sigmoid(h)[:, :3]
         return rgb
     
     def rgb_decode(self, features, ray_unit):
+        # Apply coarse-to-fine masking for cat mode
+        if self.is_cat_mode and self.cat_coarse2fine:
+            mask = self._get_cat_coarse2fine_mask(features)
+            features = features * mask
+
         rgb = self.get_color(features, ray_unit)
         return rgb  
         
     def set_active_levels(self, current_iter=None):
         self.current_optimizer = self.optimizer
 
-        anneal_levels = max((current_iter - self.initialize - self.warm_up) // self.step, 0)
-        self.active_levels = min(self.levels, anneal_levels + self.init_active_level)
+        if self.is_cat_mode:
+            if self.cat_coarse2fine:
+                # Cat mode with coarse-to-fine: Follow baseline logic exactly
+                # Start with init_active_level (default 2), add 1 level at a time
+                # Since concatenation is [Gaussian | Hash], this naturally unmasks Gaussian first
+                # Example: hybrid_levels=3, total_levels=6
+                # - Iter 1000: active_levels=2 → 8D (first 2 Gaussian levels)
+                # - Iter 2000: active_levels=3 → 12D (all 3 Gaussian levels)
+                # - Iter 3000: active_levels=4 → 16D (3 Gaussian + 1 Hash level)
+                # - ...
+                anneal_levels = max((current_iter - self.initialize - self.warm_up) // self.step, 0)
+                self.active_levels = min(self.levels, anneal_levels + self.init_active_level)
 
-        # if self.active_levels != self.pre_level:
-        #     print(f"Now ingp model level : {self.active_levels}")
+                # Print when a new level is enabled
+                if self.active_levels != self.pre_level:
+                    # Compute how many are Gaussian vs Hash
+                    active_gaussian = min(self.active_levels, self.hybrid_levels)
+                    active_hash = max(0, self.active_levels - self.hybrid_levels)
+                    gaussian_dim = active_gaussian * self.level_dim
+                    hash_dim = active_hash * self.level_dim
+                    total_dim = self.active_levels * self.level_dim
+                    print(f"[CAT C2F] Iter {current_iter}: Enabled level {self.active_levels}/{self.levels} - "
+                          f"{active_gaussian}/{self.hybrid_levels} Gaussian ({gaussian_dim}D) + {active_hash}/{self.levels - self.hybrid_levels} Hash ({hash_dim}D) = {total_dim}D total")
+            else:
+                # Cat mode without coarse-to-fine: use all levels from start
+                self.active_levels = self.levels  # All levels (6)
+        else:
+            # Baseline/add mode: use coarse-to-fine training
+            anneal_levels = max((current_iter - self.initialize - self.warm_up) // self.step, 0)
+            self.active_levels = min(self.levels, anneal_levels + self.init_active_level)
+
+            # Print when a new level is enabled
+            if self.active_levels != self.pre_level:
+                mode_label = "Add" if hasattr(self.args, 'method') and self.args.method == "add" else "Baseline"
+                active_dim = self.active_levels * self.level_dim
+                print(f"[{mode_label} C2F] Iter {current_iter}: Enabled level {self.active_levels}/{self.levels} - "
+                      f"Hashgrid & Gaussian features: {active_dim}D")
 
         self.pre_level = self.active_levels
         
@@ -219,6 +325,26 @@ class INGP(nn.Module):
     def _get_coarse2fine_mask(self, points_enc):
         mask = torch.zeros_like(points_enc)
         mask[..., :(self.active_levels * self.level_dim)] = 1
+        return mask
+
+    @torch.no_grad()
+    def _get_cat_coarse2fine_mask(self, points_enc):
+        """
+        Create mask for cat mode coarse-to-fine training.
+        Follows same logic as baseline: start with 2 levels, add 1 at a time.
+        
+        Since concatenation is [Gaussian features | Hashgrid features],
+        enabling levels 0,1,2,... naturally unmasks Gaussian features first.
+        
+        Example with hybrid_levels=3, total_levels=6:
+        - active_levels=2: unmask first 8D (2 Gaussian levels)
+        - active_levels=3: unmask first 12D (all 3 Gaussian levels)
+        - active_levels=4: unmask first 16D (3 Gaussian + 1 Hash level)
+        - active_levels=6: unmask all 24D (3 Gaussian + 3 Hash levels)
+        """
+        mask = torch.zeros_like(points_enc)
+        active_dim = self.active_levels * self.level_dim
+        mask[..., :active_dim] = 1
         return mask
 
     def _encode_3D(self, points_3D):
@@ -246,9 +372,14 @@ class INGP(nn.Module):
 
         xyz_input = points_3D_normalized.view(-1, 3)
 
-        feat_output = self.hash_encoding(xyz_input)#, eps = self.level_eps)
-
-        points_enc = feat_output.view(*points_3D_normalized.shape[:-1], feat_output.shape[-1])
+        if self.hash_encoding is not None:
+            feat_output = self.hash_encoding(xyz_input)#, eps = self.level_eps)
+            points_enc = feat_output.view(*points_3D_normalized.shape[:-1], feat_output.shape[-1])
+        else:
+            # No hashgrid - return empty features
+            # This case is for hybrid_levels >= total_levels (all Gaussian features)
+            points_enc = torch.zeros(*points_3D_normalized.shape[:-1], 0, device=xyz_input.device, dtype=xyz_input.dtype)
+        
         return points_enc
 
     def _encode_view(self, d):
