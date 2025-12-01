@@ -260,7 +260,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* background,
 	const int width, int height,
 	uint32_t c_dim, uint32_t level, uint32_t l_dim, float l_scale, uint32_t Base,
-	bool align_corners, uint32_t interp, 
+	bool align_corners, uint32_t interp,
 	const bool if_contract, const bool record_transmittance,
 	const float* means3D,
 	const float* shs,
@@ -275,6 +275,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* hash_features,
 	const int* level_offsets,
 	const float* gridrange,
+	const float* gaussian_features,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float* cam_pos,
@@ -287,7 +288,9 @@ int CudaRasterizer::Rasterizer::forward(
 	float* cover_pixels,
 	float* trans_avg,
 	bool debug,
-	const float beta)
+	const float beta,
+	const int render_mode,
+	const int hybrid_levels)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -409,6 +412,9 @@ int CudaRasterizer::Rasterizer::forward(
 		hash_features,
 		level_offsets,
 		gridrange,
+		gaussian_features,
+		render_mode,
+		hybrid_levels,
 		geomState.depths,
 		geomState.normal_opacity,
 		imgState.accum_alpha,
@@ -430,7 +436,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* background,
 	const int width, int height,
 	uint32_t c_dim, uint32_t level, uint32_t l_dim, float l_scale, uint32_t Base,
-	bool align_corners, uint32_t interp, 
+	bool align_corners, uint32_t interp,
 	const bool if_contract,
 	const float* means3D,
 	const float* shs,
@@ -444,6 +450,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* hash_features,
 	const int* level_offsets,
 	const float* gridrange,
+	const float* gaussian_features,
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float* campos,
@@ -468,8 +475,11 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dscale,
 	float* dL_drot,
 	float* dL_gradsum,
+	float* dL_dgaussian_features,
 	bool debug,
-	const float beta)
+	const float beta,
+	const int render_mode,
+	const int hybrid_levels)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -514,6 +524,9 @@ void CudaRasterizer::Rasterizer::backward(
 		hash_features,
 		level_offsets,
 		gridrange,
+		gaussian_features,
+		render_mode,
+		hybrid_levels,
 		depth_ptr,
 		imgState.accum_alpha,
 		imgState.n_contrib,
@@ -526,6 +539,7 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dnormal,
 		dL_dopacity,
 		dL_dcolor,
+		dL_dgaussian_features,
 		dL_gradsum), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance

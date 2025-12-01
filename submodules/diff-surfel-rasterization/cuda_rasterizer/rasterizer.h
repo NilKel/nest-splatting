@@ -14,6 +14,7 @@
 
 #include <vector>
 #include <functional>
+#include <cstdint>
 
 namespace CudaRasterizer
 {
@@ -51,6 +52,7 @@ namespace CudaRasterizer
 			const float* hash_features,
 			const int* level_offsets,
 			const float* gridrange,
+			const float* gaussian_features,
 			const float* viewmatrix,
 			const float* projmatrix,
 			const float* cam_pos,
@@ -63,14 +65,16 @@ namespace CudaRasterizer
 			float* cover_pixels = nullptr,
 			float* trans_avg = nullptr,
 			bool debug = false,
-			const float beta = 0.0);
+			const float beta = 0.0,
+			const int render_mode = 0,
+			const int hybrid_levels = 0);
 
 		static void backward(
 			const int P, int D, int M, int R,
 			const float* background,
-			const int width, int height, 
+			const int width, int height,
 			uint32_t c_dim, uint32_t level, uint32_t l_dim, float l_scale, uint32_t Base,
-			bool align_corners, uint32_t interp, 
+			bool align_corners, uint32_t interp,
 			const bool if_contract,
 			const float* means3D,
 			const float* shs,
@@ -84,6 +88,7 @@ namespace CudaRasterizer
 			const float* hash_features,
 			const int* level_offsets,
 			const float* gridrange,
+			const float* gaussian_features,
 			const float* viewmatrix,
 			const float* projmatrix,
 			const float* campos,
@@ -108,8 +113,11 @@ namespace CudaRasterizer
 			float* dL_dscale,
 			float* dL_drot,
 			float* dL_gradsum,
+			float* dL_dgaussian_features,
 			bool debug,
-			const float beta);
+			const float beta,
+			const int render_mode = 0,
+			const int hybrid_levels = 0);
 	};
 };
 
