@@ -46,7 +46,7 @@ def register_GridEncoder(cfg_encoding):
 
 class INGP(nn.Module):
 
-    def __init__(self, cfg_model):
+    def __init__(self, cfg_model, args=None):
         super().__init__()  
 
         self.view_dep = cfg_model.rgb.view_dep
@@ -54,6 +54,11 @@ class INGP(nn.Module):
             self.build_view_enc(cfg_model.rgb.encoding_view)
         
         view_enc_dir = 0 if not self.view_dep else self.encoder_dir.n_output_dims
+
+        # Store args for cat mode
+        self.args = args
+        self.is_cat_mode = args is not None and hasattr(args, 'method') and args.method == "cat"
+        self.hybrid_levels = args.hybrid_levels if self.is_cat_mode and hasattr(args, 'hybrid_levels') else 0
 
         self.build_encoding(cfg_model.encoding)
         self.feat_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim # + 3

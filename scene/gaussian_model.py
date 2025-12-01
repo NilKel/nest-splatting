@@ -61,6 +61,7 @@ class GaussianModel:
         self.base_opacity = 0.0
         self._appearance_level = torch.empty(0)
         self.feat_gradient_accum = torch.empty(0)
+        self._gaussian_features = torch.empty(0)
 
         self.setup_functions()
 
@@ -122,6 +123,10 @@ class GaussianModel:
         return self._appearance_level
     
     @property
+    def get_gaussian_features(self):
+        return self._gaussian_features
+    
+    @property
     def get_envmap(self): # 
         return self.env_map
     
@@ -170,6 +175,16 @@ class GaussianModel:
         ap_level = init_level * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
         self._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
 
+        # Initialize per-Gaussian features (method-specific dimensions)
+        # In "add" mode: gaussian_feat_dim = total_levels * per_level_dim = 6 * 4 = 24
+        # In "cat" mode: gaussian_feat_dim = hybrid_levels * per_level_dim
+        if args and hasattr(args, 'method') and args.method == "cat":
+            gaussian_feat_dim = args.hybrid_levels * 4  # per_level_dim = 4
+        else:
+            gaussian_feat_dim = 24  # Default: 6 levels * 4 dim
+        gaussian_feats = torch.zeros((self.get_xyz.shape[0], gaussian_feat_dim), device="cuda").float()
+        self._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -185,6 +200,7 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             {'params': [self._appearance_level], 'lr': 0, "name": "ap_level"},
+            {'params': [self._gaussian_features], 'lr': training_args.feature_lr, "name": "gaussian_features"},
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)

@@ -91,8 +91,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ap_level = init_level * torch.ones((len(checkpoint_data['xyz']), 1), device="cuda").float()
             gaussians._appearance_level = torch.nn.Parameter(ap_level.requires_grad_(True))
             
-            # Initialize per-Gaussian features (12 dimensions)
-            gaussian_feats = torch.zeros((len(checkpoint_data['xyz']), 12), device="cuda").float()
+            # Initialize per-Gaussian features (method-specific dimensions)
+            # In "add" mode: gaussian_feat_dim = total_levels * per_level_dim = 6 * 4 = 24
+            # In "cat" mode: gaussian_feat_dim = hybrid_levels * per_level_dim
+            if args.method == "cat":
+                gaussian_feat_dim = args.hybrid_levels * 4  # per_level_dim = 4
+            else:
+                gaussian_feat_dim = 24  # 6 levels * 4 dim
+            gaussian_feats = torch.zeros((len(checkpoint_data['xyz']), gaussian_feat_dim), device="cuda").float()
             gaussians._gaussian_features = torch.nn.Parameter(gaussian_feats.requires_grad_(True))
             
             print(f"[2DGS] Loaded {len(gaussians._xyz)} Gaussians")
@@ -144,7 +150,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     ingp_model = None
     if cfg_model.settings.if_ingp:
-        ingp_model = INGP(cfg_model).to('cuda')
+        ingp_model = INGP(cfg_model, args).to('cuda')
 
     opacity_reset_protect = cfg_model.training_cfg.opacity_reset_protect
     if_pixel_densify_enhance = cfg_model.settings.pixel_densify_enhance
@@ -206,7 +212,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         record_transmittance = if_pixel_densify_enhance & (iteration >= opt.pixel_densify_from_iter) & (iteration < opt.densify_until_iter)
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, ingp = ingp, 
-            beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance)
+            beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance, render_mode = args.method)
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
     
@@ -363,7 +369,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     custom_cam, do_training, keep_alive, scaling_modifer, render_mode = network_gui.receive()
                     if custom_cam != None:
                         render_pkg = render(custom_cam, gaussians, pipe, background, scaling_modifer, ingp = ingp, \
-                            beta = beta)   
+                            beta = beta, render_mode = args.method)   
                         net_image = render_net_image(render_pkg, dataset.render_items, render_mode, custom_cam)
                         net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                     metrics_dict = {
@@ -395,7 +401,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 for cam in tqdm(train_stack):
                     cam_name = cam.image_name + '.png'
                     render_pkg = render(cam, gaussians, pipe, background, ingp = ingp, \
-                        beta = beta, iteration = iteration, cfg = cfg_model)
+                        beta = beta, iteration = iteration, cfg = cfg_model, render_mode = args.method)
                     alpha_image = render_pkg["rend_alpha"]
                     bila_alpha = bilateral_filter_opencv(alpha_image.detach().cpu())
                     cam.gs_alpha_mask = bila_alpha.cpu().float()
@@ -473,7 +479,7 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
                 for idx, viewpoint in enumerate(config['cameras']):
                     
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs, ingp = ingp_model, \
-                         beta = beta, iteration = iteration, cfg = cfg_model)
+                         beta = beta, iteration = iteration, cfg = cfg_model, render_mode = args.method)
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     
@@ -535,6 +541,8 @@ if __name__ == "__main__":
     parser.add_argument("--yaml", type=str, default = "tiny")
     parser.add_argument("--method", type=str, default="baseline", 
                         help="Rendering method: 'baseline' (default), 'add', 'cat', etc.")
+    parser.add_argument("--hybrid_levels", type=int, default=3, 
+                        help="Number of finest hashgrid levels to use for per-Gaussian features in 'cat' mode (default: 3)")
 
     args = parser.parse_args(sys.argv[1:])
     

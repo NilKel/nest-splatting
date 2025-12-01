@@ -21,7 +21,7 @@ import time
 from utils.general_utils import MEM_PRINT
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
-    beta = 0, iteration = None, cfg = None, record_transmittance = False):
+    beta = 0, iteration = None, cfg = None, record_transmittance = False, render_mode = "baseline"):
     """
     Render the scene. 
     
@@ -126,6 +126,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
         contract = ingp.contract
     
+    # Only use "add" or "cat" mode during INGP training (after 2DGS phase)
+    # If ingp is None, we're in 2DGS phase, use "baseline"
+    effective_render_mode = "baseline" if ingp is None else render_mode
+
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -142,6 +146,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         beta=beta,
         if_contract = contract,
         record_transmittance = record_transmittance,
+        render_mode = effective_render_mode,
         # pipe.debug
     )
 
@@ -154,7 +159,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
+
+    # Get per-Gaussian features (for "add" and "cat" modes)
+    gaussian_features = pc.get_gaussian_features if effective_render_mode in ["add", "cat"] else None
     
+    # Apply coarse-to-fine masking to Gaussian features in "add" mode
+    # Same masking strategy as baseline hashgrid c2f: zero out inactive high-frequency levels
+    if effective_render_mode == "add" and gaussian_features is not None and ingp is not None:
+        active_dim = ingp.active_levels * ingp.level_dim
+        # Create mask matching baseline c2f pattern
+        mask = torch.zeros_like(gaussian_features)
+        mask[:, :active_dim] = 1
+        gaussian_features = gaussian_features * mask
+
+    # Get hybrid_levels for cat mode (determines Gaussian vs hashgrid feature split)
+    hybrid_levels = ingp.hybrid_levels if (hasattr(ingp, 'hybrid_levels') and effective_render_mode == "cat") else 0
+
     rendered_image, radii, allmap, transmittance_avg, num_covered_pixels = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -169,6 +189,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         features = features,
         offsets = offsets,
         gridrange = gridrange,
+        gaussian_features = gaussian_features,
+        hybrid_levels = hybrid_levels,
     )
     
     
