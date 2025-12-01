@@ -48,16 +48,76 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_list = []
 
     scene_name = args.scene_name
-    tb_writer = prepare_output_and_logger(dataset, scene_name, args.yaml)
+    tb_writer = prepare_output_and_logger(dataset, scene_name, args.yaml, args)
     args.model_path = dataset.model_path
 
     first_iter = 0
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians)
-    gaussians.training_setup(opt)
+    
+    # Check for pre-trained 2DGS Gaussians (for INGP training) BEFORE creating Scene
+    gaussian_checkpoint_path = os.path.join(dataset.source_path, "gaussian_init.pth")
+    loaded_pretrained = False
+    
     if checkpoint:
+        scene = Scene(dataset, gaussians)
+        gaussians.training_setup(opt)
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    elif cfg_model.settings.if_ingp and os.path.exists(gaussian_checkpoint_path):
+        print("\n" + "╔" + "═"*68 + "╗")
+        print("║" + " "*15 + "✓ PRE-TRAINED 2DGS CHECKPOINT FOUND" + " "*18 + "║")
+        print("╚" + "═"*68 + "╝")
+        print(f"[2DGS] Checkpoint location: {gaussian_checkpoint_path}")
+        
+        # Load checkpoint to CPU first
+        checkpoint_data = torch.load(gaussian_checkpoint_path, weights_only=False, map_location='cpu')
+        print(f"[2DGS] Checkpoint was saved at iteration: {checkpoint_data.get('iteration', 'unknown')}")
+        
+        # Check if this is the new format (dict) or old format (tuple)
+        if 'xyz' in checkpoint_data:
+            # New simplified format - load parameters directly
+            gaussians.active_sh_degree = checkpoint_data['active_sh_degree']
+            gaussians._xyz = torch.nn.Parameter(checkpoint_data['xyz'].cuda().contiguous().requires_grad_(True))
+            gaussians._features_dc = torch.nn.Parameter(checkpoint_data['features_dc'].cuda().contiguous().requires_grad_(True))
+            gaussians._features_rest = torch.nn.Parameter(checkpoint_data['features_rest'].cuda().contiguous().requires_grad_(True))
+            gaussians._scaling = torch.nn.Parameter(checkpoint_data['scaling'].cuda().contiguous().requires_grad_(True))
+            gaussians._rotation = torch.nn.Parameter(checkpoint_data['rotation'].cuda().contiguous().requires_grad_(True))
+            gaussians._opacity = torch.nn.Parameter(checkpoint_data['opacity'].cuda().contiguous().requires_grad_(True))
+            gaussians.max_radii2D = torch.zeros((len(checkpoint_data['xyz']),), device="cuda")
+            gaussians.spatial_lr_scale = checkpoint_data['spatial_lr_scale']
+            
+            # Initialize appearance_level (required for INGP rendering)
+            init_level = 24
+            ap_level = init_level * torch.ones((len(checkpoint_data['xyz']), 1), device="cuda").float()
+            gaussians._appearance_level = torch.nn.Parameter(ap_level.requires_grad_(True))
+            
+            # Initialize per-Gaussian features (12 dimensions)
+            gaussian_feats = torch.zeros((len(checkpoint_data['xyz']), 12), device="cuda").float()
+            gaussians._gaussian_features = torch.nn.Parameter(gaussian_feats.requires_grad_(True))
+            
+            print(f"[2DGS] Loaded {len(gaussians._xyz)} Gaussians")
+            loaded_pretrained = True
+            
+            # Now create Scene with loaded Gaussians
+            # Pass a special flag to prevent Scene from re-initializing the Gaussians
+            # We set gaussians._loaded_from_checkpoint to signal Scene to skip create_from_pcd
+            gaussians._loaded_from_checkpoint = True
+            scene = Scene(dataset, gaussians, load_iteration=None, shuffle=False)
+            
+            # Setup optimizer with loaded parameters
+            gaussians.training_setup(opt)
+            
+            # Skip to INGP training phase
+            first_iter = cfg_model.ingp_stage.initialize
+            print(f"[2DGS] ✓ Skipping 2DGS training, starting from iteration {first_iter} (INGP phase)")
+        else:
+            print("[2DGS] Warning: Checkpoint format not recognized, training from scratch")
+            scene = Scene(dataset, gaussians)
+            gaussians.training_setup(opt)
+    else:
+        # Normal initialization without checkpoint
+        scene = Scene(dataset, gaussians)
+        gaussians.training_setup(opt)
 
     surfel_cfg = cfg_model.surfel
     gaussians.base_opacity = surfel_cfg.base_opacity
@@ -349,31 +409,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         torch.cuda.empty_cache()
     
 
-def prepare_output_and_logger(args, scene_name, yaml_file = ""):    
-    if not args.model_path:
+def prepare_output_and_logger(dataset, scene_name, yaml_file="", args=None):
+    # Organize outputs: outputs/method/dataset/scene/name
+    # Extract dataset name from source path
+    source_parts = dataset.source_path.rstrip('/').split('/')
+    scene_name_from_path = source_parts[-1]  # e.g., "drums"
+    dataset_name = source_parts[-2] if len(source_parts) > 1 else "unknown"  # e.g., "nerf_synthetic"
+    
+    if not dataset.model_path:
+        # If no model_path specified, create default name with timestamp
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-
         now = datetime.datetime.now()
         time_str = now.strftime("-%m%d-%H%M")
-        exp_name = scene_name + time_str 
+        exp_name = scene_name + time_str
         if yaml_file != "":
             exp_name += '-' + yaml_file
-        
-        args.model_path = os.path.join("./output/", exp_name)
-        
+        dataset.model_path = os.path.join("./output/", exp_name)
+    else:
+        # User specified -m flag: treat it as the run name and organize into structure
+        run_name = dataset.model_path
+        # Strip any leading ./ or / to get just the name
+        run_name = run_name.lstrip('./').lstrip('/')
+        # Build organized path: outputs/method/dataset/scene/name
+        method = args.method if args and hasattr(args, 'method') else "baseline"
+        dataset.model_path = os.path.join("outputs", method, dataset_name, scene_name_from_path, run_name)
+    
     # Set up output folder
-    print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
-
+    print("Output folder: {}".format(dataset.model_path))
+    os.makedirs(dataset.model_path, exist_ok = True)
+    with open(os.path.join(dataset.model_path, "cfg_args"), 'w') as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(dataset))))
+    
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
+        tb_writer = SummaryWriter(dataset.model_path)
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
@@ -460,6 +533,8 @@ if __name__ == "__main__":
     parser.add_argument("--time_analysis", action="store_true")
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
+    parser.add_argument("--method", type=str, default="baseline", 
+                        help="Rendering method: 'baseline' (default), 'add', 'cat', etc.")
 
     args = parser.parse_args(sys.argv[1:])
     
