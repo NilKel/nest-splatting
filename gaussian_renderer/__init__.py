@@ -129,6 +129,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Only use "add" or "cat" mode during INGP training (after 2DGS phase)
     # If ingp is None, we're in 2DGS phase, use "baseline"
     effective_render_mode = "baseline" if ingp is None else render_mode
+    
+    # Convert render_mode string to int for CUDA
+    # 0: baseline, 1: add, 2: cat
+    render_mode_int = {"baseline": 0, "add": 1, "cat": 2}.get(effective_render_mode, 0)
+    
+    # Get hybrid_levels for cat mode
+    hybrid_levels_int = 0
+    if ingp is not None and hasattr(ingp, 'hybrid_levels'):
+        hybrid_levels_int = ingp.hybrid_levels
 
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
@@ -146,7 +155,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         beta=beta,
         if_contract = contract,
         record_transmittance = record_transmittance,
-        render_mode = effective_render_mode,
+        render_mode = render_mode_int,
+        hybrid_levels = hybrid_levels_int,
         # pipe.debug
     )
 

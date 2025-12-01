@@ -32,6 +32,7 @@ def rasterize_gaussians(
     features,
     offsets,
     gridrange,
+    gaussian_features,
     raster_settings,
     hashgrid_settings
 ):
@@ -49,6 +50,7 @@ def rasterize_gaussians(
         features,
         offsets,
         gridrange,
+        gaussian_features,
         raster_settings,
         hashgrid_settings
     )
@@ -70,6 +72,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         features,
         offsets,
         gridrange,
+        gaussian_features,
         raster_settings,
         hashgrid_settings
     ):
@@ -94,6 +97,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             features,
             offsets,
             gridrange,
+            gaussian_features,
             raster_settings.viewmatrix,
             raster_settings.projmatrix,
             raster_settings.tanfovx,
@@ -108,6 +112,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.beta,
             raster_settings.if_contract,
             raster_settings.record_transmittance,
+            raster_settings.render_mode,
+            raster_settings.hybrid_levels,
             hashgrid_settings.L,
             hashgrid_settings.S,
             hashgrid_settings.H,
@@ -133,7 +139,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         ctx.num_rendered = num_rendered
     
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, homotrans, ap_level, features, offsets, gridrange, \
-            depth, out_index, radii, sh, geomBuffer, binningBuffer, imgBuffer)
+            gaussian_features, depth, out_index, radii, sh, geomBuffer, binningBuffer, imgBuffer)
 
         # if raster_settings.record_transmittance :
         return color, radii, depth, transmittance_avg, pixels
@@ -151,7 +157,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         raster_settings = ctx.raster_settings
         hashgrid_settings = ctx.hashgrid_settings
         colors_precomp, means3D, scales, rotations, cov3Ds_precomp, homotrans, ap_level, features, offsets, gridrange, \
-            depth, out_index, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
+            gaussian_features, depth, out_index, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
@@ -169,6 +175,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 features,
                 offsets,
                 gridrange,
+                gaussian_features,
                 raster_settings.viewmatrix, 
                 raster_settings.projmatrix, 
                 raster_settings.tanfovx, 
@@ -185,6 +192,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.debug,
                 raster_settings.beta,
                 raster_settings.if_contract,
+                raster_settings.render_mode,
+                raster_settings.hybrid_levels,
                 hashgrid_settings.L,
                 hashgrid_settings.S,
                 hashgrid_settings.H,
@@ -195,13 +204,13 @@ class _RasterizeGaussians(torch.autograd.Function):
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum = _C.rasterize_gaussians_backward(*args)
+                grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum, grad_gaussian_features = _C.rasterize_gaussians_backward(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-            grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum = _C.rasterize_gaussians_backward(*args)
+            grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum, grad_gaussian_features = _C.rasterize_gaussians_backward(*args)
 
         grad_homotrans = None
 
@@ -219,6 +228,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_features,
             None,
             None,
+            grad_gaussian_features,
             None,
             None,
         )
@@ -241,6 +251,8 @@ class GaussianRasterizationSettings(NamedTuple):
     beta : float
     if_contract : bool
     record_transmittance : bool
+    render_mode : int
+    hybrid_levels : int
 
 class HashGridSettings(NamedTuple):
     L: int
@@ -269,7 +281,7 @@ class GaussianRasterizer(nn.Module):
     def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, 
         cov3D_precomp = None, \
         homotrans = None, ap_level = None, \
-        features = None, offsets = None, gridrange = None):
+        features = None, offsets = None, gridrange = None, gaussian_features = None):
         
         raster_settings = self.raster_settings
         hashgrid_settings = self.hashgrid_settings
@@ -302,7 +314,9 @@ class GaussianRasterizer(nn.Module):
         if offsets is None:
             offsets = torch.Tensor([]).int().cuda()
         if gridrange is None:
-            gridrange = torch.Tensor([]).cuda() 
+            gridrange = torch.Tensor([]).cuda()
+        if gaussian_features is None:
+            gaussian_features = torch.Tensor([]).cuda()
         
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(
@@ -319,6 +333,7 @@ class GaussianRasterizer(nn.Module):
             features,
             offsets,
             gridrange,
+            gaussian_features,
             raster_settings, 
             hashgrid_settings
         )
