@@ -465,6 +465,9 @@ renderCUDAsurfelBackward(
 	const float* __restrict__ hash_features,
 	const int* __restrict__ level_offsets,
 	const float* __restrict__ gridrange,
+	const float* __restrict__ gaussian_features,
+	const int render_mode,
+	const int hybrid_levels,
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
@@ -478,6 +481,7 @@ renderCUDAsurfelBackward(
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
+	float* __restrict__ dL_dgaussian_features,
 	float* __restrict__ dL_gradsum)
 {
 	// We rasterize again. Compute necessary block info.
@@ -559,12 +563,16 @@ renderCUDAsurfelBackward(
 	// float dL_dxyz[3] = {0};
 	float voxel_min = 0.0f;
 	float voxel_max = 0.0f;
-	if(level > 0){
-		if(level > 16){
-			printf("Error: level %d  > 16.", level);
+
+	// Determine effective hash levels (accounting for hybrid mode)
+	int effective_level = (render_mode == 2) ? (level - hybrid_levels) : level;
+
+	if(effective_level > 0){
+		if(effective_level > 16){
+			printf("Error: effective_level %d  > 16.", effective_level);
 			return;
 		}
-		for(int l = 0; l <= level; l++) collec_offsets[l] = level_offsets[l];
+		for(int l = 0; l <= effective_level; l++) collec_offsets[l] = level_offsets[l];
 		voxel_min = gridrange[0];
 		voxel_max = gridrange[1];
 	}
@@ -735,29 +743,112 @@ renderCUDAsurfelBackward(
 
 				bool contract = if_contract;
 
-				// hashgrid feature interpolation
-				// in BW, query_feature will update dL_dfeatures & dL_dxyz
-				switch (l_dim){
-					case 2: 
-						query_feature<true, C, 2>(feat, xyz, voxel_min, voxel_max, collec_offsets, 
-							appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, grad_feat, dL_dfeatures, dL_dxyz);
-						break;
-					case 4: 
-						query_feature<true, C, 4>(feat, xyz, voxel_min, voxel_max, collec_offsets, 
-							appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, grad_feat, dL_dfeatures, dL_dxyz);
-						break;
-					case 8: 
-						query_feature<true, C, 8>(feat, xyz, voxel_min, voxel_max, collec_offsets, 
-							appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, grad_feat, dL_dfeatures, dL_dxyz);
-						break;
-					default: printf("BW unsupported level dim : %d\n", l_dim);
-						break;
+				// Reconstruct final feature vector (must match forward pass logic)
+				float final_feat[C];
+				int gauss_id = collected_id[j];
+
+				// In cat mode, determine if we need hash features at all
+				int effective_hash_levels = level;
+				if(render_mode == 2 && gaussian_features != nullptr){
+					// Clamp to 0 to avoid negative values when hybrid_levels >= level
+					effective_hash_levels = max(0, level - hybrid_levels);
 				}
 
-				// Update dL_dalpha and get grad_feat
+				// In cat mode, compute offset to hash portion of gradients
+				int gaussian_feat_dim_bw = (render_mode == 2 && gaussian_features != nullptr) ? (hybrid_levels * l_dim) : 0;
+				float* grad_feat_hash = grad_feat + gaussian_feat_dim_bw;
+
+				// Only query hash features if we have hash levels
+				if(effective_hash_levels > 0){
+					// hashgrid feature interpolation
+					// in BW, query_feature will update dL_dfeatures & dL_dxyz
+					// For cat mode, pass only the hash portion of gradients
+					switch (l_dim){
+						case 2:
+							query_feature<true, C, 2>(feat, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, effective_hash_levels, l_scale, Base, align_corners, interp, contract, debug, grad_feat_hash, dL_dfeatures, dL_dxyz);
+							break;
+						case 4:
+							query_feature<true, C, 4>(feat, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, effective_hash_levels, l_scale, Base, align_corners, interp, contract, debug, grad_feat_hash, dL_dfeatures, dL_dxyz);
+							break;
+						case 8:
+							query_feature<true, C, 8>(feat, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, effective_hash_levels, l_scale, Base, align_corners, interp, contract, debug, grad_feat_hash, dL_dfeatures, dL_dxyz);
+							break;
+						default: printf("BW unsupported level dim : %d\n", l_dim);
+							break;
+					}
+				}
+				else {
+					// No hash features - initialize feat to zeros
+					for (int ch = 0; ch < C; ch++){
+						feat[ch] = 0.0f;
+					}
+				}
+
+				if(render_mode == 2 && gaussian_features != nullptr){
+					// Cat mode: concatenate [Gaussian features | Hash features]
+					int gaussian_feat_dim = hybrid_levels * l_dim;
+					int hash_feat_dim = (level - hybrid_levels) * l_dim;
+					int feat_base = gauss_id * gaussian_feat_dim;
+
+					// Copy Gaussian features to beginning
+					for (int ch = 0; ch < gaussian_feat_dim; ch++){
+						final_feat[ch] = gaussian_features[feat_base + ch];
+					}
+
+					// Copy hash features to end
+					for (int ch = 0; ch < hash_feat_dim; ch++){
+						final_feat[gaussian_feat_dim + ch] = feat[ch];
+					}
+				}
+				else if(render_mode == 1 && gaussian_features != nullptr){
+					// Add mode: add per-Gaussian features to hash features
+					// gaussian_features is always full dimension (level * l_dim)
+					// Inactive levels are masked to 0, we only process active C dimensions
+					int full_gauss_dim = level * l_dim;  // Full dimension
+					int feat_base = gauss_id * full_gauss_dim;  // Correct stride
+					for (int ch = 0; ch < C; ch++){
+						final_feat[ch] = feat[ch] + gaussian_features[feat_base + ch];
+					}
+				}
+				else{
+					// Baseline mode: just use hash features
+					for (int ch = 0; ch < C; ch++){
+						final_feat[ch] = feat[ch];
+					}
+				}
+
+				// Handle gradients for per-Gaussian features based on render_mode
+				if(dL_dgaussian_features != nullptr){
+					if(render_mode == 1){
+						// Add mode: gradients flow equally to both hash and Gaussian features
+						// Use full dimension stride (level * l_dim), not just active C
+						int full_gauss_dim = level * l_dim;
+						for (int ch = 0; ch < C; ch++){
+							atomicAdd(&dL_dgaussian_features[collected_id[j] * full_gauss_dim + ch], grad_feat[ch]);
+						}
+					}
+					else if(render_mode == 2){
+						// Cat mode: gradients are split between Gaussian and hash features
+						// hybrid_levels determines split: first hybrid_levels go to Gaussian, rest to Hash
+						// grad_feat has gradients for the concatenated feature vector
+						int gaussian_feat_dim = hybrid_levels * l_dim;
+
+						// Accumulate gradients for Gaussian features (first part of grad_feat)
+						for (int ch = 0; ch < gaussian_feat_dim; ch++){
+							atomicAdd(&dL_dgaussian_features[collected_id[j] * gaussian_feat_dim + ch], grad_feat[ch]);
+						}
+						// Note: Hash feature gradients (grad_feat[gaussian_feat_dim:]) are already
+						// handled by query_feature backward pass through dL_dfeatures
+					}
+				}
+
+				// Update dL_dalpha using final_feat (must match forward pass)
 				for (int ch = 0; ch < C; ch++)
 				{
-					const float c = feat[ch];
+					const float c = final_feat[ch];  // Use concatenated feature, not just hash
 					// Update last color (to be used in the next iteration)
 					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
 					last_color[ch] = c;
@@ -1198,6 +1289,9 @@ void BACKWARD::render(
 	const float* hash_features,
 	const int* level_offsets,
 	const float* gridrange,
+	const float* gaussian_features,
+	const int render_mode,
+	const int hybrid_levels,
 	const float* depths,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
@@ -1210,44 +1304,45 @@ void BACKWARD::render(
 	float* dL_dnormal3D,
 	float* dL_dopacity,
 	float* dL_dcolors,
+	float* dL_dgaussian_features,
 	float* dL_gradsum)
 {
 	switch (C) {
 		case 3:
 			renderCUDAsurfelBackward<3> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
-					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
-					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum);
+					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, gaussian_features, render_mode, hybrid_levels, colors, depths, final_Ts, n_contrib,
+					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_dgaussian_features, dL_gradsum);
 			break;
 		case 8:
 			renderCUDAsurfelBackward<8> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
-					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
-					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum);
+					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, gaussian_features, render_mode, hybrid_levels, colors, depths, final_Ts, n_contrib,
+					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_dgaussian_features, dL_gradsum);
 			break;
 		case 16:
 			renderCUDAsurfelBackward<16> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
-					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
-					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum);
+					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, gaussian_features, render_mode, hybrid_levels, colors, depths, final_Ts, n_contrib,
+					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_dgaussian_features, dL_gradsum);
 			break;
 		case 24:
 			renderCUDAsurfelBackward<24> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
-					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
-					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum);
+					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, gaussian_features, render_mode, hybrid_levels, colors, depths, final_Ts, n_contrib,
+					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_dgaussian_features, dL_gradsum);
 			break;
 		case 32:
 			renderCUDAsurfelBackward<32> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
-					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
-					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum);
+					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, gaussian_features, render_mode, hybrid_levels, colors, depths, final_Ts, n_contrib,
+					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_dgaussian_features, dL_gradsum);
 			break;
 		case 48:
 			renderCUDAsurfelBackward<48> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
-					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
-					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum);
+					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, gaussian_features, render_mode, hybrid_levels, colors, depths, final_Ts, n_contrib,
+					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_dgaussian_features, dL_gradsum);
 			break;
 		default:
 			printf("Unsupported channel count: %d\n", C);
