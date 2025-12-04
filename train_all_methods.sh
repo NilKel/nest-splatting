@@ -1,9 +1,11 @@
 #!/bin/bash
 # Script to train Nest-Splatting on all methods and configurations
-# Usage: ./train_all_methods.sh <scene_name> <base_name> [iterations] [data_dir]
+# Usage: ./train_all_methods.sh <base_name> [scene_names] [iterations] [data_dir]
 #
 # Example:
-#   ./train_all_methods.sh drums testall 30000
+#   ./train_all_methods.sh testall              # Run all scenes
+#   ./train_all_methods.sh testall drums,mic    # Run specific scenes
+#   ./train_all_methods.sh testall all 30000    # Run all scenes with 30k iters
 
 set -e  # Exit on error
 
@@ -11,21 +13,24 @@ set -e  # Exit on error
 DEFAULT_ITERATIONS=30000
 DEFAULT_DATA_DIR="/home/nilkel/Projects/data/nest_synthetic/nerf_synthetic"
 YAML_CONFIG="./configs/nerfsyn.yaml"
+ALL_SCENES="chair,drums,ficus,hotdog,lego,materials,mic,ship"
 
 # Parse arguments
-if [ $# -lt 2 ]; then
-    echo "Usage: $0 <scene_name> <base_name> [iterations] [data_dir]"
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <base_name> [scene_names] [iterations] [data_dir]"
     echo ""
     echo "Arguments:"
-    echo "  scene_name    Required. Name of the scene (e.g., drums, mic, lego)"
     echo "  base_name     Required. Base name for experiments (e.g., testall, exp1)"
+    echo "  scene_names   Optional. Comma-separated scene names or 'all' (default: all)"
+    echo "                Examples: drums,mic,lego OR all"
     echo "  iterations    Optional. Number of training iterations (default: 30000)"
     echo "  data_dir      Optional. Base data directory (default: /home/nilkel/Projects/data/nest_synthetic/nerf_synthetic)"
     echo ""
-    echo "Example:"
-    echo "  $0 drums testall"
-    echo "  $0 drums testall 30000"
-    echo "  $0 mic experiment1 30000 /path/to/data"
+    echo "Examples:"
+    echo "  $0 testall                      # Run all 8 scenes"
+    echo "  $0 testall drums,mic            # Run only drums and mic"
+    echo "  $0 testall all 30000            # Run all scenes with 30k iterations"
+    echo "  $0 exp1 lego 30000 /path/to/data"
     echo ""
     echo "Output structure:"
     echo "  outputs/baseline/nerf_synthetic/<scene>/<base_name>_baseline/"
@@ -33,22 +38,23 @@ if [ $# -lt 2 ]; then
     echo "  outputs/cat/nerf_synthetic/<scene>/<base_name>_cat1/"
     echo "  outputs/cat/nerf_synthetic/<scene>/<base_name>_cat2/"
     echo "  ...etc"
+    echo ""
+    echo "Available scenes: ${ALL_SCENES}"
     exit 1
 fi
 
-SCENE_NAME=$1
-BASE_NAME=$2
+BASE_NAME=$1
+SCENE_NAMES=${2:-all}
 ITERATIONS=${3:-$DEFAULT_ITERATIONS}
 DATA_DIR=${4:-$DEFAULT_DATA_DIR}
 
-# Construct full scene path
-SCENE_PATH="${DATA_DIR}/${SCENE_NAME}"
-
-# Verify scene path exists
-if [ ! -d "$SCENE_PATH" ]; then
-    echo "ERROR: Scene path does not exist: $SCENE_PATH"
-    exit 1
+# Handle "all" keyword
+if [ "$SCENE_NAMES" = "all" ]; then
+    SCENE_NAMES=$ALL_SCENES
 fi
+
+# Convert comma-separated list to array
+IFS=',' read -ra SCENES <<< "$SCENE_NAMES"
 
 # Verify YAML config exists
 if [ ! -f "$YAML_CONFIG" ]; then
@@ -56,101 +62,140 @@ if [ ! -f "$YAML_CONFIG" ]; then
     exit 1
 fi
 
+# Verify data directory exists
+if [ ! -d "$DATA_DIR" ]; then
+    echo "ERROR: Data directory does not exist: $DATA_DIR"
+    exit 1
+fi
+
 echo "════════════════════════════════════════════════════════════════════"
-echo "  Nest-Splatting - Train All Methods"
+echo "  Nest-Splatting - Train All Methods & Scenes"
 echo "════════════════════════════════════════════════════════════════════"
-echo "Scene:      $SCENE_NAME"
 echo "Base name:  $BASE_NAME"
-echo "Path:       $SCENE_PATH"
+echo "Scenes:     ${SCENES[@]}"
 echo "Iterations: $ITERATIONS"
+echo "Data dir:   $DATA_DIR"
 echo "Config:     $YAML_CONFIG"
 echo "════════════════════════════════════════════════════════════════════"
 echo ""
 
-# Counter for completed runs
-TOTAL_RUNS=8
-COMPLETED=0
-
-# Log file
+# Global log file for all scenes
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="logs"
 mkdir -p $LOG_DIR
-LOG_FILE="${LOG_DIR}/train_all_${SCENE_NAME}_${BASE_NAME}_${TIMESTAMP}.log"
+GLOBAL_LOG_FILE="${LOG_DIR}/train_all_scenes_${BASE_NAME}_${TIMESTAMP}.log"
 
-echo "Logging to: $LOG_FILE"
+echo "Logging to: $GLOBAL_LOG_FILE"
 echo ""
 
-# Function to run training
+# Function to run training for a single scene
 run_training() {
-    local method=$1
-    local experiment_name=$2
-    local extra_args=$3
+    local scene_name=$1
+    local method=$2
+    local experiment_name=$3
+    local extra_args=$4
     
-    COMPLETED=$((COMPLETED + 1))
+    CURRENT_RUN=$((CURRENT_RUN + 1))
+    
+    # Construct scene path
+    local scene_path="${DATA_DIR}/${scene_name}"
+    
+    # Verify scene path exists
+    if [ ! -d "$scene_path" ]; then
+        echo "WARNING: Scene path does not exist: $scene_path - SKIPPING"
+        SKIPPED=$((SKIPPED + 1))
+        return 0
+    fi
     
     # Determine output path based on method and experiment name
-    OUTPUT_PATH="outputs/${method}/nerf_synthetic/${SCENE_NAME}/${experiment_name}"
+    OUTPUT_PATH="outputs/${method}/nerf_synthetic/${scene_name}/${experiment_name}"
     TEST_METRICS="${OUTPUT_PATH}/test_metrics.txt"
     
     # Check if experiment already completed
     if [ -f "$TEST_METRICS" ]; then
         echo "════════════════════════════════════════════════════════════════════"
-        echo "  [$COMPLETED/$TOTAL_RUNS] SKIPPING: $method - $experiment_name"
+        echo "  [$CURRENT_RUN/$TOTAL_RUNS] SKIPPING: ${scene_name} - $method - $experiment_name"
         echo "════════════════════════════════════════════════════════════════════"
         echo "Output already exists with test_metrics.txt:"
         echo "  $TEST_METRICS"
         echo ""
-        echo "⊘ Skipped (already completed): $method - $experiment_name"
+        echo "⊘ Skipped (already completed)"
         echo "Skipped at: $(date)"
         echo ""
+        SKIPPED=$((SKIPPED + 1))
         return 0
     fi
     
     echo "════════════════════════════════════════════════════════════════════"
-    echo "  [$COMPLETED/$TOTAL_RUNS] Training: $method - $experiment_name"
+    echo "  [$CURRENT_RUN/$TOTAL_RUNS] Training: ${scene_name} - $method - $experiment_name"
     echo "════════════════════════════════════════════════════════════════════"
     
     # Construct command
-    CMD="python train.py -s $SCENE_PATH -m $experiment_name --yaml $YAML_CONFIG --eval --iterations $ITERATIONS --method $method $extra_args"
+    CMD="python train.py -s $scene_path -m $experiment_name --yaml $YAML_CONFIG --eval --iterations $ITERATIONS --method $method $extra_args"
     
     echo "Command: $CMD"
     echo "Started: $(date)"
     echo ""
     
     # Run training and log output
-    $CMD 2>&1 | tee -a $LOG_FILE
+    $CMD 2>&1 | tee -a $GLOBAL_LOG_FILE
     
     EXIT_CODE=${PIPESTATUS[0]}
     
     if [ $EXIT_CODE -eq 0 ]; then
         echo ""
-        echo "✓ Completed successfully: $method - $experiment_name"
+        echo "✓ Completed successfully: ${scene_name} - $method - $experiment_name"
         echo "Finished: $(date)"
         echo ""
+        COMPLETED=$((COMPLETED + 1))
     else
         echo ""
-        echo "✗ FAILED: $method - $experiment_name (exit code: $EXIT_CODE)"
+        echo "✗ FAILED: ${scene_name} - $method - $experiment_name (exit code: $EXIT_CODE)"
         echo "Finished: $(date)"
         echo ""
-        exit $EXIT_CODE
+        FAILED=$((FAILED + 1))
+        # Don't exit - continue with other experiments
     fi
 }
 
-# ============================================================================
-# 1. BASELINE MODE
-# ============================================================================
-run_training "baseline" "${BASE_NAME}_baseline" ""
+# Calculate total runs
+NUM_SCENES=${#SCENES[@]}
+METHODS_PER_SCENE=8  # baseline, add, cat1-6
+TOTAL_RUNS=$((NUM_SCENES * METHODS_PER_SCENE))
+CURRENT_RUN=0
+COMPLETED=0
+SKIPPED=0
+FAILED=0
+
+echo "Total experiments to check: $TOTAL_RUNS (${NUM_SCENES} scenes × ${METHODS_PER_SCENE} methods)"
+echo ""
 
 # ============================================================================
-# 2. ADD MODE
+# LOOP THROUGH ALL SCENES AND METHODS
 # ============================================================================
-run_training "add" "${BASE_NAME}_add" ""
-
-# ============================================================================
-# 3. CAT MODE - hybrid_levels 1 to 6 (no c2f)
-# ============================================================================
-for hl in {1..6}; do
-    run_training "cat" "${BASE_NAME}_cat${hl}" "--hybrid_levels $hl"
+for scene in "${SCENES[@]}"; do
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  SCENE: ${scene}"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo ""
+    
+    # 1. BASELINE MODE
+    run_training "$scene" "baseline" "${BASE_NAME}_baseline" ""
+    
+    # 2. ADD MODE
+    run_training "$scene" "add" "${BASE_NAME}_add" ""
+    
+    # 3. CAT MODE - hybrid_levels 1 to 6
+    for hl in {1..6}; do
+        run_training "$scene" "cat" "${BASE_NAME}_cat${hl}" "--hybrid_levels $hl"
+    done
+    
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  Completed all methods for scene: ${scene}"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo ""
 done
 
 # ============================================================================
@@ -158,66 +203,77 @@ done
 # ============================================================================
 echo ""
 echo "════════════════════════════════════════════════════════════════════"
-echo "  ALL TRAINING RUNS COMPLETED SUCCESSFULLY!"
+echo "  ALL TRAINING RUNS COMPLETED!"
 echo "════════════════════════════════════════════════════════════════════"
-echo "Scene:           $SCENE_NAME"
 echo "Base name:       $BASE_NAME"
+echo "Scenes:          ${SCENES[@]}"
 echo "Total runs:      $TOTAL_RUNS"
 echo "Completed:       $COMPLETED"
-echo "Log file:        $LOG_FILE"
+echo "Skipped:         $SKIPPED"
+echo "Failed:          $FAILED"
+echo "Log file:        $GLOBAL_LOG_FILE"
+echo "════════════════════════════════════════════════════════════════════"
 echo ""
-echo "Output directories:"
-echo "  outputs/baseline/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_baseline/"
-echo "  outputs/add/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_add/"
-echo "  outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat1/"
-echo "  outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat2/"
-echo "  outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat3/"
-echo "  outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat4/"
-echo "  outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat5/"
-echo "  outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat6/"
+
+if [ $FAILED -gt 0 ]; then
+    echo "⚠ WARNING: $FAILED experiments failed. Check the log file for details."
+    echo ""
+fi
+
+echo "Output directories structure:"
+echo "  outputs/{method}/nerf_synthetic/{scene}/${BASE_NAME}_{method}/"
+echo ""
+echo "Methods per scene: baseline, add, cat1, cat2, cat3, cat4, cat5, cat6"
 echo "════════════════════════════════════════════════════════════════════"
 echo ""
 
 # Create summary file
-SUMMARY_FILE="${LOG_DIR}/summary_${SCENE_NAME}_${BASE_NAME}_${TIMESTAMP}.txt"
+SUMMARY_FILE="${LOG_DIR}/summary_${BASE_NAME}_${TIMESTAMP}.txt"
 echo "Creating summary file: $SUMMARY_FILE"
 cat > $SUMMARY_FILE <<EOF
-Nest-Splatting Training Summary
+Nest-Splatting Multi-Scene Training Summary
 ════════════════════════════════════════════════════════════════════
 
-Scene:           $SCENE_NAME
 Base Name:       $BASE_NAME
-Scene Path:      $SCENE_PATH
+Scenes:          ${SCENES[@]}
+Data Directory:  $DATA_DIR
 Iterations:      $ITERATIONS
 YAML Config:     $YAML_CONFIG
 Timestamp:       $TIMESTAMP
-Log File:        $LOG_FILE
+Log File:        $GLOBAL_LOG_FILE
 
-Training Runs Completed: $COMPLETED/$TOTAL_RUNS
+Training Results:
+  Total runs:    $TOTAL_RUNS
+  Completed:     $COMPLETED
+  Skipped:       $SKIPPED
+  Failed:        $FAILED
 ────────────────────────────────────────────────────────────────────
 
-1. Baseline Mode
-   Output: outputs/baseline/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_baseline/
+Methods per scene:
+  1. Baseline Mode:  ${BASE_NAME}_baseline
+  2. Add Mode:       ${BASE_NAME}_add
+  3. Cat Mode:       ${BASE_NAME}_cat1 through ${BASE_NAME}_cat6 (hybrid_levels 1-6)
 
-2. Add Mode
-   Output: outputs/add/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_add/
+Output Structure:
+  outputs/{method}/nerf_synthetic/{scene}/${BASE_NAME}_{method}/
 
-3. Cat Mode (no c2f)
-   - hybrid_levels=1: outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat1/
-   - hybrid_levels=2: outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat2/
-   - hybrid_levels=3: outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat3/
-   - hybrid_levels=4: outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat4/
-   - hybrid_levels=5: outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat5/
-   - hybrid_levels=6: outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat6/
+Scenes Processed:
+EOF
+
+# Add each scene to summary
+for scene in "${SCENES[@]}"; do
+    echo "  - $scene" >> $SUMMARY_FILE
+done
+
+cat >> $SUMMARY_FILE <<EOF
 
 ════════════════════════════════════════════════════════════════════
 
 Checkpoint Files (for each output directory):
-  - test_metrics.txt
-  - train_metrics.txt
-  - checkpoint_config.json
-  - training_summary.txt
-  - ngp_30000.pth
+  - test_metrics.txt        (test set evaluation metrics)
+  - train_metrics.txt       (training set evaluation metrics)
+  - checkpoint_config.json  (configuration used)
+  - ngp_30000.pth           (trained model)
   - point_cloud/iteration_30000/point_cloud.ply
   - point_cloud/iteration_30000/point_cloud_gaussian_features.pth (add/cat only)
 
@@ -226,12 +282,13 @@ EOF
 
 echo "Summary saved to: $SUMMARY_FILE"
 echo ""
-echo "To analyze results, check the test_metrics.txt in each output directory:"
-echo "  cat outputs/baseline/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_baseline/test_metrics.txt"
-echo "  cat outputs/add/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_add/test_metrics.txt"
-echo "  cat outputs/cat/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_cat*/test_metrics.txt"
+echo "To analyze results across all scenes:"
+echo "  grep 'Average PSNR' outputs/*/nerf_synthetic/*/${BASE_NAME}_*/test_metrics.txt"
 echo ""
-echo "Or compare all at once:"
-echo "  grep 'Average PSNR' outputs/*/nerf_synthetic/${SCENE_NAME}/${BASE_NAME}_*/test_metrics.txt"
+echo "To see results for a specific scene (e.g., drums):"
+echo "  grep 'Average PSNR' outputs/*/nerf_synthetic/drums/${BASE_NAME}_*/test_metrics.txt"
+echo ""
+echo "To compare methods across all scenes:"
+echo "  for method in baseline add cat{1..6}; do echo \"=== \$method ===\"; grep 'Average PSNR' outputs/*/nerf_synthetic/*/${BASE_NAME}_\${method}/test_metrics.txt; done"
 echo ""
 
