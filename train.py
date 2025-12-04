@@ -306,8 +306,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if ingp is not None:
                     ingp.save_model(scene.model_path, iteration)
 
-            # Densification
-            if iteration < opt.densify_until_iter and optim_gaussian:
+            # Densification (skip on last iteration to avoid corrupting final rendering)
+            if iteration < opt.densify_until_iter and optim_gaussian and iteration < opt.iterations:
             # if optim_gaussian:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 
