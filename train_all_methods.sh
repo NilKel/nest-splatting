@@ -88,6 +88,24 @@ run_training() {
     
     COMPLETED=$((COMPLETED + 1))
     
+    # Determine output path based on method and experiment name
+    OUTPUT_PATH="outputs/${method}/nerf_synthetic/${SCENE_NAME}/${experiment_name}"
+    TEST_METRICS="${OUTPUT_PATH}/test_metrics.txt"
+    
+    # Check if experiment already completed
+    if [ -f "$TEST_METRICS" ]; then
+        echo "════════════════════════════════════════════════════════════════════"
+        echo "  [$COMPLETED/$TOTAL_RUNS] SKIPPING: $method - $experiment_name"
+        echo "════════════════════════════════════════════════════════════════════"
+        echo "Output already exists with test_metrics.txt:"
+        echo "  $TEST_METRICS"
+        echo ""
+        echo "⊘ Skipped (already completed): $method - $experiment_name"
+        echo "Skipped at: $(date)"
+        echo ""
+        return 0
+    fi
+    
     echo "════════════════════════════════════════════════════════════════════"
     echo "  [$COMPLETED/$TOTAL_RUNS] Training: $method - $experiment_name"
     echo "════════════════════════════════════════════════════════════════════"
