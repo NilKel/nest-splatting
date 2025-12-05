@@ -1,11 +1,105 @@
 #!/usr/bin/env python3
 """
-Script to parse experiment metrics and create tables organized by scene.
-Scans outputs/method/dataset/scene/name/ for test_metrics.txt and train_metrics.txt files.
-Creates train and test tables for each scene with method/name as row identifiers.
+Nest-Splatting Metrics Table Generator
+=======================================
 
-Usage:
-    python create_metrics_tables.py [--output_dir outputs] [--format csv|markdown|both]
+This script automatically scans your experiment outputs and generates beautifully
+formatted comparison tables for all your experiments.
+
+WHAT IT DOES:
+-------------
+1. Scans the outputs directory structure: outputs/method/dataset/scene/name/
+2. Finds all test_metrics.txt and train_metrics.txt files
+3. Extracts PSNR, SSIM, L1, and image count from each file
+4. Generates comparison tables organized by scene in multiple formats:
+   - Markdown tables (for README/documentation)
+   - CSV files (for Excel/spreadsheet analysis)
+   - HTML tables (interactive, color-coded for easy visual comparison)
+
+OUTPUT FILES:
+-------------
+For each scene (e.g., drums, lego, mic), the script creates:
+  - <scene>_metrics.md        : Markdown with test and train tables
+  - <scene>_metrics.html      : Beautiful HTML with color-coded cells (red=worst, green=best)
+  - <scene>_test_metrics.csv  : CSV for test metrics
+  - <scene>_train_metrics.csv : CSV for train metrics
+
+Additionally, it creates:
+  - all_metrics.md : Combined markdown file with all scenes
+
+DIRECTORY STRUCTURE EXPECTED:
+------------------------------
+outputs/
+├── baseline/
+│   └── nerf_synthetic/
+│       └── drums/
+│           └── exp1_baseline/
+│               ├── test_metrics.txt  ← Scans for these
+│               └── train_metrics.txt ← And these
+├── add/
+│   └── nerf_synthetic/
+│       └── drums/
+│           └── exp1_add/
+│               ├── test_metrics.txt
+│               └── train_metrics.txt
+└── cat/
+    └── nerf_synthetic/
+        └── drums/
+            ├── exp1_cat1/
+            │   ├── test_metrics.txt
+            │   └── train_metrics.txt
+            └── exp1_cat2/
+                ├── test_metrics.txt
+                └── train_metrics.txt
+
+METRICS FILE FORMAT:
+--------------------
+The script parses files with this format:
+  Average PSNR: 32.45 dB
+  Average SSIM: 0.9512
+  Average L1: 0.023456
+  Images rendered: 200
+
+USAGE EXAMPLES:
+---------------
+1. Basic usage (scans outputs/, creates both markdown and CSV):
+   python create_metrics_tables.py
+
+2. Scan a different directory:
+   python create_metrics_tables.py --output_dir my_results
+
+3. Generate only CSV files:
+   python create_metrics_tables.py --format csv
+
+4. Generate only markdown/HTML:
+   python create_metrics_tables.py --format markdown
+
+5. Specify where to save the tables:
+   python create_metrics_tables.py --save_dir my_analysis
+
+6. Complete custom run:
+   python create_metrics_tables.py --output_dir results --format both --save_dir tables
+
+VIEWING RESULTS:
+----------------
+- Open the HTML files in a browser for the best visual comparison
+- Colors range from red (worst) to green (best) relative to other experiments
+- Use the CSV files for further analysis in Excel or Python
+- Copy the markdown tables into your README or reports
+
+TYPICAL WORKFLOW:
+-----------------
+1. Run your training experiments: ./train_all_methods.sh exp1
+2. Generate tables: python create_metrics_tables.py
+3. Open metrics_tables/<scene>_metrics.html in a browser
+4. Compare performance across methods visually
+5. Copy relevant markdown tables to your report
+
+ARGUMENTS:
+----------
+--output_dir  : Directory to scan for experiments (default: outputs)
+--format      : Output format: csv, markdown, or both (default: both)
+--save_dir    : Where to save the generated tables (default: metrics_tables)
 """
 
 import os
@@ -14,7 +108,6 @@ import argparse
 from pathlib import Path
 from collections import defaultdict
 import csv
-import colorsys
 
 
 def parse_metrics_file(filepath):
@@ -176,14 +269,19 @@ def get_color_for_value(value, min_val, max_val, ascending=True):
     if not ascending:
         normalized = 1.0 - normalized
     
-    # Red (0) -> Yellow (0.5) -> Green (1.0)
-    # Using HSV color space: Hue goes from 0 (red) to 120 (green)
-    hue = normalized * 120 / 360  # Convert to 0-1 range for colorsys
-    saturation = 0.7
-    value_brightness = 0.9
+    # Red (0) -> Green (1.0) linear interpolation
+    # Red: rgb(230, 57, 57), Green: rgb(57, 230, 57)
+    red_start = 230
+    red_end = 57
+    green_start = 57
+    green_end = 230
+    blue_value = 57
     
-    r, g, b = colorsys.hsv_to_rgb(hue, saturation, value_brightness)
-    return f"rgb({int(r*255)}, {int(g*255)}, {int(b*255)})"
+    r = int(red_start + (red_end - red_start) * normalized)
+    g = int(green_start + (green_end - green_start) * normalized)
+    b = blue_value
+    
+    return f"rgb({r}, {g}, {b})"
 
 
 def create_html_table(scene, split, data):
@@ -200,6 +298,13 @@ def create_html_table(scene, split, data):
     """
     if not data:
         return f"<p>No {split} data available for {scene}</p>\n"
+    
+    # Filter to only include baseline, add, and cat methods
+    allowed_methods = {'baseline', 'add', 'cat'}
+    data = [item for item in data if item[0] in allowed_methods]
+    
+    if not data:
+        return f"<p>No baseline/add/cat data available for {scene}</p>\n"
     
     # Sort by method, then name
     data = sorted(data, key=lambda x: (x[0], x[1]))
@@ -362,7 +467,8 @@ def create_html_document(scene, test_data, train_data):
     html.append('<body>')
     html.append(f'<h1>{scene.upper()} - Experiment Metrics</h1>')
     html.append('<div class="info">')
-    html.append('<strong>Color Coding:</strong> Cells are color-coded from red (worst) to green (best) relative to other experiments.')
+    html.append('<strong>Color Coding:</strong> Cells are color-coded from red (worst) to green (best) relative to other experiments. ')
+    html.append('Showing baseline, add, and cat methods only.')
     html.append('</div>')
     html.append('<div class="legend">')
     html.append('<div class="legend-item">')
@@ -372,7 +478,7 @@ def create_html_document(scene, test_data, train_data):
     html.append('<span><strong>↓</strong> Lower is better (L1)</span>')
     html.append('</div>')
     html.append('<div class="legend-item">')
-    html.append('<div class="color-sample" style="background: linear-gradient(to right, rgb(230, 57, 57), rgb(230, 230, 57), rgb(57, 230, 57));"></div>')
+    html.append('<div class="color-sample" style="background: linear-gradient(to right, rgb(230, 57, 57), rgb(57, 230, 57));"></div>')
     html.append('<span>Worst → Best</span>')
     html.append('</div>')
     html.append('</div>')
