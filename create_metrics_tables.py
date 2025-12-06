@@ -25,7 +25,8 @@ For each scene (e.g., drums, lego, mic), the script creates:
   - <scene>_train_metrics.csv : CSV for train metrics
 
 Additionally, it creates:
-  - all_metrics.md : Combined markdown file with all scenes
+  - all_metrics.md   : Combined markdown file with all scenes
+  - all_metrics.html : Combined HTML with all scenes in sequence (train then test for each)
 
 DIRECTORY STRUCTURE EXPECTED:
 ------------------------------
@@ -354,27 +355,9 @@ def create_html_table(scene, split, data):
     return '\n'.join(lines)
 
 
-def create_html_document(scene, test_data, train_data):
-    """
-    Create a complete HTML document with both test and train tables for a scene.
-    
-    Args:
-        scene: Scene name
-        test_data: List of (method, name, metrics_dict) tuples for test
-        train_data: List of (method, name, metrics_dict) tuples for train
-    
-    Returns:
-        str: Complete HTML document
-    """
-    html = []
-    html.append('<!DOCTYPE html>')
-    html.append('<html lang="en">')
-    html.append('<head>')
-    html.append('<meta charset="UTF-8">')
-    html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">')
-    html.append(f'<title>{scene.upper()} - Experiment Metrics</title>')
-    html.append('<style>')
-    html.append("""
+def get_html_styles():
+    """Get the common CSS styles for HTML documents."""
+    return """
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
             max-width: 1400px;
@@ -461,7 +444,38 @@ def create_html_document(scene, test_data, train_data):
             border: 1px solid #ccc;
             border-radius: 3px;
         }
-    """)
+        .scene-section {
+            margin-bottom: 60px;
+            padding-bottom: 40px;
+            border-bottom: 2px solid #ddd;
+        }
+        .scene-section:last-child {
+            border-bottom: none;
+        }
+    """
+
+
+def create_html_document(scene, test_data, train_data):
+    """
+    Create a complete HTML document with both test and train tables for a scene.
+    
+    Args:
+        scene: Scene name
+        test_data: List of (method, name, metrics_dict) tuples for test
+        train_data: List of (method, name, metrics_dict) tuples for train
+    
+    Returns:
+        str: Complete HTML document
+    """
+    html = []
+    html.append('<!DOCTYPE html>')
+    html.append('<html lang="en">')
+    html.append('<head>')
+    html.append('<meta charset="UTF-8">')
+    html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">')
+    html.append(f'<title>{scene.upper()} - Experiment Metrics</title>')
+    html.append('<style>')
+    html.append(get_html_styles())
     html.append('</style>')
     html.append('</head>')
     html.append('<body>')
@@ -490,6 +504,70 @@ def create_html_document(scene, test_data, train_data):
     # Add train table
     if train_data:
         html.append(create_html_table(scene, 'train', train_data))
+    
+    html.append('</body>')
+    html.append('</html>')
+    
+    return '\n'.join(html)
+
+
+def create_combined_html_document(experiments):
+    """
+    Create a combined HTML document with all scenes in sequence.
+    
+    Args:
+        experiments: Dict of {scene: {'test': [...], 'train': [...]}}
+    
+    Returns:
+        str: Complete HTML document with all scenes
+    """
+    html = []
+    html.append('<!DOCTYPE html>')
+    html.append('<html lang="en">')
+    html.append('<head>')
+    html.append('<meta charset="UTF-8">')
+    html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">')
+    html.append('<title>All Scenes - Experiment Metrics</title>')
+    html.append('<style>')
+    html.append(get_html_styles())
+    html.append('</style>')
+    html.append('</head>')
+    html.append('<body>')
+    html.append('<h1>All Scenes - Experiment Metrics</h1>')
+    html.append('<div class="info">')
+    html.append('<strong>Color Coding:</strong> Cells are color-coded from red (worst) to green (best) relative to other experiments. ')
+    html.append('Showing baseline, add, and cat methods only.')
+    html.append('</div>')
+    html.append('<div class="legend">')
+    html.append('<div class="legend-item">')
+    html.append('<span><strong>↑</strong> Higher is better (PSNR, SSIM)</span>')
+    html.append('</div>')
+    html.append('<div class="legend-item">')
+    html.append('<span><strong>↓</strong> Lower is better (L1)</span>')
+    html.append('</div>')
+    html.append('<div class="legend-item">')
+    html.append('<div class="color-sample" style="background: linear-gradient(to right, rgb(230, 57, 57), rgb(57, 230, 57));"></div>')
+    html.append('<span>Worst → Best</span>')
+    html.append('</div>')
+    html.append('</div>')
+    
+    # Sort scenes alphabetically
+    scenes = sorted(experiments.keys())
+    
+    # Add each scene in sequence
+    for scene in scenes:
+        html.append('<div class="scene-section">')
+        html.append(f'<h1 style="margin-top: 0;">{scene.upper()}</h1>')
+        
+        # Add train table first
+        if experiments[scene]['train']:
+            html.append(create_html_table(scene, 'train', experiments[scene]['train']))
+        
+        # Then test table
+        if experiments[scene]['test']:
+            html.append(create_html_table(scene, 'test', experiments[scene]['test']))
+        
+        html.append('</div>')
     
     html.append('</body>')
     html.append('</html>')
@@ -648,6 +726,14 @@ def main():
             f.write("\n".join(all_markdown))
         print(f"\n  Saved combined Markdown: {md_file}")
     
+    # Save combined HTML file with all scenes
+    if args.format in ['markdown', 'both'] and experiments:
+        combined_html_file = os.path.join(args.save_dir, "all_metrics.html")
+        combined_html_content = create_combined_html_document(experiments)
+        with open(combined_html_file, 'w') as f:
+            f.write(combined_html_content)
+        print(f"  Saved combined HTML: {combined_html_file}")
+    
     print("\n" + "="*70)
     print("  COMPLETE!")
     print("="*70)
@@ -656,6 +742,7 @@ def main():
         print(f"\n  Per-scene markdown: {args.save_dir}/<scene>_metrics.md")
         print(f"  Per-scene HTML (color-coded): {args.save_dir}/<scene>_metrics.html")
         print(f"  Combined markdown: {args.save_dir}/all_metrics.md")
+        print(f"  Combined HTML (all scenes): {args.save_dir}/all_metrics.html")
     if args.format in ['csv', 'both']:
         print(f"\n  CSV files: {args.save_dir}/<scene>_test_metrics.csv, <scene>_train_metrics.csv")
     print()
