@@ -74,105 +74,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Load checkpoint to CPU first
         checkpoint_data = torch.load(gaussian_checkpoint_path, weights_only=False, map_location='cpu')
-        print(f"[2DGS] Checkpoint was saved at iteration: {checkpoint_data.get('iteration', 'unknown')}")
 
-        # Check if this is the new format (dict) or old format (tuple)
-        if 'xyz' in checkpoint_data:
-            # New simplified format - load parameters directly
-            gaussians.active_sh_degree = checkpoint_data['active_sh_degree']
-            # Restore Gaussian parameters
-            gaussians._xyz = nn.Parameter(checkpoint_data['xyz'].cuda().contiguous().requires_grad_(True))
-            gaussians._features_dc = nn.Parameter(checkpoint_data['features_dc'].cuda().contiguous().requires_grad_(True))
-            gaussians._features_rest = nn.Parameter(checkpoint_data['features_rest'].cuda().contiguous().requires_grad_(True))
-            gaussians._scaling = nn.Parameter(checkpoint_data['scaling'].cuda().contiguous().requires_grad_(True))
-            gaussians._rotation = nn.Parameter(checkpoint_data['rotation'].cuda().contiguous().requires_grad_(True))
-            gaussians._opacity = nn.Parameter(checkpoint_data['opacity'].cuda().contiguous().requires_grad_(True))
-            gaussians.active_sh_degree = checkpoint_data['active_sh_degree']
-            gaussians.spatial_lr_scale = checkpoint_data['spatial_lr_scale']
-            
-            # Restore max_radii2D (CRITICAL for pruning decisions!)
-            if 'max_radii2D' in checkpoint_data:
-                gaussians.max_radii2D = checkpoint_data['max_radii2D'].cuda()
-                print(f"[2DGS] Restored max_radii2D (max={gaussians.max_radii2D.max().item():.2f})")
-            else:
-                gaussians.max_radii2D = torch.zeros((len(checkpoint_data['xyz']),), device="cuda")
-                print(f"[2DGS] Warning: No max_radii2D in checkpoint - using zeros")
-
-            # Restore or initialize appearance_level
-            if 'appearance_level' in checkpoint_data:
-                gaussians._appearance_level = nn.Parameter(checkpoint_data['appearance_level'].cuda().requires_grad_(True))
-                print(f"[2DGS] Restored appearance_level (mean={gaussians._appearance_level.mean().item():.2f})")
-            else:
-                init_level = 24
-                ap_level = init_level * torch.ones((len(checkpoint_data['xyz']), 1), device="cuda").float()
-                gaussians._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
-                print(f"[2DGS] Warning: No appearance_level in checkpoint - using init_level={init_level}")
-
-            # Initialize per-Gaussian features (for "add" and "cat" modes)
-            # In "add" mode: gaussian_feat_dim = total_levels * per_level_dim = 6 * 4 = 24
-            # In "cat" mode: gaussian_feat_dim = hybrid_levels * per_level_dim
-            if args.method == "cat":
-                gaussian_feat_dim = args.hybrid_levels * 4  # per_level_dim = 4
-            else:
-                gaussian_feat_dim = 24  # 6 levels * 4 dim
-            gaussian_feats = torch.zeros((len(checkpoint_data['xyz']), gaussian_feat_dim), device="cuda").float()
-            gaussians._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
-            
-            print(f"[2DGS] Loaded {len(gaussians._xyz)} Gaussians")
+        # Check format: new format is tuple (model_args, iteration), old is dict
+        if isinstance(checkpoint_data, tuple):
+            # New format: saved using capture()
+            model_args, saved_iter = checkpoint_data
+            print(f"[2DGS] New checkpoint format detected (iteration {saved_iter})")
+            num_gaussians = len(model_args[1])  # model_args[1] is _xyz
+            print(f"[2DGS] Loaded {num_gaussians} Gaussians")
             loaded_pretrained = True
 
-            # Now create Scene with loaded Gaussians
-            # Pass a special flag to prevent Scene from re-initializing the Gaussians
-            # We set gaussians._loaded_from_checkpoint to signal Scene to skip create_from_pcd
+            # Set flag to prevent Scene from re-initializing
             gaussians._loaded_from_checkpoint = True
             scene = Scene(dataset, gaussians, load_iteration=None, shuffle=False)
 
-            # Setup optimizer with loaded parameters
-            gaussians.training_setup(opt)
+            # Use restore() which preserves parameter IDs for optimizer state matching
+            # This is CRITICAL - restore() doesn't create new Parameters, so optimizer state can match
+            gaussians.restore(model_args, opt)
             
-            # Restore optimizer state if available (preserves Adam momentum)
-            if 'optimizer_state' in checkpoint_data:
-                print(f"\n[2DGS] Restoring optimizer state (Adam momentum & adaptive LR)")
-                try:
-                    # Check if parameter count matches
-                    saved_param_groups = checkpoint_data['optimizer_state']['param_groups']
-                    current_param_groups = gaussians.optimizer.param_groups
-                    print(f"[2DGS] Saved param groups: {len(saved_param_groups)}, Current: {len(current_param_groups)}")
-                    
-                    # Check parameter names match
-                    for i in range(min(len(saved_param_groups), len(current_param_groups))):
-                        saved_name = saved_param_groups[i].get('name', f'group_{i}')
-                        current_name = current_param_groups[i].get('name', f'group_{i}')
-                        if saved_name != current_name:
-                            print(f"[2DGS] WARNING: Param group {i} name mismatch: saved='{saved_name}', current='{current_name}'")
-                    
-                    gaussians.optimizer.load_state_dict(checkpoint_data['optimizer_state'])
-                    print(f"[2DGS] ✓ Optimizer state loaded")
-                    
-                    # Verify loading worked
-                    loaded_count = 0
-                    for i, group in enumerate(gaussians.optimizer.param_groups):
-                        param = group['params'][0]
-                        if param in gaussians.optimizer.state and len(gaussians.optimizer.state[param]) > 0:
-                            loaded_count += 1
-                            state = gaussians.optimizer.state[param]
-                            if 'step' in state and i < 3:  # Print first few
-                                print(f"  {group['name']}: step={state['step']}, exp_avg_norm={state['exp_avg'].norm().item():.6f}")
-                    print(f"[2DGS] Parameters with optimizer state: {loaded_count}/{len(gaussians.optimizer.param_groups)}")
-                except Exception as e:
-                    print(f"[2DGS] ✗ Failed to load optimizer state: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                print(f"[2DGS] Warning: No optimizer state in checkpoint - starting with fresh optimizer")
-            
-            # Restore densification statistics if available
-            if 'xyz_gradient_accum' in checkpoint_data and 'denom' in checkpoint_data:
-                print(f"[2DGS] Restoring densification statistics")
-                gaussians.xyz_gradient_accum = checkpoint_data['xyz_gradient_accum'].cuda()
-                gaussians.denom = checkpoint_data['denom'].cuda()
-            else:
-                print(f"[2DGS] Note: No densification stats in checkpoint - will start fresh")
+            print(f"[2DGS] ✓ Checkpoint restored using restore() method (preserves parameter IDs)")
+        else:
+            # Old dict format - not supported, tell user to regenerate
+            print(f"\n{'='*70}")
+            print(f"ERROR: Old checkpoint format detected!")
+            print(f"{'='*70}")
+            print(f"The checkpoint at {gaussian_checkpoint_path} uses an outdated format")
+            print(f"that doesn't properly preserve optimizer state.")
+            print(f"\nPlease delete it and retrain:")
+            print(f"  rm {gaussian_checkpoint_path}")
+            print(f"  # Then run training again to generate a new checkpoint")
+            print(f"{'='*70}\n")
+            raise ValueError("Incompatible checkpoint format - please regenerate")
 
             # Skip to INGP training phase
             first_iter = cfg_model.ingp_stage.initialize
@@ -441,25 +373,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == cfg_model.ingp_stage.initialize and not loaded_pretrained:
                 gaussian_save_path = os.path.join(dataset.source_path, "gaussian_init.pth")
                 print(f"\n[2DGS] Saving Gaussian checkpoint to: {gaussian_save_path}")
-                checkpoint_data = {
-                    'iteration': iteration,
-                    'active_sh_degree': gaussians.active_sh_degree,
-                    'xyz': gaussians._xyz.cpu(),
-                    'features_dc': gaussians._features_dc.cpu(),
-                    'features_rest': gaussians._features_rest.cpu(),
-                    'scaling': gaussians._scaling.cpu(),
-                    'rotation': gaussians._rotation.cpu(),
-                    'opacity': gaussians._opacity.cpu(),
-                    'max_radii2D': gaussians.max_radii2D.cpu(),
-                    'spatial_lr_scale': gaussians.spatial_lr_scale,
-                    # Save appearance level (coarse-to-fine per-Gaussian feature activation)
-                    'appearance_level': gaussians._appearance_level.cpu(),
-                    # Save optimizer state to preserve Adam momentum and adaptive learning rates
-                    'optimizer_state': gaussians.optimizer.state_dict(),
-                    # Save densification statistics for continuing adaptive densification
-                    'xyz_gradient_accum': gaussians.xyz_gradient_accum.cpu(),
-                    'denom': gaussians.denom.cpu(),
-                }
+                # Save using the same format as capture() for consistent restore()
+                checkpoint_data = (gaussians.capture(), iteration)
                 torch.save(checkpoint_data, gaussian_save_path)
                 print(f"[2DGS] ✓ Saved {len(gaussians._xyz)} Gaussians with optimizer state")
 
