@@ -80,19 +80,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if 'xyz' in checkpoint_data:
             # New simplified format - load parameters directly
             gaussians.active_sh_degree = checkpoint_data['active_sh_degree']
+            # Restore Gaussian parameters
             gaussians._xyz = nn.Parameter(checkpoint_data['xyz'].cuda().contiguous().requires_grad_(True))
             gaussians._features_dc = nn.Parameter(checkpoint_data['features_dc'].cuda().contiguous().requires_grad_(True))
             gaussians._features_rest = nn.Parameter(checkpoint_data['features_rest'].cuda().contiguous().requires_grad_(True))
             gaussians._scaling = nn.Parameter(checkpoint_data['scaling'].cuda().contiguous().requires_grad_(True))
             gaussians._rotation = nn.Parameter(checkpoint_data['rotation'].cuda().contiguous().requires_grad_(True))
             gaussians._opacity = nn.Parameter(checkpoint_data['opacity'].cuda().contiguous().requires_grad_(True))
-            gaussians.max_radii2D = torch.zeros((len(checkpoint_data['xyz']),), device="cuda")
+            gaussians.active_sh_degree = checkpoint_data['active_sh_degree']
             gaussians.spatial_lr_scale = checkpoint_data['spatial_lr_scale']
+            
+            # Restore max_radii2D (CRITICAL for pruning decisions!)
+            if 'max_radii2D' in checkpoint_data:
+                gaussians.max_radii2D = checkpoint_data['max_radii2D'].cuda()
+                print(f"[2DGS] Restored max_radii2D (max={gaussians.max_radii2D.max().item():.2f})")
+            else:
+                gaussians.max_radii2D = torch.zeros((len(checkpoint_data['xyz']),), device="cuda")
+                print(f"[2DGS] Warning: No max_radii2D in checkpoint - using zeros")
 
-            # Initialize appearance_level (required for INGP rendering)
-            init_level = 24
-            ap_level = init_level * torch.ones((len(checkpoint_data['xyz']), 1), device="cuda").float()
-            gaussians._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
+            # Restore or initialize appearance_level
+            if 'appearance_level' in checkpoint_data:
+                gaussians._appearance_level = nn.Parameter(checkpoint_data['appearance_level'].cuda().requires_grad_(True))
+                print(f"[2DGS] Restored appearance_level (mean={gaussians._appearance_level.mean().item():.2f})")
+            else:
+                init_level = 24
+                ap_level = init_level * torch.ones((len(checkpoint_data['xyz']), 1), device="cuda").float()
+                gaussians._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
+                print(f"[2DGS] Warning: No appearance_level in checkpoint - using init_level={init_level}")
 
             # Initialize per-Gaussian features (for "add" and "cat" modes)
             # In "add" mode: gaussian_feat_dim = total_levels * per_level_dim = 6 * 4 = 24
@@ -438,6 +452,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     'opacity': gaussians._opacity.cpu(),
                     'max_radii2D': gaussians.max_radii2D.cpu(),
                     'spatial_lr_scale': gaussians.spatial_lr_scale,
+                    # Save appearance level (coarse-to-fine per-Gaussian feature activation)
+                    'appearance_level': gaussians._appearance_level.cpu(),
                     # Save optimizer state to preserve Adam momentum and adaptive learning rates
                     'optimizer_state': gaussians.optimizer.state_dict(),
                     # Save densification statistics for continuing adaptive densification
