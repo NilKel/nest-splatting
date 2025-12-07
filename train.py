@@ -93,6 +93,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.restore(model_args, opt)
             
             print(f"[2DGS] ✓ Checkpoint restored using restore() method (preserves parameter IDs)")
+            
+            # Skip to INGP training phase
+            first_iter = cfg_model.ingp_stage.initialize
+            print(f"[2DGS] ✓ Skipping 2DGS training, starting from iteration {first_iter} (INGP phase)")
         else:
             # Old dict format - not supported, tell user to regenerate
             print(f"\n{'='*70}")
@@ -105,14 +109,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"  # Then run training again to generate a new checkpoint")
             print(f"{'='*70}\n")
             raise ValueError("Incompatible checkpoint format - please regenerate")
-
-            # Skip to INGP training phase
-            first_iter = cfg_model.ingp_stage.initialize
-            print(f"[2DGS] ✓ Skipping 2DGS training, starting from iteration {first_iter} (INGP phase)")
-        else:
-            print("[2DGS] Warning: Checkpoint format not recognized, training from scratch")
-            scene = Scene(dataset, gaussians)
-            gaussians.training_setup(opt)
     else:
         # Normal initialization without checkpoint
         scene = Scene(dataset, gaussians)
