@@ -80,8 +80,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # New format: saved using capture()
             model_args, saved_iter = checkpoint_data
             print(f"[2DGS] New checkpoint format detected (iteration {saved_iter})")
-            num_gaussians = len(model_args[1])  # model_args[1] is _xyz
-            print(f"[2DGS] Loaded {num_gaussians} Gaussians")
+            
+            # Move all tensors to CUDA before restore()
+            # model_args format: (active_sh_degree, _xyz, _features_dc, _features_rest, _scaling, 
+            #                     _rotation, _opacity, max_radii2D, xyz_gradient_accum, denom, 
+            #                     optimizer_state, spatial_lr_scale, _gaussian_features)
+            model_args_cuda = (
+                model_args[0],  # active_sh_degree (int)
+                model_args[1].cuda(),  # _xyz
+                model_args[2].cuda(),  # _features_dc
+                model_args[3].cuda(),  # _features_rest
+                model_args[4].cuda(),  # _scaling
+                model_args[5].cuda(),  # _rotation
+                model_args[6].cuda(),  # _opacity
+                model_args[7].cuda(),  # max_radii2D
+                model_args[8].cuda(),  # xyz_gradient_accum
+                model_args[9].cuda(),  # denom
+                model_args[10],  # optimizer_state (dict, handled by PyTorch)
+                model_args[11],  # spatial_lr_scale (float)
+                model_args[12].cuda(),  # _gaussian_features
+            )
+            
+            num_gaussians = len(model_args_cuda[1])
+            print(f"[2DGS] Loaded {num_gaussians} Gaussians (moved to CUDA)")
             loaded_pretrained = True
 
             # Set flag to prevent Scene from re-initializing
@@ -90,7 +111,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Use restore() which preserves parameter IDs for optimizer state matching
             # This is CRITICAL - restore() doesn't create new Parameters, so optimizer state can match
-            gaussians.restore(model_args, opt)
+            gaussians.restore(model_args_cuda, opt)
             
             print(f"[2DGS] ✓ Checkpoint restored using restore() method (preserves parameter IDs)")
             
