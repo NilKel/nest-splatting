@@ -125,13 +125,36 @@ class GaussianModel:
             print(f"[Restore] Warning: Old checkpoint format - created _appearance_level with init_level={init_level}")
         
         self.training_setup(training_args)
+        
+        # Restore densification statistics
+        print(f"\n[Restore] Restoring densification statistics...")
+        print(f"  xyz_gradient_accum shape: {xyz_gradient_accum.shape}, mean: {xyz_gradient_accum.mean().item():.6f}")
+        print(f"  denom shape: {denom.shape}, mean: {denom.mean().item():.6f}")
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
 
-        # Load optimizer state (may not have gaussian_features if loading old checkpoint)
+        # Load optimizer state
+        print(f"\n[Restore] Loading optimizer state...")
+        print(f"[Restore] Saved opt_dict has {len(opt_dict['param_groups'])} param groups")
+        print(f"[Restore] Current optimizer has {len(self.optimizer.param_groups)} param groups")
+        
+        # Debug: Check parameter IDs before and after
+        print(f"\n[Restore] Saved param IDs in opt_dict['state']: {list(opt_dict['state'].keys())[:3]}...")
+        current_param_ids = [id(p) for pg in self.optimizer.param_groups for p in pg['params']]
+        print(f"[Restore] Current param IDs in optimizer: {current_param_ids[:3]}...")
+        
         try:
             self.optimizer.load_state_dict(opt_dict)
-        except:
+            print(f"[Restore] ✓ Optimizer state loaded successfully!")
+            
+            # Verify state was actually loaded
+            num_params_with_state = len(self.optimizer.state)
+            print(f"[Restore] ✓ {num_params_with_state} parameters have optimizer state (momentum, etc.)")
+        except Exception as e:
+            print(f"[Restore] ✗ Failed to load optimizer state: {e}")
+            print(f"[Restore] ⚠ This will cause performance degradation!")
+            print(f"[Restore] Attempting manual fallback loading...")
+            
             # If loading fails (e.g., param_groups mismatch), load what we can
             # Load the state dict for existing parameters
             for i, param_group in enumerate(self.optimizer.param_groups):
@@ -142,6 +165,8 @@ class GaussianModel:
             for param_key in opt_dict['state'].keys():
                 if param_key in [id(p) for pg in self.optimizer.param_groups for p in pg['params']]:
                     self.optimizer.state[param_key] = opt_dict['state'][param_key]
+            
+            print(f"[Restore] Manual fallback: {len(self.optimizer.state)} params have state")
 
         # Ensure gaussian_features has proper optimizer state initialized
         # Find the param_group for gaussian_features and ensure it has state

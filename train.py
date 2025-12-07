@@ -72,44 +72,55 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("╚" + "═"*68 + "╝")
         print(f"[2DGS] Checkpoint location: {gaussian_checkpoint_path}")
 
-        # Load checkpoint directly to CUDA
-        checkpoint_data = torch.load(gaussian_checkpoint_path, weights_only=False, map_location='cuda:0')
+        # Load checkpoint to CPU first
+        checkpoint_data = torch.load(gaussian_checkpoint_path, weights_only=False, map_location='cpu')
+        print(f"[2DGS] Checkpoint was saved at iteration: {checkpoint_data.get('iteration', 'unknown')}")
 
-        # Check format: new format is tuple (model_args, iteration), old is dict
-        if isinstance(checkpoint_data, tuple):
-            # New format: saved using capture()
-            model_args, saved_iter = checkpoint_data
-            print(f"[2DGS] New checkpoint format detected (iteration {saved_iter})")
+        # Check if this is the dict format (parameters only - the WORKING format)
+        if 'xyz' in checkpoint_data:
+            # Dict format - load parameters and create FRESH optimizer
+            # This gives INGP phase a clean slate (no old momentum/densification stats)
+            gaussians.active_sh_degree = checkpoint_data['active_sh_degree']
+            gaussians._xyz = nn.Parameter(checkpoint_data['xyz'].cuda().contiguous().requires_grad_(True))
+            gaussians._features_dc = nn.Parameter(checkpoint_data['features_dc'].cuda().contiguous().requires_grad_(True))
+            gaussians._features_rest = nn.Parameter(checkpoint_data['features_rest'].cuda().contiguous().requires_grad_(True))
+            gaussians._scaling = nn.Parameter(checkpoint_data['scaling'].cuda().contiguous().requires_grad_(True))
+            gaussians._rotation = nn.Parameter(checkpoint_data['rotation'].cuda().contiguous().requires_grad_(True))
+            gaussians._opacity = nn.Parameter(checkpoint_data['opacity'].cuda().contiguous().requires_grad_(True))
+            gaussians.max_radii2D = torch.zeros((len(checkpoint_data['xyz']),), device="cuda")  # RESET for fresh densification
+            gaussians.spatial_lr_scale = checkpoint_data['spatial_lr_scale']
+
+            # Initialize appearance_level (required for INGP rendering)
+            init_level = 24
+            ap_level = init_level * torch.ones((len(checkpoint_data['xyz']), 1), device="cuda").float()
+            gaussians._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
+
+            # Initialize per-Gaussian features (for "add" and "cat" modes)
+            if args.method == "cat":
+                gaussian_feat_dim = args.hybrid_levels * 4  # per_level_dim = 4
+            else:
+                gaussian_feat_dim = 24  # 6 levels * 4 dim
+            gaussian_feats = torch.zeros((len(checkpoint_data['xyz']), gaussian_feat_dim), device="cuda").float()
+            gaussians._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
             
-            num_gaussians = len(model_args[1])
-            print(f"[2DGS] Loaded {num_gaussians} Gaussians (on CUDA)")
+            print(f"[2DGS] Loaded {len(gaussians._xyz)} Gaussians")
             loaded_pretrained = True
 
             # Set flag to prevent Scene from re-initializing
             gaussians._loaded_from_checkpoint = True
             scene = Scene(dataset, gaussians, load_iteration=None, shuffle=False)
 
-            # Use restore() which preserves parameter IDs for optimizer state matching
-            # This is CRITICAL - restore() assigns the Parameters directly, preserving their identity
-            gaussians.restore(model_args, opt)
-            
-            print(f"[2DGS] ✓ Checkpoint restored using restore() method (preserves parameter IDs)")
-            
+            # Setup FRESH optimizer (no momentum from 2DGS phase - THIS IS THE KEY!)
+            gaussians.training_setup(opt)
+            print(f"[2DGS] ✓ Fresh optimizer created for INGP phase (no old momentum/densification stats)")
+
             # Skip to INGP training phase
             first_iter = cfg_model.ingp_stage.initialize
             print(f"[2DGS] ✓ Skipping 2DGS training, starting from iteration {first_iter} (INGP phase)")
         else:
-            # Old dict format - not supported, tell user to regenerate
-            print(f"\n{'='*70}")
-            print(f"ERROR: Old checkpoint format detected!")
-            print(f"{'='*70}")
-            print(f"The checkpoint at {gaussian_checkpoint_path} uses an outdated format")
-            print(f"that doesn't properly preserve optimizer state.")
-            print(f"\nPlease delete it and retrain:")
-            print(f"  rm {gaussian_checkpoint_path}")
-            print(f"  # Then run training again to generate a new checkpoint")
-            print(f"{'='*70}\n")
-            raise ValueError("Incompatible checkpoint format - please regenerate")
+            print("[2DGS] Warning: Checkpoint format not recognized, training from scratch")
+            scene = Scene(dataset, gaussians)
+            gaussians.training_setup(opt)
     else:
         # Normal initialization without checkpoint
         scene = Scene(dataset, gaussians)
@@ -370,10 +381,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == cfg_model.ingp_stage.initialize and not loaded_pretrained:
                 gaussian_save_path = os.path.join(dataset.source_path, "gaussian_init.pth")
                 print(f"\n[2DGS] Saving Gaussian checkpoint to: {gaussian_save_path}")
-                # Save using the same format as capture() for consistent restore()
-                checkpoint_data = (gaussians.capture(), iteration)
+                # Save ONLY Gaussian parameters (NOT optimizer state or densification stats)
+                # This gives INGP phase a fresh start for optimization
+                checkpoint_data = {
+                    'iteration': iteration,
+                    'active_sh_degree': gaussians.active_sh_degree,
+                    'xyz': gaussians._xyz.detach().cpu(),
+                    'features_dc': gaussians._features_dc.detach().cpu(),
+                    'features_rest': gaussians._features_rest.detach().cpu(),
+                    'scaling': gaussians._scaling.detach().cpu(),
+                    'rotation': gaussians._rotation.detach().cpu(),
+                    'opacity': gaussians._opacity.detach().cpu(),
+                    'spatial_lr_scale': gaussians.spatial_lr_scale
+                }
                 torch.save(checkpoint_data, gaussian_save_path)
-                print(f"[2DGS] ✓ Saved {len(gaussians._xyz)} Gaussians with optimizer state")
+                print(f"[2DGS] ✓ Saved {len(gaussians._xyz)} Gaussians (parameters only, fresh optimizer for INGP)")
 
         with torch.no_grad():      
             cam_uid = viewpoint_cam.uid  
