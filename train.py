@@ -115,6 +115,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Setup optimizer with loaded parameters
             gaussians.training_setup(opt)
+            
+            # Restore optimizer state if available (preserves Adam momentum)
+            if 'optimizer_state' in checkpoint_data:
+                print(f"[2DGS] Restoring optimizer state (Adam momentum & adaptive LR)")
+                gaussians.optimizer.load_state_dict(checkpoint_data['optimizer_state'])
+            else:
+                print(f"[2DGS] Warning: No optimizer state in checkpoint - starting with fresh optimizer")
+            
+            # Restore densification statistics if available
+            if 'xyz_gradient_accum' in checkpoint_data and 'denom' in checkpoint_data:
+                print(f"[2DGS] Restoring densification statistics")
+                gaussians.xyz_gradient_accum = checkpoint_data['xyz_gradient_accum'].cuda()
+                gaussians.denom = checkpoint_data['denom'].cuda()
+            else:
+                print(f"[2DGS] Note: No densification stats in checkpoint - will start fresh")
 
             # Skip to INGP training phase
             first_iter = cfg_model.ingp_stage.initialize
@@ -393,10 +408,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     'rotation': gaussians._rotation.cpu(),
                     'opacity': gaussians._opacity.cpu(),
                     'max_radii2D': gaussians.max_radii2D.cpu(),
-                    'spatial_lr_scale': gaussians.spatial_lr_scale
+                    'spatial_lr_scale': gaussians.spatial_lr_scale,
+                    # Save optimizer state to preserve Adam momentum and adaptive learning rates
+                    'optimizer_state': gaussians.optimizer.state_dict(),
+                    # Save densification statistics for continuing adaptive densification
+                    'xyz_gradient_accum': gaussians.xyz_gradient_accum.cpu(),
+                    'denom': gaussians.denom.cpu(),
                 }
                 torch.save(checkpoint_data, gaussian_save_path)
-                print(f"[2DGS] ✓ Saved {len(gaussians._xyz)} Gaussians")
+                print(f"[2DGS] ✓ Saved {len(gaussians._xyz)} Gaussians with optimizer state")
 
         with torch.no_grad():      
             cam_uid = viewpoint_cam.uid  
