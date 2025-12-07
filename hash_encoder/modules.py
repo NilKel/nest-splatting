@@ -269,27 +269,28 @@ class INGP(nn.Module):
 
         if self.is_cat_mode:
             if self.cat_coarse2fine:
-                # Cat mode with coarse-to-fine: Follow baseline logic exactly
-                # Start with init_active_level (default 2), add 1 level at a time
-                # Since concatenation is [Gaussian | Hash], this naturally unmasks Gaussian first
-                # Example: hybrid_levels=3, total_levels=6
-                # - Iter 1000: active_levels=2 → 8D (first 2 Gaussian levels)
-                # - Iter 2000: active_levels=3 → 12D (all 3 Gaussian levels)
-                # - Iter 3000: active_levels=4 → 16D (3 Gaussian + 1 Hash level)
-                # - ...
+                # Cat mode with coarse-to-fine:
+                # - Always use ALL Gaussian features (hybrid_levels)
+                # - Start hashgrid at min(2, effective_hash_levels) and progressively unlock
+                # Example: hybrid_levels=3, total_levels=6, effective_hash_levels=3
+                # - Iter 0: 3 Gaussian + min(2,3)=2 Hash = 5 total levels (20D)
+                # - Iter 3000: 3 Gaussian + 3 Hash = 6 total levels (24D)
+                effective_hash_levels = self.levels - self.hybrid_levels
+                init_hash_levels = min(self.init_active_level, effective_hash_levels)
+                
                 anneal_levels = max((current_iter - self.initialize - self.warm_up) // self.step, 0)
-                self.active_levels = min(self.levels, anneal_levels + self.init_active_level)
+                active_hash_levels = min(effective_hash_levels, anneal_levels + init_hash_levels)
+                
+                # Total active levels = all Gaussian + active hashgrid
+                self.active_levels = self.hybrid_levels + active_hash_levels
 
                 # Print when a new level is enabled
                 if self.active_levels != self.pre_level:
-                    # Compute how many are Gaussian vs Hash
-                    active_gaussian = min(self.active_levels, self.hybrid_levels)
-                    active_hash = max(0, self.active_levels - self.hybrid_levels)
-                    gaussian_dim = active_gaussian * self.level_dim
-                    hash_dim = active_hash * self.level_dim
+                    gaussian_dim = self.hybrid_levels * self.level_dim
+                    hash_dim = active_hash_levels * self.level_dim
                     total_dim = self.active_levels * self.level_dim
                     print(f"[CAT C2F] Iter {current_iter}: Enabled level {self.active_levels}/{self.levels} - "
-                          f"{active_gaussian}/{self.hybrid_levels} Gaussian ({gaussian_dim}D) + {active_hash}/{self.levels - self.hybrid_levels} Hash ({hash_dim}D) = {total_dim}D total")
+                          f"{self.hybrid_levels}/{self.hybrid_levels} Gaussian ({gaussian_dim}D) + {active_hash_levels}/{effective_hash_levels} Hash ({hash_dim}D) = {total_dim}D total")
             else:
                 # Cat mode without coarse-to-fine: use all levels from start
                 self.active_levels = self.levels  # All levels (6)

@@ -35,9 +35,9 @@ if [ $# -lt 1 ]; then
     echo "Output structure:"
     echo "  outputs/baseline/nerf_synthetic/<scene>/<base_name>_baseline/"
     echo "  outputs/add/nerf_synthetic/<scene>/<base_name>_add/"
+    echo "  outputs/cat/nerf_synthetic/<scene>/<base_name>_cat0/"
     echo "  outputs/cat/nerf_synthetic/<scene>/<base_name>_cat1/"
-    echo "  outputs/cat/nerf_synthetic/<scene>/<base_name>_cat2/"
-    echo "  ...etc"
+    echo "  ...etc (cat0 through cat6)"
     echo ""
     echo "Available scenes: ${ALL_SCENES}"
     exit 1
@@ -160,7 +160,7 @@ run_training() {
 
 # Calculate total runs
 NUM_SCENES=${#SCENES[@]}
-METHODS_PER_SCENE=8  # baseline, add, cat1-6
+METHODS_PER_SCENE=9  # baseline, add, cat0-6
 TOTAL_RUNS=$((NUM_SCENES * METHODS_PER_SCENE))
 CURRENT_RUN=0
 COMPLETED=0
@@ -186,9 +186,10 @@ for scene in "${SCENES[@]}"; do
     # 2. ADD MODE
     run_training "$scene" "add" "${BASE_NAME}_add" ""
     
-    # 3. CAT MODE - hybrid_levels 1 to 6
-    for hl in {1..6}; do
-        run_training "$scene" "cat" "${BASE_NAME}_cat${hl}" "--hybrid_levels $hl"
+    # 3. CAT MODE - hybrid_levels 0 to 6
+    # Note: cat0 should be identical to baseline (0 Gaussian features, all hashgrid)
+    for hl in {0..6}; do
+        run_training "$scene" "cat" "${BASE_NAME}_cat${hl}" "--hybrid_levels $hl --cat_coarse2fine"
     done
     
     echo ""
@@ -223,7 +224,8 @@ fi
 echo "Output directories structure:"
 echo "  outputs/{method}/nerf_synthetic/{scene}/${BASE_NAME}_{method}/"
 echo ""
-echo "Methods per scene: baseline, add, cat1, cat2, cat3, cat4, cat5, cat6"
+echo "Methods per scene: baseline, add, cat0, cat1, cat2, cat3, cat4, cat5, cat6"
+echo "  (cat0 = all hashgrid, should match baseline performance)"
 echo "════════════════════════════════════════════════════════════════════"
 echo ""
 
@@ -252,7 +254,9 @@ Training Results:
 Methods per scene:
   1. Baseline Mode:  ${BASE_NAME}_baseline
   2. Add Mode:       ${BASE_NAME}_add
-  3. Cat Mode:       ${BASE_NAME}_cat1 through ${BASE_NAME}_cat6 (hybrid_levels 1-6)
+  3. Cat Mode:       ${BASE_NAME}_cat0 through ${BASE_NAME}_cat6 (hybrid_levels 0-6)
+     - cat0: 0 Gaussian + 6 Hash (should match baseline)
+     - cat1-6: N Gaussian + (6-N) Hash levels
 
 Output Structure:
   outputs/{method}/nerf_synthetic/{scene}/${BASE_NAME}_{method}/
@@ -275,7 +279,7 @@ Checkpoint Files (for each output directory):
   - checkpoint_config.json  (configuration used)
   - ngp_30000.pth           (trained model)
   - point_cloud/iteration_30000/point_cloud.ply
-  - point_cloud/iteration_30000/point_cloud_gaussian_features.pth (add/cat only)
+  - point_cloud/iteration_30000/point_cloud_gaussian_features.pth (add/cat1-6 only)
 
 ════════════════════════════════════════════════════════════════════
 EOF
@@ -289,6 +293,6 @@ echo "To see results for a specific scene (e.g., drums):"
 echo "  grep 'Average PSNR' outputs/*/nerf_synthetic/drums/${BASE_NAME}_*/test_metrics.txt"
 echo ""
 echo "To compare methods across all scenes:"
-echo "  for method in baseline add cat{1..6}; do echo \"=== \$method ===\"; grep 'Average PSNR' outputs/*/nerf_synthetic/*/${BASE_NAME}_\${method}/test_metrics.txt; done"
+echo "  for method in baseline add cat{0..6}; do echo \"=== \$method ===\"; grep 'Average PSNR' outputs/*/nerf_synthetic/*/${BASE_NAME}_\${method}/test_metrics.txt; done"
 echo ""
 
