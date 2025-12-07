@@ -1,6 +1,14 @@
 Method,Experiment_Name,PSNR_dB,SSIM,L1,Num_Images
+add,comprehensive_add,38.22,0.9959,0.002692,100
 add,retryall,38.81,0.9962,0.002478,100
+baseline,comprehensive_baseline,38.47,0.9959,0.002412,100
 baseline,retryall,38.97,0.9961,0.002332,100
+cat,comprehensive_cat1_1level,39.82,0.9967,0.002114,100
+cat,comprehensive_cat2_2level,40.44,0.9969,0.001926,100
+cat,comprehensive_cat3_3level,39.64,0.9966,0.002221,100
+cat,comprehensive_cat4_4level,39.59,0.9965,0.002215,100
+cat,comprehensive_cat5_5level,38.82,0.9960,0.002490,100
+cat,comprehensive_cat6_6level,38.08,0.9951,0.002657,100
 cat,scratchtry_1level,38.76,0.9961,0.002495,100
 cat,scratchtrynoc2f_0level,39.95,0.9967,0.002081,100
 cat,scratchtrynoc2f_1level,40.07,0.9967,0.002048,100

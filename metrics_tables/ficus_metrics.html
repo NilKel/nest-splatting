@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FICUS - Experiment Metrics</title>
+<style>
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            max-width: 1400px;
+            margin: 40px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            border-bottom: 3px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #555;
+            margin-top: 40px;
+            margin-bottom: 20px;
+        }
+        .metrics-table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 40px;
+        }
+        .metrics-table thead {
+            background-color: #333;
+            color: white;
+        }
+        .metrics-table th {
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+        }
+        .metrics-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #eee;
+        }
+        .metrics-table tbody tr:hover {
+            background-color: #f9f9f9;
+        }
+        .metrics-table .method {
+            font-weight: 600;
+            color: #2196F3;
+        }
+        .metrics-table .name {
+            color: #666;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        .metrics-table .metric {
+            text-align: center;
+            font-weight: 600;
+            font-family: 'Courier New', monospace;
+            color: #000;
+            text-shadow: 0 0 2px rgba(255,255,255,0.8);
+        }
+        .metrics-table .count {
+            text-align: center;
+            color: #999;
+        }
+        .info {
+            background-color: #e3f2fd;
+            padding: 15px;
+            border-left: 4px solid #2196F3;
+            margin-bottom: 30px;
+            border-radius: 4px;
+        }
+        .legend {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            margin-bottom: 20px;
+            font-size: 0.9em;
+            color: #666;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .color-sample {
+            width: 60px;
+            height: 20px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+        }
+        .scene-section {
+            margin-bottom: 60px;
+            padding-bottom: 40px;
+            border-bottom: 2px solid #ddd;
+        }
+        .scene-section:last-child {
+            border-bottom: none;
+        }
+    
+</style>
+</head>
+<body>
+<h1>FICUS - Experiment Metrics</h1>
+<div class="info">
+<strong>Color Coding:</strong> Cells are color-coded from red (worst) to green (best) relative to other experiments. 
+Showing baseline, add, and cat methods only.
+</div>
+<div class="legend">
+<div class="legend-item">
+<span><strong>↑</strong> Higher is better (PSNR, SSIM)</span>
+</div>
+<div class="legend-item">
+<span><strong>↓</strong> Lower is better (L1)</span>
+</div>
+<div class="legend-item">
+<div class="color-sample" style="background: linear-gradient(to right, rgb(230, 57, 57), rgb(57, 230, 57));"></div>
+<span>Worst → Best</span>
+</div>
+</div>
+<h2>FICUS - TEST Metrics</h2>
+<table class="metrics-table">
+<thead>
+<tr>
+<th>Method</th>
+<th>Experiment Name</th>
+<th>PSNR (dB) ↑</th>
+<th>SSIM ↑</th>
+<th>L1 ↓</th>
+<th># Images</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="method">add</td>
+<td class="name">comprehensive_add</td>
+<td class="metric" style="background-color: rgb(181, 105, 57);">34.22</td>
+<td class="metric" style="background-color: rgb(171, 115, 57);">0.9833</td>
+<td class="metric" style="background-color: rgb(171, 115, 57);">0.004948</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">add</td>
+<td class="name">comprehensivec2f_add</td>
+<td class="metric" style="background-color: rgb(177, 109, 57);">34.30</td>
+<td class="metric" style="background-color: rgb(171, 115, 57);">0.9833</td>
+<td class="metric" style="background-color: rgb(159, 127, 57);">0.004842</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">cleanfin</td>
+<td class="metric" style="background-color: rgb(83, 203, 57);">35.96</td>
+<td class="metric" style="background-color: rgb(68, 218, 57);">0.9877</td>
+<td class="metric" style="background-color: rgb(92, 194, 57);">0.004282</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">cleanfin2</td>
+<td class="metric" style="background-color: rgb(85, 201, 57);">35.93</td>
+<td class="metric" style="background-color: rgb(71, 215, 57);">0.9876</td>
+<td class="metric" style="background-color: rgb(95, 191, 57);">0.004302</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">cleanfin3</td>
+<td class="metric" style="background-color: rgb(178, 108, 57);">34.28</td>
+<td class="metric" style="background-color: rgb(178, 108, 57);">0.9830</td>
+<td class="metric" style="background-color: rgb(165, 121, 57);">0.004892</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">cleanre</td>
+<td class="metric" style="background-color: rgb(58, 228, 57);">36.40</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">0.9882</td>
+<td class="metric" style="background-color: rgb(59, 227, 57);">0.004004</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">comprehensive_baseline</td>
+<td class="metric" style="background-color: rgb(71, 215, 57);">36.17</td>
+<td class="metric" style="background-color: rgb(64, 222, 57);">0.9879</td>
+<td class="metric" style="background-color: rgb(77, 209, 57);">0.004150</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">fulltrain</td>
+<td class="metric" style="background-color: rgb(72, 214, 57);">36.16</td>
+<td class="metric" style="background-color: rgb(61, 225, 57);">0.9880</td>
+<td class="metric" style="background-color: rgb(75, 211, 57);">0.004138</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">loaded</td>
+<td class="metric" style="background-color: rgb(191, 95, 57);">34.05</td>
+<td class="metric" style="background-color: rgb(187, 99, 57);">0.9826</td>
+<td class="metric" style="background-color: rgb(187, 99, 57);">0.005080</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">unloaded</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">36.43</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">0.9882</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">0.003981</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">cleanfin4re_3level</td>
+<td class="metric" style="background-color: rgb(62, 224, 57);">36.34</td>
+<td class="metric" style="background-color: rgb(68, 218, 57);">0.9877</td>
+<td class="metric" style="background-color: rgb(64, 222, 57);">0.004044</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat1_1level</td>
+<td class="metric" style="background-color: rgb(211, 75, 57);">33.68</td>
+<td class="metric" style="background-color: rgb(220, 66, 57);">0.9812</td>
+<td class="metric" style="background-color: rgb(193, 93, 57);">0.005129</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat2_2level</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">33.36</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">0.9808</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">0.005437</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat3_3level</td>
+<td class="metric" style="background-color: rgb(207, 79, 57);">33.76</td>
+<td class="metric" style="background-color: rgb(208, 78, 57);">0.9817</td>
+<td class="metric" style="background-color: rgb(189, 97, 57);">0.005092</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat4_4level</td>
+<td class="metric" style="background-color: rgb(193, 93, 57);">34.01</td>
+<td class="metric" style="background-color: rgb(199, 87, 57);">0.9821</td>
+<td class="metric" style="background-color: rgb(183, 103, 57);">0.005042</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat5_5level</td>
+<td class="metric" style="background-color: rgb(176, 110, 57);">34.31</td>
+<td class="metric" style="background-color: rgb(173, 113, 57);">0.9832</td>
+<td class="metric" style="background-color: rgb(174, 112, 57);">0.004966</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat6_6level</td>
+<td class="metric" style="background-color: rgb(162, 124, 57);">34.55</td>
+<td class="metric" style="background-color: rgb(152, 134, 57);">0.9841</td>
+<td class="metric" style="background-color: rgb(164, 122, 57);">0.004889</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensivec2f_cat0_0level</td>
+<td class="metric" style="background-color: rgb(183, 103, 57);">34.19</td>
+<td class="metric" style="background-color: rgb(176, 110, 57);">0.9831</td>
+<td class="metric" style="background-color: rgb(175, 111, 57);">0.004979</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensivec2f_cat1_1level</td>
+<td class="metric" style="background-color: rgb(195, 91, 57);">33.97</td>
+<td class="metric" style="background-color: rgb(194, 92, 57);">0.9823</td>
+<td class="metric" style="background-color: rgb(180, 106, 57);">0.005024</td>
+<td class="count">200</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensivec2f_cat2_2level</td>
+<td class="metric" style="background-color: rgb(211, 75, 57);">33.68</td>
+<td class="metric" style="background-color: rgb(213, 73, 57);">0.9815</td>
+<td class="metric" style="background-color: rgb(194, 92, 57);">0.005137</td>
+<td class="count">200</td>
+</tr>
+</tbody>
+</table>
+
+<h2>FICUS - TRAIN Metrics</h2>
+<table class="metrics-table">
+<thead>
+<tr>
+<th>Method</th>
+<th>Experiment Name</th>
+<th>PSNR (dB) ↑</th>
+<th>SSIM ↑</th>
+<th>L1 ↓</th>
+<th># Images</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="method">add</td>
+<td class="name">comprehensive_add</td>
+<td class="metric" style="background-color: rgb(137, 149, 57);">38.25</td>
+<td class="metric" style="background-color: rgb(98, 188, 57);">0.9945</td>
+<td class="metric" style="background-color: rgb(142, 144, 57);">0.003160</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">add</td>
+<td class="name">comprehensivec2f_add</td>
+<td class="metric" style="background-color: rgb(96, 190, 57);">38.68</td>
+<td class="metric" style="background-color: rgb(70, 216, 57);">0.9949</td>
+<td class="metric" style="background-color: rgb(89, 197, 57);">0.002921</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">cleanfin</td>
+<td class="metric" style="background-color: rgb(144, 142, 57);">38.17</td>
+<td class="metric" style="background-color: rgb(98, 188, 57);">0.9945</td>
+<td class="metric" style="background-color: rgb(155, 131, 57);">0.003220</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">cleanfin2</td>
+<td class="metric" style="background-color: rgb(178, 108, 57);">37.82</td>
+<td class="metric" style="background-color: rgb(140, 146, 57);">0.9939</td>
+<td class="metric" style="background-color: rgb(212, 74, 57);">0.003477</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">cleanfin3</td>
+<td class="metric" style="background-color: rgb(108, 178, 57);">38.56</td>
+<td class="metric" style="background-color: rgb(91, 195, 57);">0.9946</td>
+<td class="metric" style="background-color: rgb(97, 189, 57);">0.002959</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">cleanre</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">39.10</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">0.9951</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">0.002775</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">comprehensive_baseline</td>
+<td class="metric" style="background-color: rgb(108, 178, 57);">38.56</td>
+<td class="metric" style="background-color: rgb(91, 195, 57);">0.9946</td>
+<td class="metric" style="background-color: rgb(118, 168, 57);">0.003051</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">fulltrain</td>
+<td class="metric" style="background-color: rgb(87, 199, 57);">38.78</td>
+<td class="metric" style="background-color: rgb(70, 216, 57);">0.9949</td>
+<td class="metric" style="background-color: rgb(91, 195, 57);">0.002931</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">loaded</td>
+<td class="metric" style="background-color: rgb(196, 90, 57);">37.62</td>
+<td class="metric" style="background-color: rgb(146, 140, 57);">0.9938</td>
+<td class="metric" style="background-color: rgb(197, 89, 57);">0.003408</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">test_diag</td>
+<td class="metric" style="background-color: rgb(189, 97, 57);">37.70</td>
+<td class="metric" style="background-color: rgb(223, 63, 57);">0.9927</td>
+<td class="metric" style="background-color: rgb(185, 101, 57);">0.003354</td>
+<td class="count">300</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">test_load</td>
+<td class="metric" style="background-color: rgb(198, 88, 57);">37.60</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">0.9926</td>
+<td class="metric" style="background-color: rgb(186, 100, 57);">0.003361</td>
+<td class="count">300</td>
+</tr>
+<tr>
+<td class="method">baseline</td>
+<td class="name">unloaded</td>
+<td class="metric" style="background-color: rgb(77, 209, 57);">38.88</td>
+<td class="metric" style="background-color: rgb(77, 209, 57);">0.9948</td>
+<td class="metric" style="background-color: rgb(84, 202, 57);">0.002897</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">cleanfin4re_3level</td>
+<td class="metric" style="background-color: rgb(58, 228, 57);">39.08</td>
+<td class="metric" style="background-color: rgb(70, 216, 57);">0.9949</td>
+<td class="metric" style="background-color: rgb(65, 221, 57);">0.002812</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat1_1level</td>
+<td class="metric" style="background-color: rgb(75, 211, 57);">38.90</td>
+<td class="metric" style="background-color: rgb(63, 223, 57);">0.9950</td>
+<td class="metric" style="background-color: rgb(70, 216, 57);">0.002834</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat2_2level</td>
+<td class="metric" style="background-color: rgb(178, 108, 57);">37.82</td>
+<td class="metric" style="background-color: rgb(119, 167, 57);">0.9942</td>
+<td class="metric" style="background-color: rgb(191, 95, 57);">0.003381</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat3_3level</td>
+<td class="metric" style="background-color: rgb(100, 186, 57);">38.64</td>
+<td class="metric" style="background-color: rgb(91, 195, 57);">0.9946</td>
+<td class="metric" style="background-color: rgb(88, 198, 57);">0.002918</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat4_4level</td>
+<td class="metric" style="background-color: rgb(137, 149, 57);">38.25</td>
+<td class="metric" style="background-color: rgb(119, 167, 57);">0.9942</td>
+<td class="metric" style="background-color: rgb(127, 159, 57);">0.003095</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat5_5level</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">37.27</td>
+<td class="metric" style="background-color: rgb(188, 98, 57);">0.9932</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">0.003555</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensive_cat6_6level</td>
+<td class="metric" style="background-color: rgb(206, 80, 57);">37.52</td>
+<td class="metric" style="background-color: rgb(202, 84, 57);">0.9930</td>
+<td class="metric" style="background-color: rgb(191, 95, 57);">0.003383</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensivec2f_cat0_0level</td>
+<td class="metric" style="background-color: rgb(138, 148, 57);">38.24</td>
+<td class="metric" style="background-color: rgb(105, 181, 57);">0.9944</td>
+<td class="metric" style="background-color: rgb(136, 150, 57);">0.003135</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensivec2f_cat1_1level</td>
+<td class="metric" style="background-color: rgb(90, 196, 57);">38.75</td>
+<td class="metric" style="background-color: rgb(77, 209, 57);">0.9948</td>
+<td class="metric" style="background-color: rgb(89, 197, 57);">0.002920</td>
+<td class="count">100</td>
+</tr>
+<tr>
+<td class="method">cat</td>
+<td class="name">comprehensivec2f_cat2_2level</td>
+<td class="metric" style="background-color: rgb(95, 191, 57);">38.69</td>
+<td class="metric" style="background-color: rgb(77, 209, 57);">0.9948</td>
+<td class="metric" style="background-color: rgb(85, 201, 57);">0.002903</td>
+<td class="count">100</td>
+</tr>
+</tbody>
+</table>
+
+</body>
+</html>
