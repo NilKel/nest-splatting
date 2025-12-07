@@ -332,16 +332,17 @@ class INGP(nn.Module):
     def _get_cat_coarse2fine_mask(self, points_enc):
         """
         Create mask for cat mode coarse-to-fine training.
-        Follows same logic as baseline: start with 2 levels, add 1 at a time.
+        Always uses ALL Gaussian features, progressively unlocks hashgrid.
         
         Since concatenation is [Gaussian features | Hashgrid features],
-        enabling levels 0,1,2,... naturally unmasks Gaussian features first.
+        active_levels = hybrid_levels + active_hash_levels
         
-        Example with hybrid_levels=3, total_levels=6:
-        - active_levels=2: unmask first 8D (2 Gaussian levels)
-        - active_levels=3: unmask first 12D (all 3 Gaussian levels)
-        - active_levels=4: unmask first 16D (3 Gaussian + 1 Hash level)
-        - active_levels=6: unmask all 24D (3 Gaussian + 3 Hash levels)
+        Example with hybrid_levels=3, total_levels=6, effective_hash=3:
+        - Iter 0: active_levels=5 (3 Gaussian + 2 Hash) → unmask 20D
+        - Iter 3000: active_levels=6 (3 Gaussian + 3 Hash) → unmask 24D
+        
+        Edge case: hybrid_levels=6, total=6, effective_hash=0:
+        - active_levels always 6 (all Gaussian, no hash) → unmask 24D from start
         """
         mask = torch.zeros_like(points_enc)
         active_dim = self.active_levels * self.level_dim
