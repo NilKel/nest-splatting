@@ -82,22 +82,48 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self._gaussian_features,
+            self._appearance_level,  # Add appearance_level to checkpoint
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree,
-        self._xyz,
-        self._features_dc,
-        self._features_rest,
-        self._scaling,
-        self._rotation,
-        self._opacity,
-        self.max_radii2D,
-        xyz_gradient_accum,
-        denom,
-        opt_dict,
-        self.spatial_lr_scale,
-        self._gaussian_features) = model_args
+        # Handle both old format (13 elements) and new format (14 elements with _appearance_level)
+        if len(model_args) == 14:
+            # New format with _appearance_level
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            self._gaussian_features,
+            self._appearance_level) = model_args
+        else:
+            # Old format without _appearance_level - create it before training_setup()
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            self._gaussian_features) = model_args
+            # Create _appearance_level (needed by training_setup)
+            init_level = 24
+            ap_level = init_level * torch.ones((self._xyz.shape[0], 1), device="cuda").float()
+            self._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
+            print(f"[Restore] Warning: Old checkpoint format - created _appearance_level with init_level={init_level}")
+        
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
