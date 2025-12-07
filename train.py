@@ -118,8 +118,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             # Restore optimizer state if available (preserves Adam momentum)
             if 'optimizer_state' in checkpoint_data:
-                print(f"[2DGS] Restoring optimizer state (Adam momentum & adaptive LR)")
-                gaussians.optimizer.load_state_dict(checkpoint_data['optimizer_state'])
+                print(f"\n[2DGS] Restoring optimizer state (Adam momentum & adaptive LR)")
+                try:
+                    # Check if parameter count matches
+                    saved_param_groups = checkpoint_data['optimizer_state']['param_groups']
+                    current_param_groups = gaussians.optimizer.param_groups
+                    print(f"[2DGS] Saved param groups: {len(saved_param_groups)}, Current: {len(current_param_groups)}")
+                    
+                    # Check parameter names match
+                    for i in range(min(len(saved_param_groups), len(current_param_groups))):
+                        saved_name = saved_param_groups[i].get('name', f'group_{i}')
+                        current_name = current_param_groups[i].get('name', f'group_{i}')
+                        if saved_name != current_name:
+                            print(f"[2DGS] WARNING: Param group {i} name mismatch: saved='{saved_name}', current='{current_name}'")
+                    
+                    gaussians.optimizer.load_state_dict(checkpoint_data['optimizer_state'])
+                    print(f"[2DGS] ✓ Optimizer state loaded")
+                    
+                    # Verify loading worked
+                    loaded_count = 0
+                    for i, group in enumerate(gaussians.optimizer.param_groups):
+                        param = group['params'][0]
+                        if param in gaussians.optimizer.state and len(gaussians.optimizer.state[param]) > 0:
+                            loaded_count += 1
+                            state = gaussians.optimizer.state[param]
+                            if 'step' in state and i < 3:  # Print first few
+                                print(f"  {group['name']}: step={state['step']}, exp_avg_norm={state['exp_avg'].norm().item():.6f}")
+                    print(f"[2DGS] Parameters with optimizer state: {loaded_count}/{len(gaussians.optimizer.param_groups)}")
+                except Exception as e:
+                    print(f"[2DGS] ✗ Failed to load optimizer state: {e}")
+                    import traceback
+                    traceback.print_exc()
             else:
                 print(f"[2DGS] Warning: No optimizer state in checkpoint - starting with fresh optimizer")
             
