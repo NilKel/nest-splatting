@@ -1,0 +1,492 @@
+Using pip 25.2 from /home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/pip (python 3.10)
+Processing /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization
+  Preparing metadata (setup.py): started
+  Running command python setup.py egg_info
+  running egg_info
+  creating /tmp/pip-pip-egg-info-u3chspu0/diff_surfel_rasterization.egg-info
+  writing /tmp/pip-pip-egg-info-u3chspu0/diff_surfel_rasterization.egg-info/PKG-INFO
+  writing dependency_links to /tmp/pip-pip-egg-info-u3chspu0/diff_surfel_rasterization.egg-info/dependency_links.txt
+  writing top-level names to /tmp/pip-pip-egg-info-u3chspu0/diff_surfel_rasterization.egg-info/top_level.txt
+  writing manifest file '/tmp/pip-pip-egg-info-u3chspu0/diff_surfel_rasterization.egg-info/SOURCES.txt'
+  W1208 18:00:31.262000 634120 site-packages/torch/utils/cpp_extension.py:633] Attempted to use ninja as the BuildExtension backend but we could not find ninja.. Falling back to using the slow distutils backend.
+  reading manifest file '/tmp/pip-pip-egg-info-u3chspu0/diff_surfel_rasterization.egg-info/SOURCES.txt'
+  adding license file 'LICENSE.md'
+  writing manifest file '/tmp/pip-pip-egg-info-u3chspu0/diff_surfel_rasterization.egg-info/SOURCES.txt'
+  Preparing metadata (setup.py): finished with status 'done'
+Building wheels for collected packages: diff_surfel_rasterization
+  DEPRECATION: Building 'diff_surfel_rasterization' using the legacy setup.py bdist_wheel mechanism, which will be removed in a future version. pip 25.3 will enforce this behaviour change. A possible replacement is to use the standardized build interface by setting the `--use-pep517` option, (possibly combined with `--no-build-isolation`), or adding a `pyproject.toml` file to the source tree of 'diff_surfel_rasterization'. Discussion can be found at https://github.com/pypa/pip/issues/6334
+  Building wheel for diff_surfel_rasterization (setup.py): started
+  Running command python setup.py bdist_wheel
+  running bdist_wheel
+  W1208 18:00:33.253000 634167 site-packages/torch/utils/cpp_extension.py:633] Attempted to use ninja as the BuildExtension backend but we could not find ninja.. Falling back to using the slow distutils backend.
+  running build
+  running build_py
+  copying diff_surfel_rasterization/__init__.py -> build/lib.linux-x86_64-cpython-310/diff_surfel_rasterization
+  running build_ext
+  W1208 18:00:33.269000 634167 site-packages/torch/utils/cpp_extension.py:534] There are no g++ version bounds defined for CUDA version 12.8
+  building 'diff_surfel_rasterization._C' extension
+  /usr/local/cuda/bin/nvcc -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/nilkel/miniconda3/envs/nest_splatting/include/python3.10 -c cuda_rasterizer/backward.cu -o build/temp.linux-x86_64-cpython-310/cuda_rasterizer/backward.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options '-fPIC' -I/home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/ -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C -gencode=arch=compute_120,code=compute_120 -gencode=arch=compute_120,code=sm_120 -std=c++17
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec2.hpp(102): warning #20012-D: __device__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<2, T, Q> const& v) = default;
+                     ^
+
+  Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec2.hpp(102): warning #20012-D: __host__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<2, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec2.hpp(150): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<2, T, Q> & operator=(vec const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec2.hpp(150): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<2, T, Q> & operator=(vec const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec3.hpp(108): warning #20012-D: __device__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<3, T, Q> const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec3.hpp(108): warning #20012-D: __host__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<3, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec3.hpp(185): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<3, T, Q>& operator=(vec<3, T, Q> const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec3.hpp(185): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<3, T, Q>& operator=(vec<3, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec4.hpp(106): warning #20012-D: __device__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<4, T, Q> const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec4.hpp(106): warning #20012-D: __host__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<4, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec4.hpp(257): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<4, T, Q>& operator=(vec<4, T, Q> const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec4.hpp(257): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<4, T, Q>& operator=(vec<4, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_mat2x2.hpp(36): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_mat2x2.hpp(36): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_mat2x2.hpp(76): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 2, T, Q>& operator=(mat<2, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_mat2x2.hpp(76): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 2, T, Q>& operator=(mat<2, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x3.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x3.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x3.hpp(77): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 3, T, Q>& operator=(mat<2, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x3.hpp(77): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 3, T, Q>& operator=(mat<2, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x4.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x4.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 4, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x4.hpp(79): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 4, T, Q>& operator=(mat<2, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x4.hpp(79): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 4, T, Q>& operator=(mat<2, 4, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x2.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x2.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x2.hpp(84): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 2, T, Q>& operator=(mat<3, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x2.hpp(84): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 2, T, Q>& operator=(mat<3, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x3.hpp(36): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x3.hpp(36): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x3.hpp(83): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 3, T, Q>& operator=(mat<3, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x3.hpp(83): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 3, T, Q>& operator=(mat<3, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/../detail/type_vec1.hpp(96): warning #20012-D: __device__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<1, T, Q> const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/../detail/type_vec1.hpp(96): warning #20012-D: __host__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<1, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/../detail/type_vec1.hpp(132): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<1, T, Q> & operator=(vec const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/../detail/type_vec1.hpp(132): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<1, T, Q> & operator=(vec const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x4.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x4.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 4, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x4.hpp(84): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 4, T, Q>& operator=(mat<3, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x4.hpp(84): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 4, T, Q>& operator=(mat<3, 4, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x2.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x2.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x2.hpp(89): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 2, T, Q>& operator=(mat<4, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x2.hpp(89): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 2, T, Q>& operator=(mat<4, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x3.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x3.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x3.hpp(89): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 3, T, Q>& operator=(mat<4, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x3.hpp(89): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 3, T, Q>& operator=(mat<4, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x4.hpp(36): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x4.hpp(36): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 4, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x4.hpp(88): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 4, T, Q>& operator=(mat<4, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x4.hpp(88): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 4, T, Q>& operator=(mat<4, 4, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec2.hpp(102): warning #20012-D: __device__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<2, T, Q> const& v) = default;
+                     ^
+
+  Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec2.hpp(102): warning #20012-D: __host__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<2, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec2.hpp(150): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<2, T, Q> & operator=(vec const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec2.hpp(150): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<2, T, Q> & operator=(vec const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec3.hpp(108): warning #20012-D: __device__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<3, T, Q> const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec3.hpp(108): warning #20012-D: __host__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<3, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec3.hpp(185): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<3, T, Q>& operator=(vec<3, T, Q> const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec3.hpp(185): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<3, T, Q>& operator=(vec<3, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec4.hpp(106): warning #20012-D: __device__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<4, T, Q> const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec4.hpp(106): warning #20012-D: __host__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<4, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec4.hpp(257): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<4, T, Q>& operator=(vec<4, T, Q> const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_vec4.hpp(257): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<4, T, Q>& operator=(vec<4, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_mat2x2.hpp(36): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_mat2x2.hpp(36): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_mat2x2.hpp(76): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 2, T, Q>& operator=(mat<2, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/type_mat2x2.hpp(76): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 2, T, Q>& operator=(mat<2, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x3.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x3.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x3.hpp(77): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 3, T, Q>& operator=(mat<2, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x3.hpp(77): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 3, T, Q>& operator=(mat<2, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x4.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x4.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<2, 4, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x4.hpp(79): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 4, T, Q>& operator=(mat<2, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat2x4.hpp(79): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<2, 4, T, Q>& operator=(mat<2, 4, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x2.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x2.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x2.hpp(84): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 2, T, Q>& operator=(mat<3, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x2.hpp(84): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 2, T, Q>& operator=(mat<3, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x3.hpp(36): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x3.hpp(36): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x3.hpp(83): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 3, T, Q>& operator=(mat<3, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x3.hpp(83): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 3, T, Q>& operator=(mat<3, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/../detail/type_vec1.hpp(96): warning #20012-D: __device__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<1, T, Q> const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/../detail/type_vec1.hpp(96): warning #20012-D: __host__ annotation is ignored on a function("vec") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec(vec<1, T, Q> const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/../detail/type_vec1.hpp(132): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<1, T, Q> & operator=(vec const& v) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/../detail/type_vec1.hpp(132): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr vec<1, T, Q> & operator=(vec const& v) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x4.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x4.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<3, 4, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x4.hpp(84): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 4, T, Q>& operator=(mat<3, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat3x4.hpp(84): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<3, 4, T, Q>& operator=(mat<3, 4, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x2.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x2.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x2.hpp(89): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 2, T, Q>& operator=(mat<4, 2, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x2.hpp(89): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 2, T, Q>& operator=(mat<4, 2, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x3.hpp(37): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x3.hpp(37): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x3.hpp(89): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 3, T, Q>& operator=(mat<4, 3, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x3.hpp(89): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 3, T, Q>& operator=(mat<4, 3, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x4.hpp(36): warning #20012-D: __device__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x4.hpp(36): warning #20012-D: __host__ annotation is ignored on a function("mat") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat(mat<4, 4, T, Q> const& m) = default;
+                                             ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x4.hpp(88): warning #20012-D: __device__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 4, T, Q>& operator=(mat<4, 4, T, Q> const& m) = default;
+                     ^
+
+  /home/nilkel/Projects/nest-splatting/submodules/diff-surfel-rasterization/third_party/glm/glm/./ext/../detail/.././ext/../detail/type_mat4x4.hpp(88): warning #20012-D: __host__ annotation is ignored on a function("operator=") that is explicitly defaulted on its first declaration
+      __attribute__((device)) __attribute__((host)) constexpr mat<4, 4, T, Q>& operator=(mat<4, 4, T, Q> const& m) = default;
+                                             ^
+
+  cuda_rasterizer/auxiliary.h(201): warning #177-D: variable "p_proj" was declared but never referenced
+     float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+            ^
+
+  cuda_rasterizer/backward.cu(937): warning #177-D: variable "pk" was declared but never referenced
+         const float3 pk = collected_pk[j];
+                      ^
+
+  cuda_rasterizer/backward.cu(651): warning #177-D: variable "splat_size" was declared but never referenced
+       const float splat_size = collected_size[j];
+                   ^
+
+  cuda_rasterizer/backward.cu(689): warning #177-D: variable "w" was declared but never referenced
+       const float w = alpha * T;
+                   ^
+
+  cuda_rasterizer/backward.cu(523): warning #177-D: variable "render_number" was declared but never referenced
+     const int render_number = other_maps[pix_id + 7 * H * W];
+               ^
+
+  cuda_rasterizer/backward.cu(545): warning #177-D: variable "dL_dmax_dweight" was declared but never referenced
+     float dL_dmax_dweight;
+           ^
+
+  cuda_rasterizer/backward.cu(603): warning #177-D: variable "ddelx_dx" was declared but never referenced
+     const float ddelx_dx = 0.5 * W;
+                 ^
+
+  cuda_rasterizer/backward.cu(604): warning #177-D: variable "ddely_dy" was declared but never referenced
+     const float ddely_dy = 0.5 * H;
+                 ^
+
+  cuda_rasterizer/hashgrid.h(208): warning #181-D: argument is incompatible with corresponding format string conversion (expected type "int" but argument has type "double")
+                for(int d = 0; d < D; d++)printf("%d ", pos[d]);
+                                                        ^
+            detected during instantiation of "void renderCUDAsurfelBackward<C>(const uint2 *, const uint32_t *, float, int, int, uint32_t, uint32_t, float, uint32_t, __nv_bool, uint32_t, __nv_bool, const glm::vec2 *, float, float, const float *, const int *, const float *, const float2 *, const float4 *, const float *, const float *, const float *, const float *, const int *, const float *, const float *, int, int, const float *, const float *, const float *, const uint32_t *, const float *, const float *, float *, float *, float *, float3 *, float *, float *, float *, float *, float *) [with C=3U]" at line 1312 of cuda_rasterizer/backward.cu
+
+  cuda_rasterizer/hashgrid.h(237): warning #181-D: argument is incompatible with corresponding format string conversion (expected type "int" but argument has type "double")
+                    for(int d = 0; d < D; d++)printf("%d ", pos[d]);
+                                                            ^
+            detected during instantiation of "void renderCUDAsurfelBackward<C>(const uint2 *, const uint32_t *, float, int, int, uint32_t, uint32_t, float, uint32_t, __nv_bool, uint32_t, __nv_bool, const glm::vec2 *, float, float, const float *, const int *, const float *, const float2 *, const float4 *, const float *, const float *, const float *, const float *, const int *, const float *, const float *, int, int, const float *, const float *, const float *, const uint32_t *, const float *, const float *, float *, float *, float *, float3 *, float *, float *, float *, float *, float *) [with C=3U]" at line 1312 of cuda_rasterizer/backward.cu
+
+  Building wheel for diff_surfel_rasterization (setup.py): finished with status 'canceled'
+ERROR: Operation cancelled by user

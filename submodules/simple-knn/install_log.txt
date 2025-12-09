@@ -1,0 +1,29 @@
+Using pip 25.2 from /home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/pip (python 3.10)
+Processing /home/nilkel/Projects/nest-splatting/submodules/simple-knn
+  Preparing metadata (setup.py): started
+  Running command python setup.py egg_info
+  running egg_info
+  creating /tmp/pip-pip-egg-info-srfj_pkk/simple_knn.egg-info
+  writing /tmp/pip-pip-egg-info-srfj_pkk/simple_knn.egg-info/PKG-INFO
+  writing dependency_links to /tmp/pip-pip-egg-info-srfj_pkk/simple_knn.egg-info/dependency_links.txt
+  writing top-level names to /tmp/pip-pip-egg-info-srfj_pkk/simple_knn.egg-info/top_level.txt
+  writing manifest file '/tmp/pip-pip-egg-info-srfj_pkk/simple_knn.egg-info/SOURCES.txt'
+  W1208 18:00:55.137000 634453 site-packages/torch/utils/cpp_extension.py:633] Attempted to use ninja as the BuildExtension backend but we could not find ninja.. Falling back to using the slow distutils backend.
+  reading manifest file '/tmp/pip-pip-egg-info-srfj_pkk/simple_knn.egg-info/SOURCES.txt'
+  adding license file 'LICENSE.md'
+  writing manifest file '/tmp/pip-pip-egg-info-srfj_pkk/simple_knn.egg-info/SOURCES.txt'
+  Preparing metadata (setup.py): finished with status 'done'
+Building wheels for collected packages: simple_knn
+  DEPRECATION: Building 'simple_knn' using the legacy setup.py bdist_wheel mechanism, which will be removed in a future version. pip 25.3 will enforce this behaviour change. A possible replacement is to use the standardized build interface by setting the `--use-pep517` option, (possibly combined with `--no-build-isolation`), or adding a `pyproject.toml` file to the source tree of 'simple_knn'. Discussion can be found at https://github.com/pypa/pip/issues/6334
+  Building wheel for simple_knn (setup.py): started
+  Running command python setup.py bdist_wheel
+  running bdist_wheel
+  W1208 18:00:57.122000 634506 site-packages/torch/utils/cpp_extension.py:633] Attempted to use ninja as the BuildExtension backend but we could not find ninja.. Falling back to using the slow distutils backend.
+  running build
+  running build_ext
+  W1208 18:00:57.130000 634506 site-packages/torch/utils/cpp_extension.py:534] There are no g++ version bounds defined for CUDA version 12.8
+  building 'simple_knn._C' extension
+  creating build/temp.linux-x86_64-cpython-310
+  g++ -pthread -B /home/nilkel/miniconda3/envs/nest_splatting/compiler_compat -Wno-unused-result -Wsign-compare -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /home/nilkel/miniconda3/envs/nest_splatting/include -fPIC -O2 -isystem /home/nilkel/miniconda3/envs/nest_splatting/include -fPIC -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/nilkel/miniconda3/envs/nest_splatting/include/python3.10 -c ext.cpp -o build/temp.linux-x86_64-cpython-310/ext.o -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C -std=c++17
+  Building wheel for simple_knn (setup.py): finished with status 'canceled'
+ERROR: Operation cancelled by user

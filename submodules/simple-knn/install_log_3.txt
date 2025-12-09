@@ -1,0 +1,62 @@
+nohup: ignoring input
+running install
+/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/setuptools/_distutils/cmd.py:90: SetuptoolsDeprecationWarning: setup.py install is deprecated.
+!!
+
+        ********************************************************************************
+        Please avoid running ``setup.py`` directly.
+        Instead, use pypa/build, pypa/installer or other
+        standards-based tools.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://blog.ganssle.io/articles/2021/10/setup-py-deprecated.html for details.
+        ********************************************************************************
+
+!!
+  self.initialize_options()
+running build
+running build_ext
+W1208 18:01:47.042000 634862 site-packages/torch/utils/cpp_extension.py:633] Attempted to use ninja as the BuildExtension backend but we could not find ninja.. Falling back to using the slow distutils backend.
+W1208 18:01:47.050000 634862 site-packages/torch/utils/cpp_extension.py:534] There are no g++ version bounds defined for CUDA version 12.8
+building 'simple_knn._C' extension
+g++ -pthread -B /home/nilkel/miniconda3/envs/nest_splatting/compiler_compat -Wno-unused-result -Wsign-compare -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /home/nilkel/miniconda3/envs/nest_splatting/include -fPIC -O2 -isystem /home/nilkel/miniconda3/envs/nest_splatting/include -fPIC -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/nilkel/miniconda3/envs/nest_splatting/include/python3.10 -c ext.cpp -o build/temp.linux-x86_64-cpython-310/ext.o -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C -std=c++17
+/usr/local/cuda/bin/nvcc -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/nilkel/miniconda3/envs/nest_splatting/include/python3.10 -c simple_knn.cu -o build/temp.linux-x86_64-cpython-310/simple_knn.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options '-fPIC' -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C -gencode=arch=compute_120,code=compute_120 -gencode=arch=compute_120,code=sm_120 -std=c++17
+simple_knn.cu:24: warning: "__CUDACC__" redefined
+   24 | #define __CUDACC__
+      | 
+<command-line>: note: this is the location of the previous definition
+simple_knn.cu:24: warning: "__CUDACC__" redefined
+   24 | #define __CUDACC__
+      | 
+<command-line>: note: this is the location of the previous definition
+/usr/local/cuda/bin/nvcc -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/nilkel/miniconda3/envs/nest_splatting/include/python3.10 -c spatial.cu -o build/temp.linux-x86_64-cpython-310/spatial.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options '-fPIC' -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C -gencode=arch=compute_120,code=compute_120 -gencode=arch=compute_120,code=sm_120 -std=c++17
+spatial.cu: In function ‘at::Tensor distCUDA2(const at::Tensor&)’:
+spatial.cu:23:64: warning: ‘T* at::Tensor::data() const [with T = float]’ is deprecated: Tensor.data<T>() is deprecated. Please use Tensor.data_ptr<T>() instead. [-Wdeprecated-declarations]
+   23 |   SimpleKNN::knn(P, (float3*)points.contiguous().data<float>(), means.contiguous().data<float>());
+      |                             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~
+/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include/ATen/core/TensorBody.h:247:1: note: declared here
+  247 |   T * data() const {
+      | ^ ~~
+spatial.cu:23:102: warning: ‘T* at::Tensor::data() const [with T = float]’ is deprecated: Tensor.data<T>() is deprecated. Please use Tensor.data_ptr<T>() instead. [-Wdeprecated-declarations]
+   23 |   SimpleKNN::knn(P, (float3*)points.contiguous().data<float>(), means.contiguous().data<float>());
+      |                                                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   ^ 
+/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include/ATen/core/TensorBody.h:247:1: note: declared here
+  247 |   T * data() const {
+      | ^ ~~
+creating build/lib.linux-x86_64-cpython-310/simple_knn
+g++ -pthread -B /home/nilkel/miniconda3/envs/nest_splatting/compiler_compat -Wno-unused-result -Wsign-compare -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /home/nilkel/miniconda3/envs/nest_splatting/include -fPIC -O2 -isystem /home/nilkel/miniconda3/envs/nest_splatting/include -shared build/temp.linux-x86_64-cpython-310/ext.o build/temp.linux-x86_64-cpython-310/simple_knn.o build/temp.linux-x86_64-cpython-310/spatial.o -L/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/lib -L/usr/local/cuda/lib64 -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-cpython-310/simple_knn/_C.cpython-310-x86_64-linux-gnu.so
+running install_lib
+creating /home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/simple_knn
+copying build/lib.linux-x86_64-cpython-310/simple_knn/_C.cpython-310-x86_64-linux-gnu.so -> /home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/simple_knn
+running install_egg_info
+running egg_info
+writing simple_knn.egg-info/PKG-INFO
+writing dependency_links to simple_knn.egg-info/dependency_links.txt
+writing top-level names to simple_knn.egg-info/top_level.txt
+reading manifest file 'simple_knn.egg-info/SOURCES.txt'
+adding license file 'LICENSE.md'
+writing manifest file 'simple_knn.egg-info/SOURCES.txt'
+Copying simple_knn.egg-info to /home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/simple_knn-0.0.0-py3.10.egg-info
+running install_scripts

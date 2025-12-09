@@ -167,26 +167,28 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 padded_offsets[:offsets.shape[0]] = offsets
                 offsets = padded_offsets
         
-        # Adaptive mode: soft blend per-Gaussian and hashgrid features
+        # Adaptive mode: pass ONLY per-Gaussian features (24D), compute mask in CUDA from gamma
         elif is_adaptive_mode and pc._adaptive_feat_dim > 0:
-            # Compute soft mask from gamma in Python (enables autograd for gamma)
-            mask = pc.get_adaptive_mask(ingp.level_dim)  # (N, num_levels * level_dim)
+            # Get per-Gaussian features (total_levels * per_level_dim) = 24D
+            adaptive_features = pc.get_adaptive_features  # (N, 24)
             
-            # Concatenate [adaptive_features | mask] for CUDA
-            adaptive_features = pc.get_adaptive_features  # (N, feat_dim)
-            colors_precomp = torch.cat([adaptive_features, mask], dim=-1)  # (N, 2 * feat_dim)
+            # Pass per-Gaussian features as colors_precomp (24D, NOT concatenated with mask)
+            colors_precomp = adaptive_features
             shs = None
-            render_mode = 6
+            render_mode = 6  # Adaptive blending mode
             
-            # Use full hashgrid levels for adaptive mode
+            # Use full hashgrid levels (total_levels from config)
             levels = ingp.active_levels
             
-            # Pad offsets to 17 elements
+            # Pad offsets to 17 elements (CUDA expects up to 16 levels + 1)
             if offsets.shape[0] < 17:
                 padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
                 padded_offsets[:offsets.shape[0]] = offsets
                 offsets = padded_offsets
-    
+            
+            # Store mask for regularization loss (compute in Python for autograd)
+            mask = pc.get_adaptive_mask(ingp.level_dim)  # (N, 24)
+            breakpoint()
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -298,7 +300,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         ray_map = ray_map * render_mask
 
         feature_vis = rendered_image[:3].detach().abs()
-        
+        breakpoint()
         rendered_image = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), rays_dir)
 
         rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
@@ -332,6 +334,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'surf_normal': surf_normal,
             'gaussian_num' : render_gs_nums,
     })
+    
+    # Add adaptive mask for regularization loss (if in adaptive mode)
+    if is_adaptive_mode and pc._adaptive_feat_dim > 0:
+        rets['adaptive_mask'] = mask  # (N, feat_dim)
     
     return rets
     

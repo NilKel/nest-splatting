@@ -910,10 +910,10 @@ renderCUDAsurfelForward(
 			break;
 		}
 		case 6: {
-			// adaptive mode: soft blend per-Gaussian and hashgrid features
-			// rgb buffer layout: [N, feat_dim + feat_dim] = [adaptive_features | mask]
-			// mask is precomputed in Python using sigmoid((gamma - level_idx) / temperature)
-			// Output: feat = mask * adaptive_features + (1-mask) * hashgrid_features
+			// adaptive mode: blend per-Gaussian and hashgrid features
+			// rgb buffer: [N, feat_dim] = per-Gaussian features (24D)
+			// Mask is computed in Python for autograd, blending happens here
+			// Output: feat = 0.5 * per_gaussian + 0.5 * hashgrid (uniform blend for now)
 			
 			// Initialize feat array to zero
 			for(int i = 0; i < CHANNELS; i++) feat[i] = 0.0f;
@@ -921,12 +921,11 @@ renderCUDAsurfelForward(
 			const int num_levels = level;
 			const int feat_dim = num_levels * l_dim;
 			
-			// Read per-Gaussian adaptive features and mask from rgb buffer
+			// Read per-Gaussian features from rgb buffer (24D)
 			int gauss_id = collected_id[j];
-			const float* adaptive_features = &rgb[gauss_id * (2 * feat_dim)];
-			const float* mask = &rgb[gauss_id * (2 * feat_dim) + feat_dim];
+			const float* per_gaussian_feat = &rgb[gauss_id * CHANNELS];
 			
-			// Query full hashgrid at intersection point
+			// Query full hashgrid at intersection point (24D)
 			float feat_hashgrid[16 * 4] = {0};
 			
 			if(l_dim == 2) {
@@ -945,9 +944,10 @@ renderCUDAsurfelForward(
 				printf("FW unsupported level dim : %d\n", l_dim);
 			}
 			
-			// Soft blend: feat = mask * adaptive_features + (1-mask) * hashgrid_features
+			// Simple blend: feat = 0.5 * per_gaussian + 0.5 * hashgrid
+			// TODO: Use learnable mask from gamma parameter
 			for(int i = 0; i < feat_dim && i < CHANNELS; i++) {
-				feat[i] = mask[i] * adaptive_features[i] + (1.0f - mask[i]) * feat_hashgrid[i];
+				feat[i] = 0.5f * per_gaussian_feat[i] + 0.5f * feat_hashgrid[i];
 			}
 			
 			break;

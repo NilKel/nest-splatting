@@ -1,0 +1,24 @@
+running install
+/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/setuptools/_distutils/cmd.py:90: SetuptoolsDeprecationWarning: setup.py install is deprecated.
+!!
+
+        ********************************************************************************
+        Please avoid running ``setup.py`` directly.
+        Instead, use pypa/build, pypa/installer or other
+        standards-based tools.
+
+        This deprecation is overdue, please update your project and remove deprecated
+        calls to avoid build errors in the future.
+
+        See https://blog.ganssle.io/articles/2021/10/setup-py-deprecated.html for details.
+        ********************************************************************************
+
+!!
+  self.initialize_options()
+running build
+running build_ext
+W1208 18:01:20.717000 634691 site-packages/torch/utils/cpp_extension.py:633] Attempted to use ninja as the BuildExtension backend but we could not find ninja.. Falling back to using the slow distutils backend.
+W1208 18:01:20.723000 634691 site-packages/torch/utils/cpp_extension.py:534] There are no g++ version bounds defined for CUDA version 12.8
+building 'simple_knn._C' extension
+g++ -pthread -B /home/nilkel/miniconda3/envs/nest_splatting/compiler_compat -Wno-unused-result -Wsign-compare -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /home/nilkel/miniconda3/envs/nest_splatting/include -fPIC -O2 -isystem /home/nilkel/miniconda3/envs/nest_splatting/include -fPIC -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/nilkel/miniconda3/envs/nest_splatting/include/python3.10 -c ext.cpp -o build/temp.linux-x86_64-cpython-310/ext.o -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C -std=c++17
+interrupted

@@ -73,7 +73,8 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& features_diffuse,
 	const torch::Tensor& offsets_diffuse,
 	const torch::Tensor& gridrange_diffuse,
-	const int render_mode)
+	const int render_mode,
+	const torch::Tensor& adaptive_mask)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 	AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -84,9 +85,10 @@ RasterizeGaussiansCUDA(
   const int W = image_width;
   uint32_t C = 3;
 
-  // For hybrid_features mode (render_mode=4), C will be calculated after determining D from features
+  // For hybrid_features mode (render_mode=4) and adaptive mode (render_mode=6), 
+  // C will be calculated after determining D from features
   // For other modes, use colors dimension if available
-  if (colors.numel() != 0 && render_mode != 4) C = colors.size(1);
+  if (colors.numel() != 0 && render_mode != 4 && render_mode != 6) C = colors.size(1);
   
   CHECK_INPUT(background);
   CHECK_INPUT(means3D);
@@ -156,6 +158,14 @@ RasterizeGaussiansCUDA(
 
 		uint32_t total_levels = Level >> 16;  // Extract bits 16-31
 		C = total_levels * D;  // e.g., 6 × 4 = 24D (constant regardless of active_levels)
+	}
+	else if(render_mode == 6) {
+		// Adaptive mode: soft blend per-Gaussian and hashgrid features
+		// Input: colors_precomp = [adaptive_features (total_levels×D) | mask (total_levels×D)]
+		// Output: blended features (total_levels×D)
+		// Output dimension is ALWAYS total_levels * D, same as baseline/cat mode
+		uint32_t num_levels = offsets.size(0) - 1;  // total_levels from hashgrid
+		C = num_levels * D;  // e.g., 6 × 4 = 24D (same as baseline)
 	}
 	else {
 		// Single hashgrid modes
