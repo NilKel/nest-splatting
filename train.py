@@ -51,6 +51,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene_name = args.scene_name
     tb_writer = prepare_output_and_logger(dataset, scene_name, args.yaml, args)
     args.model_path = dataset.model_path
+    
+    # Pass method and hybrid_levels to dataset for use in Scene/GaussianModel
+    dataset.method = args.method
+    dataset.hybrid_levels = args.hybrid_levels if hasattr(args, 'hybrid_levels') else 3
 
     first_iter = 0
     gaussians = GaussianModel(dataset.sh_degree)
@@ -92,9 +96,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians._loaded_from_checkpoint = True
         scene = Scene(dataset, gaussians)
         
-        # Setup optimizer and restore its state
+        # Initialize per-Gaussian features for cat mode (trained from scratch after warmup)
+        if args.method == "cat" and args.hybrid_levels > 0:
+            per_level_dim = 4  # From config encoding.hashgrid.dim
+            gaussians._gaussian_feat_dim = args.hybrid_levels * per_level_dim
+            gaussian_feats = torch.zeros((len(gaussians.get_xyz), gaussians._gaussian_feat_dim), device="cuda").float()
+            gaussians._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+        else:
+            gaussians._gaussian_feat_dim = 0
+            gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+        
+        # Setup optimizer (gaussian_features will be added to param groups if present)
         gaussians.training_setup(opt)
-        gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
+        
+        # Load optimizer state from warmup checkpoint
+        # For cat mode, gaussian_features won't be in the saved state - that's fine, they train from scratch
+        if args.method != "cat":
+            gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
         
         # Move optimizer state to GPU
         for state in gaussians.optimizer.state.values():
@@ -156,7 +174,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     ingp_model = None
     if cfg_model.settings.if_ingp:
-        ingp_model = INGP(cfg_model).to('cuda')
+        ingp_model = INGP(cfg_model, args=args).to('cuda')
 
     opacity_reset_protect = cfg_model.training_cfg.opacity_reset_protect
     if_pixel_densify_enhance = cfg_model.settings.pixel_densify_enhance
@@ -566,6 +584,9 @@ def prepare_output_and_logger(dataset, scene_name, yaml_file="", args=None):
         run_name = dataset.model_path
         run_name = run_name.lstrip('./').lstrip('/')
         method = args.method if args and hasattr(args, 'method') else "baseline"
+        # For cat mode, append hybrid_levels to the run name
+        if method == "cat" and args and hasattr(args, 'hybrid_levels'):
+            run_name = f"{run_name}_{args.hybrid_levels}_levels"
         dataset.model_path = os.path.join("outputs", dataset_name, scene_from_path, method, run_name)
     
     print("Output folder: {}".format(dataset.model_path))
@@ -656,15 +677,19 @@ if __name__ == "__main__":
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
     
-    # Method argument - only baseline for now
+    # Method argument - baseline or cat
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline"],
-                        help="Rendering method: 'baseline' (default NeST)")
+                        choices=["baseline", "cat"],
+                        help="Rendering method: 'baseline' (default NeST) or 'cat' (hybrid per-Gaussian + hashgrid)")
+    parser.add_argument("--hybrid_levels", type=int, default=3,
+                        help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
 
     args = parser.parse_args(sys.argv[1:])
     
     print("Optimizing " + args.model_path)
     print(f"Method: {args.method.upper()}")
+    if args.method == "cat":
+        print(f"Hybrid levels: {args.hybrid_levels} (per-Gaussian features for coarse levels)")
 
     cfg_model = Config(args.yaml)
     merge_cfg_to_args(args, cfg_model)

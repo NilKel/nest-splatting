@@ -113,18 +113,55 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     ap_level = None
     contract = False
 
-    if hash_in_CUDA:
-        features, offsets, levels, per_level_scale, base_resolution, align_corners, interpolation \
-            = ingp.hash_encoding.get_params()
-        gridrange = ingp.gridrange
+    # Cat mode detection and setup
+    is_cat_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_cat_mode') and ingp.is_cat_mode
+    hybrid_levels = ingp.hybrid_levels if is_cat_mode else 0
+    render_mode = 0  # 0 = baseline, 4 = cat
 
-        levels = ingp.active_levels
+    if hash_in_CUDA:
+        # Check if hashgrid is disabled (cat mode with hybrid_levels == total_levels)
+        if hasattr(ingp, 'hashgrid_disabled') and ingp.hashgrid_disabled:
+            # No hashgrid - pure per-Gaussian mode
+            features = torch.zeros((1, ingp.level_dim), device="cuda")
+            offsets = torch.zeros((1,), dtype=torch.int32, device="cuda")
+            gridrange = ingp.gridrange
+            per_level_scale = 1
+            base_resolution = 0
+            align_corners = False
+            interpolation = 0
+            # Encode: total_levels in upper bits, 0 hashgrid levels, hybrid_levels in lower bits
+            levels = (ingp.levels << 16) | (0 << 8) | ingp.hybrid_levels
+        else:
+            # Normal hashgrid mode (baseline or cat with hashgrid)
+            features, offsets, levels, per_level_scale, base_resolution, align_corners, interpolation \
+                = ingp.hash_encoding.get_params()
+            gridrange = ingp.gridrange
+            levels = ingp.active_levels
         
         homotrans = pc.get_homotrans()
-        ### ap level
         ap_level = pc.get_appearance_level
-
         contract = ingp.contract
+        
+        # Cat mode: only activate if hybrid_levels > 0
+        # When hybrid_levels == 0, behave identically to baseline
+        if is_cat_mode and hybrid_levels > 0:
+            # Set per-Gaussian features as colors_precomp
+            colors_precomp = pc.get_gaussian_features
+            shs = None
+            render_mode = 4
+            
+            # Encode levels for CUDA case 4: (total << 16) | (active_hashgrid << 8) | hybrid
+            # Uses active_hashgrid_levels for C2F (progressively enables hashgrid levels)
+            total_levels = ingp.levels
+            active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
+            levels = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+            
+            # Pad offsets to 17 elements (CUDA code expects up to 16 levels + 1)
+            # This is needed because CUDA copies offsets based on max possible levels
+            if offsets.shape[0] < 17:
+                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
+                padded_offsets[:offsets.shape[0]] = offsets
+                offsets = padded_offsets
     
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
@@ -169,8 +206,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         features = features,
         offsets = offsets,
         gridrange = gridrange,
+        render_mode = render_mode,
     )
-    
     
     # additional regularizations
     render_alpha = allmap[1:2]

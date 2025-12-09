@@ -61,6 +61,10 @@ class GaussianModel:
         self.base_opacity = 0.0
         self._appearance_level = torch.empty(0)
         self.feat_gradient_accum = torch.empty(0)
+        
+        # Per-Gaussian features for cat mode
+        self._gaussian_features = torch.empty(0)
+        self._gaussian_feat_dim = 0  # Will be set in create_from_pcd
 
         self.setup_functions()
 
@@ -78,21 +82,44 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._gaussian_features,
+            self._gaussian_feat_dim,
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        # Handle both old format (12 elements) and new format (14 elements with gaussian_features)
+        if len(model_args) == 14:
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale,
+            self._gaussian_features,
+            self._gaussian_feat_dim) = model_args
+        else:
+            # Old format without gaussian_features
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale) = model_args
+            self._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._gaussian_feat_dim = 0
+        
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -120,6 +147,10 @@ class GaussianModel:
     @property
     def get_appearance_level(self):
         return self._appearance_level
+    
+    @property
+    def get_gaussian_features(self):
+        return self._gaussian_features
     
     @property
     def get_envmap(self): # 
@@ -169,6 +200,20 @@ class GaussianModel:
         init_level = 24
         ap_level = init_level * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
         self._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
+        
+        # Initialize per-Gaussian features for cat mode
+        # Dimension = hybrid_levels * per_level_dim (default: 3 * 4 = 12)
+        if hasattr(args, 'method') and args.method == "cat" and hasattr(args, 'hybrid_levels'):
+            per_level_dim = 4  # From config encoding.hashgrid.dim
+            self._gaussian_feat_dim = args.hybrid_levels * per_level_dim
+        else:
+            self._gaussian_feat_dim = 0
+        
+        if self._gaussian_feat_dim > 0:
+            gaussian_feats = torch.zeros((self.get_xyz.shape[0], self._gaussian_feat_dim), device="cuda").float()
+            self._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+        else:
+            self._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -186,6 +231,10 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             {'params': [self._appearance_level], 'lr': 0, "name": "ap_level"},
         ]
+        
+        # Add per-Gaussian features for cat mode (if present)
+        if self._gaussian_feat_dim > 0:
+            l.append({'params': [self._gaussian_features], 'lr': training_args.feature_lr, "name": "gaussian_features"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -340,6 +389,8 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._appearance_level = optimizable_tensors["ap_level"]
+        if "gaussian_features" in optimizable_tensors:
+            self._gaussian_features = optimizable_tensors["gaussian_features"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.feat_gradient_accum = self.feat_gradient_accum[valid_points_mask]
@@ -370,7 +421,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -378,6 +429,10 @@ class GaussianModel:
         "scaling" : new_scaling,
         "rotation" : new_rotation, 
         "ap_level" : new_ap_level}
+        
+        # Add gaussian_features if present (cat mode)
+        if new_gaussian_features is not None and self._gaussian_feat_dim > 0:
+            d["gaussian_features"] = new_gaussian_features
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -387,6 +442,8 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._appearance_level = optimizable_tensors["ap_level"]
+        if "gaussian_features" in optimizable_tensors:
+            self._gaussian_features = optimizable_tensors["gaussian_features"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.feat_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -415,8 +472,13 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
         new_ap_level = self._appearance_level[selected_pts_mask].repeat(N,1)
+        
+        # Handle gaussian_features for cat mode
+        new_gaussian_features = None
+        if self._gaussian_feat_dim > 0:
+            new_gaussian_features = self._gaussian_features[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -435,8 +497,13 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
 
         new_ap_level = self._appearance_level[selected_pts_mask]
+        
+        # Handle gaussian_features for cat mode
+        new_gaussian_features = None
+        if self._gaussian_feat_dim > 0:
+            new_gaussian_features = self._gaussian_features[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, ap_update, act_level, densify_tag = True, prune_tag = True):
         
