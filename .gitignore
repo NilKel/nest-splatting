@@ -35,6 +35,7 @@ docker-compose.override.yml
 # Output / cache
 # -----------------------------
 output/
+outputs/
 checkpoints/
 logs/
 tmp/

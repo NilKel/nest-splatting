@@ -106,12 +106,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians._gaussian_feat_dim = 0
             gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
         
+        # Initialize adaptive mode parameters (trained from scratch after warmup)
+        if args.method == "adaptive":
+            per_level_dim = 4
+            num_levels = args.adaptive_levels
+            gaussians._adaptive_feat_dim = num_levels * per_level_dim
+            gaussians._adaptive_num_levels = num_levels
+            
+            # Initialize gamma to -1.0 (favors hashgrid initially)
+            gamma_init = -1.0 * torch.ones((gaussians.get_xyz.shape[0], 1), device="cuda").float()
+            gaussians._gamma = nn.Parameter(gamma_init.requires_grad_(True))
+            
+            # Initialize adaptive features to small random values
+            adaptive_feats = torch.randn((gaussians.get_xyz.shape[0], gaussians._adaptive_feat_dim), device="cuda").float() * 0.01
+            gaussians._adaptive_features = nn.Parameter(adaptive_feats.requires_grad_(True))
+        else:
+            gaussians._adaptive_feat_dim = 0
+            gaussians._adaptive_num_levels = 0
+            gaussians._gamma = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            gaussians._adaptive_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+        
         # Setup optimizer (gaussian_features will be added to param groups if present)
         gaussians.training_setup(opt)
         
         # Load optimizer state from warmup checkpoint
-        # For cat mode, gaussian_features won't be in the saved state - that's fine, they train from scratch
-        if args.method != "cat":
+        # For cat/adaptive mode, new params won't be in saved state - they train from scratch
+        if args.method not in ["cat", "adaptive"]:
             gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
         
         # Move optimizer state to GPU
@@ -283,8 +303,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normal_loss = lambda_normal * (normal_error).mean()
         dist_loss = lambda_dist * (rend_dist).mean()
 
+        # Adaptive mode: regularization to encourage per-Gaussian features
+        adaptive_reg_loss = torch.tensor(0.0, device="cuda")
+        if args.method == "adaptive" and gaussians._adaptive_feat_dim > 0 and ingp is not None:
+            # Update temperature (exponential decay)
+            gaussians.update_temperature(iteration, opt.iterations)
+            
+            # Penalize hashgrid usage: mean(1 - mask) where mask=1 means use per-Gaussian
+            mask = gaussians.get_adaptive_mask(ingp.level_dim)
+            if mask is not None:
+                adaptive_reg_loss = args.lambda_adaptive * (1.0 - mask).mean()
+
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss
 
         total_loss.backward()
 
@@ -587,6 +618,9 @@ def prepare_output_and_logger(dataset, scene_name, yaml_file="", args=None):
         # For cat mode, append hybrid_levels to the run name
         if method == "cat" and args and hasattr(args, 'hybrid_levels'):
             run_name = f"{run_name}_{args.hybrid_levels}_levels"
+        # For adaptive mode, append adaptive_levels to the run name
+        elif method == "adaptive" and args and hasattr(args, 'adaptive_levels'):
+            run_name = f"{run_name}_{args.adaptive_levels}_levels"
         dataset.model_path = os.path.join("outputs", dataset_name, scene_from_path, method, run_name)
     
     print("Output folder: {}".format(dataset.model_path))
@@ -677,12 +711,16 @@ if __name__ == "__main__":
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
     
-    # Method argument - baseline or cat
+    # Method argument - baseline, cat, or adaptive
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "cat"],
-                        help="Rendering method: 'baseline' (default NeST) or 'cat' (hybrid per-Gaussian + hashgrid)")
+                        choices=["baseline", "cat", "adaptive"],
+                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), or 'adaptive' (learnable per-Gaussian blend)")
     parser.add_argument("--hybrid_levels", type=int, default=3,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
+    parser.add_argument("--adaptive_levels", type=int, default=6,
+                        help="Total number of levels for adaptive mode (default: 6)")
+    parser.add_argument("--lambda_adaptive", type=float, default=0.001,
+                        help="Regularization weight for adaptive mode to encourage per-Gaussian features")
 
     args = parser.parse_args(sys.argv[1:])
     

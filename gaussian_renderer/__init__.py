@@ -116,7 +116,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Cat mode detection and setup
     is_cat_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_cat_mode') and ingp.is_cat_mode
     hybrid_levels = ingp.hybrid_levels if is_cat_mode else 0
-    render_mode = 0  # 0 = baseline, 4 = cat
+    
+    # Adaptive mode detection
+    is_adaptive_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_mode') and ingp.is_adaptive_mode
+    
+    render_mode = 0  # 0 = baseline, 4 = cat, 6 = adaptive
 
     if hash_in_CUDA:
         # Check if hashgrid is disabled (cat mode with hybrid_levels == total_levels)
@@ -158,6 +162,26 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             
             # Pad offsets to 17 elements (CUDA code expects up to 16 levels + 1)
             # This is needed because CUDA copies offsets based on max possible levels
+            if offsets.shape[0] < 17:
+                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
+                padded_offsets[:offsets.shape[0]] = offsets
+                offsets = padded_offsets
+        
+        # Adaptive mode: soft blend per-Gaussian and hashgrid features
+        elif is_adaptive_mode and pc._adaptive_feat_dim > 0:
+            # Compute soft mask from gamma in Python (enables autograd for gamma)
+            mask = pc.get_adaptive_mask(ingp.level_dim)  # (N, num_levels * level_dim)
+            
+            # Concatenate [adaptive_features | mask] for CUDA
+            adaptive_features = pc.get_adaptive_features  # (N, feat_dim)
+            colors_precomp = torch.cat([adaptive_features, mask], dim=-1)  # (N, 2 * feat_dim)
+            shs = None
+            render_mode = 6
+            
+            # Use full hashgrid levels for adaptive mode
+            levels = ingp.active_levels
+            
+            # Pad offsets to 17 elements
             if offsets.shape[0] < 17:
                 padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
                 padded_offsets[:offsets.shape[0]] = offsets

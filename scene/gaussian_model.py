@@ -65,6 +65,14 @@ class GaussianModel:
         # Per-Gaussian features for cat mode
         self._gaussian_features = torch.empty(0)
         self._gaussian_feat_dim = 0  # Will be set in create_from_pcd
+        
+        # Adaptive mode parameters
+        self._gamma = torch.empty(0)  # (N, 1) learnable blend parameter
+        self._adaptive_features = torch.empty(0)  # (N, total_levels * per_level_dim)
+        self._adaptive_feat_dim = 0
+        self._adaptive_num_levels = 0
+        self.temperature = 1.0
+        self.min_temperature = 0.01
 
         self.setup_functions()
 
@@ -84,11 +92,38 @@ class GaussianModel:
             self.spatial_lr_scale,
             self._gaussian_features,
             self._gaussian_feat_dim,
+            self._gamma,
+            self._adaptive_features,
+            self._adaptive_feat_dim,
+            self._adaptive_num_levels,
+            self.temperature,
         )
     
     def restore(self, model_args, training_args):
-        # Handle both old format (12 elements) and new format (14 elements with gaussian_features)
-        if len(model_args) == 14:
+        # Handle multiple checkpoint formats
+        if len(model_args) == 19:
+            # New format with adaptive mode
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale,
+            self._gaussian_features,
+            self._gaussian_feat_dim,
+            self._gamma,
+            self._adaptive_features,
+            self._adaptive_feat_dim,
+            self._adaptive_num_levels,
+            self.temperature) = model_args
+        elif len(model_args) == 14:
+            # Cat mode format
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
@@ -103,6 +138,10 @@ class GaussianModel:
             self.spatial_lr_scale,
             self._gaussian_features,
             self._gaussian_feat_dim) = model_args
+            self._gamma = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._adaptive_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._adaptive_feat_dim = 0
+            self._adaptive_num_levels = 0
         else:
             # Old format without gaussian_features
             (self.active_sh_degree, 
@@ -119,6 +158,10 @@ class GaussianModel:
             self.spatial_lr_scale) = model_args
             self._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             self._gaussian_feat_dim = 0
+            self._gamma = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._adaptive_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._adaptive_feat_dim = 0
+            self._adaptive_num_levels = 0
         
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
@@ -153,6 +196,14 @@ class GaussianModel:
         return self._gaussian_features
     
     @property
+    def get_gamma(self):
+        return self._gamma
+    
+    @property
+    def get_adaptive_features(self):
+        return self._adaptive_features
+    
+    @property
     def get_envmap(self): # 
         return self.env_map
     
@@ -170,6 +221,34 @@ class GaussianModel:
 
         return build_H(rots, scales, xyzs)
 
+    def update_temperature(self, iteration, max_iter):
+        """Exponential decay of temperature for adaptive mode."""
+        if max_iter > 0:
+            ratio = iteration / max_iter
+            self.temperature = 1.0 * (self.min_temperature / 1.0) ** ratio
+        return self.temperature
+
+    def get_adaptive_mask(self, level_dim):
+        """
+        Compute soft mask for adaptive feature blending.
+        mask[i] = 1 means use per-Gaussian, mask[i] = 0 means use hashgrid.
+        """
+        if self._adaptive_num_levels == 0:
+            return None
+        
+        N = self._gamma.shape[0]
+        num_levels = self._adaptive_num_levels
+        
+        # Create level indices: [0, 1, ..., num_levels-1]
+        level_indices = torch.arange(num_levels, device=self._gamma.device, dtype=self._gamma.dtype)
+        
+        # Compute per-level mask: sigmoid((gamma - level_idx) / temperature)
+        mask_per_level = torch.sigmoid((self._gamma - level_indices) / self.temperature)
+        
+        # Expand mask to full feature dimension
+        mask_expanded = mask_per_level.repeat_interleave(level_dim, dim=1)
+        
+        return mask_expanded
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
@@ -214,6 +293,26 @@ class GaussianModel:
             self._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
         else:
             self._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+        
+        # Initialize adaptive mode parameters
+        if hasattr(args, 'method') and args.method == "adaptive":
+            per_level_dim = 4
+            num_levels = getattr(args, 'adaptive_levels', 6)
+            self._adaptive_feat_dim = num_levels * per_level_dim
+            self._adaptive_num_levels = num_levels
+            
+            # Initialize gamma to -1.0 (favors hashgrid initially)
+            gamma_init = -1.0 * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
+            self._gamma = nn.Parameter(gamma_init.requires_grad_(True))
+            
+            # Initialize adaptive features to small random values
+            adaptive_feats = torch.randn((self.get_xyz.shape[0], self._adaptive_feat_dim), device="cuda").float() * 0.01
+            self._adaptive_features = nn.Parameter(adaptive_feats.requires_grad_(True))
+        else:
+            self._adaptive_feat_dim = 0
+            self._adaptive_num_levels = 0
+            self._gamma = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._adaptive_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -235,6 +334,11 @@ class GaussianModel:
         # Add per-Gaussian features for cat mode (if present)
         if self._gaussian_feat_dim > 0:
             l.append({'params': [self._gaussian_features], 'lr': training_args.feature_lr, "name": "gaussian_features"})
+        
+        # Add adaptive mode parameters (if present)
+        if self._adaptive_feat_dim > 0:
+            l.append({'params': [self._gamma], 'lr': training_args.opacity_lr, "name": "gamma"})
+            l.append({'params': [self._adaptive_features], 'lr': training_args.feature_lr, "name": "adaptive_features"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -391,6 +495,10 @@ class GaussianModel:
         self._appearance_level = optimizable_tensors["ap_level"]
         if "gaussian_features" in optimizable_tensors:
             self._gaussian_features = optimizable_tensors["gaussian_features"]
+        if "gamma" in optimizable_tensors:
+            self._gamma = optimizable_tensors["gamma"]
+        if "adaptive_features" in optimizable_tensors:
+            self._adaptive_features = optimizable_tensors["adaptive_features"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.feat_gradient_accum = self.feat_gradient_accum[valid_points_mask]
@@ -421,7 +529,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -433,6 +541,12 @@ class GaussianModel:
         # Add gaussian_features if present (cat mode)
         if new_gaussian_features is not None and self._gaussian_feat_dim > 0:
             d["gaussian_features"] = new_gaussian_features
+        
+        # Add adaptive mode parameters
+        if new_gamma is not None and self._adaptive_feat_dim > 0:
+            d["gamma"] = new_gamma
+        if new_adaptive_features is not None and self._adaptive_feat_dim > 0:
+            d["adaptive_features"] = new_adaptive_features
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -444,6 +558,10 @@ class GaussianModel:
         self._appearance_level = optimizable_tensors["ap_level"]
         if "gaussian_features" in optimizable_tensors:
             self._gaussian_features = optimizable_tensors["gaussian_features"]
+        if "gamma" in optimizable_tensors:
+            self._gamma = optimizable_tensors["gamma"]
+        if "adaptive_features" in optimizable_tensors:
+            self._adaptive_features = optimizable_tensors["adaptive_features"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.feat_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -477,8 +595,15 @@ class GaussianModel:
         new_gaussian_features = None
         if self._gaussian_feat_dim > 0:
             new_gaussian_features = self._gaussian_features[selected_pts_mask].repeat(N,1)
+        
+        # Handle adaptive mode parameters
+        new_gamma = None
+        new_adaptive_features = None
+        if self._adaptive_feat_dim > 0:
+            new_gamma = self._gamma[selected_pts_mask].repeat(N,1)
+            new_adaptive_features = self._adaptive_features[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -502,8 +627,15 @@ class GaussianModel:
         new_gaussian_features = None
         if self._gaussian_feat_dim > 0:
             new_gaussian_features = self._gaussian_features[selected_pts_mask]
+        
+        # Handle adaptive mode parameters
+        new_gamma = None
+        new_adaptive_features = None
+        if self._adaptive_feat_dim > 0:
+            new_gamma = self._gamma[selected_pts_mask]
+            new_adaptive_features = self._adaptive_features[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, ap_update, act_level, densify_tag = True, prune_tag = True):
         

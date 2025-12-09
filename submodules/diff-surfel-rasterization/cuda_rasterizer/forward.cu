@@ -909,6 +909,49 @@ renderCUDAsurfelForward(
 
 			break;
 		}
+		case 6: {
+			// adaptive mode: soft blend per-Gaussian and hashgrid features
+			// rgb buffer layout: [N, feat_dim + feat_dim] = [adaptive_features | mask]
+			// mask is precomputed in Python using sigmoid((gamma - level_idx) / temperature)
+			// Output: feat = mask * adaptive_features + (1-mask) * hashgrid_features
+			
+			// Initialize feat array to zero
+			for(int i = 0; i < CHANNELS; i++) feat[i] = 0.0f;
+			
+			const int num_levels = level;
+			const int feat_dim = num_levels * l_dim;
+			
+			// Read per-Gaussian adaptive features and mask from rgb buffer
+			int gauss_id = collected_id[j];
+			const float* adaptive_features = &rgb[gauss_id * (2 * feat_dim)];
+			const float* mask = &rgb[gauss_id * (2 * feat_dim) + feat_dim];
+			
+			// Query full hashgrid at intersection point
+			float feat_hashgrid[16 * 4] = {0};
+			
+			if(l_dim == 2) {
+				query_feature<false, 16 * 4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug);
+			} else if(l_dim == 4) {
+				query_feature<false, 16 * 4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug);
+			} else if(l_dim == 8) {
+				query_feature<false, 16 * 4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug);
+			} else if(l_dim == 12) {
+				query_feature<false, 16 * 4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug);
+			} else {
+				printf("FW unsupported level dim : %d\n", l_dim);
+			}
+			
+			// Soft blend: feat = mask * adaptive_features + (1-mask) * hashgrid_features
+			for(int i = 0; i < feat_dim && i < CHANNELS; i++) {
+				feat[i] = mask[i] * adaptive_features[i] + (1.0f - mask[i]) * feat_hashgrid[i];
+			}
+			
+			break;
+		}
 		case 1: {
 			// Surface mode with optional per-Gaussian baseline features
 			// Surface hashgrid: 12 features per level → dot product → 4 scalars per level

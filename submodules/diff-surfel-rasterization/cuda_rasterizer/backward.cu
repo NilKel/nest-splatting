@@ -961,6 +961,73 @@ renderCUDAsurfelBackward(
 
 				break;
 			}
+		case 6: {
+			// adaptive mode backward: soft blend gradients
+			// Forward: feat = mask * adaptive_features + (1-mask) * hashgrid_features
+			// Backward: 
+			//   d_adaptive_features = mask * grad_feat
+			//   d_hashgrid_features = (1-mask) * grad_feat  
+			//   d_mask = grad_feat * (adaptive_features - hashgrid_features) [handled in Python]
+			
+			const int num_levels = level;
+			const int feat_dim = num_levels * l_dim;
+			
+			// Read per-Gaussian adaptive features and mask from colors buffer
+			const float* adaptive_features = &colors[global_id * (2 * feat_dim)];
+			const float* mask = &colors[global_id * (2 * feat_dim) + feat_dim];
+			
+			// Query full hashgrid at intersection point (needed for mask gradient)
+			float feat_hashgrid[16 * 4] = {0};
+			if(l_dim == 2) {
+				query_feature<false, 16 * 4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug);
+			} else if(l_dim == 4) {
+				query_feature<false, 16 * 4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug);
+			} else if(l_dim == 8) {
+				query_feature<false, 16 * 4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug);
+			} else if(l_dim == 12) {
+				query_feature<false, 16 * 4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug);
+			}
+			
+			// Compute scaled gradients for hashgrid backprop: grad_hash = (1-mask) * grad_feat
+			float grad_hashgrid[16 * 4];
+			for(int i = 0; i < feat_dim && i < 64; i++) {
+				grad_hashgrid[i] = (1.0f - mask[i]) * grad_feat[i];
+			}
+			
+			// Backprop to hashgrid with scaled gradients
+			if(l_dim == 2) {
+				query_feature<true, 16 * 4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug,
+					grad_hashgrid, dL_dfeatures, dL_dxyz);
+			} else if(l_dim == 4) {
+				query_feature<true, 16 * 4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug,
+					grad_hashgrid, dL_dfeatures, dL_dxyz);
+			} else if(l_dim == 8) {
+				query_feature<true, 16 * 4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug,
+					grad_hashgrid, dL_dfeatures, dL_dxyz);
+			} else if(l_dim == 12) {
+				query_feature<true, 16 * 4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, num_levels, l_scale, Base, align_corners, interp, contract, debug,
+					grad_hashgrid, dL_dfeatures, dL_dxyz);
+			}
+			
+			// Backprop to adaptive features and mask
+			// dL_dcolors layout: [d_adaptive | d_mask]
+			for(int i = 0; i < feat_dim && i < 64; i++) {
+				float d_adaptive = mask[i] * grad_feat[i];
+				float d_mask = grad_feat[i] * (adaptive_features[i] - feat_hashgrid[i]);
+				atomicAdd(&(dL_dcolors[global_id * (2 * feat_dim) + i]), d_adaptive);
+				atomicAdd(&(dL_dcolors[global_id * (2 * feat_dim) + feat_dim + i]), d_mask);
+			}
+			
+			break;
+		}
 		case 1: {
 		// Surface mode backward with optional baseline features
 		// Forward: feat = ReLU(-dot(vec, normal) + baseline)

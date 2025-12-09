@@ -60,6 +60,9 @@ class INGP(nn.Module):
         self.is_cat_mode = args is not None and hasattr(args, 'method') and args.method == "cat"
         self.hybrid_levels = args.hybrid_levels if self.is_cat_mode and hasattr(args, 'hybrid_levels') else 0
         
+        # Store args for adaptive mode configuration
+        self.is_adaptive_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive"
+        
         self.build_encoding(cfg_model.encoding)
         # MLP input is always total_levels * dim (buffer size is constant)
         self.feat_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim # + 3
