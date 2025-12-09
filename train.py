@@ -102,6 +102,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if isinstance(v, torch.Tensor):
                     state[k] = v.cuda()
         
+        # Restore densification state (critical for identical behavior)
+        if 'xyz_gradient_accum' in ckpt:
+            gaussians.xyz_gradient_accum = ckpt['xyz_gradient_accum'].cuda()
+            gaussians.denom = ckpt['denom'].cuda()
+        
         # Load gs_alpha masks for all cameras
         gs_alpha_masks = ckpt['gs_alpha_masks']
         for cam in scene.getTrainCameras():
@@ -113,6 +118,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loaded_from_warmup = True
         
         print(f"  GS Alpha masks loaded: {len(gs_alpha_masks)}")
+        print(f"  Densification state: {'restored' if 'xyz_gradient_accum' in ckpt else 'reset (old checkpoint)'}")
         print(f"  Resuming from iteration {first_iter + 1}")
         print("="*70 + "\n")
     else:
@@ -425,6 +431,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         'spatial_lr_scale': gaussians.spatial_lr_scale,
                         'optimizer_state': gaussians.optimizer.state_dict(),
                         'gs_alpha_masks': gs_alpha_masks,
+                        # Densification state - needed for identical behavior
+                        'xyz_gradient_accum': gaussians.xyz_gradient_accum.detach().cpu(),
+                        'denom': gaussians.denom.detach().cpu(),
                     }
                     
                     torch.save(warmup_ckpt, warmup_checkpoint_path)
