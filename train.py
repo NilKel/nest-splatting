@@ -11,6 +11,7 @@
 
 import os
 import torch
+import torch.nn as nn
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -48,16 +49,79 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_list = []
 
     scene_name = args.scene_name
-    tb_writer = prepare_output_and_logger(dataset, scene_name, args.yaml)
+    tb_writer = prepare_output_and_logger(dataset, scene_name, args.yaml, args)
     args.model_path = dataset.model_path
 
     first_iter = 0
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians)
-    gaussians.training_setup(opt)
+    
+    # Check for warmup checkpoint in data directory
+    warmup_checkpoint_path = os.path.join(dataset.source_path, "warmup_checkpoint.pth")
+    loaded_from_warmup = False
+    
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        # User-specified checkpoint takes priority
+        scene = Scene(dataset, gaussians)
+        gaussians.training_setup(opt)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
+    elif cfg_model.settings.if_ingp and os.path.exists(warmup_checkpoint_path):
+        # Load warmup checkpoint - skip 2DGS phase
+        print("\n" + "="*70)
+        print("  LOADING 2DGS WARMUP CHECKPOINT")
+        print("="*70)
+        print(f"  Path: {warmup_checkpoint_path}")
+        
+        ckpt = torch.load(warmup_checkpoint_path, map_location='cpu', weights_only=False)
+        print(f"  Saved at iteration: {ckpt['iteration']}")
+        print(f"  Number of Gaussians: {ckpt['n_gaussians']}")
+        
+        # Load Gaussian parameters
+        gaussians.active_sh_degree = ckpt['active_sh_degree']
+        gaussians._xyz = nn.Parameter(ckpt['xyz'].cuda().requires_grad_(True))
+        gaussians._features_dc = nn.Parameter(ckpt['features_dc'].cuda().requires_grad_(True))
+        gaussians._features_rest = nn.Parameter(ckpt['features_rest'].cuda().requires_grad_(True))
+        gaussians._scaling = nn.Parameter(ckpt['scaling'].cuda().requires_grad_(True))
+        gaussians._rotation = nn.Parameter(ckpt['rotation'].cuda().requires_grad_(True))
+        gaussians._opacity = nn.Parameter(ckpt['opacity'].cuda().requires_grad_(True))
+        gaussians._appearance_level = nn.Parameter(ckpt['appearance_level'].cuda().requires_grad_(True))
+        gaussians.max_radii2D = ckpt['max_radii2D'].cuda()
+        gaussians.spatial_lr_scale = ckpt['spatial_lr_scale']
+        
+        # Create scene (won't reinitialize Gaussians)
+        gaussians._loaded_from_checkpoint = True
+        scene = Scene(dataset, gaussians)
+        
+        # Setup optimizer and restore its state
+        gaussians.training_setup(opt)
+        gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
+        
+        # Move optimizer state to GPU
+        for state in gaussians.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.cuda()
+        
+        # Load gs_alpha masks for all cameras
+        gs_alpha_masks = ckpt['gs_alpha_masks']
+        for cam in scene.getTrainCameras():
+            if cam.image_name in gs_alpha_masks:
+                cam.gs_alpha_mask = gs_alpha_masks[cam.image_name].cpu().float()
+        
+        # Resume from after the warmup iteration
+        first_iter = ckpt['iteration']
+        loaded_from_warmup = True
+        
+        print(f"  GS Alpha masks loaded: {len(gs_alpha_masks)}")
+        print(f"  Resuming from iteration {first_iter + 1}")
+        print("="*70 + "\n")
+    else:
+        # Normal initialization - train from scratch
+        scene = Scene(dataset, gaussians)
+        gaussians.training_setup(opt)
+        if cfg_model.settings.if_ingp:
+            print(f"\n[INFO] No warmup checkpoint found at {warmup_checkpoint_path}")
+            print(f"[INFO] Will train 2DGS for {cfg_model.ingp_stage.initialize} iterations, then save checkpoint.\n")
 
     surfel_cfg = cfg_model.surfel
     gaussians.base_opacity = surfel_cfg.base_opacity
@@ -109,11 +173,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         elif iteration <= cfg_model.ingp_stage.switch_iter:
             ingp = ingp_model
             densify_grad_threshold = cfg_model.training_cfg.densify_grad_threshold
+            appearance_update_threshold = 0.0
         else:
             ingp = ingp_model
             densify_grad_threshold = cfg_model.training_cfg.ingp_densify_threshold
             densification_interval = cfg_model.training_cfg.ingp_densification_interval
             opacity_reset_interval = cfg_model.training_cfg.ingp_opacity_reset_interval
+            appearance_update_threshold = 0.0
         
         optim_gaussian = True
         optim_ngp = False
@@ -130,11 +196,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.base_opacity += surfel_cfg.tg_base_alpha / update_times
                 beta += surfel_cfg.tg_beta / update_times
 
-        # During warm up process, gaussians are fixed. 
-        for group in gaussians.optimizer.param_groups:
-            for param in group['params']:
-                param.requires_grad = optim_gaussian 
-        
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -163,7 +224,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if cfg_model.settings.gs_alpha and ingp is not None:
                 gt_alpha = viewpoint_cam.gs_alpha_mask.cuda().float()
         except:
-            print(f"Error! no gs alpha for {viewpoint_cam.image_name} .")
+            if not loaded_from_warmup:
+                print(f"Error! no gs alpha for {viewpoint_cam.image_name} .")
             pass
 
         rend_alpha = render_pkg['rend_alpha']
@@ -214,9 +276,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration % 10 == 0:
                 loss_dict = {
                     "Loss": f"{ema_loss_for_log:.{5}f}",
-                    # "distort": f"{ema_dist_for_log:.{5}f}",
-                    # "normal": f"{ema_normal_for_log:.{5}f}",
-                    # "Mask":f"{ema_mask_for_log:.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}",
                 }
                 progress_bar.set_postfix(loss_dict)
@@ -242,7 +301,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Densification
             if iteration < opt.densify_until_iter and optim_gaussian:
-            # if optim_gaussian:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, pixels = pixels)
@@ -309,14 +367,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     metrics_dict = {
                         "#": gaussians.get_opacity.shape[0],
                         "loss": ema_loss_for_log
-                        # Add more metrics as needed
                     }
-                    # Send the data
                     network_gui.send(net_image_bytes, dataset.source_path, metrics_dict)
                     if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
                         break
                 except Exception as e:
-                    # raise e
                     network_gui.conn = None
 
         with torch.no_grad():
@@ -331,49 +386,184 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if not os.path.exists(os.path.join(scene.model_path, "gt_alpha")):
                     os.mkdir(os.path.join(scene.model_path, "gt_alpha"))
 
-                train_stack = scene.getTrainCameras() #.copy()
-                for cam in tqdm(train_stack):
+                # Collect gs_alpha masks for all cameras
+                gs_alpha_masks = {}
+                train_stack = scene.getTrainCameras()
+                for cam in tqdm(train_stack, desc="Generating masks"):
                     cam_name = cam.image_name + '.png'
                     render_pkg = render(cam, gaussians, pipe, background, ingp = ingp, \
                         beta = beta, iteration = iteration, cfg = cfg_model)
                     alpha_image = render_pkg["rend_alpha"]
                     bila_alpha = bilateral_filter_opencv(alpha_image.detach().cpu())
                     cam.gs_alpha_mask = bila_alpha.cpu().float()
+                    gs_alpha_masks[cam.image_name] = bila_alpha.cpu().float()
 
                     alpha_name = os.path.join(scene.model_path, 'gs_alpha', cam_name)
                     save_img_u8(bila_alpha.permute(1,2,0).expand(-1,-1,3).numpy(), alpha_name)
 
                     alpha_name = os.path.join(scene.model_path, 'gt_alpha', cam_name)
                     save_img_u8(cam.gt_alpha_mask.permute(1,2,0).expand(-1,-1,3).detach().cpu().numpy(), alpha_name)
+                
+                # Save warmup checkpoint (only if training from scratch)
+                if not loaded_from_warmup:
+                    print("\n" + "="*70)
+                    print("  SAVING 2DGS WARMUP CHECKPOINT")
+                    print("="*70)
+                    
+                    warmup_ckpt = {
+                        'iteration': iteration,
+                        'n_gaussians': len(gaussians.get_xyz),
+                        'active_sh_degree': gaussians.active_sh_degree,
+                        'xyz': gaussians._xyz.detach().cpu(),
+                        'features_dc': gaussians._features_dc.detach().cpu(),
+                        'features_rest': gaussians._features_rest.detach().cpu(),
+                        'scaling': gaussians._scaling.detach().cpu(),
+                        'rotation': gaussians._rotation.detach().cpu(),
+                        'opacity': gaussians._opacity.detach().cpu(),
+                        'appearance_level': gaussians._appearance_level.detach().cpu(),
+                        'max_radii2D': gaussians.max_radii2D.detach().cpu(),
+                        'spatial_lr_scale': gaussians.spatial_lr_scale,
+                        'optimizer_state': gaussians.optimizer.state_dict(),
+                        'gs_alpha_masks': gs_alpha_masks,
+                    }
+                    
+                    torch.save(warmup_ckpt, warmup_checkpoint_path)
+                    print(f"  Saved to: {warmup_checkpoint_path}")
+                    print(f"  Gaussians: {warmup_ckpt['n_gaussians']}")
+                    print(f"  GS Alpha masks: {len(gs_alpha_masks)}")
+                    print("  Next run will skip 2DGS phase and resume from here.")
+                    print("="*70 + "\n")
 
         torch.cuda.empty_cache()
     
+    # Final test and train rendering with stride 1
+    final_ingp = ingp_model if ingp_model is not None else ingp
+    
+    print("\n" + "="*70)
+    print(" "*20 + "FINAL TEST RENDERING")
+    print("="*70)
+    render_final_images(scene, gaussians, pipe, background, final_ingp, beta, iteration, cfg_model, args, 
+                        cameras=scene.getTestCameras(), output_subdir='final_test_renders', metrics_file='test_metrics.txt')
+    
+    print("\n" + "="*70)
+    print(" "*20 + "FINAL TRAIN RENDERING")
+    print("="*70)
+    render_final_images(scene, gaussians, pipe, background, final_ingp, beta, iteration, cfg_model, args,
+                        cameras=scene.getTrainCameras(), output_subdir='final_train_renders', metrics_file='train_metrics.txt')
 
-def prepare_output_and_logger(args, scene_name, yaml_file = ""):    
-    if not args.model_path:
+
+def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, 
+                        cameras, output_subdir, metrics_file, stride=1):
+    """Render images and compute metrics."""
+    
+    final_output_dir = os.path.join(scene.model_path, output_subdir)
+    os.makedirs(final_output_dir, exist_ok=True)
+    
+    if len(cameras) == 0:
+        print(f"[FINAL] No cameras available, skipping.")
+        return
+    
+    psnr_values = []
+    ssim_values = []
+    l1_values = []
+    rendered_indices = []
+    
+    with torch.no_grad():
+        for idx, viewpoint in enumerate(cameras):
+            if idx % stride != 0:
+                continue
+            
+            render_pkg = render(viewpoint, gaussians, pipe, background, 
+                              ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
+            
+            rendered = torch.clamp(render_pkg["render"], 0.0, 1.0)
+            gt = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+            
+            psnr_val = psnr(rendered, gt).mean().item()
+            ssim_val = ssim(rendered, gt).mean().item()
+            l1_val = l1_loss(rendered, gt).mean().item()
+            
+            psnr_values.append(psnr_val)
+            ssim_values.append(ssim_val)
+            l1_values.append(l1_val)
+            rendered_indices.append(idx)
+            
+            # Save images with consistent index naming
+            rendered_np = rendered.permute(1, 2, 0).cpu().numpy()
+            gt_np = gt.permute(1, 2, 0).cpu().numpy()
+            
+            save_img_u8(gt_np, os.path.join(final_output_dir, f"{idx:03d}_gt.png"))
+            save_img_u8(rendered_np, os.path.join(final_output_dir, f"{idx:03d}_render.png"))
+            
+            cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
+            print(f"[FINAL] Idx {idx:3d} ({cam_name}): PSNR={psnr_val:.2f} SSIM={ssim_val:.4f}")
+    
+    # Summary
+    avg_psnr = np.mean(psnr_values)
+    avg_ssim = np.mean(ssim_values)
+    avg_l1 = np.mean(l1_values)
+    
+    print(f"\n[FINAL] ════════════════════════════════════════")
+    print(f"[FINAL] Metrics ({len(psnr_values)} images):")
+    print(f"[FINAL]   Average PSNR: {avg_psnr:.2f} dB")
+    print(f"[FINAL]   Average SSIM: {avg_ssim:.4f}")
+    print(f"[FINAL]   Average L1:   {avg_l1:.6f}")
+    print(f"[FINAL] ════════════════════════════════════════")
+    print(f"[FINAL] Images saved to: {final_output_dir}")
+    
+    # Save metrics file in output root
+    metrics_path = os.path.join(scene.model_path, metrics_file)
+    with open(metrics_path, 'w') as f:
+        f.write(f"Final Evaluation (stride={stride})\n")
+        f.write(f"════════════════════════════════════════\n")
+        f.write(f"Images rendered: {len(psnr_values)}\n")
+        f.write(f"Average PSNR:    {avg_psnr:.2f} dB\n")
+        f.write(f"Average SSIM:    {avg_ssim:.4f}\n")
+        f.write(f"Average L1:      {avg_l1:.6f}\n\n")
+        f.write(f"Per-image results:\n")
+        f.write(f"{'Index':<10} {'PSNR (dB)':<12} {'SSIM':<12} {'L1':<12}\n")
+        f.write(f"{'-'*46}\n")
+        
+        for i, idx in enumerate(rendered_indices):
+            f.write(f"{idx:<10} {psnr_values[i]:>10.2f} {ssim_values[i]:>10.4f} {l1_values[i]:>12.6f}\n")
+    
+    print(f"[FINAL] Metrics saved to: {metrics_path}")
+
+
+def prepare_output_and_logger(dataset, scene_name, yaml_file="", args=None):
+    # Extract dataset and scene from source_path
+    # e.g., /path/to/nerf_synthetic/ficus -> dataset=nerf_synthetic, scene=ficus
+    source_parts = dataset.source_path.rstrip('/').split('/')
+    scene_from_path = source_parts[-1]  # e.g., "ficus"
+    dataset_name = source_parts[-2] if len(source_parts) > 1 else "unknown"  # e.g., "nerf_synthetic"
+    
+    if not dataset.model_path:
+        # If no model_path specified, create default name with timestamp
         if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
+            unique_str = os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
-
         now = datetime.datetime.now()
         time_str = now.strftime("-%m%d-%H%M")
-        exp_name = scene_name + time_str 
+        exp_name = scene_name + time_str
         if yaml_file != "":
             exp_name += '-' + yaml_file
-        
-        args.model_path = os.path.join("./output/", exp_name)
-        
-    # Set up output folder
-    print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+        dataset.model_path = os.path.join("./output/", exp_name)
+    else:
+        # User specified -m flag: organize as outputs/{dataset}/{scene}/{method}/{name}
+        run_name = dataset.model_path
+        run_name = run_name.lstrip('./').lstrip('/')
+        method = args.method if args and hasattr(args, 'method') else "baseline"
+        dataset.model_path = os.path.join("outputs", dataset_name, scene_from_path, method, run_name)
+    
+    print("Output folder: {}".format(dataset.model_path))
+    os.makedirs(dataset.model_path, exist_ok=True)
+    with open(os.path.join(dataset.model_path, "cfg_args"), 'w') as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(dataset))))
 
-    # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
+        tb_writer = SummaryWriter(dataset.model_path)
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
@@ -387,7 +577,6 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
         tb_writer.add_scalar('iter_time', elapsed, iteration)
         tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
 
-    # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
@@ -423,12 +612,7 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
         torch.cuda.empty_cache()
 
 def merge_cfg_to_args(args, cfg):
-    """Merge specific sections from config into args
-    Args:
-        args: ArgumentParser args
-        cfg: Config object from yaml
-    """
-    # Only flatten training_cfg, settings and loss sections
+    """Merge specific sections from config into args"""
     target_sections = ['training_cfg', 'settings', 'loss']
     
     for section in target_sections:
@@ -439,7 +623,6 @@ def merge_cfg_to_args(args, cfg):
                     setattr(args, k, v)
 
 if __name__ == "__main__":
-    # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -460,24 +643,27 @@ if __name__ == "__main__":
     parser.add_argument("--time_analysis", action="store_true")
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
+    
+    # Method argument - only baseline for now
+    parser.add_argument("--method", type=str, default="baseline",
+                        choices=["baseline"],
+                        help="Rendering method: 'baseline' (default NeST)")
 
     args = parser.parse_args(sys.argv[1:])
     
     print("Optimizing " + args.model_path)
+    print(f"Method: {args.method.upper()}")
 
     cfg_model = Config(args.yaml)
     merge_cfg_to_args(args, cfg_model)
 
     print("args: ", args)
 
-    # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, \
         args)
 
-    # All done
     print("\nTraining complete.")

@@ -80,6 +80,9 @@ class Scene:
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"), args = args)
+        elif hasattr(self.gaussians, '_loaded_from_checkpoint') and self.gaussians._loaded_from_checkpoint:
+            # Gaussians already loaded from warmup checkpoint, skip create_from_pcd
+            print(f"[Scene] Using pre-loaded Gaussians ({len(self.gaussians.get_xyz)} points)")
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, args = args)
 

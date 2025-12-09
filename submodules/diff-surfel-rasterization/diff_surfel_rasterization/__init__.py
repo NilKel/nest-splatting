@@ -32,8 +32,12 @@ def rasterize_gaussians(
     features,
     offsets,
     gridrange,
+    features_diffuse,
+    offsets_diffuse,
+    gridrange_diffuse,
     raster_settings,
-    hashgrid_settings
+    hashgrid_settings,
+    render_mode
 ):
     return _RasterizeGaussians.apply(
         means3D,
@@ -49,8 +53,12 @@ def rasterize_gaussians(
         features,
         offsets,
         gridrange,
+        features_diffuse,
+        offsets_diffuse,
+        gridrange_diffuse,
         raster_settings,
-        hashgrid_settings
+        hashgrid_settings,
+        render_mode
     )
 
 class _RasterizeGaussians(torch.autograd.Function):
@@ -70,8 +78,12 @@ class _RasterizeGaussians(torch.autograd.Function):
         features,
         offsets,
         gridrange,
+        features_diffuse,
+        offsets_diffuse,
+        gridrange_diffuse,
         raster_settings,
-        hashgrid_settings
+        hashgrid_settings,
+        render_mode
     ):
 
         start_event = torch.cuda.Event(enable_timing=True)
@@ -112,7 +124,11 @@ class _RasterizeGaussians(torch.autograd.Function):
             hashgrid_settings.S,
             hashgrid_settings.H,
             hashgrid_settings.align_corners,
-            hashgrid_settings.interpolation
+            hashgrid_settings.interpolation,
+            features_diffuse,
+            offsets_diffuse,
+            gridrange_diffuse,
+            render_mode
         )
 
         # Invoke C++/CUDA rasterizer
@@ -131,8 +147,10 @@ class _RasterizeGaussians(torch.autograd.Function):
         ctx.raster_settings = raster_settings
         ctx.hashgrid_settings = hashgrid_settings
         ctx.num_rendered = num_rendered
-    
+        ctx.render_mode = render_mode
+
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, homotrans, ap_level, features, offsets, gridrange, \
+            features_diffuse, offsets_diffuse, gridrange_diffuse, \
             depth, out_index, radii, sh, geomBuffer, binningBuffer, imgBuffer)
 
         # if raster_settings.record_transmittance :
@@ -150,7 +168,9 @@ class _RasterizeGaussians(torch.autograd.Function):
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
         hashgrid_settings = ctx.hashgrid_settings
+        render_mode = ctx.render_mode
         colors_precomp, means3D, scales, rotations, cov3Ds_precomp, homotrans, ap_level, features, offsets, gridrange, \
+            features_diffuse, offsets_diffuse, gridrange_diffuse, \
             depth, out_index, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
@@ -189,19 +209,23 @@ class _RasterizeGaussians(torch.autograd.Function):
                 hashgrid_settings.S,
                 hashgrid_settings.H,
                 hashgrid_settings.align_corners,
-                hashgrid_settings.interpolation)
+                hashgrid_settings.interpolation,
+                features_diffuse,
+                offsets_diffuse,
+                gridrange_diffuse,
+                render_mode)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum = _C.rasterize_gaussians_backward(*args)
+                grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum, grad_features_diffuse = _C.rasterize_gaussians_backward(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_bw.dump")
                 print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
                 raise ex
         else:
-            grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum = _C.rasterize_gaussians_backward(*args)
+            grad_features, grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_feat_sum, grad_features_diffuse = _C.rasterize_gaussians_backward(*args)
 
         grad_homotrans = None
 
@@ -217,10 +241,14 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_homotrans,
             grad_feat_sum,
             grad_features,
-            None,
-            None,
-            None,
-            None,
+            None,  # offsets
+            None,  # gridrange
+            grad_features_diffuse,
+            None,  # offsets_diffuse
+            None,  # gridrange_diffuse
+            None,  # raster_settings
+            None,  # hashgrid_settings
+            None,  # render_mode
         )
 
         return grads
@@ -266,10 +294,12 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, 
+    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None,
         cov3D_precomp = None, \
         homotrans = None, ap_level = None, \
-        features = None, offsets = None, gridrange = None):
+        features = None, offsets = None, gridrange = None, \
+        features_diffuse = None, offsets_diffuse = None, gridrange_diffuse = None, \
+        render_mode = 0):
         
         raster_settings = self.raster_settings
         hashgrid_settings = self.hashgrid_settings
@@ -302,7 +332,15 @@ class GaussianRasterizer(nn.Module):
         if offsets is None:
             offsets = torch.Tensor([]).int().cuda()
         if gridrange is None:
-            gridrange = torch.Tensor([]).cuda() 
+            gridrange = torch.Tensor([]).cuda()
+        
+        # For surface_rgb mode: second hashgrid for diffuse RGB
+        if features_diffuse is None:
+            features_diffuse = torch.Tensor([]).cuda()
+        if offsets_diffuse is None:
+            offsets_diffuse = torch.Tensor([]).int().cuda()
+        if gridrange_diffuse is None:
+            gridrange_diffuse = torch.Tensor([]).cuda()
         
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(
@@ -311,7 +349,7 @@ class GaussianRasterizer(nn.Module):
             shs,
             colors_precomp,
             opacities,
-            scales, 
+            scales,
             rotations,
             cov3D_precomp,
             homotrans,
@@ -319,7 +357,11 @@ class GaussianRasterizer(nn.Module):
             features,
             offsets,
             gridrange,
-            raster_settings, 
-            hashgrid_settings
+            features_diffuse,
+            offsets_diffuse,
+            gridrange_diffuse,
+            raster_settings,
+            hashgrid_settings,
+            render_mode
         )
 

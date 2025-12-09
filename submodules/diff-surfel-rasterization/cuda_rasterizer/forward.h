@@ -79,7 +79,12 @@ namespace FORWARD
 		float* out_others,
 		int* out_index,
 		float* cover_pixels, 
-		float* trans_avg);
+		float* trans_avg,
+		const uint32_t D_diffuse = 0,
+		const float* hash_features_diffuse = nullptr,
+		const int* level_offsets_diffuse = nullptr,
+		const float* gridrange_diffuse = nullptr,
+		const int render_mode = 0);
 }
 
 

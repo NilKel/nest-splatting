@@ -1,0 +1,9 @@
+running install
+running build
+running build_py
+creating build/lib.linux-x86_64-cpython-310/diff_surfel_rasterization
+copying diff_surfel_rasterization/__init__.py -> build/lib.linux-x86_64-cpython-310/diff_surfel_rasterization
+running build_ext
+building 'diff_surfel_rasterization._C' extension
+creating build/temp.linux-x86_64-cpython-310/cuda_rasterizer
+/usr/local/cuda/bin/nvcc -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include -I/home/nilkel/miniconda3/envs/nest_splatting/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/home/nilkel/miniconda3/envs/nest_splatting/include/python3.10 -c cuda_rasterizer/backward.cu -o build/temp.linux-x86_64-cpython-310/cuda_rasterizer/backward.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options '-fPIC' -I/home/nilkel/miniconda3/envs/nest_splatting/include -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C -gencode=arch=compute_120,code=compute_120 -gencode=arch=compute_120,code=sm_120 -std=c++17
