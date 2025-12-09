@@ -106,6 +106,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if 'xyz_gradient_accum' in ckpt:
             gaussians.xyz_gradient_accum = ckpt['xyz_gradient_accum'].cuda()
             gaussians.denom = ckpt['denom'].cuda()
+            if 'feat_gradient_accum' in ckpt:
+                gaussians.feat_gradient_accum = ckpt['feat_gradient_accum'].cuda()
         
         # Load gs_alpha masks for all cameras
         gs_alpha_masks = ckpt['gs_alpha_masks']
@@ -433,6 +435,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         'gs_alpha_masks': gs_alpha_masks,
                         # Densification state - needed for identical behavior
                         'xyz_gradient_accum': gaussians.xyz_gradient_accum.detach().cpu(),
+                        'feat_gradient_accum': gaussians.feat_gradient_accum.detach().cpu(),
                         'denom': gaussians.denom.detach().cpu(),
                     }
                     
