@@ -121,6 +121,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Initialize adaptive features to small random values
             adaptive_feats = torch.randn((gaussians.get_xyz.shape[0], gaussians._adaptive_feat_dim), device="cuda").float() * 0.01
             gaussians._adaptive_features = nn.Parameter(adaptive_feats.requires_grad_(True))
+        elif args.method == "adaptive_add":
+            # adaptive_add mode: per-Gaussian features + weight for blending with hashgrid
+            # Use total_levels from config (same as hashgrid)
+            num_levels = cfg_model.encoding.levels
+            per_level_dim = cfg_model.encoding.hashgrid.dim
+            gaussians._adaptive_feat_dim = num_levels * per_level_dim
+            gaussians._adaptive_num_levels = num_levels
+            
+            # Initialize gamma (blend weight) to 0.0 (sigmoid(0) = 0.5, equal blend)
+            gamma_init = torch.zeros((gaussians.get_xyz.shape[0], 1), device="cuda").float()
+            gaussians._gamma = nn.Parameter(gamma_init.requires_grad_(True))
+            
+            # Initialize adaptive features to small random values
+            adaptive_feats = torch.randn((gaussians.get_xyz.shape[0], gaussians._adaptive_feat_dim), device="cuda").float() * 0.01
+            gaussians._adaptive_features = nn.Parameter(adaptive_feats.requires_grad_(True))
+            
+            print(f"[ADAPTIVE_ADD MODE] Initialized {len(gaussians.get_xyz)} Gaussians")
+            print(f"[ADAPTIVE_ADD MODE] Per-Gaussian features: {gaussians._adaptive_feat_dim}D")
+            print(f"[ADAPTIVE_ADD MODE] Blend weight (gamma): 1D per Gaussian")
         else:
             gaussians._adaptive_feat_dim = 0
             gaussians._adaptive_num_levels = 0
@@ -766,31 +785,21 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
             
             # Cat mode decomposition: render with masked features
             if do_decomposition:
-                # Save original gaussian features
-                original_gaussian_features = gaussians._gaussian_features.data.clone()
-                
-                # NGP-only: zero out gaussian features
-                gaussians._gaussian_features.data.zero_()
+                # NGP-only: zero out per-Gaussian features, keep hashgrid
                 ngp_render_pkg = render(viewpoint, gaussians, pipe, background,
-                                       ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
+                                       ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                       decompose_mode='ngp_only')
                 ngp_rendered = torch.clamp(ngp_render_pkg["render"], 0.0, 1.0)
                 ngp_rendered_np = ngp_rendered.permute(1, 2, 0).cpu().numpy()
                 save_img_u8(ngp_rendered_np, os.path.join(ngp_output_dir, f"{idx:03d}_ngp.png"))
                 
-                # Restore gaussian features
-                gaussians._gaussian_features.data.copy_(original_gaussian_features)
-                
-                # Gaussian-only: temporarily disable hashgrid by setting active_hashgrid_levels to 0
-                original_active_hashgrid = ingp.active_hashgrid_levels
-                ingp.active_hashgrid_levels = 0
+                # Gaussian-only: zero out hashgrid features, keep per-Gaussian
                 gaussian_render_pkg = render(viewpoint, gaussians, pipe, background,
-                                            ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
+                                            ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                            decompose_mode='gaussian_only')
                 gaussian_rendered = torch.clamp(gaussian_render_pkg["render"], 0.0, 1.0)
                 gaussian_rendered_np = gaussian_rendered.permute(1, 2, 0).cpu().numpy()
                 save_img_u8(gaussian_rendered_np, os.path.join(gaussian_output_dir, f"{idx:03d}_gaussian.png"))
-                
-                # Restore hashgrid levels
-                ingp.active_hashgrid_levels = original_active_hashgrid
             
             cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
             print(f"[FINAL] Idx {idx:3d} ({cam_name}): PSNR={psnr_val:.2f} SSIM={ssim_val:.4f}")
@@ -948,10 +957,10 @@ if __name__ == "__main__":
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
     
-    # Method argument - baseline, cat, adaptive, diffuse, specular, diffuse_ngp, or diffuse_offset
+    # Method argument - baseline, cat, adaptive, adaptive_add, diffuse, specular, diffuse_ngp, or diffuse_offset
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "cat", "adaptive", "diffuse", "specular", "diffuse_ngp", "diffuse_offset"],
-                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'adaptive' (learnable per-Gaussian blend), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), or 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query)")
+                        choices=["baseline", "cat", "adaptive", "adaptive_add", "diffuse", "specular", "diffuse_ngp", "diffuse_offset"],
+                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), or 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query)")
     parser.add_argument("--hybrid_levels", type=int, default=3,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
     parser.add_argument("--lambda_adaptive", type=float, default=0.001,
@@ -979,6 +988,8 @@ if __name__ == "__main__":
         print(f"Diffuse+NGP mode: diffuse SH + hashgrid on unprojected expected depth")
     elif args.method == "diffuse_offset":
         print(f"Diffuse+Offset mode: diffuse SH as xyz offset, hashgrid MLP for final RGB")
+    elif args.method == "adaptive_add":
+        print(f"Adaptive Add mode: weighted sum of per-Gaussian features and hashgrid features")
 
     cfg_model = Config(args.yaml)
     merge_cfg_to_args(args, cfg_model)

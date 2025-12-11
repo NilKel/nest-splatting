@@ -21,11 +21,14 @@ import time
 from utils.general_utils import MEM_PRINT
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
-    beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False):
+    beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False, decompose_mode = None):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
+    
+    decompose_mode: None (normal), 'gaussian_only' (zero hashgrid features), 'ngp_only' (zero per-Gaussian features)
+                   Only used in cat mode for visualization/debugging.
     """
 
     render_start_time = time.time()
@@ -133,7 +136,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Adaptive mode detection
     is_adaptive_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_mode') and ingp.is_adaptive_mode
     
-    render_mode = 0  # 0 = baseline, 4 = cat, 6 = adaptive
+    # Adaptive_add mode detection (weighted sum of per-Gaussian and hashgrid features)
+    is_adaptive_add_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_add_mode') and ingp.is_adaptive_add_mode
+    
+    render_mode = 0  # 0 = baseline, 4 = cat, 6 = adaptive, 7 = adaptive_add
 
     if hash_in_CUDA:
         # Check if hashgrid is disabled (cat mode with hybrid_levels == total_levels)
@@ -204,6 +210,26 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             features = torch.zeros((1, ingp.level_dim), device="cuda")
             offsets = torch.zeros((1,), dtype=torch.int32, device="cuda")
             levels = 0
+        
+        # Adaptive_add mode: pass per-Gaussian features + weight to CUDA, blend in rasterizer
+        elif is_adaptive_add_mode and pc._adaptive_feat_dim > 0:
+            # Get per-Gaussian features (N, feat_dim) and gamma (N, 1)
+            adaptive_features = pc.get_adaptive_features  # (N, feat_dim)
+            gamma = pc.get_gamma  # (N, 1)
+            
+            # Compute weight from gamma: weight = sigmoid(gamma) in [0, 1]
+            weight = torch.sigmoid(gamma)  # (N, 1)
+            
+            # Concatenate features + weight: [feat_dim | 1] = (N, feat_dim + 1)
+            colors_precomp = torch.cat([adaptive_features, weight], dim=1)  # (N, feat_dim + 1)
+            shs = None
+            render_mode = 7  # adaptive_add mode
+            
+            # Encode levels for CUDA: (total_levels << 16) | (active_hashgrid_levels << 8)
+            # The weight is passed via colors_precomp, hashgrid is queried in CUDA
+            total_levels = ingp.levels
+            active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
+            levels = (total_levels << 16) | (active_hashgrid_levels << 8)
     
     # For diffuse/diffuse_ngp/diffuse_offset mode, use sh_degree=0 (only DC component)
     # For specular mode, use full active_sh_degree
@@ -425,6 +451,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         ray_map = ray_map * render_mask
 
         feature_vis = rendered_image[:3].detach().abs()
+        
+        # Cat mode decomposition: mask out features for visualization
+        if decompose_mode is not None and is_cat_mode and hybrid_levels > 0:
+            per_level_dim = ingp.level_dim
+            gaussian_feat_dim = hybrid_levels * per_level_dim
+            hashgrid_feat_dim = (ingp.levels - hybrid_levels) * per_level_dim
+            
+            if decompose_mode == 'gaussian_only':
+                # Zero out hashgrid features (last hashgrid_feat_dim channels)
+                rendered_image[gaussian_feat_dim:, :, :] = 0
+            elif decompose_mode == 'ngp_only':
+                # Zero out per-Gaussian features (first gaussian_feat_dim channels)
+                rendered_image[:gaussian_feat_dim, :, :] = 0
         
         rendered_image = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), rays_dir)
 
