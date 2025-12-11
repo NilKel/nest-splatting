@@ -283,6 +283,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     white_bg = torch.tensor([1, 1, 1], dtype=torch.float32, device="cuda")
     black_bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
     use_alternating_bg = args.method in ["diffuse_ngp", "diffuse_offset"]
+    
+    # Random background mode: use random per-pixel background during training for unbiased opacity
+    use_random_bg = args.random_background
+    if use_random_bg:
+        print("Using random per-pixel background during training (eval will use black background)")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -359,7 +364,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         # Alternate background color every 10 iterations for diffuse_ngp/diffuse_offset
         # This prevents Gaussians from hiding things with RGB instead of opacity
-        if use_alternating_bg:
+        if use_random_bg:
+            # Random background: pass black to renderer, apply random per-pixel bg afterward
+            current_bg = black_bg
+        elif use_alternating_bg:
             current_bg = white_bg if (iteration // 10) % 2 == 0 else black_bg
         else:
             current_bg = background
@@ -372,8 +380,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
         gt_image = viewpoint_cam.original_image.cuda()
         
+        # Apply random per-pixel background for unbiased opacity training
+        if use_random_bg:
+            H, W = image.shape[1], image.shape[2]
+            random_bg = torch.rand(3, H, W, device="cuda")
+            rend_alpha = render_pkg["rend_alpha"]
+            
+            # Apply random background to rendered image
+            image = image + (1.0 - rend_alpha) * random_bg
+            
+            # Apply same random background to GT image
+            gt_alpha_for_bg = viewpoint_cam.gt_alpha_mask.cuda().float() if cfg_model.settings.gt_alpha else (gt_image != 0).any(dim=0, keepdim=True).float()
+            gt_image = gt_image + (1.0 - gt_alpha_for_bg) * random_bg
         # Apply same background to GT image for consistent loss computation
-        if use_alternating_bg:
+        elif use_alternating_bg:
             gt_alpha_for_bg = viewpoint_cam.gt_alpha_mask.cuda().float() if cfg_model.settings.gt_alpha else (gt_image != 0).any(dim=0, keepdim=True).float()
             gt_image = gt_image + (1.0 - gt_alpha_for_bg) * current_bg.unsqueeze(-1).unsqueeze(-1)
             
@@ -646,16 +666,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Final test and train rendering with stride 1
     final_ingp = ingp_model if ingp_model is not None else ingp
     
+    # For random_background mode, use black background during evaluation
+    eval_background = black_bg if use_random_bg else background
+    
     print("\n" + "="*70)
     print(" "*20 + "FINAL TEST RENDERING")
     print("="*70)
-    render_final_images(scene, gaussians, pipe, background, final_ingp, beta, iteration, cfg_model, args, 
+    render_final_images(scene, gaussians, pipe, eval_background, final_ingp, beta, iteration, cfg_model, args, 
                         cameras=scene.getTestCameras(), output_subdir='final_test_renders', metrics_file='test_metrics.txt')
     
     print("\n" + "="*70)
     print(" "*20 + "FINAL TRAIN RENDERING")
     print("="*70)
-    render_final_images(scene, gaussians, pipe, background, final_ingp, beta, iteration, cfg_model, args,
+    render_final_images(scene, gaussians, pipe, eval_background, final_ingp, beta, iteration, cfg_model, args,
                         cameras=scene.getTrainCameras(), output_subdir='final_train_renders', metrics_file='train_metrics.txt')
 
 
@@ -888,6 +911,8 @@ if __name__ == "__main__":
                         help="Use rasterized xyz instead of unprojected depth (diffuse_ngp/diffuse_offset only)")
     parser.add_argument("--scout_lambda", type=float, default=0.01,
                         help="Weight for scout loss in diffuse_offset xyz mode (moves Gaussians toward offset target)")
+    parser.add_argument("--random_background", action="store_true",
+                        help="Use random per-pixel background during training for unbiased opacity learning. Eval uses black background.")
 
     args = parser.parse_args(sys.argv[1:])
     
