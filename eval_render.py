@@ -24,7 +24,7 @@ from utils.mesh_utils import GaussianExtractor, to_cam_open3d, post_process_mesh
 from utils.render_utils import generate_path, create_videos
 from hash_encoder.modules import INGP
 from hash_encoder.config import Config
-from utils.render_utils import save_img_u8
+from utils.render_utils import save_img_u8, convert_gray_to_cmap
 from lpipsPyTorch import lpips
 from train import merge_cfg_to_args
 
@@ -52,6 +52,10 @@ if __name__ == "__main__":
     parser.add_argument("--method", type=str, default="baseline",
                         choices=["baseline", "cat", "adaptive", "diffuse", "specular", "diffuse_ngp", "diffuse_offset"],
                         help="Rendering method (must match training)")
+    parser.add_argument("--hybrid_levels", type=int, default=3,
+                        help="Number of coarse levels to replace with per-Gaussian features (cat mode only, must match training)")
+    parser.add_argument("--eval_depth", action="store_true",
+                        help="Render and save depth maps (expected and median)")
     args = get_combined_args(parser)
 
     exp_path = args.model_path
@@ -166,6 +170,26 @@ if __name__ == "__main__":
                     # Non-diffuse_ngp mode: just save the render
                     img_name = os.path.join(test_renders, base_name + '.png')
                     save_img_u8(image.permute(1,2,0).detach().cpu().numpy(), img_name)
+                
+                # Save depth maps if --eval_depth is set
+                if args.eval_depth:
+                    depth_expected = render_pkg['depth_expected']  # (1, H, W)
+                    depth_median = render_pkg['depth_median']  # (1, H, W)
+                    
+                    # Convert to numpy for colormap
+                    depth_expected_np = depth_expected.squeeze(0).cpu().numpy()
+                    depth_median_np = depth_median.squeeze(0).cpu().numpy()
+                    
+                    # Save as colormapped images
+                    depth_expected_color = convert_gray_to_cmap(
+                        depth_expected_np, map_mode='turbo', revert=False
+                    )
+                    depth_median_color = convert_gray_to_cmap(
+                        depth_median_np, map_mode='turbo', revert=False
+                    )
+                    
+                    save_img_u8(depth_expected_color, os.path.join(test_renders, base_name + '_depth_expected.png'))
+                    save_img_u8(depth_median_color, os.path.join(test_renders, base_name + '_depth_median.png'))
 
     if not args.skip_mesh:
         gaussExtractor = GaussianExtractor(render, gaussians, pipe, background, ingp = ingp_model, \

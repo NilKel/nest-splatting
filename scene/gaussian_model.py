@@ -389,6 +389,10 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        # Add per-Gaussian features for cat mode
+        if self._gaussian_feat_dim > 0:
+            for i in range(self._gaussian_feat_dim):
+                l.append('gf_{}'.format(i))
         return l
 
     def save_ply(self, path):
@@ -405,7 +409,13 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        
+        # Include gaussian_features if present (cat mode)
+        if self._gaussian_feat_dim > 0:
+            gaussian_feats = self._gaussian_features.detach().cpu().numpy()
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, gaussian_feats), axis=1)
+        else:
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -465,6 +475,27 @@ class GaussianModel:
         self.active_sh_degree = self.max_sh_degree
 
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+        # Load per-Gaussian features for cat mode (if present in PLY and args specify cat mode)
+        gf_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("gf_")]
+        if len(gf_names) > 0:
+            gf_names = sorted(gf_names, key = lambda x: int(x.split('_')[-1]))
+            gaussian_feats = np.zeros((xyz.shape[0], len(gf_names)))
+            for idx, attr_name in enumerate(gf_names):
+                gaussian_feats[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            self._gaussian_feat_dim = len(gf_names)
+            self._gaussian_features = nn.Parameter(torch.tensor(gaussian_feats, dtype=torch.float, device="cuda").requires_grad_(True))
+            print(f"Loaded {self._gaussian_feat_dim}D per-Gaussian features for cat mode")
+        elif args is not None and hasattr(args, 'method') and args.method == "cat" and hasattr(args, 'hybrid_levels'):
+            # Cat mode but no features in PLY - initialize them (for old checkpoints)
+            per_level_dim = 4
+            self._gaussian_feat_dim = args.hybrid_levels * per_level_dim
+            gaussian_feats = torch.zeros((xyz.shape[0], self._gaussian_feat_dim), device="cuda").float()
+            self._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+            print(f"Warning: No per-Gaussian features in PLY, initialized {self._gaussian_feat_dim}D zeros for cat mode")
+        else:
+            self._gaussian_feat_dim = 0
+            self._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
         init_level = 6
         ap_level = init_level * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
