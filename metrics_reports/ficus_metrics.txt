@@ -1,0 +1,53 @@
+################################################################################
+#  SCENE: FICUS
+#  Generated: 2025-12-11 07:38:32
+#  Completed experiments: 17
+################################################################################
+
+================================================================================
+  TEST METRICS
+================================================================================
+Method       Name                                    PSNR     SSIM         L1   #Img
+--------------------------------------------------------------------------------
+baseline     exp1_baseline                          35.90   0.9876   0.004317    200
+baseline     retryingwarmcleanloadvarpath           35.71   0.9876   0.004446    200
+baseline     retryingwarmcleannoloadvarpath         35.93   0.9876   0.004292    200
+baseline     retryingwarmcleanyesloadvarpath        36.37   0.9882   0.004043    200
+baseline     retryingwarmcleanyesloadvarpathsan     35.65   0.9876   0.004494    200
+baseline     test_baseline_check                    36.20   0.9882   0.004142    200
+cat          c2ftest_3_levels                       35.98   0.9873   0.004297    200
+cat          exp1_cat0_0_levels                     36.07   0.9880   0.004220    200
+cat          exp1_cat1_1_levels                     36.41   0.9883   0.003976    200
+cat          exp1_cat2_2_levels                     35.79   0.9873   0.004401    200
+cat          exp1_cat3_3_levels                     36.21   0.9876   0.004107    200
+cat          exp1_cat4_4_levels                     36.16   0.9877   0.004151    200
+cat          exp1_cat5_5_levels                     36.32   0.9879   0.004057    200
+cat          exp1_cat6_6_levels                     36.13   0.9875   0.004180    200
+cat          retryingwarmcleanyesloadvarpathsan_3_levels    36.19   0.9877   0.004109    200
+cat          test_cat_padded_3_levels               36.02   0.9876   0.004191    200
+diffuse      c2ftest                                32.28   0.9763   0.006619    200
+================================================================================
+
+================================================================================
+  TRAIN METRICS
+================================================================================
+Method       Name                                    PSNR     SSIM         L1   #Img
+--------------------------------------------------------------------------------
+baseline     exp1_baseline                          38.09   0.9944   0.003288    100
+baseline     retryingwarmcleanloadvarpath           38.15   0.9946   0.003228    100
+baseline     retryingwarmcleannoloadvarpath         37.69   0.9940   0.003487    100
+baseline     retryingwarmcleanyesloadvarpath        38.92   0.9949   0.002894    100
+baseline     retryingwarmcleanyesloadvarpathsan     38.19   0.9945   0.003220    100
+baseline     test_baseline_check                    38.77   0.9950   0.002939    100
+cat          c2ftest_3_levels                       38.86   0.9949   0.002955    100
+cat          exp1_cat0_0_levels                     38.57   0.9948   0.003023    100
+cat          exp1_cat1_1_levels                     39.58   0.9955   0.002618    100
+cat          exp1_cat2_2_levels                     38.74   0.9950   0.003022    100
+cat          exp1_cat3_3_levels                     39.23   0.9951   0.002765    100
+cat          exp1_cat4_4_levels                     38.89   0.9948   0.002906    100
+cat          exp1_cat5_5_levels                     38.95   0.9947   0.002844    100
+cat          exp1_cat6_6_levels                     38.49   0.9939   0.003020    100
+cat          retryingwarmcleanyesloadvarpathsan_3_levels    39.20   0.9953   0.002818    100
+cat          test_cat_padded_3_levels               38.97   0.9952   0.002860    100
+diffuse      c2ftest                                32.01   0.9806   0.006258    100
+================================================================================

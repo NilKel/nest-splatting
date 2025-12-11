@@ -570,7 +570,7 @@ renderCUDAsurfelBackward(
 	float voxel_min = 0.0f;
 	float voxel_max = 0.0f;
 	if(level > 0){
-		// For hybrid_features (render_mode==4), level is encoded as:
+		// For hybrid_features (render_mode==4) and adaptive_add (render_mode==7), level is encoded as:
 		// (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 		// Decode to get actual hashgrid levels for offset copying
 		int actual_levels = level;
@@ -580,6 +580,10 @@ renderCUDAsurfelBackward(
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			int hybrid_levels = level & 0xFF;
 			actual_levels = active_hashgrid_levels;  // Use ACTIVE hashgrid levels for coarse-to-fine
+		} else if(render_mode == 7){
+			// adaptive_add mode: level = (total_levels << 16) | (active_hashgrid_levels << 8)
+			int active_hashgrid_levels = (level >> 8) & 0xFF;
+			actual_levels = active_hashgrid_levels;
 		} else if(level > 16){
 			printf("Error: level %d  > 16.", level);
 			return;
@@ -1025,6 +1029,89 @@ renderCUDAsurfelBackward(
 				atomicAdd(&(dL_dcolors[global_id * (2 * feat_dim) + i]), d_adaptive);
 				atomicAdd(&(dL_dcolors[global_id * (2 * feat_dim) + feat_dim + i]), d_mask);
 			}
+			
+			break;
+		}
+		case 7: {
+			// adaptive_add mode backward: weighted sum gradients
+			// Forward: feat = weight * per_gaussian + (1 - weight) * hashgrid
+			// Backward:
+			//   d_per_gaussian = weight * grad_feat
+			//   d_hashgrid = (1 - weight) * grad_feat
+			//   d_weight = sum(grad_feat * (per_gaussian - hashgrid))
+			
+			// Decode level parameter: (total_levels << 16) | (active_hashgrid_levels << 8)
+			const int total_levels = (level >> 16) & 0xFF;
+			const int active_hashgrid_levels = (level >> 8) & 0xFF;
+			const int feat_dim = total_levels * l_dim;
+			
+			// Read per-Gaussian features and weight from colors buffer
+			// Layout: [feat_dim features | 1 weight] = feat_dim + 1 total
+			const int colors_precomp_stride = feat_dim + 1;
+			const float* per_gaussian_data = &colors[global_id * colors_precomp_stride];
+			const float weight = per_gaussian_data[feat_dim];  // Already sigmoid'd
+			const float inv_weight = 1.0f - weight;
+			
+			// Query hashgrid at intersection point (needed for weight gradient)
+			float feat_hashgrid[16 * 4] = {0};
+			if (active_hashgrid_levels > 0) {
+				if(l_dim == 2) {
+					query_feature<false, 16 * 4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				} else if(l_dim == 4) {
+					query_feature<false, 16 * 4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				} else if(l_dim == 8) {
+					query_feature<false, 16 * 4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				} else if(l_dim == 12) {
+					query_feature<false, 16 * 4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				}
+			}
+			
+			// Compute scaled gradients for hashgrid backprop: grad_hash = (1 - weight) * grad_feat
+			float grad_hashgrid[16 * 4];
+			for(int i = 0; i < feat_dim && i < 64; i++) {
+				grad_hashgrid[i] = inv_weight * grad_feat[i];
+			}
+			
+			// Backprop to hashgrid with scaled gradients
+			if (active_hashgrid_levels > 0) {
+				if(l_dim == 2) {
+					query_feature<true, 16 * 4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+						grad_hashgrid, dL_dfeatures, dL_dxyz);
+				} else if(l_dim == 4) {
+					query_feature<true, 16 * 4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+						grad_hashgrid, dL_dfeatures, dL_dxyz);
+				} else if(l_dim == 8) {
+					query_feature<true, 16 * 4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+						grad_hashgrid, dL_dfeatures, dL_dxyz);
+				} else if(l_dim == 12) {
+					query_feature<true, 16 * 4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+						grad_hashgrid, dL_dfeatures, dL_dxyz);
+				}
+			}
+			
+			// Backprop to per-Gaussian features: d_per_gaussian = weight * grad_feat
+			// and compute d_weight = sum(grad_feat * (per_gaussian - hashgrid))
+			float d_weight = 0.0f;
+			for(int i = 0; i < feat_dim && i < 64; i++) {
+				float d_per_gaussian = weight * grad_feat[i];
+				atomicAdd(&(dL_dcolors[global_id * colors_precomp_stride + i]), d_per_gaussian);
+				
+				// Accumulate weight gradient
+				d_weight += grad_feat[i] * (per_gaussian_data[i] - feat_hashgrid[i]);
+			}
+			
+			// Backprop through sigmoid: d_gamma = d_weight * weight * (1 - weight)
+			// (sigmoid derivative: d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x)))
+			float d_gamma = d_weight * weight * inv_weight;
+			atomicAdd(&(dL_dcolors[global_id * colors_precomp_stride + feat_dim]), d_gamma);
 			
 			break;
 		}

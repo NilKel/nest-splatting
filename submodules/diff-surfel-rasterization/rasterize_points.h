@@ -52,8 +52,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& features_diffuse,
 	const torch::Tensor& offsets_diffuse,
 	const torch::Tensor& gridrange_diffuse,
-	const int render_mode,
-	const torch::Tensor& adaptive_mask);
+	const int render_mode);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
@@ -96,8 +95,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& features_diffuse,
 	const torch::Tensor& offsets_diffuse,
 	const torch::Tensor& gridrange_diffuse,
-	const int render_mode,
-	const torch::Tensor& adaptive_mask);
+	const int render_mode);
 		
 torch::Tensor markVisible(
 		torch::Tensor& means3D,

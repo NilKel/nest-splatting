@@ -1,0 +1,229 @@
+Found 8 experiments:
+  - baseline/exp1_baseline
+  - cat/exp1_cat0_0_levels
+  - cat/exp1_cat1_1_levels
+  - cat/exp1_cat2_2_levels
+  - cat/exp1_cat3_3_levels
+  - cat/exp1_cat4_4_levels
+  - cat/exp1_cat5_5_levels
+  - cat/exp1_cat6_6_levels
+
+====================================================================================================
+Top 2 Methods by PSNR for Each Image
+====================================================================================================
+Index    #1 Method                              PSNR1  #2 Method                              PSNR2
+----------------------------------------------------------------------------------------------------
+0        cat/exp1_cat5_5_levels                 39.20  cat/exp1_cat2_2_levels                 39.03
+1        cat/exp1_cat5_5_levels                 36.91  cat/exp1_cat3_3_levels                 36.88
+2        cat/exp1_cat2_2_levels                 33.69  cat/exp1_cat4_4_levels                 33.56
+3        cat/exp1_cat4_4_levels                 30.98  cat/exp1_cat3_3_levels                 30.72
+4        cat/exp1_cat5_5_levels                 36.32  cat/exp1_cat4_4_levels                 36.16
+5        cat/exp1_cat4_4_levels                 33.27  cat/exp1_cat3_3_levels                 32.80
+6        cat/exp1_cat2_2_levels                 40.54  cat/exp1_cat4_4_levels                 40.42
+7        cat/exp1_cat2_2_levels                 38.69  cat/exp1_cat3_3_levels                 38.53
+8        cat/exp1_cat6_6_levels                 34.97  cat/exp1_cat5_5_levels                 34.91
+9        cat/exp1_cat4_4_levels                 30.99  cat/exp1_cat3_3_levels                 30.83
+10       cat/exp1_cat1_1_levels                 39.61  cat/exp1_cat2_2_levels                 39.54
+11       cat/exp1_cat2_2_levels                 39.90  cat/exp1_cat5_5_levels                 39.90
+12       cat/exp1_cat3_3_levels                 38.44  cat/exp1_cat5_5_levels                 38.43
+13       cat/exp1_cat4_4_levels                 37.39  cat/exp1_cat5_5_levels                 37.23
+14       cat/exp1_cat5_5_levels                 40.08  cat/exp1_cat2_2_levels                 40.05
+15       cat/exp1_cat5_5_levels                 38.06  cat/exp1_cat3_3_levels                 38.03
+16       baseline/exp1_baseline                 36.78  cat/exp1_cat6_6_levels                 36.55
+17       cat/exp1_cat5_5_levels                 38.17  cat/exp1_cat4_4_levels                 38.08
+18       cat/exp1_cat4_4_levels                 39.20  cat/exp1_cat1_1_levels                 39.18
+19       cat/exp1_cat5_5_levels                 40.07  cat/exp1_cat2_2_levels                 40.03
+20       cat/exp1_cat3_3_levels                 38.89  cat/exp1_cat2_2_levels                 38.82
+21       cat/exp1_cat5_5_levels                 39.95  cat/exp1_cat4_4_levels                 39.86
+22       cat/exp1_cat3_3_levels                 39.66  cat/exp1_cat2_2_levels                 39.64
+23       cat/exp1_cat3_3_levels                 39.78  cat/exp1_cat1_1_levels                 39.67
+24       cat/exp1_cat5_5_levels                 38.10  cat/exp1_cat3_3_levels                 37.99
+25       cat/exp1_cat2_2_levels                 39.20  cat/exp1_cat4_4_levels                 39.11
+26       cat/exp1_cat4_4_levels                 40.36  cat/exp1_cat5_5_levels                 40.24
+27       cat/exp1_cat5_5_levels                 37.81  cat/exp1_cat2_2_levels                 37.67
+28       cat/exp1_cat4_4_levels                 39.94  cat/exp1_cat5_5_levels                 39.90
+29       cat/exp1_cat4_4_levels                 41.01  cat/exp1_cat1_1_levels                 40.90
+30       cat/exp1_cat3_3_levels                 32.11  cat/exp1_cat4_4_levels                 32.02
+31       cat/exp1_cat2_2_levels                 39.85  cat/exp1_cat5_5_levels                 39.84
+32       cat/exp1_cat4_4_levels                 39.28  cat/exp1_cat1_1_levels                 39.21
+33       cat/exp1_cat5_5_levels                 39.96  cat/exp1_cat2_2_levels                 39.76
+34       cat/exp1_cat5_5_levels                 39.95  cat/exp1_cat3_3_levels                 39.83
+35       cat/exp1_cat1_1_levels                 41.25  cat/exp1_cat4_4_levels                 41.18
+36       cat/exp1_cat2_2_levels                 38.47  cat/exp1_cat3_3_levels                 38.43
+37       cat/exp1_cat4_4_levels                 36.96  cat/exp1_cat5_5_levels                 36.83
+38       cat/exp1_cat4_4_levels                 39.96  cat/exp1_cat1_1_levels                 39.90
+39       cat/exp1_cat6_6_levels                 34.69  cat/exp1_cat5_5_levels                 34.61
+40       cat/exp1_cat0_0_levels                 36.81  cat/exp1_cat5_5_levels                 36.79
+41       cat/exp1_cat1_1_levels                 40.52  cat/exp1_cat4_4_levels                 40.52
+42       cat/exp1_cat5_5_levels                 40.20  cat/exp1_cat3_3_levels                 40.14
+43       cat/exp1_cat5_5_levels                 39.73  cat/exp1_cat3_3_levels                 39.61
+44       cat/exp1_cat5_5_levels                 38.04  cat/exp1_cat4_4_levels                 37.93
+45       cat/exp1_cat1_1_levels                 33.24  baseline/exp1_baseline                 32.95
+46       cat/exp1_cat4_4_levels                 38.81  cat/exp1_cat2_2_levels                 38.75
+47       baseline/exp1_baseline                 36.53  cat/exp1_cat6_6_levels                 36.39
+48       cat/exp1_cat4_4_levels                 36.90  cat/exp1_cat2_2_levels                 36.62
+49       cat/exp1_cat4_4_levels                 40.27  cat/exp1_cat1_1_levels                 40.24
+50       cat/exp1_cat5_5_levels                 39.01  cat/exp1_cat4_4_levels                 38.93
+51       cat/exp1_cat4_4_levels                 31.44  cat/exp1_cat3_3_levels                 31.13
+52       cat/exp1_cat3_3_levels                 37.43  cat/exp1_cat4_4_levels                 37.21
+53       cat/exp1_cat3_3_levels                 39.47  cat/exp1_cat2_2_levels                 39.33
+54       cat/exp1_cat0_0_levels                 37.14  cat/exp1_cat5_5_levels                 37.07
+55       cat/exp1_cat4_4_levels                 38.96  cat/exp1_cat5_5_levels                 38.91
+56       cat/exp1_cat4_4_levels                 38.74  cat/exp1_cat2_2_levels                 38.69
+57       cat/exp1_cat5_5_levels                 38.72  cat/exp1_cat2_2_levels                 38.47
+58       cat/exp1_cat2_2_levels                 33.47  cat/exp1_cat4_4_levels                 33.43
+59       cat/exp1_cat4_4_levels                 38.03  cat/exp1_cat5_5_levels                 37.85
+60       cat/exp1_cat5_5_levels                 39.03  cat/exp1_cat4_4_levels                 38.89
+61       cat/exp1_cat4_4_levels                 40.59  cat/exp1_cat1_1_levels                 40.38
+62       cat/exp1_cat1_1_levels                 30.96  cat/exp1_cat3_3_levels                 30.74
+63       baseline/exp1_baseline                 36.38  cat/exp1_cat5_5_levels                 36.30
+64       cat/exp1_cat2_2_levels                 33.12  cat/exp1_cat5_5_levels                 33.06
+65       cat/exp1_cat4_4_levels                 39.37  cat/exp1_cat2_2_levels                 39.16
+66       cat/exp1_cat4_4_levels                 40.78  cat/exp1_cat1_1_levels                 40.59
+67       cat/exp1_cat4_4_levels                 39.51  cat/exp1_cat3_3_levels                 39.48
+68       cat/exp1_cat5_5_levels                 37.78  cat/exp1_cat2_2_levels                 37.69
+69       baseline/exp1_baseline                 36.36  cat/exp1_cat5_5_levels                 36.36
+70       cat/exp1_cat4_4_levels                 39.60  cat/exp1_cat5_5_levels                 39.57
+71       cat/exp1_cat5_5_levels                 39.83  cat/exp1_cat2_2_levels                 39.73
+72       cat/exp1_cat3_3_levels                 40.01  cat/exp1_cat2_2_levels                 39.96
+73       cat/exp1_cat2_2_levels                 38.83  cat/exp1_cat4_4_levels                 38.77
+74       baseline/exp1_baseline                 37.28  cat/exp1_cat4_4_levels                 37.04
+75       cat/exp1_cat3_3_levels                 40.34  cat/exp1_cat2_2_levels                 40.29
+76       cat/exp1_cat5_5_levels                 38.82  cat/exp1_cat4_4_levels                 38.77
+77       cat/exp1_cat4_4_levels                 39.38  cat/exp1_cat1_1_levels                 39.31
+78       cat/exp1_cat5_5_levels                 36.37  baseline/exp1_baseline                 36.30
+79       cat/exp1_cat3_3_levels                 38.41  cat/exp1_cat2_2_levels                 38.39
+80       cat/exp1_cat5_5_levels                 37.71  cat/exp1_cat1_1_levels                 37.67
+81       cat/exp1_cat0_0_levels                 35.20  cat/exp1_cat2_2_levels                 35.08
+82       cat/exp1_cat4_4_levels                 39.01  cat/exp1_cat2_2_levels                 38.88
+83       cat/exp1_cat4_4_levels                 39.36  cat/exp1_cat1_1_levels                 39.23
+84       cat/exp1_cat4_4_levels                 39.20  cat/exp1_cat5_5_levels                 38.99
+85       cat/exp1_cat3_3_levels                 38.38  cat/exp1_cat5_5_levels                 38.36
+86       cat/exp1_cat4_4_levels                 36.97  cat/exp1_cat6_6_levels                 36.77
+87       cat/exp1_cat0_0_levels                 36.94  cat/exp1_cat3_3_levels                 36.88
+88       cat/exp1_cat0_0_levels                 37.32  cat/exp1_cat5_5_levels                 37.27
+89       cat/exp1_cat5_5_levels                 40.11  cat/exp1_cat3_3_levels                 40.05
+90       cat/exp1_cat5_5_levels                 38.10  cat/exp1_cat3_3_levels                 37.99
+91       cat/exp1_cat3_3_levels                 36.21  cat/exp1_cat4_4_levels                 36.04
+92       cat/exp1_cat3_3_levels                 38.10  cat/exp1_cat2_2_levels                 37.68
+93       cat/exp1_cat3_3_levels                 40.40  cat/exp1_cat2_2_levels                 40.33
+94       cat/exp1_cat4_4_levels                 39.20  cat/exp1_cat1_1_levels                 39.12
+95       cat/exp1_cat5_5_levels                 39.45  cat/exp1_cat3_3_levels                 39.27
+96       cat/exp1_cat4_4_levels                 37.34  cat/exp1_cat5_5_levels                 37.13
+97       cat/exp1_cat0_0_levels                 37.79  cat/exp1_cat5_5_levels                 37.68
+98       cat/exp1_cat4_4_levels                 34.21  cat/exp1_cat3_3_levels                 34.07
+99       cat/exp1_cat1_1_levels                 31.25  cat/exp1_cat3_3_levels                 31.22
+100      cat/exp1_cat2_2_levels                 37.36  cat/exp1_cat0_0_levels                 37.20
+101      cat/exp1_cat5_5_levels                 39.60  cat/exp1_cat3_3_levels                 39.54
+102      cat/exp1_cat4_4_levels                 38.98  cat/exp1_cat5_5_levels                 38.88
+103      cat/exp1_cat6_6_levels                 36.23  cat/exp1_cat5_5_levels                 36.16
+104      cat/exp1_cat3_3_levels                 40.21  cat/exp1_cat5_5_levels                 40.20
+105      cat/exp1_cat4_4_levels                 39.78  cat/exp1_cat1_1_levels                 39.69
+106      cat/exp1_cat3_3_levels                 39.50  cat/exp1_cat5_5_levels                 39.44
+107      cat/exp1_cat4_4_levels                 37.00  cat/exp1_cat5_5_levels                 36.73
+108      cat/exp1_cat2_2_levels                 38.78  cat/exp1_cat3_3_levels                 38.67
+109      cat/exp1_cat0_0_levels                 37.74  cat/exp1_cat1_1_levels                 37.67
+110      cat/exp1_cat2_2_levels                 33.95  cat/exp1_cat0_0_levels                 33.90
+111      cat/exp1_cat5_5_levels                 37.94  cat/exp1_cat3_3_levels                 37.87
+112      cat/exp1_cat5_5_levels                 37.28  cat/exp1_cat4_4_levels                 37.27
+113      baseline/exp1_baseline                 37.02  cat/exp1_cat6_6_levels                 36.71
+114      cat/exp1_cat4_4_levels                 40.33  cat/exp1_cat5_5_levels                 40.31
+115      cat/exp1_cat3_3_levels                 36.99  cat/exp1_cat0_0_levels                 36.66
+116      cat/exp1_cat3_3_levels                 40.15  cat/exp1_cat4_4_levels                 40.15
+117      cat/exp1_cat4_4_levels                 39.37  cat/exp1_cat1_1_levels                 39.24
+118      baseline/exp1_baseline                 37.40  cat/exp1_cat5_5_levels                 37.39
+119      cat/exp1_cat5_5_levels                 38.50  cat/exp1_cat2_2_levels                 38.45
+120      cat/exp1_cat3_3_levels                 39.64  cat/exp1_cat5_5_levels                 39.60
+121      cat/exp1_cat2_2_levels                 38.92  cat/exp1_cat3_3_levels                 38.74
+122      cat/exp1_cat0_0_levels                 37.74  cat/exp1_cat1_1_levels                 37.70
+123      cat/exp1_cat4_4_levels                 40.10  cat/exp1_cat1_1_levels                 39.85
+124      cat/exp1_cat5_5_levels                 37.83  cat/exp1_cat1_1_levels                 37.79
+125      cat/exp1_cat5_5_levels                 40.07  cat/exp1_cat3_3_levels                 40.06
+126      baseline/exp1_baseline                 37.52  cat/exp1_cat0_0_levels                 37.40
+127      cat/exp1_cat4_4_levels                 39.29  cat/exp1_cat1_1_levels                 39.18
+128      cat/exp1_cat3_3_levels                 39.03  cat/exp1_cat5_5_levels                 38.95
+129      cat/exp1_cat6_6_levels                 34.98  cat/exp1_cat5_5_levels                 34.88
+130      cat/exp1_cat4_4_levels                 39.97  cat/exp1_cat2_2_levels                 39.91
+131      cat/exp1_cat3_3_levels                 39.21  cat/exp1_cat5_5_levels                 39.20
+132      cat/exp1_cat3_3_levels                 39.28  cat/exp1_cat1_1_levels                 39.10
+133      cat/exp1_cat4_4_levels                 32.12  cat/exp1_cat3_3_levels                 31.69
+134      cat/exp1_cat5_5_levels                 37.78  cat/exp1_cat2_2_levels                 37.70
+135      cat/exp1_cat5_5_levels                 38.36  cat/exp1_cat2_2_levels                 38.35
+136      cat/exp1_cat5_5_levels                 38.15  cat/exp1_cat3_3_levels                 38.07
+137      cat/exp1_cat0_0_levels                 36.95  cat/exp1_cat5_5_levels                 36.95
+138      cat/exp1_cat0_0_levels                 37.68  cat/exp1_cat5_5_levels                 37.67
+139      cat/exp1_cat5_5_levels                 40.20  cat/exp1_cat3_3_levels                 40.14
+140      cat/exp1_cat4_4_levels                 37.19  cat/exp1_cat6_6_levels                 36.86
+141      cat/exp1_cat5_5_levels                 38.50  cat/exp1_cat3_3_levels                 38.44
+142      cat/exp1_cat5_5_levels                 38.10  cat/exp1_cat3_3_levels                 38.08
+143      cat/exp1_cat5_5_levels                 40.12  cat/exp1_cat3_3_levels                 40.10
+144      cat/exp1_cat5_5_levels                 37.83  cat/exp1_cat3_3_levels                 37.77
+145      cat/exp1_cat3_3_levels                 40.23  cat/exp1_cat4_4_levels                 40.16
+146      cat/exp1_cat5_5_levels                 37.20  baseline/exp1_baseline                 37.16
+147      cat/exp1_cat5_5_levels                 36.25  baseline/exp1_baseline                 36.17
+148      cat/exp1_cat4_4_levels                 38.78  cat/exp1_cat2_2_levels                 38.58
+149      cat/exp1_cat2_2_levels                 38.09  cat/exp1_cat5_5_levels                 38.07
+150      baseline/exp1_baseline                 37.26  cat/exp1_cat4_4_levels                 36.99
+151      cat/exp1_cat5_5_levels                 40.04  cat/exp1_cat2_2_levels                 39.99
+152      cat/exp1_cat4_4_levels                 39.17  cat/exp1_cat5_5_levels                 39.06
+153      cat/exp1_cat5_5_levels                 39.57  cat/exp1_cat4_4_levels                 39.42
+154      baseline/exp1_baseline                 36.52  cat/exp1_cat5_5_levels                 36.37
+155      cat/exp1_cat6_6_levels                 34.78  cat/exp1_cat5_5_levels                 34.66
+156      cat/exp1_cat5_5_levels                 39.72  cat/exp1_cat2_2_levels                 39.62
+157      cat/exp1_cat2_2_levels                 38.83  cat/exp1_cat5_5_levels                 38.69
+158      cat/exp1_cat6_6_levels                 36.69  cat/exp1_cat4_4_levels                 36.55
+159      cat/exp1_cat1_1_levels                 39.19  cat/exp1_cat5_5_levels                 39.13
+160      cat/exp1_cat3_3_levels                 40.45  cat/exp1_cat5_5_levels                 40.41
+161      cat/exp1_cat1_1_levels                 39.25  cat/exp1_cat4_4_levels                 39.21
+162      cat/exp1_cat5_5_levels                 36.84  cat/exp1_cat0_0_levels                 36.79
+163      cat/exp1_cat4_4_levels                 39.35  cat/exp1_cat1_1_levels                 39.29
+164      cat/exp1_cat5_5_levels                 38.34  cat/exp1_cat3_3_levels                 38.29
+165      cat/exp1_cat4_4_levels                 38.88  cat/exp1_cat5_5_levels                 38.83
+166      cat/exp1_cat5_5_levels                 40.03  cat/exp1_cat3_3_levels                 39.91
+167      cat/exp1_cat3_3_levels                 39.64  cat/exp1_cat2_2_levels                 39.62
+168      cat/exp1_cat1_1_levels                 33.05  cat/exp1_cat4_4_levels                 32.66
+169      cat/exp1_cat5_5_levels                 39.90  cat/exp1_cat3_3_levels                 39.88
+170      cat/exp1_cat5_5_levels                 39.35  cat/exp1_cat3_3_levels                 39.16
+171      cat/exp1_cat4_4_levels                 39.30  cat/exp1_cat5_5_levels                 39.13
+172      cat/exp1_cat5_5_levels                 37.15  cat/exp1_cat3_3_levels                 37.06
+173      cat/exp1_cat4_4_levels                 36.84  cat/exp1_cat5_5_levels                 36.71
+174      cat/exp1_cat5_5_levels                 39.79  cat/exp1_cat2_2_levels                 39.74
+175      cat/exp1_cat2_2_levels                 39.85  cat/exp1_cat5_5_levels                 39.85
+176      cat/exp1_cat2_2_levels                 33.29  cat/exp1_cat4_4_levels                 33.28
+177      cat/exp1_cat3_3_levels                 33.96  cat/exp1_cat4_4_levels                 33.81
+178      cat/exp1_cat3_3_levels                 39.38  cat/exp1_cat2_2_levels                 39.22
+179      cat/exp1_cat2_2_levels                 38.69  cat/exp1_cat3_3_levels                 38.57
+180      cat/exp1_cat4_4_levels                 35.81  cat/exp1_cat6_6_levels                 35.72
+181      cat/exp1_cat5_5_levels                 37.80  cat/exp1_cat3_3_levels                 37.75
+182      cat/exp1_cat0_0_levels                 37.48  cat/exp1_cat5_5_levels                 37.40
+183      cat/exp1_cat1_1_levels                 39.21  cat/exp1_cat3_3_levels                 39.20
+184      cat/exp1_cat4_4_levels                 39.76  cat/exp1_cat3_3_levels                 39.75
+185      cat/exp1_cat5_5_levels                 37.71  cat/exp1_cat2_2_levels                 37.58
+186      cat/exp1_cat4_4_levels                 39.27  cat/exp1_cat2_2_levels                 39.25
+187      cat/exp1_cat4_4_levels                 37.54  cat/exp1_cat5_5_levels                 37.41
+188      cat/exp1_cat2_2_levels                 39.75  cat/exp1_cat3_3_levels                 39.72
+189      cat/exp1_cat2_2_levels                 32.71  cat/exp1_cat4_4_levels                 32.51
+190      cat/exp1_cat3_3_levels                 40.19  cat/exp1_cat5_5_levels                 40.15
+191      cat/exp1_cat2_2_levels                 41.31  cat/exp1_cat3_3_levels                 41.21
+192      cat/exp1_cat2_2_levels                 39.84  cat/exp1_cat3_3_levels                 39.74
+193      cat/exp1_cat5_5_levels                 36.61  cat/exp1_cat3_3_levels                 36.56
+194      baseline/exp1_baseline                 37.49  cat/exp1_cat0_0_levels                 37.30
+195      cat/exp1_cat4_4_levels                 39.08  cat/exp1_cat2_2_levels                 38.93
+196      cat/exp1_cat4_4_levels                 40.26  cat/exp1_cat2_2_levels                 40.25
+197      cat/exp1_cat5_5_levels                 37.65  cat/exp1_cat0_0_levels                 37.64
+198      cat/exp1_cat3_3_levels                 40.27  cat/exp1_cat5_5_levels                 40.24
+199      cat/exp1_cat5_5_levels                 37.77  cat/exp1_cat3_3_levels                 37.63
+
+====================================================================================================
+Summary: Win counts (how many times each method was #1 or #2)
+====================================================================================================
+Method                                      #1 Wins    #2 Wins      Total
+----------------------------------------------------------------------
+cat/exp1_cat5_5_levels                           57         50        107
+cat/exp1_cat4_4_levels                           53         29         82
+cat/exp1_cat3_3_levels                           29         46         75
+cat/exp1_cat2_2_levels                           23         37         60
+cat/exp1_cat1_1_levels                           10         21         31
+cat/exp1_cat0_0_levels                           11          7         18
+baseline/exp1_baseline                           11          4         15
+cat/exp1_cat6_6_levels                            6          6         12

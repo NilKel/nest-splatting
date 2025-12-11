@@ -62,6 +62,8 @@ class INGP(nn.Module):
         
         # Store args for adaptive mode configuration
         self.is_adaptive_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive"
+        # Store args for adaptive_add mode configuration (weighted sum of per-Gaussian and hashgrid)
+        self.is_adaptive_add_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive_add"
         
         # Store args for diffuse mode configuration (per-Gaussian RGB, no viewdir, no hashgrid)
         self.is_diffuse_mode = args is not None and hasattr(args, 'method') and args.method == "diffuse"

@@ -317,6 +317,20 @@ class GaussianModel:
             # Initialize adaptive features to small random values
             adaptive_feats = torch.randn((self.get_xyz.shape[0], self._adaptive_feat_dim), device="cuda").float() * 0.01
             self._adaptive_features = nn.Parameter(adaptive_feats.requires_grad_(True))
+        elif hasattr(args, 'method') and args.method == "adaptive_add":
+            # adaptive_add mode: per-Gaussian features + weight for weighted blending
+            per_level_dim = 4
+            num_levels = getattr(args, 'adaptive_levels', 6)
+            self._adaptive_feat_dim = num_levels * per_level_dim
+            self._adaptive_num_levels = num_levels
+            
+            # Initialize gamma (blend weight) to 0.0 (sigmoid(0) = 0.5, equal blend)
+            gamma_init = torch.zeros((self.get_xyz.shape[0], 1), device="cuda").float()
+            self._gamma = nn.Parameter(gamma_init.requires_grad_(True))
+            
+            # Initialize adaptive features to small random values
+            adaptive_feats = torch.randn((self.get_xyz.shape[0], self._adaptive_feat_dim), device="cuda").float() * 0.01
+            self._adaptive_features = nn.Parameter(adaptive_feats.requires_grad_(True))
         else:
             self._adaptive_feat_dim = 0
             self._adaptive_num_levels = 0

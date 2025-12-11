@@ -952,6 +952,58 @@ renderCUDAsurfelForward(
 			
 			break;
 		}
+		case 7: {
+			// adaptive_add mode: weighted sum of per-Gaussian and hashgrid features
+			// rgb buffer: [N, feat_dim + 1] = [per-Gaussian features (feat_dim) | weight (1)]
+			// weight = sigmoid(gamma) in [0, 1], passed from Python
+			// Output: feat = weight * per_gaussian + (1 - weight) * hashgrid
+			
+			// Initialize feat array to zero
+			for(int i = 0; i < CHANNELS; i++) feat[i] = 0.0f;
+			
+			// Decode level parameter: (total_levels << 16) | (active_hashgrid_levels << 8)
+			const int total_levels = (level >> 16) & 0xFF;  // Extract bits 16-23
+			const int active_hashgrid_levels = (level >> 8) & 0xFF;  // Extract bits 8-15
+			const int feat_dim = total_levels * l_dim;  // e.g., 6 × 4 = 24D
+			
+			// Read per-Gaussian features and weight from rgb buffer
+			// Layout: [feat_dim features | 1 weight] = feat_dim + 1 total
+			int gauss_id = collected_id[j];
+			const int colors_precomp_stride = feat_dim + 1;  // per-Gaussian data size
+			const float* per_gaussian_data = &rgb[gauss_id * colors_precomp_stride];
+			
+			// Extract weight (last element)
+			const float weight = per_gaussian_data[feat_dim];  // Already sigmoid'd in Python
+			const float inv_weight = 1.0f - weight;
+			
+			// Query hashgrid at intersection point
+			float feat_hashgrid[16 * 4] = {0};
+			
+			if (active_hashgrid_levels > 0) {
+				if(l_dim == 2) {
+					query_feature<false, 16 * 4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				} else if(l_dim == 4) {
+					query_feature<false, 16 * 4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				} else if(l_dim == 8) {
+					query_feature<false, 16 * 4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				} else if(l_dim == 12) {
+					query_feature<false, 16 * 4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+						appearance_level, hash_features, active_hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				} else {
+					printf("FW unsupported level dim : %d\n", l_dim);
+				}
+			}
+			
+			// Weighted blend: feat = weight * per_gaussian + (1 - weight) * hashgrid
+			for(int i = 0; i < feat_dim && i < CHANNELS; i++) {
+				feat[i] = weight * per_gaussian_data[i] + inv_weight * feat_hashgrid[i];
+			}
+			
+			break;
+		}
 		case 1: {
 			// Surface mode with optional per-Gaussian baseline features
 			// Surface hashgrid: 12 features per level → dot product → 4 scalars per level

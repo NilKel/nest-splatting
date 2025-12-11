@@ -73,8 +73,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& features_diffuse,
 	const torch::Tensor& offsets_diffuse,
 	const torch::Tensor& gridrange_diffuse,
-	const int render_mode,
-	const torch::Tensor& adaptive_mask)
+	const int render_mode)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 	AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -166,6 +165,14 @@ RasterizeGaussiansCUDA(
 		// Output dimension is ALWAYS total_levels * D, same as baseline/cat mode
 		uint32_t num_levels = offsets.size(0) - 1;  // total_levels from hashgrid
 		C = num_levels * D;  // e.g., 6 × 4 = 24D (same as baseline)
+	}
+	else if(render_mode == 7) {
+		// Adaptive_add mode: weighted sum of per-Gaussian and hashgrid features
+		// Input: colors_precomp = [per-Gaussian features (total_levels×D) | weight (1)]
+		// Output: blended features (total_levels×D)
+		// Level encoding: (total_levels << 16) | (active_hashgrid_levels << 8)
+		uint32_t total_levels = Level >> 16;  // Extract bits 16-31
+		C = total_levels * D;  // e.g., 6 × 4 = 24D
 	}
 	else {
 		// Single hashgrid modes
@@ -308,8 +315,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& features_diffuse,
 	const torch::Tensor& offsets_diffuse,
 	const torch::Tensor& gridrange_diffuse,
-	const int render_mode
-	) 
+	const int render_mode) 
 {
 
   CHECK_INPUT(background);
@@ -384,6 +390,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 		uint32_t total_levels = Level >> 16;  // Extract bits 16-31
 		C = total_levels * D;  // e.g., 6 × 4 = 24D (constant regardless of active_levels)
 	}
+	else if(render_mode == 7) {
+		// Adaptive_add mode: weighted sum of per-Gaussian and hashgrid features
+		// Output dimension: total_levels×D
+		// Level encoding: (total_levels << 16) | (active_hashgrid_levels << 8)
+		uint32_t total_levels = Level >> 16;  // Extract bits 16-31
+		C = total_levels * D;  // e.g., 6 × 4 = 24D
+	}
 	else {
 	// Single hashgrid modes
 	// Determine output dimensions based on render_mode
@@ -418,6 +431,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
 //   torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
   // For hybrid_features (render_mode=4): dL_dcolors is hybrid_levels×D (per-Gaussian features only)
+  // For adaptive_add (render_mode=7): dL_dcolors is total_levels×D + 1 (features + weight)
   // For other modes: dL_dcolors is C-dimensional
   uint32_t colors_dim = C;
   if (render_mode == 4) {
@@ -425,6 +439,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	// Level encoding: (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 	uint32_t hybrid_levels = Level & 0xFF;  // Extract bits 0-7
 	colors_dim = hybrid_levels * D;  // e.g., 3 × 4 = 12D
+  } else if (render_mode == 7) {
+	// adaptive_add mode: colors_precomp = [per-Gaussian features (feat_dim) | weight (1)]
+	// Level encoding: (total_levels << 16) | (active_hashgrid_levels << 8)
+	uint32_t total_levels = Level >> 16;  // Extract bits 16-31
+	colors_dim = total_levels * D + 1;  // e.g., 6 × 4 + 1 = 25D
   }
   torch::Tensor dL_dcolors = torch::zeros({P, colors_dim}, means3D.options());
   torch::Tensor dL_dnormal = torch::zeros({P, 3}, means3D.options());
