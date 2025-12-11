@@ -689,6 +689,26 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     final_output_dir = os.path.join(scene.model_path, output_subdir)
     os.makedirs(final_output_dir, exist_ok=True)
     
+    # Create depth output directory
+    depth_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'depths'))
+    os.makedirs(depth_output_dir, exist_ok=True)
+    
+    # Check if cat mode decomposition should be done
+    is_cat_mode = (ingp is not None and hasattr(ingp, 'is_cat_mode') and ingp.is_cat_mode 
+                   and hasattr(args, 'hybrid_levels') and args.hybrid_levels > 0)
+    total_levels = ingp.levels if ingp is not None else 0
+    
+    # Skip decomposition if hybrid_levels is 0 or equals total_levels (no meaningful decomposition)
+    do_decomposition = is_cat_mode and args.hybrid_levels < total_levels
+    
+    if do_decomposition:
+        # Create directories for decomposed renders
+        ngp_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'ngp_only'))
+        gaussian_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'gaussian_only'))
+        os.makedirs(ngp_output_dir, exist_ok=True)
+        os.makedirs(gaussian_output_dir, exist_ok=True)
+        print(f"[FINAL] Cat mode decomposition enabled: saving NGP-only and Gaussian-only renders")
+    
     if len(cameras) == 0:
         print(f"[FINAL] No cameras available, skipping.")
         return
@@ -725,25 +745,52 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
             save_img_u8(gt_np, os.path.join(final_output_dir, f"{idx:03d}_gt.png"))
             save_img_u8(rendered_np, os.path.join(final_output_dir, f"{idx:03d}_render.png"))
             
-            # Save depth maps if --eval_depth is set
-            if hasattr(args, 'eval_depth') and args.eval_depth:
-                depth_expected = render_pkg['depth_expected']  # (1, H, W)
-                depth_median = render_pkg['depth_median']  # (1, H, W)
+            # Always save depth maps to separate folder
+            depth_expected = render_pkg['depth_expected']  # (1, H, W)
+            depth_median = render_pkg['depth_median']  # (1, H, W)
+            
+            # Convert to numpy for colormap
+            depth_expected_np = depth_expected.squeeze(0).cpu().numpy()
+            depth_median_np = depth_median.squeeze(0).cpu().numpy()
+            
+            # Save as colormapped images
+            depth_expected_color = convert_gray_to_cmap(
+                depth_expected_np, map_mode='turbo', revert=False
+            )
+            depth_median_color = convert_gray_to_cmap(
+                depth_median_np, map_mode='turbo', revert=False
+            )
+            
+            save_img_u8(depth_expected_color, os.path.join(depth_output_dir, f"{idx:03d}_depth_expected.png"))
+            save_img_u8(depth_median_color, os.path.join(depth_output_dir, f"{idx:03d}_depth_median.png"))
+            
+            # Cat mode decomposition: render with masked features
+            if do_decomposition:
+                # Save original gaussian features
+                original_gaussian_features = gaussians._gaussian_features.data.clone()
                 
-                # Convert to numpy for colormap
-                depth_expected_np = depth_expected.squeeze(0).cpu().numpy()
-                depth_median_np = depth_median.squeeze(0).cpu().numpy()
+                # NGP-only: zero out gaussian features
+                gaussians._gaussian_features.data.zero_()
+                ngp_render_pkg = render(viewpoint, gaussians, pipe, background,
+                                       ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
+                ngp_rendered = torch.clamp(ngp_render_pkg["render"], 0.0, 1.0)
+                ngp_rendered_np = ngp_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(ngp_rendered_np, os.path.join(ngp_output_dir, f"{idx:03d}_ngp.png"))
                 
-                # Save as colormapped images (convert_gray_to_cmap expects numpy array)
-                depth_expected_color = convert_gray_to_cmap(
-                    depth_expected_np, map_mode='turbo', revert=False
-                )
-                depth_median_color = convert_gray_to_cmap(
-                    depth_median_np, map_mode='turbo', revert=False
-                )
+                # Restore gaussian features
+                gaussians._gaussian_features.data.copy_(original_gaussian_features)
                 
-                save_img_u8(depth_expected_color, os.path.join(final_output_dir, f"{idx:03d}_depth_expected.png"))
-                save_img_u8(depth_median_color, os.path.join(final_output_dir, f"{idx:03d}_depth_median.png"))
+                # Gaussian-only: temporarily disable hashgrid by setting active_hashgrid_levels to 0
+                original_active_hashgrid = ingp.active_hashgrid_levels
+                ingp.active_hashgrid_levels = 0
+                gaussian_render_pkg = render(viewpoint, gaussians, pipe, background,
+                                            ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
+                gaussian_rendered = torch.clamp(gaussian_render_pkg["render"], 0.0, 1.0)
+                gaussian_rendered_np = gaussian_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(gaussian_rendered_np, os.path.join(gaussian_output_dir, f"{idx:03d}_gaussian.png"))
+                
+                # Restore hashgrid levels
+                ingp.active_hashgrid_levels = original_active_hashgrid
             
             cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
             print(f"[FINAL] Idx {idx:3d} ({cam_name}): PSNR={psnr_val:.2f} SSIM={ssim_val:.4f}")
@@ -760,6 +807,10 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     print(f"[FINAL]   Average L1:   {avg_l1:.6f}")
     print(f"[FINAL] ════════════════════════════════════════")
     print(f"[FINAL] Images saved to: {final_output_dir}")
+    print(f"[FINAL] Depth maps saved to: {depth_output_dir}")
+    if do_decomposition:
+        print(f"[FINAL] NGP-only renders saved to: {ngp_output_dir}")
+        print(f"[FINAL] Gaussian-only renders saved to: {gaussian_output_dir}")
     
     # Save metrics file in output root
     metrics_path = os.path.join(scene.model_path, metrics_file)
