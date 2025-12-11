@@ -73,6 +73,15 @@ class GaussianModel:
         self._adaptive_num_levels = 0
         self.temperature = 1.0
         self.min_temperature = 0.01
+        
+        # Diffuse mode flag (uses SH degree 0, no hashgrid)
+        self._diffuse_mode = False
+        # Specular mode flag (full 2DGS with SH, no hashgrid)
+        self._specular_mode = False
+        # Diffuse+NGP mode flag (diffuse SH + hashgrid on unprojected depth)
+        self._diffuse_ngp_mode = False
+        # Diffuse+Offset mode flag (diffuse SH as xyz offset for hashgrid query)
+        self._diffuse_offset_mode = False
 
         self.setup_functions()
 
@@ -102,7 +111,7 @@ class GaussianModel:
     def restore(self, model_args, training_args):
         # Handle multiple checkpoint formats
         if len(model_args) == 19:
-            # New format with adaptive mode
+            # Format with adaptive mode (no diffuse)
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
@@ -313,6 +322,9 @@ class GaussianModel:
             self._adaptive_num_levels = 0
             self._gamma = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             self._adaptive_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+        
+        # Diffuse mode flag (uses SH degree 0, no hashgrid)
+        self._diffuse_mode = hasattr(args, 'method') and args.method == "diffuse"
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -321,10 +333,20 @@ class GaussianModel:
 
         self.feat_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
+        # For diffuse mode, don't train features_rest (SH degree 0 only)
+        f_rest_lr = 0.0 if self._diffuse_mode else training_args.feature_lr / 20.0
+        
+        # For diffuse_offset mode, reduce learning rates for stability
+        f_dc_lr = training_args.feature_lr
+        xyz_lr_scale = 1.0
+        if self._diffuse_offset_mode:
+            f_dc_lr = training_args.feature_lr * 0.01  # 100x smaller for offset stability
+            xyz_lr_scale = 0.1  # 10x smaller for position stability (reduce overpruning)
+        
         l = [
-            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale * xyz_lr_scale, "name": "xyz"},
+            {'params': [self._features_dc], 'lr': f_dc_lr, "name": "f_dc"},
+            {'params': [self._features_rest], 'lr': f_rest_lr, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
@@ -339,10 +361,10 @@ class GaussianModel:
         if self._adaptive_feat_dim > 0:
             l.append({'params': [self._gamma], 'lr': training_args.opacity_lr, "name": "gamma"})
             l.append({'params': [self._adaptive_features], 'lr': training_args.feature_lr, "name": "adaptive_features"})
-
+        
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale*xyz_lr_scale,
+                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale*xyz_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
 
@@ -602,7 +624,7 @@ class GaussianModel:
         if self._adaptive_feat_dim > 0:
             new_gamma = self._gamma[selected_pts_mask].repeat(N,1)
             new_adaptive_features = self._adaptive_features[selected_pts_mask].repeat(N,1)
-
+        
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -634,7 +656,7 @@ class GaussianModel:
         if self._adaptive_feat_dim > 0:
             new_gamma = self._gamma[selected_pts_mask]
             new_adaptive_features = self._adaptive_features[selected_pts_mask]
-
+        
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, ap_update, act_level, densify_tag = True, prune_tag = True):

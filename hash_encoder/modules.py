@@ -63,11 +63,31 @@ class INGP(nn.Module):
         # Store args for adaptive mode configuration
         self.is_adaptive_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive"
         
-        self.build_encoding(cfg_model.encoding)
-        # MLP input is always total_levels * dim (buffer size is constant)
-        self.feat_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim # + 3
+        # Store args for diffuse mode configuration (per-Gaussian RGB, no viewdir, no hashgrid)
+        self.is_diffuse_mode = args is not None and hasattr(args, 'method') and args.method == "diffuse"
+        # Store args for specular mode configuration (full 2DGS with SH, no hashgrid)
+        self.is_specular_mode = args is not None and hasattr(args, 'method') and args.method == "specular"
+        # Store args for diffuse_ngp mode (diffuse SH + hashgrid on unprojected depth)
+        self.is_diffuse_ngp_mode = args is not None and hasattr(args, 'method') and args.method == "diffuse_ngp"
+        # Store args for diffuse_offset mode (diffuse SH as xyz offset for hashgrid query)
+        self.is_diffuse_offset_mode = args is not None and hasattr(args, 'method') and args.method == "diffuse_offset"
         
-        self.mlp_rgb = self.build_mlp(cfg_model.rgb, input_dim=self.feat_dim + view_enc_dir, output_dim = 3)
+        self.build_encoding(cfg_model.encoding)
+        
+        # Diffuse/Specular mode: no MLP needed, just SH-based RGB
+        if self.is_diffuse_mode or self.is_specular_mode:
+            self.feat_dim = 3  # RGB
+            self.mlp_rgb = None
+            self.view_dep = False  # View dependency handled by SH, not MLP
+        elif self.is_diffuse_ngp_mode or self.is_diffuse_offset_mode:
+            # Diffuse_ngp/diffuse_offset mode: need MLP for hashgrid decoding
+            # MLP input is hashgrid features + view encoding
+            self.feat_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim
+            self.mlp_rgb = self.build_mlp(cfg_model.rgb, input_dim=self.feat_dim + view_enc_dir, output_dim=3)
+        else:
+            # MLP input is always total_levels * dim (buffer size is constant)
+            self.feat_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim # + 3
+            self.mlp_rgb = self.build_mlp(cfg_model.rgb, input_dim=self.feat_dim + view_enc_dir, output_dim = 3)
         
         self.training_setup(cfg_model.optim)
 
@@ -88,11 +108,19 @@ class INGP(nn.Module):
         lr_spec = training_args.params.spec_lr
 
         l = []
-        # Only add hash_encoding if it exists (not disabled in cat mode)
+        # Only add hash_encoding if it exists (not disabled in cat mode or diffuse mode)
         if self.hash_encoding is not None:
             l.append({'params': self.hash_encoding.parameters(), 'lr': lr_encoding, "name": "hash_encoding"})
-        l.append({'params': self.mlp_rgb.parameters(), 'lr': lr_mlp_rgb, "name": "rgb_mlp"})
+        # Only add MLP if it exists (not diffuse mode)
+        if self.mlp_rgb is not None:
+            l.append({'params': self.mlp_rgb.parameters(), 'lr': lr_mlp_rgb, "name": "rgb_mlp"})
 
+        # For diffuse mode, create a dummy optimizer (no INGP params to optimize)
+        if len(l) == 0:
+            # Create a dummy parameter for the optimizer
+            self._dummy_param = nn.Parameter(torch.zeros(1, device="cuda"))
+            l.append({'params': [self._dummy_param], 'lr': 0.0, "name": "dummy"})
+        
         self.optimizer = torch.optim.Adam(l, betas=(0.9, 0.99), eps=1e-15)
 
     def build_encoding(self, cfg_encoding):
@@ -114,8 +142,42 @@ class INGP(nn.Module):
         self.level_dim = cfg_encoding.hashgrid.dim
         self.levels = num_levels_total  # Total levels (for MLP input size)
         
+        # Diffuse mode: no hashgrid at all, just per-Gaussian RGB (SH degree 0)
+        if self.is_diffuse_mode:
+            print(f'[DIFFUSE MODE] No hashgrid - using SH degree 0')
+            print(f'[DIFFUSE MODE] hash_in_cuda = False')
+            self.hash_encoding = None
+            self.hashgrid_disabled = True
+            self.hashgrid_levels = 0
+            self.resolutions = []
+            self.active_hashgrid_levels = 0
+            self.active_levels = 0
+            # Set coarse-to-fine params (not used but needed to avoid AttributeError)
+            self.level_mask = False
+            self.init_active_level = 0
+            self.step = 1000  # Dummy value, not used in diffuse mode
+            # For diffuse mode, feat_dim is 3 (RGB)
+            return 3
+        
+        # Specular mode: no hashgrid, full 2DGS with SH (view-dependent)
+        if self.is_specular_mode:
+            print(f'[SPECULAR MODE] No hashgrid - using full SH (2DGS style)')
+            print(f'[SPECULAR MODE] hash_in_cuda = False')
+            self.hash_encoding = None
+            self.hashgrid_disabled = True
+            self.hashgrid_levels = 0
+            self.resolutions = []
+            self.active_hashgrid_levels = 0
+            self.active_levels = 0
+            # Set coarse-to-fine params (not used but needed to avoid AttributeError)
+            self.level_mask = False
+            self.init_active_level = 0
+            self.step = 1000  # Dummy value, not used in specular mode
+            # For specular mode, feat_dim is 3 (RGB from SH)
+            return 3
+        
         # For cat mode: create hashgrid with only the finest (total - hybrid) levels
-        if self.is_cat_mode and self.hybrid_levels > 0:
+        elif self.is_cat_mode and self.hybrid_levels > 0:
             self.hashgrid_levels = num_levels_total - self.hybrid_levels
             
             if self.hashgrid_levels <= 0:
@@ -187,7 +249,11 @@ class INGP(nn.Module):
         encoding_dim = cfg_encoding.hashgrid.dim * cfg_encoding.levels
 
         self.level_mask = cfg_encoding.coarse2fine.enabled
-        print(f'If coarse2fine : {self.level_mask}')
+        # Diffuse_ngp/diffuse_offset: override C2F to disabled
+        if self.is_diffuse_ngp_mode or self.is_diffuse_offset_mode:
+            print(f'If coarse2fine : False (disabled for diffuse_ngp/diffuse_offset mode)')
+        else:
+            print(f'If coarse2fine : {self.level_mask}')
         if self.level_mask:
             self.init_active_level = cfg_encoding.coarse2fine.init_active_level
             self.step = cfg_encoding.coarse2fine.step
@@ -243,6 +309,10 @@ class INGP(nn.Module):
         return rgb
     
     def rgb_decode(self, features, ray_unit):
+        # Diffuse/Specular mode: features are already RGB from SH, just return them
+        if self.is_diffuse_mode or self.is_specular_mode:
+            return features
+        # Diffuse_ngp and baseline: decode features through MLP
         rgb = self.get_color(features, ray_unit)
         return rgb  
         
@@ -251,7 +321,19 @@ class INGP(nn.Module):
 
         anneal_levels = max((current_iter - self.initialize - self.warm_up) // self.step, 0)
         
-        if self.is_cat_mode and self.hybrid_levels > 0:
+        # Diffuse/Specular mode: no hashgrid levels, just SH
+        if self.is_diffuse_mode or self.is_specular_mode:
+            self.active_levels = 0
+            self.active_hashgrid_levels = 0
+            self.optim_gaussian = True
+            return 0
+        
+        # Diffuse_ngp/diffuse_offset mode: disable C2F, use all levels immediately
+        if self.is_diffuse_ngp_mode or self.is_diffuse_offset_mode:
+            self.active_levels = self.levels
+            self.active_hashgrid_levels = self.levels
+            # Skip C2F annealing - all levels active from start
+        elif self.is_cat_mode and self.hybrid_levels > 0:
             # Cat mode C2F:
             # - Per-Gaussian features: Always fully active (all hybrid_levels)
             # - Hashgrid: C2F from min(2, hashgrid_levels) → hashgrid_levels
@@ -269,6 +351,12 @@ class INGP(nn.Module):
         if current_iter >= self.switch_iter and current_iter < self.switch_iter + self.keep_geometry:
             self.optim_gaussian = False
         elif current_iter >= self.initialize and current_iter < self.initialize + self.warm_up:
+            self.optim_gaussian = False
+        elif self.is_diffuse_ngp_mode and current_iter < self.initialize + 2000:
+            # Diffuse_ngp mode: freeze gaussians for first 2k iterations, only train hashgrid
+            self.optim_gaussian = False
+        elif self.is_diffuse_offset_mode and current_iter < self.initialize + 1000:
+            # Diffuse_offset mode: freeze gaussians for first 1k iterations, only train hashgrid
             self.optim_gaussian = False
         else:
             self.optim_gaussian = True

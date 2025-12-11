@@ -49,6 +49,9 @@ if __name__ == "__main__":
     parser.add_argument("--unbounded", action="store_true", help='Mesh: using unbounded mode for meshing')
     parser.add_argument("--mesh_res", default=1024, type=int, help='Mesh: resolution for unbounded mesh extraction')
     parser.add_argument("--yaml", type=str, default = "tiny")
+    parser.add_argument("--method", type=str, default="baseline",
+                        choices=["baseline", "cat", "adaptive", "diffuse", "specular", "diffuse_ngp", "diffuse_offset"],
+                        help="Rendering method (must match training)")
     args = get_combined_args(parser)
 
     exp_path = args.model_path
@@ -59,7 +62,7 @@ if __name__ == "__main__":
     cfg_model = Config(yaml_file)
     merge_cfg_to_args(args, cfg_model)
 
-    ingp_model = INGP(cfg_model).to('cuda')
+    ingp_model = INGP(cfg_model, args=args).to('cuda')
     ingp_model.load_model(exp_path, iteration)
 
     dataset, pipe = model.extract(args), pipeline.extract(args)
@@ -115,20 +118,54 @@ if __name__ == "__main__":
         os.makedirs(test_renders, exist_ok = True)
         os.makedirs(test_gt, exist_ok = True)
         
+        # Check for diffuse_ngp/diffuse_offset mode
+        is_diffuse_ngp = hasattr(ingp_model, 'is_diffuse_ngp_mode') and ingp_model.is_diffuse_ngp_mode
+        is_diffuse_offset = hasattr(ingp_model, 'is_diffuse_offset_mode') and ingp_model.is_diffuse_offset_mode
+        
         viewpoint_stack = scene.getTestCameras().copy()
         with torch.no_grad():
             for cam in tqdm(viewpoint_stack):
-                cam_name = cam.image_name + '.png'
+                base_name = cam.image_name
                 render_pkg = render(cam, gaussians, pipe, background, ingp = ingp_model, \
                     beta = beta, iteration = iteration, cfg = cfg_model)
             
                 image = render_pkg["render"]
                 gt = cam.original_image
 
-                img_name = os.path.join(test_renders, cam_name)
-                save_img_u8(image.permute(1,2,0).detach().cpu().numpy(), img_name)
-                img_name = os.path.join(test_gt, cam_name)
+                # Save ground truth
+                img_name = os.path.join(test_gt, base_name + '.png')
                 save_img_u8(gt.permute(1,2,0).detach().cpu().numpy(), img_name)
+                
+                # Save diffuse_ngp outputs: combined, gaussian/offset, and ngp in same folder
+                if is_diffuse_ngp and 'gaussian_rgb' in render_pkg and 'ngp_rgb' in render_pkg:
+                    # Combined image (gaussian + ngp)
+                    img_name = os.path.join(test_renders, base_name + '_combined.png')
+                    save_img_u8(image.permute(1,2,0).detach().cpu().numpy(), img_name)
+                    # Gaussian RGB only
+                    gaussian_rgb = render_pkg['gaussian_rgb']
+                    img_name = os.path.join(test_renders, base_name + '_gaussian.png')
+                    save_img_u8(gaussian_rgb.permute(1,2,0).detach().cpu().numpy(), img_name)
+                    # NGP RGB only
+                    ngp_rgb = render_pkg['ngp_rgb']
+                    img_name = os.path.join(test_renders, base_name + '_ngp.png')
+                    save_img_u8(ngp_rgb.permute(1,2,0).detach().cpu().numpy(), img_name)
+                # Save diffuse_offset outputs: final rgb, offset, and ngp in same folder
+                elif is_diffuse_offset and 'gaussian_rgb' in render_pkg and 'ngp_rgb' in render_pkg:
+                    # Final RGB (from hashgrid MLP)
+                    img_name = os.path.join(test_renders, base_name + '.png')
+                    save_img_u8(image.permute(1,2,0).detach().cpu().numpy(), img_name)
+                    # Offset (rendered diffuse SH, used as xyz offset)
+                    offset_rgb = render_pkg['gaussian_rgb']
+                    img_name = os.path.join(test_renders, base_name + '_offset.png')
+                    save_img_u8(offset_rgb.permute(1,2,0).detach().cpu().numpy(), img_name)
+                    # NGP RGB (same as final in diffuse_offset mode)
+                    ngp_rgb = render_pkg['ngp_rgb']
+                    img_name = os.path.join(test_renders, base_name + '_ngp.png')
+                    save_img_u8(ngp_rgb.permute(1,2,0).detach().cpu().numpy(), img_name)
+                else:
+                    # Non-diffuse_ngp mode: just save the render
+                    img_name = os.path.join(test_renders, base_name + '.png')
+                    save_img_u8(image.permute(1,2,0).detach().cpu().numpy(), img_name)
 
     if not args.skip_mesh:
         gaussExtractor = GaussianExtractor(render, gaussians, pipe, background, ingp = ingp_model, \

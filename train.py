@@ -127,12 +127,110 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians._gamma = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             gaussians._adaptive_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
         
+        # Initialize diffuse mode: reinitialize SH from scratch with degree 0 only
+        if args.method == "diffuse":
+            gaussians._diffuse_mode = True
+            gaussians._specular_mode = False
+            gaussians._diffuse_ngp_mode = False
+            gaussians._diffuse_offset_mode = False
+            n_gaussians = len(gaussians.get_xyz)
+            
+            # Reinitialize features_dc to zeros (will be optimized)
+            # SH DC: rgb = sh * 0.28209 + 0.5, so sh=0 gives gray (0.5, 0.5, 0.5)
+            features_dc = torch.zeros((n_gaussians, 1, 3), device="cuda").float()
+            gaussians._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+            
+            # Zero out features_rest (not used with degree 0, but keep for compatibility)
+            features_rest = torch.zeros((n_gaussians, 15, 3), device="cuda").float()
+            gaussians._features_rest = nn.Parameter(features_rest.requires_grad_(False))
+            
+            # Set active_sh_degree to 0
+            gaussians.active_sh_degree = 0
+            
+            print(f"[DIFFUSE MODE] Initialized {n_gaussians} Gaussians with fresh SH degree 0")
+            print(f"[DIFFUSE MODE] features_dc: {gaussians._features_dc.shape} (trainable)")
+            print(f"[DIFFUSE MODE] features_rest: {gaussians._features_rest.shape} (frozen)")
+        
+        # Initialize specular mode: reinitialize full SH from scratch (2DGS style)
+        elif args.method == "specular":
+            gaussians._diffuse_mode = False
+            gaussians._specular_mode = True
+            gaussians._diffuse_ngp_mode = False
+            gaussians._diffuse_offset_mode = False
+            n_gaussians = len(gaussians.get_xyz)
+            
+            # Reinitialize features_dc to zeros
+            features_dc = torch.zeros((n_gaussians, 1, 3), device="cuda").float()
+            gaussians._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+            
+            # Reinitialize features_rest to zeros (will be trained)
+            features_rest = torch.zeros((n_gaussians, 15, 3), device="cuda").float()
+            gaussians._features_rest = nn.Parameter(features_rest.requires_grad_(True))
+            
+            # Start with active_sh_degree = 0, will increase during training
+            gaussians.active_sh_degree = 0
+            
+            print(f"[SPECULAR MODE] Initialized {n_gaussians} Gaussians with fresh SH (max degree 3)")
+            print(f"[SPECULAR MODE] features_dc: {gaussians._features_dc.shape} (trainable)")
+            print(f"[SPECULAR MODE] features_rest: {gaussians._features_rest.shape} (trainable)")
+        
+        # Initialize diffuse_ngp mode: diffuse SH + hashgrid on unprojected depth
+        elif args.method == "diffuse_ngp":
+            gaussians._diffuse_mode = False
+            gaussians._specular_mode = False
+            gaussians._diffuse_ngp_mode = True
+            gaussians._diffuse_offset_mode = False
+            n_gaussians = len(gaussians.get_xyz)
+            
+            # Reinitialize features_dc to zeros (diffuse component)
+            features_dc = torch.zeros((n_gaussians, 1, 3), device="cuda").float()
+            gaussians._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+            
+            # Zero out features_rest (not used with degree 0)
+            features_rest = torch.zeros((n_gaussians, 15, 3), device="cuda").float()
+            gaussians._features_rest = nn.Parameter(features_rest.requires_grad_(False))
+            
+            # Set active_sh_degree to 0 (diffuse only)
+            gaussians.active_sh_degree = 0
+            
+            print(f"[DIFFUSE_NGP MODE] Initialized {n_gaussians} Gaussians with fresh SH degree 0")
+            print(f"[DIFFUSE_NGP MODE] features_dc: {gaussians._features_dc.shape} (trainable)")
+            print(f"[DIFFUSE_NGP MODE] Hashgrid will be queried on unprojected expected depth")
+        
+        # Initialize diffuse_offset mode: diffuse SH as xyz offset for hashgrid query
+        elif args.method == "diffuse_offset":
+            gaussians._diffuse_mode = False
+            gaussians._specular_mode = False
+            gaussians._diffuse_ngp_mode = False
+            gaussians._diffuse_offset_mode = True
+            n_gaussians = len(gaussians.get_xyz)
+            
+            # Reinitialize features_dc to zeros (will be used as xyz offset)
+            features_dc = torch.zeros((n_gaussians, 1, 3), device="cuda").float()
+            gaussians._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+            
+            # Zero out features_rest (not used with degree 0)
+            features_rest = torch.zeros((n_gaussians, 15, 3), device="cuda").float()
+            gaussians._features_rest = nn.Parameter(features_rest.requires_grad_(False))
+            
+            # Set active_sh_degree to 0 (diffuse only)
+            gaussians.active_sh_degree = 0
+            
+            print(f"[DIFFUSE_OFFSET MODE] Initialized {n_gaussians} Gaussians with zero offsets")
+            print(f"[DIFFUSE_OFFSET MODE] features_dc: {gaussians._features_dc.shape} (trainable, used as xyz offset)")
+            print(f"[DIFFUSE_OFFSET MODE] Hashgrid queried at unprojected_xyz + rendered_offset")
+        else:
+            gaussians._diffuse_mode = False
+            gaussians._specular_mode = False
+            gaussians._diffuse_ngp_mode = False
+            gaussians._diffuse_offset_mode = False
+        
         # Setup optimizer (gaussian_features will be added to param groups if present)
         gaussians.training_setup(opt)
         
         # Load optimizer state from warmup checkpoint
-        # For cat/adaptive mode, new params won't be in saved state - they train from scratch
-        if args.method not in ["cat", "adaptive"]:
+        # For cat/adaptive/diffuse mode, new params won't be in saved state - they train from scratch
+        if args.method not in ["cat", "adaptive", "diffuse"]:
             gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
         
         # Move optimizer state to GPU
@@ -180,6 +278,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    
+    # For diffuse_ngp/diffuse_offset: prepare alternating backgrounds to prevent RGB hiding
+    white_bg = torch.tensor([1, 1, 1], dtype=torch.float32, device="cuda")
+    black_bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+    use_alternating_bg = args.method in ["diffuse_ngp", "diffuse_offset"]
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -253,12 +356,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         record_transmittance = if_pixel_densify_enhance & (iteration >= opt.pixel_densify_from_iter) & (iteration < opt.densify_until_iter)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, ingp = ingp, 
-            beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance)
+        
+        # Alternate background color every 10 iterations for diffuse_ngp/diffuse_offset
+        # This prevents Gaussians from hiding things with RGB instead of opacity
+        if use_alternating_bg:
+            current_bg = white_bg if (iteration // 10) % 2 == 0 else black_bg
+        else:
+            current_bg = background
+        
+        render_pkg = render(viewpoint_cam, gaussians, pipe, current_bg, ingp = ingp, 
+            beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance,
+            use_xyz_mode = args.use_xyz_mode)
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
     
         gt_image = viewpoint_cam.original_image.cuda()
+        
+        # Apply same background to GT image for consistent loss computation
+        if use_alternating_bg:
+            gt_alpha_for_bg = viewpoint_cam.gt_alpha_mask.cuda().float() if cfg_model.settings.gt_alpha else (gt_image != 0).any(dim=0, keepdim=True).float()
+            gt_image = gt_image + (1.0 - gt_alpha_for_bg) * current_bg.unsqueeze(-1).unsqueeze(-1)
+            
+            # Debug: save images at bg transition iterations to verify alternating works
+            debug_iters = [first_iter, first_iter + 9, first_iter + 10, first_iter + 19, first_iter + 20]
+            if iteration in debug_iters:
+                output_path = os.path.join(scene.model_path, 'training_output')
+                bg_str = "white" if current_bg[0] > 0.5 else "black"
+                save_img_u8(image.permute(1,2,0).detach().cpu().numpy(), 
+                           os.path.join(output_path, f'debug_iter{iteration}_render_{bg_str}.png'))
+                save_img_u8(gt_image.permute(1,2,0).detach().cpu().numpy(), 
+                           os.path.join(output_path, f'debug_iter{iteration}_gt_{bg_str}.png'))
 
         error_img = torch.abs(gt_image - image)
 
@@ -315,8 +442,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 mask = render_pkg['adaptive_mask']
                 adaptive_reg_loss = args.lambda_adaptive * (1.0 - mask).mean()
 
+        # Scout loss for diffuse_offset xyz mode: move Gaussians toward offset target
+        # This is the "Squad follows Scout" geometry loss
+        scout_loss = torch.tensor(0.0, device="cuda")
+        if args.method == "diffuse_offset" and args.use_xyz_mode and 'scout_loss_data' in render_pkg:
+            scout_data = render_pkg['scout_loss_data']
+            points_base = scout_data['points_base']  # (H*W, 3) - has gradients
+            points_target = scout_data['points_target']  # (H*W, 3) - detached
+            scout_mask = scout_data['render_mask'].view(-1)  # (H*W,)
+            
+            # MSE loss only where alpha > 0
+            diff = (points_base - points_target) ** 2  # (H*W, 3)
+            diff_masked = diff[scout_mask.bool()]  # Only valid pixels
+            if diff_masked.numel() > 0:
+                scout_loss = args.scout_lambda * diff_masked.mean()
+
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss
 
         total_loss.backward()
 
@@ -364,6 +506,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, pixels = pixels)
                 
                 prune_tag = (iteration % opacity_reset_interval >= opacity_reset_protect * densification_interval)
+                # Diffuse_offset mode: pause pruning for first 3k iterations after initialize
+                if args.method == "diffuse_offset" and iteration < cfg_model.ingp_stage.initialize + 3000:
+                    prune_tag = False
                 if iteration > opt.densify_from_iter and iteration % densification_interval == 0:
                     size_threshold = 20 if iteration > opacity_reset_interval else None
                     gaussians.densify_and_prune(densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold, \
@@ -557,6 +702,26 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
             save_img_u8(gt_np, os.path.join(final_output_dir, f"{idx:03d}_gt.png"))
             save_img_u8(rendered_np, os.path.join(final_output_dir, f"{idx:03d}_render.png"))
             
+            # Save depth maps if --eval_depth is set
+            if hasattr(args, 'eval_depth') and args.eval_depth:
+                depth_expected = render_pkg['depth_expected']  # (1, H, W)
+                depth_median = render_pkg['depth_median']  # (1, H, W)
+                
+                # Convert to numpy for colormap
+                depth_expected_np = depth_expected.squeeze(0).cpu().numpy()
+                depth_median_np = depth_median.squeeze(0).cpu().numpy()
+                
+                # Save as colormapped images (convert_gray_to_cmap expects numpy array)
+                depth_expected_color = convert_gray_to_cmap(
+                    depth_expected_np, map_mode='turbo', revert=False
+                )
+                depth_median_color = convert_gray_to_cmap(
+                    depth_median_np, map_mode='turbo', revert=False
+                )
+                
+                save_img_u8(depth_expected_color, os.path.join(final_output_dir, f"{idx:03d}_depth_expected.png"))
+                save_img_u8(depth_median_color, os.path.join(final_output_dir, f"{idx:03d}_depth_median.png"))
+            
             cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
             print(f"[FINAL] Idx {idx:3d} ({cam_name}): PSNR={psnr_val:.2f} SSIM={ssim_val:.4f}")
     
@@ -709,14 +874,20 @@ if __name__ == "__main__":
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
     
-    # Method argument - baseline, cat, or adaptive
+    # Method argument - baseline, cat, adaptive, diffuse, specular, diffuse_ngp, or diffuse_offset
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "cat", "adaptive"],
-                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), or 'adaptive' (learnable per-Gaussian blend)")
+                        choices=["baseline", "cat", "adaptive", "diffuse", "specular", "diffuse_ngp", "diffuse_offset"],
+                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'adaptive' (learnable per-Gaussian blend), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), or 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query)")
     parser.add_argument("--hybrid_levels", type=int, default=3,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
     parser.add_argument("--lambda_adaptive", type=float, default=0.001,
                         help="Regularization weight for adaptive mode to encourage per-Gaussian features")
+    parser.add_argument("--eval_depth", action="store_true",
+                        help="Render and save depth maps (expected and median) during final evaluation")
+    parser.add_argument("--use_xyz_mode", action="store_true",
+                        help="Use rasterized xyz instead of unprojected depth (diffuse_ngp/diffuse_offset only)")
+    parser.add_argument("--scout_lambda", type=float, default=0.01,
+                        help="Weight for scout loss in diffuse_offset xyz mode (moves Gaussians toward offset target)")
 
     args = parser.parse_args(sys.argv[1:])
     
@@ -724,6 +895,14 @@ if __name__ == "__main__":
     print(f"Method: {args.method.upper()}")
     if args.method == "cat":
         print(f"Hybrid levels: {args.hybrid_levels} (per-Gaussian features for coarse levels)")
+    elif args.method == "diffuse":
+        print(f"Diffuse mode: SH degree 0, no viewdir, no hashgrid")
+    elif args.method == "specular":
+        print(f"Specular mode: full 2DGS with SH (view-dependent), no hashgrid")
+    elif args.method == "diffuse_ngp":
+        print(f"Diffuse+NGP mode: diffuse SH + hashgrid on unprojected expected depth")
+    elif args.method == "diffuse_offset":
+        print(f"Diffuse+Offset mode: diffuse SH as xyz offset, hashgrid MLP for final RGB")
 
     cfg_model = Config(args.yaml)
     merge_cfg_to_args(args, cfg_model)

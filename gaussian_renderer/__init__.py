@@ -21,7 +21,7 @@ import time
 from utils.general_utils import MEM_PRINT
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
-    beta = 0, iteration = None, cfg = None, record_transmittance = False):
+    beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False):
     """
     Render the scene. 
     
@@ -76,17 +76,30 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     shs = None
     colors_precomp = None
     
+    # Diffuse mode: use 0-degree SH (just DC component = diffuse RGB), no hashgrid
+    is_diffuse_mode = ingp is not None and hasattr(ingp, 'is_diffuse_mode') and ingp.is_diffuse_mode
+    # Specular mode: full 2DGS with SH (view-dependent), no hashgrid
+    is_specular_mode = ingp is not None and hasattr(ingp, 'is_specular_mode') and ingp.is_specular_mode
+    # Diffuse_ngp mode: diffuse SH + hashgrid on unprojected depth
+    is_diffuse_ngp_mode = ingp is not None and hasattr(ingp, 'is_diffuse_ngp_mode') and ingp.is_diffuse_ngp_mode
+    # Diffuse_offset mode: diffuse SH as xyz offset for hashgrid query
+    is_diffuse_offset_mode = ingp is not None and hasattr(ingp, 'is_diffuse_offset_mode') and ingp.is_diffuse_offset_mode
+    
     hash_in_CUDA = True
     try:
         if ingp is None:
             hash_in_CUDA = False
         if iteration < cfg.ingp_stage.switch_iter:
             hash_in_CUDA = False
+        # Diffuse/Specular mode: never use hash_in_CUDA (no hashgrid)
+        # Diffuse_ngp/diffuse_offset: also don't use hash_in_CUDA (we query hashgrid in Python on unprojected depth)
+        if is_diffuse_mode or is_specular_mode or is_diffuse_ngp_mode or is_diffuse_offset_mode:
+            hash_in_CUDA = False
     except:
         pass
     
 
-    if ingp is not None and hash_in_CUDA == False:
+    if ingp is not None and hash_in_CUDA == False and not is_diffuse_mode and not is_specular_mode and not is_diffuse_ngp_mode and not is_diffuse_offset_mode:
         ### warm-up
         override_color = ingp(points_3D = means3D, with_xyz = False).float()
         feat_dim = ingp.active_levels * ingp.level_dim
@@ -167,28 +180,35 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 padded_offsets[:offsets.shape[0]] = offsets
                 offsets = padded_offsets
         
-        # Adaptive mode: pass ONLY per-Gaussian features (24D), compute mask in CUDA from gamma
+        # Adaptive mode: blend per-Gaussian and hashgrid features in Python, pass 24D to rasterizer
         elif is_adaptive_mode and pc._adaptive_feat_dim > 0:
-            # Get per-Gaussian features (total_levels * per_level_dim) = 24D
+            # Query hashgrid features for all Gaussians (24D)
+            xyz = pc.get_xyz  # (N, 3)
+            hash_features = ingp._encode_3D(xyz)  # (N, 24)
+            
+            # Get per-Gaussian features (24D)
             adaptive_features = pc.get_adaptive_features  # (N, 24)
             
-            # Pass per-Gaussian features as colors_precomp (24D, NOT concatenated with mask)
-            colors_precomp = adaptive_features
-            shs = None
-            render_mode = 6  # Adaptive blending mode
-            
-            # Use full hashgrid levels (total_levels from config)
-            levels = ingp.active_levels
-            
-            # Pad offsets to 17 elements (CUDA expects up to 16 levels + 1)
-            if offsets.shape[0] < 17:
-                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
-                padded_offsets[:offsets.shape[0]] = offsets
-                offsets = padded_offsets
-            
-            # Store mask for regularization loss (compute in Python for autograd)
+            # Compute soft mask from gamma (enables autograd for gamma)
             mask = pc.get_adaptive_mask(ingp.level_dim)  # (N, 24)
-            breakpoint()
+            
+            # Blend in Python: blended = mask * adaptive + (1-mask) * hash
+            blended_features = mask * adaptive_features + (1.0 - mask) * hash_features  # (N, 24)
+            
+            # Pass blended 24D features to rasterizer (same as baseline/cat mode)
+            colors_precomp = blended_features
+            shs = None
+            render_mode = 0  # Standard rendering with precomputed colors
+            
+            # Disable hashgrid query in CUDA since we already queried in Python
+            features = torch.zeros((1, ingp.level_dim), device="cuda")
+            offsets = torch.zeros((1,), dtype=torch.int32, device="cuda")
+            levels = 0
+    
+    # For diffuse/diffuse_ngp/diffuse_offset mode, use sh_degree=0 (only DC component)
+    # For specular mode, use full active_sh_degree
+    sh_degree_to_use = 0 if (is_diffuse_mode or is_diffuse_ngp_mode or is_diffuse_offset_mode) else pc.active_sh_degree
+    
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -198,7 +218,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
+        sh_degree=sh_degree_to_use,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=False,
@@ -272,7 +292,112 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # get contributed gaussians per pixel 
     render_gs_nums = allmap[7:8]
 
-    if ingp is not None:
+    # Diffuse_ngp mode: unproject median depth, query hashgrid, add to diffuse RGB
+    gaussian_rgb_diffuse_ngp = None
+    ngp_rgb_diffuse_ngp = None
+    if is_diffuse_ngp_mode and ingp is not None:
+        W, H = viewpoint_camera.image_width, viewpoint_camera.image_height
+        
+        # Store Gaussian RGB (diffuse SH) before adding NGP contribution
+        render_mask = (render_alpha > 0)
+        gaussian_rgb_diffuse_ngp = rendered_image.clone()
+        
+        # Unproject median depth to 3D points (detached - no gradient through depth)
+        points_3d, rays_d, rays_o = depths_to_points(viewpoint_camera, render_depth_median.detach())
+        # points_3d: (H*W, 3), rays_d: (H*W, 3)
+        
+        # Query hashgrid at unprojected 3D points
+        hash_features = ingp(points_3D=points_3d, with_xyz=False).float()  # (H*W, feat_dim)
+        
+        # Get view direction for MLP
+        ray_unit = torch_F.normalize(rays_d, dim=-1).float()
+        
+        # Decode through MLP to get view-dependent RGB
+        ngp_rgb = ingp.rgb_decode(hash_features, ray_unit)  # (H*W, 3)
+        ngp_rgb = ngp_rgb.view(H, W, 3).permute(2, 0, 1)  # (3, H, W)
+        
+        # Apply alpha mask
+        ngp_rgb = ngp_rgb * render_mask
+        
+        # Store NGP RGB separately
+        ngp_rgb_diffuse_ngp = ngp_rgb.clone()
+        
+        # Add NGP contribution to diffuse SH RGB
+        rendered_image = rendered_image + ngp_rgb
+    
+    # Diffuse_offset mode: use rendered diffuse SH as xyz offset, query hashgrid at offset position
+    # Implements "Scout and Squad" strategy for clean gradient flow
+    scout_loss_data = None
+    if is_diffuse_offset_mode and ingp is not None:
+        W, H = viewpoint_camera.image_width, viewpoint_camera.image_height
+        render_mask = (render_alpha > 0)
+        
+        # rendered_image contains the diffuse SH output (3, H, W) - this is the offset (Delta_P)
+        # SH to RGB conversion is: rgb = sh * 0.28209 + 0.5, so we need to subtract 0.5 to center at 0
+        # Reshape to (H*W, 3) for adding to xyz
+        offset_3d_raw = rendered_image.permute(1, 2, 0).reshape(-1, 3) - 0.5  # (H*W, 3), centered at 0
+        # Clamp offset to [-0.1, 0.1] to prevent large displacements
+        offset_3d = torch.clamp(offset_3d_raw, -0.1, 0.1)
+        
+        # Store the offset for visualization (unclamped, but centered)
+        gaussian_rgb_diffuse_ngp = rendered_image.clone() - 0.5
+        
+        if use_xyz_mode:
+            # XYZ MODE: Use rasterized xyz directly from allmap[8:11]
+            
+            # P_base: rasterized Gaussian positions (alpha-blended)
+            render_xyz = allmap[8:11]  # (3, H, W)
+            
+            # For RGB loss: detach P_base so gradients only flow through offset
+            points_3d_base_detached = render_xyz.permute(1, 2, 0).reshape(-1, 3).detach()  # (H*W, 3)
+            
+            # P_query = P_base.detach() + Delta_P (offset has grads for RGB loss)
+            points_3d_query = points_3d_base_detached + offset_3d  # (H*W, 3)
+            
+            # For scout loss: DON'T detach P_base - we need gradients to move Gaussians
+            # scout_loss = MSE(P_base, P_target) where P_target = (P_base + offset).detach()
+            # This pulls Gaussians toward where the offset found the surface
+            points_3d_base_with_grad = render_xyz.permute(1, 2, 0).reshape(-1, 3)  # (H*W, 3), has grads
+            points_3d_target = points_3d_query.detach()  # (H*W, 3), detached
+            
+            scout_loss_data = {
+                'points_base': points_3d_base_with_grad,  # Has gradients for Gaussian positions
+                'points_target': points_3d_target,  # Detached target
+                'render_mask': render_mask,  # Only compute loss where alpha > 0
+            }
+            
+            # Get view direction from camera
+            rays_d, rays_o = cam2rays(viewpoint_camera)
+        else:
+            # DEPTH MODE: Unproject median depth to 3D points
+            points_3d, rays_d, rays_o = depths_to_points(viewpoint_camera, render_depth_median.detach())
+            # points_3d: (H*W, 3), rays_d: (H*W, 3)
+            
+            # Add offset to unprojected xyz (offset has gradients, points_3d is detached)
+            points_3d_query = points_3d.detach() + offset_3d  # (H*W, 3)
+        
+        # Query hashgrid at query points
+        hash_features = ingp(points_3D=points_3d_query, with_xyz=False).float()  # (H*W, feat_dim)
+        
+        # Get view direction for MLP
+        ray_unit = torch_F.normalize(rays_d, dim=-1).float()
+        
+        # Decode through MLP to get final RGB
+        final_rgb = ingp.rgb_decode(hash_features, ray_unit)  # (H*W, 3)
+        final_rgb = final_rgb.view(H, W, 3).permute(2, 0, 1)  # (3, H, W)
+        
+        # Apply alpha mask
+        final_rgb = final_rgb * render_mask
+        
+        # Store NGP RGB separately (this is the final output in diffuse_offset mode)
+        ngp_rgb_diffuse_ngp = final_rgb.clone()
+        
+        # Final RGB is purely from hashgrid MLP (not additive like diffuse_ngp)
+        rendered_image = final_rgb
+    
+    # Diffuse/Specular mode: no MLP decoding needed, rendered_image is already RGB from SH
+    # Baseline mode: decode hashgrid features through MLP
+    elif ingp is not None and not is_diffuse_mode and not is_specular_mode and not is_diffuse_ngp_mode and not is_diffuse_offset_mode:
         # if hash_in_CUDA:
         rays_d, rays_o = cam2rays(viewpoint_camera)
         W, H = viewpoint_camera.image_width, viewpoint_camera.image_height
@@ -300,7 +425,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         ray_map = ray_map * render_mask
 
         feature_vis = rendered_image[:3].detach().abs()
-        breakpoint()
+        
         rendered_image = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), rays_dir)
 
         rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
@@ -333,11 +458,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'surf_depth': surf_depth,
             'surf_normal': surf_normal,
             'gaussian_num' : render_gs_nums,
+            'depth_expected': render_depth_expected,
+            'depth_median': render_depth_median,
     })
+    
+    # Add diffuse_ngp mode separate RGB outputs
+    if gaussian_rgb_diffuse_ngp is not None:
+        rets['gaussian_rgb'] = gaussian_rgb_diffuse_ngp
+    if ngp_rgb_diffuse_ngp is not None:
+        rets['ngp_rgb'] = ngp_rgb_diffuse_ngp
+    
+    # Add scout loss data for diffuse_offset xyz mode
+    if scout_loss_data is not None:
+        rets['scout_loss_data'] = scout_loss_data
     
     # Add adaptive mask for regularization loss (if in adaptive mode)
     if is_adaptive_mode and pc._adaptive_feat_dim > 0:
         rets['adaptive_mask'] = mask  # (N, feat_dim)
     
     return rets
-    
