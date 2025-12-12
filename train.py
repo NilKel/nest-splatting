@@ -1037,6 +1037,8 @@ if __name__ == "__main__":
                         help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), or 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query)")
     parser.add_argument("--hybrid_levels", type=int, default=3,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
+    parser.add_argument("--disable_c2f", action="store_true",
+                        help="Disable coarse-to-fine for cat mode (all levels active from start)")
     parser.add_argument("--lambda_adaptive", type=float, default=0.001,
                         help="Regularization weight for adaptive mode to encourage per-Gaussian features")
     parser.add_argument("--eval_depth", action="store_true",
@@ -1054,6 +1056,8 @@ if __name__ == "__main__":
     print(f"Method: {args.method.upper()}")
     if args.method == "cat":
         print(f"Hybrid levels: {args.hybrid_levels} (per-Gaussian features for coarse levels)")
+        if args.disable_c2f:
+            print(f"C2F disabled: all levels active from start")
     elif args.method == "diffuse":
         print(f"Diffuse mode: SH degree 0, no viewdir, no hashgrid")
     elif args.method == "specular":

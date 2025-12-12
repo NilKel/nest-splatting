@@ -59,6 +59,7 @@ class INGP(nn.Module):
         self.args = args
         self.is_cat_mode = args is not None and hasattr(args, 'method') and args.method == "cat"
         self.hybrid_levels = args.hybrid_levels if self.is_cat_mode and hasattr(args, 'hybrid_levels') else 0
+        self.disable_c2f = args is not None and hasattr(args, 'disable_c2f') and args.disable_c2f
         
         # Store args for adaptive mode configuration
         self.is_adaptive_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive"
@@ -340,13 +341,17 @@ class INGP(nn.Module):
             # - Per-Gaussian features: Always fully active (all hybrid_levels)
             # - Hashgrid: Start with 0 levels if hybrid_levels >= init_active_level, then C2F to hashgrid_levels
             # This ensures Gaussians train alone first, then hashgrid is gradually added
-            if self.hybrid_levels >= self.init_active_level:
+            if self.disable_c2f:
+                # C2F disabled: all hashgrid levels active from start
+                self.active_hashgrid_levels = self.hashgrid_levels
+            elif self.hybrid_levels >= self.init_active_level:
                 # Gaussian features cover the "coarse" levels, start hashgrid from 0
                 init_hashgrid_levels = 0
+                self.active_hashgrid_levels = min(self.hashgrid_levels, anneal_levels + init_hashgrid_levels)
             else:
                 # hybrid_levels < init_active_level: start with some hashgrid levels
                 init_hashgrid_levels = min(self.init_active_level - self.hybrid_levels, self.hashgrid_levels)
-            self.active_hashgrid_levels = min(self.hashgrid_levels, anneal_levels + init_hashgrid_levels)
+                self.active_hashgrid_levels = min(self.hashgrid_levels, anneal_levels + init_hashgrid_levels)
             # active_levels represents total active output levels (for MLP input size tracking)
             self.active_levels = self.hybrid_levels + self.active_hashgrid_levels
         else:
