@@ -338,8 +338,14 @@ class INGP(nn.Module):
         elif self.is_cat_mode and self.hybrid_levels > 0:
             # Cat mode C2F:
             # - Per-Gaussian features: Always fully active (all hybrid_levels)
-            # - Hashgrid: C2F from min(2, hashgrid_levels) → hashgrid_levels
-            init_hashgrid_levels = min(self.init_active_level, self.hashgrid_levels)
+            # - Hashgrid: Start with 0 levels if hybrid_levels >= init_active_level, then C2F to hashgrid_levels
+            # This ensures Gaussians train alone first, then hashgrid is gradually added
+            if self.hybrid_levels >= self.init_active_level:
+                # Gaussian features cover the "coarse" levels, start hashgrid from 0
+                init_hashgrid_levels = 0
+            else:
+                # hybrid_levels < init_active_level: start with some hashgrid levels
+                init_hashgrid_levels = min(self.init_active_level - self.hybrid_levels, self.hashgrid_levels)
             self.active_hashgrid_levels = min(self.hashgrid_levels, anneal_levels + init_hashgrid_levels)
             # active_levels represents total active output levels (for MLP input size tracking)
             self.active_levels = self.hybrid_levels + self.active_hashgrid_levels
@@ -353,7 +359,12 @@ class INGP(nn.Module):
         if current_iter >= self.switch_iter and current_iter < self.switch_iter + self.keep_geometry:
             self.optim_gaussian = False
         elif current_iter >= self.initialize and current_iter < self.initialize + self.warm_up:
-            self.optim_gaussian = False
+            # Cat mode: never freeze Gaussians during warm-up
+            # Per-Gaussian features need to train from the start since they handle coarse levels
+            if self.is_cat_mode:
+                self.optim_gaussian = True
+            else:
+                self.optim_gaussian = False
         elif self.is_diffuse_ngp_mode and current_iter < self.initialize + 2000:
             # Diffuse_ngp mode: freeze gaussians for first 2k iterations, only train hashgrid
             self.optim_gaussian = False
