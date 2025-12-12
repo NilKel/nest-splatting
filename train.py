@@ -17,7 +17,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, build_scaling_rotation
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
@@ -496,8 +496,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if diff_masked.numel() > 0:
                 scout_loss = args.scout_lambda * diff_masked.mean()
 
+        # MCMC regularization losses - encourage sparsity in opacity and scale
+        mcmc_opacity_reg = torch.tensor(0.0, device="cuda")
+        mcmc_scale_reg = torch.tensor(0.0, device="cuda")
+        if args.mcmc:
+            mcmc_opacity_reg = args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
+            mcmc_scale_reg = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
+
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg
 
         total_loss.backward()
 
@@ -538,24 +545,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if ingp is not None:
                     ingp.save_model(scene.model_path, iteration)
 
-            # Densification
+            # Densification / MCMC Relocation
             if iteration < opt.densify_until_iter and optim_gaussian:
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, pixels = pixels)
-                
-                prune_tag = (iteration % opacity_reset_interval >= opacity_reset_protect * densification_interval)
-                # Diffuse_offset mode: pause pruning for first 3k iterations after initialize
-                if args.method == "diffuse_offset" and iteration < cfg_model.ingp_stage.initialize + 3000:
-                    prune_tag = False
-                if iteration > opt.densify_from_iter and iteration % densification_interval == 0:
-                    size_threshold = 20 if iteration > opacity_reset_interval else None
-                    gaussians.densify_and_prune(densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold, \
-                    appearance_update_threshold, active_levels, densify_tag = (iteration < opt.densify_until_iter), prune_tag = prune_tag)
-                
-                if iteration % opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    if iteration <= cfg_model.training_cfg.reset_until_iter:
-                        gaussians.reset_opacity()
+                if args.mcmc:
+                    # MCMC mode: relocate dead Gaussians and add new ones
+                    if args.cap_max <= 0:
+                        raise ValueError("--cap_max must be specified and positive when using --mcmc mode")
+                    
+                    if iteration > opt.densify_from_iter and iteration % densification_interval == 0:
+                        # Find dead Gaussians (very low opacity)
+                        dead_mask = (gaussians.get_opacity <= 0.005).squeeze(-1)
+                        gaussians.relocate_gs(dead_mask=dead_mask)
+                        gaussians.add_new_gs(cap_max=args.cap_max)
+                else:
+                    # Traditional densification
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, pixels = pixels)
+                    
+                    prune_tag = (iteration % opacity_reset_interval >= opacity_reset_protect * densification_interval)
+                    # Diffuse_offset mode: pause pruning for first 3k iterations after initialize
+                    if args.method == "diffuse_offset" and iteration < cfg_model.ingp_stage.initialize + 3000:
+                        prune_tag = False
+                    if iteration > opt.densify_from_iter and iteration % densification_interval == 0:
+                        size_threshold = 20 if iteration > opacity_reset_interval else None
+                        gaussians.densify_and_prune(densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold, \
+                        appearance_update_threshold, active_levels, densify_tag = (iteration < opt.densify_until_iter), prune_tag = prune_tag)
+                    
+                    if iteration % opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                        if iteration <= cfg_model.training_cfg.reset_until_iter:
+                            gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -566,6 +585,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if optim_ngp:
                     ingp.current_optimizer.step()
                     ingp.current_optimizer.zero_grad(set_to_none = True)
+                
+                # MCMC: SGLD noise injection after optimizer step
+                if args.mcmc:
+                    # Get current xyz learning rate
+                    xyz_lr = gaussians.optimizer.param_groups[0]['lr']
+                    
+                    # Build covariance from scale and rotation
+                    L = build_scaling_rotation(
+                        torch.cat([gaussians.get_scaling, torch.ones_like(gaussians.get_scaling[:, :1])], dim=-1),
+                        gaussians.get_rotation
+                    )
+                    actual_covariance = L @ L.transpose(1, 2)
+                    
+                    # Sigmoid function for opacity-based noise scaling
+                    def op_sigmoid(x, k=100, x0=0.995):
+                        return 1 / (1 + torch.exp(-k * (x - x0)))
+                    
+                    # Generate noise scaled by opacity (low opacity = more noise)
+                    noise = torch.randn_like(gaussians._xyz) * op_sigmoid(1 - gaussians.get_opacity) * args.noise_lr * xyz_lr
+                    # Transform noise by covariance
+                    noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
+                    # Add noise to positions
+                    gaussians._xyz.data.add_(noise)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -1049,6 +1091,18 @@ if __name__ == "__main__":
                         help="Weight for scout loss in diffuse_offset xyz mode (moves Gaussians toward offset target)")
     parser.add_argument("--random_background", action="store_true",
                         help="Use random per-pixel background during training for unbiased opacity learning. Eval uses black background.")
+    
+    # MCMC arguments - based on "3D Gaussian Splatting as Markov Chain Monte Carlo"
+    parser.add_argument("--mcmc", action="store_true",
+                        help="Enable MCMC-based Gaussian management (replaces traditional densification)")
+    parser.add_argument("--cap_max", type=int, default=-1,
+                        help="Maximum number of Gaussians (required for MCMC mode)")
+    parser.add_argument("--opacity_reg", type=float, default=0.01,
+                        help="L1 regularization weight on opacity (MCMC mode)")
+    parser.add_argument("--scale_reg", type=float, default=0.01,
+                        help="L1 regularization weight on scale (MCMC mode)")
+    parser.add_argument("--noise_lr", type=float, default=5e5,
+                        help="SGLD noise learning rate multiplier (MCMC mode)")
 
     args = parser.parse_args(sys.argv[1:])
     

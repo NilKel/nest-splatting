@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>dec2ftest - Results</title>
+<style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            max-width: 1400px;
+            margin: 40px auto;
+            padding: 20px;
+            background-color: #1a1a2e;
+            color: #eee;
+        }
+        h1 {
+            color: #00d9ff;
+            border-bottom: 3px solid #00d9ff;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #ff6b6b;
+            margin-top: 40px;
+        }
+        .metrics-table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: #16213e;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            margin-bottom: 40px;
+        }
+        .metrics-table thead {
+            background-color: #0f3460;
+        }
+        .metrics-table th {
+            padding: 12px;
+            text-align: center;
+            font-weight: 600;
+            color: #00d9ff;
+        }
+        .metrics-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #0f3460;
+            text-align: center;
+        }
+        .metrics-table tbody tr:hover {
+            background-color: #1a1a40;
+        }
+        .metrics-table .method {
+            font-weight: 600;
+            color: #ff6b6b;
+            text-align: left;
+        }
+        .metrics-table .metric {
+            font-weight: 600;
+            font-family: 'Courier New', monospace;
+            color: #000;
+        }
+        .info {
+            background-color: #0f3460;
+            padding: 15px;
+            border-left: 4px solid #00d9ff;
+            margin-bottom: 30px;
+            border-radius: 4px;
+        }
+        .legend {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+            font-size: 0.9em;
+        }
+        .color-sample {
+            width: 60px;
+            height: 20px;
+            border: 1px solid #333;
+            border-radius: 3px;
+        }
+        .scene-section {
+            margin-bottom: 60px;
+            padding-bottom: 40px;
+            border-bottom: 2px solid #0f3460;
+        }
+    </style>
+</head>
+<body>
+<h1>dec2ftest - Baseline vs Cat Results</h1>
+<div class="info">
+<strong>Methods:</strong> baseline, cat0 (0 Gaussian levels), cat1-6 (1-6 Gaussian levels)<br>
+<strong>Color:</strong> Red = worst, Green = best (per column)
+</div>
+<div class="legend">
+<span><strong>↑</strong> Higher is better</span>
+<span><strong>↓</strong> Lower is better</span>
+<div class="color-sample" style="background: linear-gradient(to right, rgb(230, 57, 57), rgb(57, 230, 57));"></div>
+<span>Worst → Best</span>
+</div>
+<div class="scene-section">
+<h1>Summary Tables</h1>
+<h2>Summary - TEST PSNR (dB)</h2>
+<table class="metrics-table">
+<thead><tr>
+<th>Method</th>
+<th>chair</th>
+<th>Average</th>
+</tr></thead>
+<tbody>
+<tr>
+<td class="method">baseline</td>
+<td class="metric" style="background-color: rgb(146, 140, 57);">35.30</td>
+<td class="metric" style="font-weight: bold;">35.30</td>
+</tr>
+<tr>
+<td class="method">cat0</td>
+<td class="metric" style="background-color: rgb(159, 127, 57);">35.26</td>
+<td class="metric" style="font-weight: bold;">35.26</td>
+</tr>
+<tr>
+<td class="method">cat1</td>
+<td class="metric" style="background-color: rgb(76, 210, 57);">35.52</td>
+<td class="metric" style="font-weight: bold;">35.52</td>
+</tr>
+<tr>
+<td class="method">cat2</td>
+<td class="metric" style="background-color: rgb(85, 201, 57);">35.49</td>
+<td class="metric" style="font-weight: bold;">35.49</td>
+</tr>
+<tr>
+<td class="method">cat3</td>
+<td class="metric" style="background-color: rgb(60, 226, 57);">35.57</td>
+<td class="metric" style="font-weight: bold;">35.57</td>
+</tr>
+<tr>
+<td class="method">cat4</td>
+<td class="metric" style="background-color: rgb(111, 175, 57);">35.41</td>
+<td class="metric" style="font-weight: bold;">35.41</td>
+</tr>
+<tr>
+<td class="method">cat5</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">35.58</td>
+<td class="metric" style="font-weight: bold;">35.58</td>
+</tr>
+<tr>
+<td class="method">cat6</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">35.04</td>
+<td class="metric" style="font-weight: bold;">35.04</td>
+</tr>
+</tbody></table>
+<h2>Summary - TRAIN PSNR (dB)</h2>
+<table class="metrics-table">
+<thead><tr>
+<th>Method</th>
+<th>chair</th>
+<th>Average</th>
+</tr></thead>
+<tbody>
+<tr>
+<td class="method">baseline</td>
+<td class="metric" style="background-color: rgb(142, 144, 57);">38.60</td>
+<td class="metric" style="font-weight: bold;">38.60</td>
+</tr>
+<tr>
+<td class="method">cat0</td>
+<td class="metric" style="background-color: rgb(140, 146, 57);">38.62</td>
+<td class="metric" style="font-weight: bold;">38.62</td>
+</tr>
+<tr>
+<td class="method">cat1</td>
+<td class="metric" style="background-color: rgb(71, 215, 57);">39.47</td>
+<td class="metric" style="font-weight: bold;">39.47</td>
+</tr>
+<tr>
+<td class="method">cat2</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">39.65</td>
+<td class="metric" style="font-weight: bold;">39.65</td>
+</tr>
+<tr>
+<td class="method">cat3</td>
+<td class="metric" style="background-color: rgb(61, 225, 57);">39.60</td>
+<td class="metric" style="font-weight: bold;">39.60</td>
+</tr>
+<tr>
+<td class="method">cat4</td>
+<td class="metric" style="background-color: rgb(121, 165, 57);">38.85</td>
+<td class="metric" style="font-weight: bold;">38.85</td>
+</tr>
+<tr>
+<td class="method">cat5</td>
+<td class="metric" style="background-color: rgb(108, 178, 57);">39.02</td>
+<td class="metric" style="font-weight: bold;">39.02</td>
+</tr>
+<tr>
+<td class="method">cat6</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">37.52</td>
+<td class="metric" style="font-weight: bold;">37.52</td>
+</tr>
+</tbody></table>
+</div>
+<div class="scene-section">
+<h1>CHAIR</h1>
+<h2>CHAIR - TEST</h2>
+<table class="metrics-table">
+<thead><tr>
+<th>Method</th><th>PSNR (dB) ↑</th><th>SSIM ↑</th><th>L1 ↓</th>
+</tr></thead>
+<tbody>
+<tr>
+<td class="method">baseline</td>
+<td class="metric" style="background-color: rgb(146, 140, 57);">35.30</td>
+<td class="metric" style="background-color: rgb(94, 192, 57);">0.9873</td>
+<td class="metric" style="background-color: rgb(92, 194, 57);">0.004520</td>
+</tr>
+<tr>
+<td class="method">cat0</td>
+<td class="metric" style="background-color: rgb(159, 127, 57);">35.26</td>
+<td class="metric" style="background-color: rgb(106, 180, 57);">0.9872</td>
+<td class="metric" style="background-color: rgb(116, 170, 57);">0.004588</td>
+</tr>
+<tr>
+<td class="method">cat1</td>
+<td class="metric" style="background-color: rgb(76, 210, 57);">35.52</td>
+<td class="metric" style="background-color: rgb(69, 217, 57);">0.9875</td>
+<td class="metric" style="background-color: rgb(88, 198, 57);">0.004507</td>
+</tr>
+<tr>
+<td class="method">cat2</td>
+<td class="metric" style="background-color: rgb(85, 201, 57);">35.49</td>
+<td class="metric" style="background-color: rgb(81, 205, 57);">0.9874</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">0.004415</td>
+</tr>
+<tr>
+<td class="method">cat3</td>
+<td class="metric" style="background-color: rgb(60, 226, 57);">35.57</td>
+<td class="metric" style="background-color: rgb(81, 205, 57);">0.9874</td>
+<td class="metric" style="background-color: rgb(63, 223, 57);">0.004433</td>
+</tr>
+<tr>
+<td class="method">cat4</td>
+<td class="metric" style="background-color: rgb(111, 175, 57);">35.41</td>
+<td class="metric" style="background-color: rgb(81, 205, 57);">0.9874</td>
+<td class="metric" style="background-color: rgb(111, 175, 57);">0.004573</td>
+</tr>
+<tr>
+<td class="method">cat5</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">35.58</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">0.9876</td>
+<td class="metric" style="background-color: rgb(66, 220, 57);">0.004443</td>
+</tr>
+<tr>
+<td class="method">cat6</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">35.04</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">0.9862</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">0.004921</td>
+</tr>
+</tbody></table>
+<h2>CHAIR - TRAIN</h2>
+<table class="metrics-table">
+<thead><tr>
+<th>Method</th><th>PSNR (dB) ↑</th><th>SSIM ↑</th><th>L1 ↓</th>
+</tr></thead>
+<tbody>
+<tr>
+<td class="method">baseline</td>
+<td class="metric" style="background-color: rgb(142, 144, 57);">38.60</td>
+<td class="metric" style="background-color: rgb(129, 157, 57);">0.9933</td>
+<td class="metric" style="background-color: rgb(119, 167, 57);">0.003380</td>
+</tr>
+<tr>
+<td class="method">cat0</td>
+<td class="metric" style="background-color: rgb(140, 146, 57);">38.62</td>
+<td class="metric" style="background-color: rgb(123, 163, 57);">0.9934</td>
+<td class="metric" style="background-color: rgb(119, 167, 57);">0.003376</td>
+</tr>
+<tr>
+<td class="method">cat1</td>
+<td class="metric" style="background-color: rgb(71, 215, 57);">39.47</td>
+<td class="metric" style="background-color: rgb(73, 213, 57);">0.9943</td>
+<td class="metric" style="background-color: rgb(76, 210, 57);">0.003112</td>
+</tr>
+<tr>
+<td class="method">cat2</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">39.65</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">0.9946</td>
+<td class="metric" style="background-color: rgb(57, 230, 57);">0.002988</td>
+</tr>
+<tr>
+<td class="method">cat3</td>
+<td class="metric" style="background-color: rgb(61, 225, 57);">39.60</td>
+<td class="metric" style="background-color: rgb(68, 218, 57);">0.9944</td>
+<td class="metric" style="background-color: rgb(57, 229, 57);">0.002990</td>
+</tr>
+<tr>
+<td class="method">cat4</td>
+<td class="metric" style="background-color: rgb(121, 165, 57);">38.85</td>
+<td class="metric" style="background-color: rgb(90, 196, 57);">0.9940</td>
+<td class="metric" style="background-color: rgb(119, 167, 57);">0.003378</td>
+</tr>
+<tr>
+<td class="method">cat5</td>
+<td class="metric" style="background-color: rgb(108, 178, 57);">39.02</td>
+<td class="metric" style="background-color: rgb(112, 174, 57);">0.9936</td>
+<td class="metric" style="background-color: rgb(105, 181, 57);">0.003290</td>
+</tr>
+<tr>
+<td class="method">cat6</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">37.52</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">0.9915</td>
+<td class="metric" style="background-color: rgb(230, 57, 57);">0.004065</td>
+</tr>
+</tbody></table>
+</div>
+</body></html>

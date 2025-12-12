@@ -365,3 +365,21 @@ class GaussianRasterizer(nn.Module):
             render_mode
         )
 
+def compute_relocation(opacity_old, scale_old, N, binoms, n_max):
+    """
+    Compute new opacities and scales for MCMC relocation.
+    
+    Args:
+        opacity_old: [N] tensor of old opacities (after sigmoid)
+        scale_old: [N, 2] tensor of old scales (after exp)
+        N: [N] int tensor of relocation ratios
+        binoms: [n_max, n_max] tensor of binomial coefficients
+        n_max: maximum value for N
+    
+    Returns:
+        new_opacity: [N] tensor of new opacities
+        new_scale: [N, 2] tensor of new scales
+    """
+    new_opacity, new_scale = _C.compute_relocation(opacity_old, scale_old, N.int(), binoms, n_max)
+    return new_opacity, new_scale
+

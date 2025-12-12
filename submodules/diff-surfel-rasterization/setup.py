@@ -29,6 +29,7 @@ setup(
             "cuda_rasterizer/rasterizer_impl.cu",
             "cuda_rasterizer/forward.cu",
             "cuda_rasterizer/backward.cu",
+            "cuda_rasterizer/utils.cu",
             "rasterize_points.cu",
             "ext.cpp"],
             extra_compile_args={"nvcc": ["-I" + conda_include]})

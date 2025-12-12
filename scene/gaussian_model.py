@@ -747,3 +747,219 @@ class GaussianModel:
         else:
             self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
             self.denom[update_filter] += 1
+
+    # ==================== MCMC Methods ====================
+    # Based on "3D Gaussian Splatting as Markov Chain Monte Carlo"
+    
+    def _mcmc_update_params(self, idxs, ratio):
+        """
+        Compute new opacity and scale for relocated Gaussians using the MCMC relocation kernel.
+        
+        Args:
+            idxs: Indices of Gaussians to update
+            ratio: [N, 1] tensor of relocation ratios (how many children each Gaussian produces)
+        
+        Returns:
+            Tuple of (xyz, features_dc, features_rest, opacity, scaling, rotation, ap_level, gaussian_features, gamma, adaptive_features)
+        """
+        from utils.reloc_utils import compute_relocation_cuda
+        
+        new_opacity, new_scaling = compute_relocation_cuda(
+            opacity_old=self.get_opacity[idxs, 0],
+            scale_old=self.get_scaling[idxs],
+            N=ratio[idxs, 0] + 1
+        )
+        
+        # Clamp opacity to valid range and convert back to logit space
+        new_opacity = torch.clamp(new_opacity.unsqueeze(-1), max=1.0 - torch.finfo(torch.float32).eps, min=0.005)
+        new_opacity = self.inverse_opacity_activation(new_opacity)
+        
+        # Convert scale back to log space
+        new_scaling = self.scaling_inverse_activation(new_scaling)
+        
+        # Handle gaussian_features for cat mode
+        gaussian_features = None
+        if self._gaussian_feat_dim > 0:
+            gaussian_features = self._gaussian_features[idxs]
+        
+        # Handle adaptive mode parameters
+        gamma = None
+        adaptive_features = None
+        if self._adaptive_feat_dim > 0:
+            gamma = self._gamma[idxs]
+            adaptive_features = self._adaptive_features[idxs]
+        
+        return (
+            self._xyz[idxs],
+            self._features_dc[idxs],
+            self._features_rest[idxs],
+            new_opacity,
+            new_scaling,
+            self._rotation[idxs],
+            self._appearance_level[idxs],
+            gaussian_features,
+            gamma,
+            adaptive_features
+        )
+
+    def _mcmc_sample_alives(self, probs, num, alive_indices=None):
+        """
+        Sample Gaussian indices based on opacity probabilities.
+        
+        Args:
+            probs: Probability weights for sampling (typically opacity values)
+            num: Number of samples to draw
+            alive_indices: Optional indices to sample from (if None, samples from all)
+        
+        Returns:
+            sampled_idxs: Indices of sampled Gaussians
+            ratio: Bincount tensor showing how many times each index was sampled
+        """
+        probs = probs / (probs.sum() + torch.finfo(torch.float32).eps)
+        sampled_idxs = torch.multinomial(probs, num, replacement=True)
+        if alive_indices is not None:
+            sampled_idxs = alive_indices[sampled_idxs]
+        
+        # Create ratio tensor with proper size
+        ratio = torch.zeros(self._xyz.shape[0], 1, device="cuda", dtype=torch.int32)
+        bincount = torch.bincount(sampled_idxs, minlength=self._xyz.shape[0])
+        ratio[:, 0] = bincount
+        
+        return sampled_idxs, ratio
+
+    def relocate_gs(self, dead_mask):
+        """
+        Relocate dead Gaussians by sampling from alive ones.
+        
+        Dead Gaussians (those with very low opacity) are replaced with copies of
+        alive Gaussians, with their opacity and scale adjusted using the MCMC
+        relocation kernel to preserve the overall contribution.
+        
+        Args:
+            dead_mask: Boolean tensor indicating which Gaussians are "dead" (low opacity)
+        """
+        if dead_mask.sum() == 0:
+            return
+        
+        alive_mask = ~dead_mask
+        dead_indices = dead_mask.nonzero(as_tuple=True)[0]
+        alive_indices = alive_mask.nonzero(as_tuple=True)[0]
+        
+        if alive_indices.shape[0] <= 0:
+            return
+        
+        # Sample from alive Gaussians based on opacity
+        probs = self.get_opacity[alive_indices, 0]
+        reinit_idx, ratio = self._mcmc_sample_alives(alive_indices=alive_indices, probs=probs, num=dead_indices.shape[0])
+        
+        # Get updated parameters for the sampled Gaussians
+        (
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_ap_level,
+            new_gaussian_features,
+            new_gamma,
+            new_adaptive_features
+        ) = self._mcmc_update_params(reinit_idx, ratio=ratio)
+        
+        # Replace dead Gaussians with the new parameters
+        self._xyz.data[dead_indices] = new_xyz
+        self._features_dc.data[dead_indices] = new_features_dc
+        self._features_rest.data[dead_indices] = new_features_rest
+        self._opacity.data[dead_indices] = new_opacity
+        self._scaling.data[dead_indices] = new_scaling
+        self._rotation.data[dead_indices] = new_rotation
+        self._appearance_level.data[dead_indices] = new_ap_level
+        
+        if self._gaussian_feat_dim > 0 and new_gaussian_features is not None:
+            self._gaussian_features.data[dead_indices] = new_gaussian_features
+        
+        if self._adaptive_feat_dim > 0:
+            if new_gamma is not None:
+                self._gamma.data[dead_indices] = new_gamma
+            if new_adaptive_features is not None:
+                self._adaptive_features.data[dead_indices] = new_adaptive_features
+        
+        # Update the source Gaussians as well (they gave away some of their "mass")
+        self._opacity.data[reinit_idx] = new_opacity
+        self._scaling.data[reinit_idx] = new_scaling
+        
+        # Reset optimizer state for modified indices
+        self._reset_optimizer_state_for_indices(torch.cat([dead_indices, reinit_idx.unique()]))
+
+    def add_new_gs(self, cap_max):
+        """
+        Add new Gaussians by sampling from existing ones, up to a capacity limit.
+        
+        New Gaussians are created by sampling from existing Gaussians based on
+        their opacity. The source Gaussians have their opacity and scale adjusted
+        using the MCMC relocation kernel.
+        
+        Args:
+            cap_max: Maximum total number of Gaussians allowed
+        
+        Returns:
+            Number of new Gaussians added
+        """
+        current_num_points = self._opacity.shape[0]
+        target_num = min(cap_max, int(1.05 * current_num_points))
+        num_gs = max(0, target_num - current_num_points)
+        
+        if num_gs <= 0:
+            return 0
+        
+        # Sample from all Gaussians based on opacity
+        probs = self.get_opacity.squeeze(-1)
+        add_idx, ratio = self._mcmc_sample_alives(probs=probs, num=num_gs)
+        
+        # Get parameters for new Gaussians
+        (
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_ap_level,
+            new_gaussian_features,
+            new_gamma,
+            new_adaptive_features
+        ) = self._mcmc_update_params(add_idx, ratio=ratio)
+        
+        # Update source Gaussians (they gave away some of their "mass")
+        self._opacity.data[add_idx] = new_opacity
+        self._scaling.data[add_idx] = new_scaling
+        
+        # Add new Gaussians using existing densification_postfix
+        self.densification_postfix(
+            new_xyz, new_features_dc, new_features_rest, new_opacity, 
+            new_scaling, new_rotation, new_ap_level, 
+            new_gaussian_features, new_gamma, new_adaptive_features
+        )
+        
+        # Reset optimizer state for modified source indices
+        self._reset_optimizer_state_for_indices(add_idx.unique())
+        
+        return num_gs
+
+    def _reset_optimizer_state_for_indices(self, inds):
+        """
+        Reset optimizer state (momentum) for specific Gaussian indices.
+        
+        Args:
+            inds: Indices of Gaussians whose optimizer state should be reset
+        """
+        if inds.numel() == 0:
+            return
+            
+        for group in self.optimizer.param_groups:
+            if group["name"] in ["mlp", "env"]:
+                continue
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+            if stored_state is not None:
+                stored_state["exp_avg"][inds] = 0
+                stored_state["exp_avg_sq"][inds] = 0
