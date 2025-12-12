@@ -699,6 +699,80 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     print("="*70)
     render_final_images(scene, gaussians, pipe, eval_background, final_ingp, beta, iteration, cfg_model, args,
                         cameras=scene.getTrainCameras(), output_subdir='final_train_renders', metrics_file='train_metrics.txt')
+    
+    # Save training log with point count and framerate
+    save_training_log(scene, gaussians, final_ingp, pipe, args, cfg_model, iteration)
+
+
+def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
+    """Save training statistics to training_log.txt."""
+    import time
+    
+    log_path = os.path.join(scene.model_path, 'training_log.txt')
+    
+    # Count Gaussians
+    num_gaussians = len(gaussians.get_xyz)
+    
+    # Estimate framerate by timing a few renders
+    print("\n[LOG] Measuring render framerate...")
+    test_cameras = scene.getTestCameras()
+    if len(test_cameras) > 0:
+        # Warm up
+        viewpoint = test_cameras[0]
+        bg = torch.zeros(3, device="cuda")
+        beta = cfg_model.surfel.tg_beta
+        
+        with torch.no_grad():
+            # Warm-up render
+            _ = render(viewpoint, gaussians, pipe, bg, ingp=ingp, beta=beta, 
+                      iteration=iteration, cfg=cfg_model)
+            torch.cuda.synchronize()
+            
+            # Time multiple renders
+            num_timing_iters = 100
+            start_time = time.time()
+            for _ in range(num_timing_iters):
+                _ = render(viewpoint, gaussians, pipe, bg, ingp=ingp, beta=beta,
+                          iteration=iteration, cfg=cfg_model)
+            torch.cuda.synchronize()
+            elapsed = time.time() - start_time
+            
+            fps = num_timing_iters / elapsed
+            ms_per_frame = (elapsed / num_timing_iters) * 1000
+    else:
+        fps = 0
+        ms_per_frame = 0
+    
+    # Get resolution
+    if len(test_cameras) > 0:
+        H, W = test_cameras[0].image_height, test_cameras[0].image_width
+        resolution = f"{W}x{H}"
+    else:
+        resolution = "unknown"
+    
+    # Write log
+    with open(log_path, 'w') as f:
+        f.write("Training Log\n")
+        f.write("=" * 50 + "\n\n")
+        
+        f.write(f"Method: {args.method}\n")
+        if args.method == "cat":
+            f.write(f"Hybrid Levels: {args.hybrid_levels}\n")
+        f.write(f"Iterations: {iteration}\n")
+        f.write(f"Resolution: {resolution}\n\n")
+        
+        f.write("Model Statistics\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Number of Gaussians: {num_gaussians:,}\n\n")
+        
+        f.write("Performance\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Render FPS: {fps:.2f}\n")
+        f.write(f"Time per frame: {ms_per_frame:.2f} ms\n")
+    
+    print(f"[LOG] Training log saved to: {log_path}")
+    print(f"[LOG] Number of Gaussians: {num_gaussians:,}")
+    print(f"[LOG] Render FPS: {fps:.2f} ({ms_per_frame:.2f} ms/frame)")
 
 
 def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, 
