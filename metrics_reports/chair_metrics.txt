@@ -1,7 +1,7 @@
 ################################################################################
 #  SCENE: CHAIR
-#  Generated: 2025-12-11 07:38:32
-#  Completed experiments: 17
+#  Generated: 2025-12-15 04:05:35
+#  Completed experiments: 41
 ################################################################################
 
 ================================================================================
@@ -9,14 +9,38 @@
 ================================================================================
 Method       Name                                    PSNR     SSIM         L1   #Img
 --------------------------------------------------------------------------------
+baseline     dec2ftest_baseline                     35.30   0.9873   0.004520    200
 baseline     exp1_baseline                          35.07   0.9871   0.004778    200
-cat          exp1_cat0_0_levels                     35.29   0.9872   0.004578    200
-cat          exp1_cat1_1_levels                     35.48   0.9875   0.004463    200
-cat          exp1_cat2_2_levels                     35.54   0.9876   0.004426    200
-cat          exp1_cat3_3_levels                     35.47   0.9873   0.004543    200
-cat          exp1_cat4_4_levels                     35.49   0.9874   0.004497    200
-cat          exp1_cat5_5_levels                     35.55   0.9876   0.004445    200
-cat          exp1_cat6_6_levels                     35.26   0.9863   0.004672    200
+baseline     no2f                                   35.29   0.9872   0.004610    200
+baseline     no2fmc1e5ns005op                       34.88   0.9861   0.004914    200
+baseline     no2fmcmc1e5ns001scoprune               35.21   0.9871   0.004634    200
+baseline     noc2f_baseline                         35.26   0.9872   0.004611    200
+baseline     nocfmcmc001op001sc1e5ns_baseline       35.27   0.9870   0.004558    200
+cat          fixc2f_5_levels                        35.59   0.9876   0.004462    200
+cat          no2f_5_levels                          35.64   0.9877   0.004399    200
+cat          no2fmc1e5ns001sc002op_5_levels         35.32   0.9873   0.004616    200
+cat          no2fmcmc1e5ns001sc_5_levels            35.70   0.9877   0.004326    200
+cat          no2fmcmc1e5ns001scop_5_levels          35.66   0.9877   0.004431    200
+cat          no2fmcmc1e5ns001scoprune_5_levels      35.72   0.9879   0.004400    200
+cat          no2fmcmc1e5ns001yscoprune_5_levels     35.78   0.9880   0.004356    200
+cat          no2fmcmc_2_levels                      10.96   0.7794   0.122971    200
+cat          no2fmcmc_5_levels                      35.63   0.9876   0.004376    200
+cat          no2fmcmcsreg_5_levels                  35.54   0.9875   0.004392    200
+cat          noc2f_cat0_0_levels                    34.98   0.9872   0.004809    200
+cat          noc2f_cat1_1_levels                    35.51   0.9875   0.004460    200
+cat          noc2f_cat2_2_levels                    35.57   0.9875   0.004408    200
+cat          noc2f_cat3_3_levels                    35.56   0.9875   0.004441    200
+cat          noc2f_cat4_4_levels                    35.66   0.9875   0.004364    200
+cat          noc2f_cat5_5_levels                    35.50   0.9876   0.004500    200
+cat          noc2f_cat6_6_levels                    35.06   0.9861   0.004864    200
+cat          nocfmcmc001op001sc1e5ns_cat0_0_levels    35.11   0.9869   0.004695    200
+cat          nocfmcmc001op001sc1e5ns_cat1_1_levels    35.66   0.9877   0.004401    200
+cat          nocfmcmc001op001sc1e5ns_cat2_2_levels    35.45   0.9876   0.004604    200
+cat          nocfmcmc001op001sc1e5ns_cat3_3_levels    35.56   0.9877   0.004528    200
+cat          nocfmcmc001op001sc1e5ns_cat4_4_levels    35.65   0.9879   0.004415    200
+cat          nocfmcmc001op001sc1e5ns_cat5_5_levels    35.67   0.9880   0.004504    200
+cat          nocfmcmc001op001sc1e5ns_cat6_6_levels    10.96   0.7794   0.122975    200
+cat          rbgc2ftest_5_levels                    34.02   0.9848   0.005068    200
 diffuse      c2ftest2                               32.33   0.9764   0.006874    200
 diffuse_ngp  c2ftest2                               34.02   0.9818   0.005315    200
 diffuse_ngp  c2ftest2median                         34.20   0.9812   0.005300    200
@@ -33,14 +57,38 @@ specular     c2ftest2                               35.04   0.9856   0.004679   
 ================================================================================
 Method       Name                                    PSNR     SSIM         L1   #Img
 --------------------------------------------------------------------------------
+baseline     dec2ftest_baseline                     38.60   0.9933   0.003380    100
 baseline     exp1_baseline                          38.39   0.9933   0.003578    100
-cat          exp1_cat0_0_levels                     38.70   0.9934   0.003354    100
-cat          exp1_cat1_1_levels                     39.33   0.9943   0.003124    100
-cat          exp1_cat2_2_levels                     39.53   0.9945   0.003097    100
-cat          exp1_cat3_3_levels                     39.40   0.9943   0.003140    100
-cat          exp1_cat4_4_levels                     39.18   0.9942   0.003257    100
-cat          exp1_cat5_5_levels                     38.95   0.9937   0.003297    100
-cat          exp1_cat6_6_levels                     38.06   0.9916   0.003660    100
+baseline     no2f                                   38.62   0.9933   0.003455    100
+baseline     no2fmc1e5ns005op                       38.38   0.9933   0.003624    100
+baseline     no2fmcmc1e5ns001scoprune               38.45   0.9936   0.003534    100
+baseline     noc2f_baseline                         38.54   0.9933   0.003434    100
+baseline     nocfmcmc001op001sc1e5ns_baseline       38.82   0.9937   0.003269    100
+cat          fixc2f_5_levels                        39.01   0.9937   0.003274    100
+cat          no2f_5_levels                          39.13   0.9938   0.003194    100
+cat          no2fmc1e5ns001sc002op_5_levels         37.87   0.9921   0.003685    100
+cat          no2fmcmc1e5ns001sc_5_levels            39.94   0.9945   0.002911    100
+cat          no2fmcmc1e5ns001scop_5_levels          38.40   0.9926   0.003414    100
+cat          no2fmcmc1e5ns001scoprune_5_levels      38.45   0.9926   0.003425    100
+cat          no2fmcmc1e5ns001yscoprune_5_levels     38.64   0.9928   0.003333    100
+cat          no2fmcmc_2_levels                      11.14   0.7794   0.121184    100
+cat          no2fmcmc_5_levels                      39.63   0.9943   0.003090    100
+cat          no2fmcmcsreg_5_levels                  39.51   0.9942   0.003068    100
+cat          noc2f_cat0_0_levels                    37.96   0.9931   0.003771    100
+cat          noc2f_cat1_1_levels                    39.68   0.9947   0.003054    100
+cat          noc2f_cat2_2_levels                    39.75   0.9948   0.002953    100
+cat          noc2f_cat3_3_levels                    39.55   0.9945   0.003127    100
+cat          noc2f_cat4_4_levels                    39.61   0.9943   0.002987    100
+cat          noc2f_cat5_5_levels                    38.80   0.9936   0.003362    100
+cat          noc2f_cat6_6_levels                    37.71   0.9914   0.003903    100
+cat          nocfmcmc001op001sc1e5ns_cat0_0_levels    38.45   0.9935   0.003475    100
+cat          nocfmcmc001op001sc1e5ns_cat1_1_levels    39.39   0.9942   0.003036    100
+cat          nocfmcmc001op001sc1e5ns_cat2_2_levels    38.91   0.9941   0.003405    100
+cat          nocfmcmc001op001sc1e5ns_cat3_3_levels    38.91   0.9939   0.003353    100
+cat          nocfmcmc001op001sc1e5ns_cat4_4_levels    38.84   0.9936   0.003273    100
+cat          nocfmcmc001op001sc1e5ns_cat5_5_levels    38.35   0.9928   0.003569    100
+cat          nocfmcmc001op001sc1e5ns_cat6_6_levels    11.14   0.7794   0.121189    100
+cat          rbgc2ftest_5_levels                    36.83   0.9914   0.003904    100
 diffuse      c2ftest2                               34.35   0.9828   0.005628    100
 diffuse_ngp  c2ftest2                               37.04   0.9899   0.004003    100
 diffuse_ngp  c2ftest2median                         36.80   0.9888   0.004079    100

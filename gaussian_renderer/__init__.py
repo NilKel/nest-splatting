@@ -230,10 +230,99 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             total_levels = ingp.levels
             active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
             levels = (total_levels << 16) | (active_hashgrid_levels << 8)
-    
+
+        # hybrid_SH mode: Activate separately then add
+        # Gaussian SH → RGB (+0.5, clamp) → [0,1]
+        # Hashgrid → sigmoid → [0,1]
+        # Add and clamp in CUDA
+        is_hybrid_sh_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_hybrid_sh_mode') and ingp.is_hybrid_sh_mode
+
+        if is_hybrid_sh_mode:
+            # Evaluate Gaussian SH to raw RGB (NO +0.5, NO clamp yet - done in CUDA)
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            
+            # Evaluate SH to get RAW RGB (no activation)
+            sh_degree = pc.active_sh_degree
+            raw_rgb = eval_sh(sh_degree, shs_view, dir_pp_normalized)  # (N, 3) - raw values
+            
+            colors_precomp = raw_rgb  # (N, 3) - raw RGB values
+            shs = None
+            render_mode = 8  # hybrid_SH mode
+
+            # Encode decompose_mode and sh_degree into levels parameter
+            # Format: (decompose_flag << 24) | (sh_degree << 16) | (hashgrid_levels << 8)
+            decompose_flag = 0
+            if decompose_mode == 'gaussian_only':
+                decompose_flag = 1
+            elif decompose_mode == 'ngp_only':
+                decompose_flag = 2
+
+            # hybrid_SH always uses 1 hashgrid level
+            levels = (decompose_flag << 24) | (sh_degree << 16) | (1 << 8)
+        
+        # hybrid_SH_raw mode: Add raw then activate together
+        # Gaussian SH → raw RGB (unbounded)
+        # Hashgrid → raw features (unbounded)
+        # Add and sigmoid in CUDA
+        is_hybrid_sh_raw_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_hybrid_sh_raw_mode') and ingp.is_hybrid_sh_raw_mode
+
+        if is_hybrid_sh_raw_mode:
+            # Evaluate Gaussian SH to raw RGB (NO activation)
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            
+            # Evaluate SH to get RAW RGB (no activation)
+            sh_degree = pc.active_sh_degree
+            raw_rgb = eval_sh(sh_degree, shs_view, dir_pp_normalized)  # (N, 3) - raw values
+            
+            colors_precomp = raw_rgb  # (N, 3) - raw RGB values
+            shs = None
+            render_mode = 10  # hybrid_SH_raw mode
+
+            # Encode decompose_mode and sh_degree into levels parameter
+            # Format: (decompose_flag << 24) | (sh_degree << 16) | (hashgrid_levels << 8)
+            decompose_flag = 0
+            if decompose_mode == 'gaussian_only':
+                decompose_flag = 1
+            elif decompose_mode == 'ngp_only':
+                decompose_flag = 2
+
+            # hybrid_SH_raw always uses 1 hashgrid level
+            levels = (decompose_flag << 24) | (sh_degree << 16) | (1 << 8)
+
+        # hybrid_SH_post mode: pass raw SH coefficients, add DC residual in CUDA, eval SH in Python post-raster
+        is_hybrid_sh_post_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_hybrid_sh_post_mode') and ingp.is_hybrid_sh_post_mode
+
+        if is_hybrid_sh_post_mode:
+            # Pass per-Gaussian SH coefficients as colors_precomp
+            # Format: (N, 16, 3) -> flatten to (N, 48)
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            colors_precomp = shs_view.reshape(-1, 48)  # Flatten to (N, 48)
+            shs = None
+            render_mode = 9  # hybrid_SH_post mode
+
+            # Encode decompose_mode and sh_degree into levels parameter
+            # Format: (decompose_flag << 24) | (sh_degree << 16) | (hashgrid_levels << 8)
+            decompose_flag = 0
+            if decompose_mode == 'gaussian_only':
+                decompose_flag = 1
+            elif decompose_mode == 'ngp_only':
+                decompose_flag = 2
+
+            sh_degree = pc.active_sh_degree
+            # hybrid_SH_post always uses 1 hashgrid level for DC residual
+            levels = (decompose_flag << 24) | (sh_degree << 16) | (1 << 8)
+
     # For diffuse/diffuse_ngp/diffuse_offset mode, use sh_degree=0 (only DC component)
     # For specular mode, use full active_sh_degree
-    sh_degree_to_use = 0 if (is_diffuse_mode or is_diffuse_ngp_mode or is_diffuse_offset_mode) else pc.active_sh_degree
+    # For hybrid_SH/hybrid_SH_post, SH is handled separately (pre or post raster)
+    if is_hybrid_sh_mode or is_hybrid_sh_post_mode:
+        sh_degree_to_use = 0  # SH handled outside standard path
+    else:
+        sh_degree_to_use = 0 if (is_diffuse_mode or is_diffuse_ngp_mode or is_diffuse_offset_mode) else pc.active_sh_degree
     
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
@@ -465,10 +554,32 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 # Zero out per-Gaussian features (first gaussian_feat_dim channels)
                 rendered_image[:gaussian_feat_dim, :, :] = 0
         
-        rendered_image = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), rays_dir)
-
-        rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
-        rendered_image = rendered_image * render_mask
+        # hybrid_SH and hybrid_SH_raw modes: rasterizer outputs activated RGB
+        if is_hybrid_sh_mode or is_hybrid_sh_raw_mode:
+            # Activation already done in CUDA rasterizer
+            rendered_image = rendered_image * render_mask
+        elif is_hybrid_sh_post_mode:
+            # hybrid_SH_post mode: rasterizer outputs modified SH coefficients (48D)
+            # Evaluate SH with view direction to get RGB
+            sh_degree = pc.active_sh_degree
+            
+            # rendered_image is (48, H, W) - reshape to (H*W, 48) then to (H*W, 3, 16)
+            sh_flat = rendered_image.view(48, -1).permute(1, 0)  # (H*W, 48)
+            sh_coeffs = sh_flat.view(-1, 3, 16)  # (H*W, 3, 16) - assumes degree 3
+            
+            # Get view directions for each pixel
+            dir_pp_normalized = rays_dir  # (H*W, 3)
+            
+            # Evaluate SH
+            rgb = eval_sh(sh_degree, sh_coeffs, dir_pp_normalized)
+            rgb = torch.clamp_min(rgb + 0.5, 0.0)  # (H*W, 3)
+            
+            rendered_image = rgb.view(H, W, 3).permute(2, 0, 1)  # (3, H, W)
+            rendered_image = rendered_image * render_mask
+        else:
+            rendered_image = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), rays_dir)
+            rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
+            rendered_image = rendered_image * render_mask
 
         vis_appearance_level = allmap[11:14]
 

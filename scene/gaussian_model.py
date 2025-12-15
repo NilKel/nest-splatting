@@ -578,6 +578,12 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if group["name"] == "mlp" or group["name"] == "env": continue
             assert len(group["params"]) == 1
+            
+            # Skip param groups that aren't in the tensors_dict
+            if group["name"] not in tensors_dict:
+                optimizable_tensors[group["name"]] = group["params"][0]
+                continue
+                
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
@@ -866,7 +872,15 @@ class GaussianModel:
             new_adaptive_features
         ) = self._mcmc_update_params(reinit_idx, ratio=ratio)
         
-        # Replace dead Gaussians with the new parameters
+        # Reset optimizer state for sampled indices FIRST (before updating)
+        # This is critical - we zero out momentum for source Gaussians that are giving away mass
+        self._reset_optimizer_state_for_indices(reinit_idx.unique())
+
+        # Update the source Gaussians (they gave away some of their "mass")
+        self._opacity.data[reinit_idx] = new_opacity
+        self._scaling.data[reinit_idx] = new_scaling
+
+        # Replace dead Gaussians with the new parameters (copy from sampled)
         self._xyz.data[dead_indices] = new_xyz
         self._features_dc.data[dead_indices] = new_features_dc
         self._features_rest.data[dead_indices] = new_features_rest
@@ -874,22 +888,18 @@ class GaussianModel:
         self._scaling.data[dead_indices] = new_scaling
         self._rotation.data[dead_indices] = new_rotation
         self._appearance_level.data[dead_indices] = new_ap_level
-        
+
         if self._gaussian_feat_dim > 0 and new_gaussian_features is not None:
             self._gaussian_features.data[dead_indices] = new_gaussian_features
-        
+
         if self._adaptive_feat_dim > 0:
             if new_gamma is not None:
                 self._gamma.data[dead_indices] = new_gamma
             if new_adaptive_features is not None:
                 self._adaptive_features.data[dead_indices] = new_adaptive_features
-        
-        # Update the source Gaussians as well (they gave away some of their "mass")
-        self._opacity.data[reinit_idx] = new_opacity
-        self._scaling.data[reinit_idx] = new_scaling
-        
-        # Reset optimizer state for modified indices
-        self._reset_optimizer_state_for_indices(torch.cat([dead_indices, reinit_idx.unique()]))
+
+        # Reset optimizer state for dead indices (they got completely new values)
+        self._reset_optimizer_state_for_indices(dead_indices)
 
     def add_new_gs(self, cap_max):
         """

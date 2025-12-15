@@ -584,6 +584,10 @@ renderCUDAsurfelBackward(
 			// adaptive_add mode: level = (total_levels << 16) | (active_hashgrid_levels << 8)
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			actual_levels = active_hashgrid_levels;
+		} else if(render_mode == 8 || render_mode == 10){
+			// hybrid_SH and hybrid_SH_raw modes: level encodes (decompose_flag << 24) | (sh_degree << 16) | (1 << 8)
+			// Don't check level > 16 since we use higher bits for encoding
+			actual_levels = 1;  // Always 1 hashgrid level
 		} else if(level > 16){
 			printf("Error: level %d  > 16.", level);
 			return;
@@ -1112,6 +1116,154 @@ renderCUDAsurfelBackward(
 			// (sigmoid derivative: d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x)))
 			float d_gamma = d_weight * weight * inv_weight;
 			atomicAdd(&(dL_dcolors[global_id * colors_precomp_stride + feat_dim]), d_gamma);
+
+			break;
+		}
+		case 8: {
+			// hybrid_SH mode backward pass
+			// Forward: gaussian_rgb = clamp(gaussian_raw + 0.5), hashgrid_rgb = sigmoid(hashgrid_raw)
+			//          feat = clamp(gaussian_rgb + hashgrid_rgb)
+			// Need to backprop through: clamp → addition → [clamp+0.5, sigmoid]
+			
+			// Decode level parameter
+			const int decompose_flag = (level >> 24) & 0xFF;   // 0=normal, 1=gaussian_only, 2=ngp_only
+			const int hashgrid_levels = (level >> 8) & 0xFF;   // Should be 1
+			
+			int gauss_id = collected_id[j];
+			
+			// Get forward pass values to compute derivatives
+			float gaussian_raw[3];
+			gaussian_raw[0] = colors[gauss_id * 3 + 0];
+			gaussian_raw[1] = colors[gauss_id * 3 + 1];
+			gaussian_raw[2] = colors[gauss_id * 3 + 2];
+			
+			// Recompute activated values
+			float gaussian_rgb[3];
+			gaussian_rgb[0] = fmaxf(0.0f, fminf(1.0f, gaussian_raw[0] + 0.5f));
+			gaussian_rgb[1] = fmaxf(0.0f, fminf(1.0f, gaussian_raw[1] + 0.5f));
+			gaussian_rgb[2] = fmaxf(0.0f, fminf(1.0f, gaussian_raw[2] + 0.5f));
+			
+			// Query hashgrid to get raw values for sigmoid derivative
+			float hashgrid_raw[3] = {0.0f, 0.0f, 0.0f};
+			if (hashgrid_levels > 0 && decompose_flag != 1) {
+				query_feature<false, 3, 3>(hashgrid_raw, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, 1, l_scale, Base, align_corners, interp, contract, debug);
+			}
+			
+			float hashgrid_rgb[3];
+			hashgrid_rgb[0] = 1.0f / (1.0f + expf(-hashgrid_raw[0]));
+			hashgrid_rgb[1] = 1.0f / (1.0f + expf(-hashgrid_raw[1]));
+			hashgrid_rgb[2] = 1.0f / (1.0f + expf(-hashgrid_raw[2]));
+			
+			// Backprop through final clamp
+			float grad_pre_clamp[3];
+			for(int c = 0; c < 3; c++) {
+				float sum_val = gaussian_rgb[c] + hashgrid_rgb[c];
+				// Clamp derivative: 1 if in range [0,1], else 0
+				grad_pre_clamp[c] = (sum_val >= 0.0f && sum_val <= 1.0f) ? grad_feat[c] : 0.0f;
+			}
+			
+			// Backprop to gaussian_rgb and hashgrid_rgb
+			if (decompose_flag != 2) {  // Not ngp_only
+				for(int c = 0; c < 3; c++) {
+					// Backprop through gaussian clamp (+0.5)
+					float val_after_add = gaussian_raw[c] + 0.5f;
+					float grad_gaussian_raw = (val_after_add >= 0.0f && val_after_add <= 1.0f) ? grad_pre_clamp[c] : 0.0f;
+					atomicAdd(&dL_dcolors[gauss_id * 3 + c], alpha * T * grad_gaussian_raw);
+				}
+			}
+			
+			// Backprop to hashgrid through sigmoid
+			if (hashgrid_levels > 0 && decompose_flag != 1) {  // Not gaussian_only
+				float grad_hashgrid_raw[3];
+				for(int c = 0; c < 3; c++) {
+					// Sigmoid derivative: sigmoid(x) * (1 - sigmoid(x))
+					grad_hashgrid_raw[c] = alpha * T * grad_pre_clamp[c] * hashgrid_rgb[c] * (1.0f - hashgrid_rgb[c]);
+				}
+				
+				float feat_dummy[3];
+				query_feature<true, 3, 3>(feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, 1, l_scale, Base, align_corners, interp, contract, debug,
+					grad_hashgrid_raw, dL_dfeatures, dL_dxyz);
+			}
+
+			break;
+		}
+		case 9: {
+			// hybrid_SH_post mode: DEPRECATED
+			break;
+		}
+		case 10: {
+			// hybrid_SH_raw mode backward pass
+			// Forward: combined_raw = gaussian_raw + hashgrid_raw, feat = sigmoid(combined_raw)
+			// Need to backprop through: sigmoid → addition → [gaussian_raw, hashgrid_raw]
+			
+			// Decode level parameter
+			const int decompose_flag = (level >> 24) & 0xFF;   // 0=normal, 1=gaussian_only, 2=ngp_only
+			const int hashgrid_levels = (level >> 8) & 0xFF;   // Should be 1
+			
+			int gauss_id = collected_id[j];
+			
+			// Get forward pass values
+			float gaussian_raw[3];
+			gaussian_raw[0] = colors[gauss_id * 3 + 0];
+			gaussian_raw[1] = colors[gauss_id * 3 + 1];
+			gaussian_raw[2] = colors[gauss_id * 3 + 2];
+			
+			// Query hashgrid to get raw values
+			float hashgrid_raw[3] = {0.0f, 0.0f, 0.0f};
+			if (hashgrid_levels > 0 && decompose_flag != 1) {
+				query_feature<false, 3, 3>(hashgrid_raw, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, 1, l_scale, Base, align_corners, interp, contract, debug);
+			}
+			
+			// Recompute combined and activated values
+			float combined_raw[3];
+			if (decompose_flag == 2) {
+				combined_raw[0] = hashgrid_raw[0];
+				combined_raw[1] = hashgrid_raw[1];
+				combined_raw[2] = hashgrid_raw[2];
+			} else if (decompose_flag == 1) {
+				combined_raw[0] = gaussian_raw[0];
+				combined_raw[1] = gaussian_raw[1];
+				combined_raw[2] = gaussian_raw[2];
+			} else {
+				combined_raw[0] = gaussian_raw[0] + hashgrid_raw[0];
+				combined_raw[1] = gaussian_raw[1] + hashgrid_raw[1];
+				combined_raw[2] = gaussian_raw[2] + hashgrid_raw[2];
+			}
+			
+			// Compute sigmoid values for derivative
+			float sigmoid_val[3];
+			sigmoid_val[0] = 1.0f / (1.0f + expf(-combined_raw[0]));
+			sigmoid_val[1] = 1.0f / (1.0f + expf(-combined_raw[1]));
+			sigmoid_val[2] = 1.0f / (1.0f + expf(-combined_raw[2]));
+			
+			// Backprop through sigmoid: d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x))
+			float grad_combined_raw[3];
+			for(int c = 0; c < 3; c++) {
+				grad_combined_raw[c] = grad_feat[c] * sigmoid_val[c] * (1.0f - sigmoid_val[c]);
+			}
+			
+			// Backprop to gaussian_raw
+			if (decompose_flag != 2) {  // Not ngp_only
+				for(int c = 0; c < 3; c++) {
+					atomicAdd(&dL_dcolors[gauss_id * 3 + c], alpha * T * grad_combined_raw[c]);
+				}
+			}
+			
+			// Backprop to hashgrid_raw
+			if (hashgrid_levels > 0 && decompose_flag != 1) {  // Not gaussian_only
+				float grad_hashgrid_raw[3];
+				for(int c = 0; c < 3; c++) {
+					grad_hashgrid_raw[c] = alpha * T * grad_combined_raw[c];
+				}
+				
+				float feat_dummy[3];
+				query_feature<true, 3, 3>(feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, 1, l_scale, Base, align_corners, interp, contract, debug,
+					grad_hashgrid_raw, dL_dfeatures, dL_dxyz);
+			}
 			
 			break;
 		}

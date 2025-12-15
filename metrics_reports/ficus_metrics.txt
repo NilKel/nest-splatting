@@ -1,7 +1,7 @@
 ################################################################################
 #  SCENE: FICUS
-#  Generated: 2025-12-11 07:38:32
-#  Completed experiments: 17
+#  Generated: 2025-12-15 04:05:35
+#  Completed experiments: 41
 ################################################################################
 
 ================================================================================
@@ -9,13 +9,23 @@
 ================================================================================
 Method       Name                                    PSNR     SSIM         L1   #Img
 --------------------------------------------------------------------------------
+baseline     dec2ftest_baseline                     36.07   0.9878   0.004224    200
 baseline     exp1_baseline                          35.90   0.9876   0.004317    200
+baseline     noc2f_baseline                         35.27   0.9874   0.004713    200
+baseline     nocfmcmc001op001sc1e5ns_baseline       17.09   0.8371   0.046954    200
 baseline     retryingwarmcleanloadvarpath           35.71   0.9876   0.004446    200
 baseline     retryingwarmcleannoloadvarpath         35.93   0.9876   0.004292    200
 baseline     retryingwarmcleanyesloadvarpath        36.37   0.9882   0.004043    200
 baseline     retryingwarmcleanyesloadvarpathsan     35.65   0.9876   0.004494    200
 baseline     test_baseline_check                    36.20   0.9882   0.004142    200
 cat          c2ftest_3_levels                       35.98   0.9873   0.004297    200
+cat          dec2ftest_cat0_0_levels                36.18   0.9881   0.004129    200
+cat          dec2ftest_cat1_1_levels                36.06   0.9879   0.004207    200
+cat          dec2ftest_cat2_2_levels                35.87   0.9876   0.004339    200
+cat          dec2ftest_cat3_3_levels                35.59   0.9869   0.004533    200
+cat          dec2ftest_cat4_4_levels                36.11   0.9877   0.004177    200
+cat          dec2ftest_cat5_5_levels                36.27   0.9877   0.004104    200
+cat          dec2ftest_cat6_6_levels                36.05   0.9874   0.004270    200
 cat          exp1_cat0_0_levels                     36.07   0.9880   0.004220    200
 cat          exp1_cat1_1_levels                     36.41   0.9883   0.003976    200
 cat          exp1_cat2_2_levels                     35.79   0.9873   0.004401    200
@@ -23,6 +33,20 @@ cat          exp1_cat3_3_levels                     36.21   0.9876   0.004107   
 cat          exp1_cat4_4_levels                     36.16   0.9877   0.004151    200
 cat          exp1_cat5_5_levels                     36.32   0.9879   0.004057    200
 cat          exp1_cat6_6_levels                     36.13   0.9875   0.004180    200
+cat          noc2f_cat0_0_levels                    35.84   0.9877   0.004361    200
+cat          noc2f_cat1_1_levels                    35.70   0.9874   0.004416    200
+cat          noc2f_cat2_2_levels                    35.69   0.9871   0.004434    200
+cat          noc2f_cat3_3_levels                    36.07   0.9874   0.004222    200
+cat          noc2f_cat4_4_levels                    35.67   0.9872   0.004481    200
+cat          noc2f_cat5_5_levels                    36.22   0.9878   0.004120    200
+cat          noc2f_cat6_6_levels                    35.97   0.9874   0.004291    200
+cat          nocfmcmc001op001sc1e5ns_cat0_0_levels    17.09   0.8371   0.046959    200
+cat          nocfmcmc001op001sc1e5ns_cat1_1_levels    35.40   0.9850   0.004555    200
+cat          nocfmcmc001op001sc1e5ns_cat2_2_levels    35.78   0.9852   0.004266    200
+cat          nocfmcmc001op001sc1e5ns_cat3_3_levels    17.09   0.8371   0.046958    200
+cat          nocfmcmc001op001sc1e5ns_cat4_4_levels    17.09   0.8371   0.046959    200
+cat          nocfmcmc001op001sc1e5ns_cat5_5_levels    17.09   0.8371   0.046960    200
+cat          nocfmcmc001op001sc1e5ns_cat6_6_levels    17.09   0.8371   0.046961    200
 cat          retryingwarmcleanyesloadvarpathsan_3_levels    36.19   0.9877   0.004109    200
 cat          test_cat_padded_3_levels               36.02   0.9876   0.004191    200
 diffuse      c2ftest                                32.28   0.9763   0.006619    200
@@ -33,13 +57,23 @@ diffuse      c2ftest                                32.28   0.9763   0.006619   
 ================================================================================
 Method       Name                                    PSNR     SSIM         L1   #Img
 --------------------------------------------------------------------------------
+baseline     dec2ftest_baseline                     38.67   0.9947   0.002992    100
 baseline     exp1_baseline                          38.09   0.9944   0.003288    100
+baseline     noc2f_baseline                         37.59   0.9944   0.003461    100
+baseline     nocfmcmc001op001sc1e5ns_baseline       17.40   0.8488   0.042731    100
 baseline     retryingwarmcleanloadvarpath           38.15   0.9946   0.003228    100
 baseline     retryingwarmcleannoloadvarpath         37.69   0.9940   0.003487    100
 baseline     retryingwarmcleanyesloadvarpath        38.92   0.9949   0.002894    100
 baseline     retryingwarmcleanyesloadvarpathsan     38.19   0.9945   0.003220    100
 baseline     test_baseline_check                    38.77   0.9950   0.002939    100
 cat          c2ftest_3_levels                       38.86   0.9949   0.002955    100
+cat          dec2ftest_cat0_0_levels                38.63   0.9948   0.003013    100
+cat          dec2ftest_cat1_1_levels                39.03   0.9952   0.002865    100
+cat          dec2ftest_cat2_2_levels                38.55   0.9948   0.003095    100
+cat          dec2ftest_cat3_3_levels                38.26   0.9945   0.003233    100
+cat          dec2ftest_cat4_4_levels                38.70   0.9947   0.003000    100
+cat          dec2ftest_cat5_5_levels                38.62   0.9944   0.003028    100
+cat          dec2ftest_cat6_6_levels                38.44   0.9939   0.003077    100
 cat          exp1_cat0_0_levels                     38.57   0.9948   0.003023    100
 cat          exp1_cat1_1_levels                     39.58   0.9955   0.002618    100
 cat          exp1_cat2_2_levels                     38.74   0.9950   0.003022    100
@@ -47,6 +81,20 @@ cat          exp1_cat3_3_levels                     39.23   0.9951   0.002765   
 cat          exp1_cat4_4_levels                     38.89   0.9948   0.002906    100
 cat          exp1_cat5_5_levels                     38.95   0.9947   0.002844    100
 cat          exp1_cat6_6_levels                     38.49   0.9939   0.003020    100
+cat          noc2f_cat0_0_levels                    38.27   0.9946   0.003164    100
+cat          noc2f_cat1_1_levels                    38.95   0.9954   0.002931    100
+cat          noc2f_cat2_2_levels                    38.20   0.9946   0.003249    100
+cat          noc2f_cat3_3_levels                    38.82   0.9949   0.002982    100
+cat          noc2f_cat4_4_levels                    38.43   0.9946   0.003113    100
+cat          noc2f_cat5_5_levels                    38.74   0.9946   0.002944    100
+cat          noc2f_cat6_6_levels                    38.10   0.9938   0.003198    100
+cat          nocfmcmc001op001sc1e5ns_cat0_0_levels    17.40   0.8488   0.042735    100
+cat          nocfmcmc001op001sc1e5ns_cat1_1_levels    38.18   0.9931   0.003177    100
+cat          nocfmcmc001op001sc1e5ns_cat2_2_levels    38.79   0.9933   0.002852    100
+cat          nocfmcmc001op001sc1e5ns_cat3_3_levels    17.40   0.8488   0.042734    100
+cat          nocfmcmc001op001sc1e5ns_cat4_4_levels    17.40   0.8488   0.042735    100
+cat          nocfmcmc001op001sc1e5ns_cat5_5_levels    17.40   0.8488   0.042736    100
+cat          nocfmcmc001op001sc1e5ns_cat6_6_levels    17.40   0.8488   0.042737    100
 cat          retryingwarmcleanyesloadvarpathsan_3_levels    39.20   0.9953   0.002818    100
 cat          test_cat_padded_3_levels               38.97   0.9952   0.002860    100
 diffuse      c2ftest                                32.01   0.9806   0.006258    100

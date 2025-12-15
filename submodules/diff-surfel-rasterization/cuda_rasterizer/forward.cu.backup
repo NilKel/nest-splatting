@@ -153,85 +153,6 @@ __device__ void eval_sh_inline(int deg, const float* sh, const float3& dir, floa
 	result[2] = fmaxf(result[2], 0.0f);
 }
 
-
-// Inline SH evaluation WITHOUT activation (for hybrid_SH mode)
-// Returns raw SH RGB values before activation
-__device__ void eval_sh_raw(int deg, const float* sh, const float3& dir, float* result) {
-	// DC component (degree 0) - NO +0.5 offset
-	result[0] = SH_C0 * sh[0];  // R
-	result[1] = SH_C0 * sh[1];  // G
-	result[2] = SH_C0 * sh[2];  // B
-
-	if (deg > 0) {
-		float x = dir.x;
-		float y = dir.y;
-		float z = dir.z;
-
-		// Degree 1 (coefficients 1-3, indices 3-11)
-		result[0] = result[0] - SH_C1 * y * sh[3]  + SH_C1 * z * sh[6]  - SH_C1 * x * sh[9];   // R
-		result[1] = result[1] - SH_C1 * y * sh[4]  + SH_C1 * z * sh[7]  - SH_C1 * x * sh[10];  // G
-		result[2] = result[2] - SH_C1 * y * sh[5]  + SH_C1 * z * sh[8]  - SH_C1 * x * sh[11];  // B
-
-		if (deg > 1) {
-			float xx = x * x, yy = y * y, zz = z * z;
-			float xy = x * y, yz = y * z, xz = x * z;
-
-			// Degree 2 (coefficients 4-8, indices 12-26)
-			result[0] = result[0] +
-				SH_C2[0] * xy * sh[12] +
-				SH_C2[1] * yz * sh[15] +
-				SH_C2[2] * (2.0f * zz - xx - yy) * sh[18] +
-				SH_C2[3] * xz * sh[21] +
-				SH_C2[4] * (xx - yy) * sh[24];
-
-			result[1] = result[1] +
-				SH_C2[0] * xy * sh[13] +
-				SH_C2[1] * yz * sh[16] +
-				SH_C2[2] * (2.0f * zz - xx - yy) * sh[19] +
-				SH_C2[3] * xz * sh[22] +
-				SH_C2[4] * (xx - yy) * sh[25];
-
-			result[2] = result[2] +
-				SH_C2[0] * xy * sh[14] +
-				SH_C2[1] * yz * sh[17] +
-				SH_C2[2] * (2.0f * zz - xx - yy) * sh[20] +
-				SH_C2[3] * xz * sh[23] +
-				SH_C2[4] * (xx - yy) * sh[26];
-
-			if (deg > 2) {
-				// Degree 3 (coefficients 9-15, indices 27-47)
-				result[0] = result[0] +
-					SH_C3[0] * y * (3.0f * xx - yy) * sh[27] +
-					SH_C3[1] * xy * z * sh[30] +
-					SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[33] +
-					SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[36] +
-					SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[39] +
-					SH_C3[5] * z * (xx - yy) * sh[42] +
-					SH_C3[6] * x * (xx - 3.0f * yy) * sh[45];
-
-				result[1] = result[1] +
-					SH_C3[0] * y * (3.0f * xx - yy) * sh[28] +
-					SH_C3[1] * xy * z * sh[31] +
-					SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[34] +
-					SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[37] +
-					SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[40] +
-					SH_C3[5] * z * (xx - yy) * sh[43] +
-					SH_C3[6] * x * (xx - 3.0f * yy) * sh[46];
-
-				result[2] = result[2] +
-					SH_C3[0] * y * (3.0f * xx - yy) * sh[29] +
-					SH_C3[1] * xy * z * sh[32] +
-					SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[35] +
-					SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[38] +
-					SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[41] +
-					SH_C3[5] * z * (xx - yy) * sh[44] +
-					SH_C3[6] * x * (xx - 3.0f * yy) * sh[47];
-			}
-		}
-	}
-	// NO activation here - returns raw values
-}
-
 // Compute a 2D-to-2D mapping matrix from a tangent plane into a image plane
 // given a 2D gaussian parameters.
 __device__ void compute_transmat(
@@ -746,7 +667,7 @@ renderCUDAsurfelForward(
 			int hybrid_levels = level;
 			// Hashgrid levels determined from offsets during query
 			hashgrid_levels = 16;  // Max possible, will be clamped by actual offsets
-		} else if(render_mode == 8 || render_mode == 9 || render_mode == 10){
+		} else if(render_mode == 8 || render_mode == 9){
 			// hybrid_SH/hybrid_SH_post mode: level encodes (decompose_flag << 24) | (sh_degree << 16) | (1 << 8)
 			// Don't check level > 16 since we use higher bits for encoding
 			hashgrid_levels = 1;  // Always 1 for hybrid_SH modes
@@ -1170,121 +1091,94 @@ renderCUDAsurfelForward(
 			break;
 		}
 		case 8: {
-			// hybrid_SH mode: Activate separately then add
-			// Gaussian SH → RGB (+0.5, clamp) → [0,1]
-			// Hashgrid → raw features → sigmoid → [0,1]
-			// Add them → [0,2] → clamp to [0,1]
-			// Activation happens BEFORE alpha blending
+			// hybrid_SH mode: Per-Gaussian RGB (pre-computed from SH in Python) + hashgrid DC residual
+			// Input: rgb buffer contains pre-evaluated RGB colors (N, 3)
 			
 			// Decode level parameter
 			const int decompose_flag = (level >> 24) & 0xFF;   // 0=normal, 1=gaussian_only, 2=ngp_only
 			const int hashgrid_levels = (level >> 8) & 0xFF;   // Should be 1
 
-			// 1. Load per-Gaussian raw SH RGB from rgb buffer (evaluated in Python, no activation yet)
+			// 1. Load per-Gaussian pre-computed RGB from rgb buffer
 			int gauss_id = collected_id[j];
-			float gaussian_raw[3];
-			gaussian_raw[0] = rgb[gauss_id * 3 + 0];
-			gaussian_raw[1] = rgb[gauss_id * 3 + 1];
-			gaussian_raw[2] = rgb[gauss_id * 3 + 2];
-			
-			// Apply standard SH activation: +0.5 and clamp to [0,1]
 			float gaussian_rgb[3];
-			gaussian_rgb[0] = fmaxf(0.0f, fminf(1.0f, gaussian_raw[0] + 0.5f));
-			gaussian_rgb[1] = fmaxf(0.0f, fminf(1.0f, gaussian_raw[1] + 0.5f));
-			gaussian_rgb[2] = fmaxf(0.0f, fminf(1.0f, gaussian_raw[2] + 0.5f));
+			gaussian_rgb[0] = rgb[gauss_id * 3 + 0];
+			gaussian_rgb[1] = rgb[gauss_id * 3 + 1];
+			gaussian_rgb[2] = rgb[gauss_id * 3 + 2];
 
-			// 2. Query hashgrid for raw residual (3 values)
-			float hashgrid_raw[3] = {0.0f, 0.0f, 0.0f};
+			// 2. Query hashgrid for DC residual (3 values)
+			float dc_residual[3] = {0.0f, 0.0f, 0.0f};
 
 			if (hashgrid_levels > 0 && decompose_flag != 1) {  // Skip if gaussian_only
 				// Query single-level hashgrid at intersection point
-				query_feature<false, 3, 3>(hashgrid_raw, xyz, voxel_min, voxel_max,
+				query_feature<false, 3, 3>(dc_residual, xyz, voxel_min, voxel_max,
 					collec_offsets, appearance_level, hash_features,
 					1, l_scale, Base, align_corners, interp, contract, debug);
 			}
-			
-			// Apply sigmoid activation to hashgrid features
-			float hashgrid_rgb[3];
-			hashgrid_rgb[0] = 1.0f / (1.0f + expf(-hashgrid_raw[0]));
-			hashgrid_rgb[1] = 1.0f / (1.0f + expf(-hashgrid_raw[1]));
-			hashgrid_rgb[2] = 1.0f / (1.0f + expf(-hashgrid_raw[2]));
 
 			// 3. Combine based on decompose mode
 			if (decompose_flag == 2) {
-				// ngp_only mode: Only use hashgrid (activated)
-				feat[0] = hashgrid_rgb[0];
-				feat[1] = hashgrid_rgb[1];
-				feat[2] = hashgrid_rgb[2];
+				// ngp_only mode: Only use hashgrid DC residual
+				feat[0] = dc_residual[0];
+				feat[1] = dc_residual[1];
+				feat[2] = dc_residual[2];
 			} else if (decompose_flag == 1) {
-				// gaussian_only mode: Only use Gaussian SH (activated)
+				// gaussian_only mode: Only use per-Gaussian RGB
 				feat[0] = gaussian_rgb[0];
 				feat[1] = gaussian_rgb[1];
 				feat[2] = gaussian_rgb[2];
 			} else {
-				// Normal mode: Add activated values and clamp to [0,1]
-				feat[0] = fmaxf(0.0f, fminf(1.0f, gaussian_rgb[0] + hashgrid_rgb[0]));
-				feat[1] = fmaxf(0.0f, fminf(1.0f, gaussian_rgb[1] + hashgrid_rgb[1]));
-				feat[2] = fmaxf(0.0f, fminf(1.0f, gaussian_rgb[2] + hashgrid_rgb[2]));
+				// Normal mode: Add hashgrid residual to per-Gaussian RGB
+				feat[0] = gaussian_rgb[0] + dc_residual[0];
+				feat[1] = gaussian_rgb[1] + dc_residual[1];
+				feat[2] = gaussian_rgb[2] + dc_residual[2];
 			}
 
 			break;
 		}
 		case 9: {
-			// hybrid_SH_post mode: DEPRECATED - kept for backward compatibility
-			// Use mode 8 or 10 instead
-			break;
-		}
-		case 10: {
-			// hybrid_SH_raw mode: Add raw values then activate together
-			// Gaussian SH → raw RGB (unbounded)
-			// Hashgrid → raw features (unbounded)
-			// Add them → sigmoid → [0,1]
-			// Activation happens BEFORE alpha blending
+			// hybrid_SH_post mode: Pass SH coefficients through, add DC residual in SH space
+			// Input: rgb buffer contains SH coefficients (N, 48)
+			// Output: modified SH coefficients (48D) - SH eval happens in Python post-raster
 			
 			// Decode level parameter
 			const int decompose_flag = (level >> 24) & 0xFF;   // 0=normal, 1=gaussian_only, 2=ngp_only
+			const int sh_degree = (level >> 16) & 0xFF;        // Active SH degree (0-3)
 			const int hashgrid_levels = (level >> 8) & 0xFF;   // Should be 1
-
-			// 1. Load per-Gaussian raw SH RGB from rgb buffer (evaluated in Python, no activation)
+			
+			// Constants
+			const int num_sh_coeffs = (sh_degree + 1) * (sh_degree + 1);  // e.g., 16 for degree 3
+			const int sh_data_size = num_sh_coeffs * 3;  // e.g., 48 for degree 3
+			
+			// 1. Load per-Gaussian SH coefficients from rgb buffer
 			int gauss_id = collected_id[j];
-			float gaussian_raw[3];
-			gaussian_raw[0] = rgb[gauss_id * 3 + 0];
-			gaussian_raw[1] = rgb[gauss_id * 3 + 1];
-			gaussian_raw[2] = rgb[gauss_id * 3 + 2];
-
-			// 2. Query hashgrid for raw residual (3 values)
-			float hashgrid_raw[3] = {0.0f, 0.0f, 0.0f};
-
+			const float* sh_coeffs = rgb + (gauss_id * 48);  // Always 48 for degree 3
+			
+			// 2. Query hashgrid for DC residual (3 values)
+			float dc_residual[3] = {0.0f, 0.0f, 0.0f};
+			
 			if (hashgrid_levels > 0 && decompose_flag != 1) {  // Skip if gaussian_only
-				// Query single-level hashgrid at intersection point
-				query_feature<false, 3, 3>(hashgrid_raw, xyz, voxel_min, voxel_max,
+				query_feature<false, 3, 3>(dc_residual, xyz, voxel_min, voxel_max,
 					collec_offsets, appearance_level, hash_features,
 					1, l_scale, Base, align_corners, interp, contract, debug);
 			}
-
-			// 3. Combine based on decompose mode
-			float combined_raw[3];
-			if (decompose_flag == 2) {
-				// ngp_only mode: Only use hashgrid raw
-				combined_raw[0] = hashgrid_raw[0];
-				combined_raw[1] = hashgrid_raw[1];
-				combined_raw[2] = hashgrid_raw[2];
-			} else if (decompose_flag == 1) {
-				// gaussian_only mode: Only use Gaussian raw
-				combined_raw[0] = gaussian_raw[0];
-				combined_raw[1] = gaussian_raw[1];
-				combined_raw[2] = gaussian_raw[2];
-			} else {
-				// Normal mode: Add raw values
-				combined_raw[0] = gaussian_raw[0] + hashgrid_raw[0];
-				combined_raw[1] = gaussian_raw[1] + hashgrid_raw[1];
-				combined_raw[2] = gaussian_raw[2] + hashgrid_raw[2];
+			
+			// 3. Output modified SH coefficients
+			// Copy all SH coefficients first
+			for(int i = 0; i < 48 && i < CHANNELS; i++) {
+				if (decompose_flag == 2) {
+					// ngp_only mode: Zero out per-Gaussian SH
+					feat[i] = 0.0f;
+				} else {
+					feat[i] = sh_coeffs[i];
+				}
 			}
 			
-			// 4. Apply sigmoid activation to combined raw values
-			feat[0] = 1.0f / (1.0f + expf(-combined_raw[0]));
-			feat[1] = 1.0f / (1.0f + expf(-combined_raw[1]));
-			feat[2] = 1.0f / (1.0f + expf(-combined_raw[2]));
+			// Add DC residual to first 3 coefficients (DC component: sh0_r, sh0_g, sh0_b)
+			if (decompose_flag != 1) {  // Not gaussian_only
+				feat[0] += dc_residual[0];  // R channel DC
+				feat[1] += dc_residual[1];  // G channel DC
+				feat[2] += dc_residual[2];  // B channel DC
+			}
 			
 			break;
 		}

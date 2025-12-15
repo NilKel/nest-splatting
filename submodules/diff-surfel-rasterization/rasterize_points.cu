@@ -174,6 +174,16 @@ RasterizeGaussiansCUDA(
 		uint32_t total_levels = Level >> 16;  // Extract bits 16-31
 		C = total_levels * D;  // e.g., 6 × 4 = 24D
 	}
+	else if(render_mode == 8 || render_mode == 10) {
+		// hybrid_SH and hybrid_SH_raw modes: output RGB (3 channels)
+		// Level encodes (decompose_flag << 24) | (hashgrid_levels << 8)
+		C = 3;  // RGB output
+	}
+	else if(render_mode == 9) {
+		// hybrid_SH_post mode: outputs SH coefficients (48 channels for degree 3)
+		// Level encodes (decompose_flag << 24) | (sh_degree << 16) | (hashgrid_levels << 8)
+		C = 48;  // SH coefficients output
+	}
 	else {
 		// Single hashgrid modes
 		// Determine output dimensions based on render_mode
@@ -397,6 +407,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 		uint32_t total_levels = Level >> 16;  // Extract bits 16-31
 		C = total_levels * D;  // e.g., 6 × 4 = 24D
 	}
+	else if(render_mode == 8 || render_mode == 10) {
+		// hybrid_SH and hybrid_SH_raw modes: output RGB (3 channels)
+		// Level encodes (decompose_flag << 24) | (hashgrid_levels << 8)
+		C = 3;  // RGB output
+	}
+	else if(render_mode == 9) {
+		// hybrid_SH_post mode: outputs SH coefficients (48 channels for degree 3)
+		// Level encodes (decompose_flag << 24) | (sh_degree << 16) | (hashgrid_levels << 8)
+		C = 48;  // SH coefficients output
+	}
 	else {
 	// Single hashgrid modes
 	// Determine output dimensions based on render_mode
@@ -444,6 +464,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	// Level encoding: (total_levels << 16) | (active_hashgrid_levels << 8)
 	uint32_t total_levels = Level >> 16;  // Extract bits 16-31
 	colors_dim = total_levels * D + 1;  // e.g., 6 × 4 + 1 = 25D
+  } else if (render_mode == 8 || render_mode == 10) {
+	// hybrid_SH and hybrid_SH_raw modes: colors_precomp = pre-evaluated RGB (3 channels)
+	// dL_dcolors needs to match input RGB size
+	colors_dim = 3;  // RGB
+  } else if (render_mode == 9) {
+	// hybrid_SH_post mode: colors_precomp = SH coefficients (48 channels)
+	// dL_dcolors needs to match input SH coefficient size
+	colors_dim = 48;  // SH coefficients
   }
   torch::Tensor dL_dcolors = torch::zeros({P, colors_dim}, means3D.options());
   torch::Tensor dL_dnormal = torch::zeros({P, 3}, means3D.options());

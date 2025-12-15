@@ -1,11 +1,12 @@
 #!/bin/bash
 # Script to train Nest-Splatting with baseline and cat modes (hybrid_levels 0-6)
-# Usage: ./train_baseline_cat.sh <base_name> [scene_names] [iterations] [data_dir]
+# Usage: ./train_baseline_cat.sh <base_name> [scene_names] [iterations] [data_dir] [extra_args]
 #
 # Example:
 #   ./train_baseline_cat.sh exp1              # Run all scenes
 #   ./train_baseline_cat.sh exp1 drums,mic    # Run specific scenes
 #   ./train_baseline_cat.sh exp1 all 30000    # Run all scenes with 30k iters
+#   ./train_baseline_cat.sh exp1 all 30000 default "--disable_c2f"  # With extra args
 
 set -e  # Exit on error
 
@@ -17,18 +18,21 @@ ALL_SCENES="chair,drums,ficus,hotdog,lego,materials,mic,ship"
 
 # Parse arguments
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <base_name> [scene_names] [iterations] [data_dir]"
+    echo "Usage: $0 <base_name> [scene_names] [iterations] [data_dir] [extra_args]"
     echo ""
     echo "Arguments:"
     echo "  base_name     Required. Base name for experiments (e.g., exp1, test)"
     echo "  scene_names   Optional. Comma-separated scene names or 'all' (default: all)"
     echo "  iterations    Optional. Number of training iterations (default: 30000)"
-    echo "  data_dir      Optional. Base data directory"
+    echo "  data_dir      Optional. Base data directory (use 'default' for default path)"
+    echo "  extra_args    Optional. Extra arguments to pass to train.py (e.g., '--disable_c2f')"
     echo ""
     echo "Examples:"
-    echo "  $0 exp1                         # Run all 8 scenes"
-    echo "  $0 exp1 drums,mic               # Run only drums and mic"
-    echo "  $0 exp1 all 30000               # Run all scenes with 30k iterations"
+    echo "  $0 exp1                                      # Run all 8 scenes"
+    echo "  $0 exp1 drums,mic                            # Run only drums and mic"
+    echo "  $0 exp1 all 30000                            # Run all scenes with 30k iterations"
+    echo "  $0 exp1 all 30000 default \"--disable_c2f\"   # With --disable_c2f flag"
+    echo "  $0 exp1 chair 30000 default \"--mcmc --cap_max 300000\"  # With MCMC mode"
     echo ""
     echo "Methods trained per scene:"
     echo "  - baseline"
@@ -42,6 +46,12 @@ BASE_NAME=$1
 SCENE_NAMES=${2:-all}
 ITERATIONS=${3:-$DEFAULT_ITERATIONS}
 DATA_DIR=${4:-$DEFAULT_DATA_DIR}
+EXTRA_ARGS=${5:-""}
+
+# Handle "default" keyword for data_dir
+if [ "$DATA_DIR" = "default" ]; then
+    DATA_DIR=$DEFAULT_DATA_DIR
+fi
 
 # Handle "all" keyword
 if [ "$SCENE_NAMES" = "all" ]; then
@@ -66,11 +76,14 @@ fi
 echo "════════════════════════════════════════════════════════════════════"
 echo "  Nest-Splatting - Baseline & Cat Training"
 echo "════════════════════════════════════════════════════════════════════"
-echo "Base name:  $BASE_NAME"
-echo "Scenes:     ${SCENES[@]}"
-echo "Iterations: $ITERATIONS"
-echo "Data dir:   $DATA_DIR"
-echo "Config:     $YAML_CONFIG"
+echo "Base name:   $BASE_NAME"
+echo "Scenes:      ${SCENES[@]}"
+echo "Iterations:  $ITERATIONS"
+echo "Data dir:    $DATA_DIR"
+echo "Config:      $YAML_CONFIG"
+if [ -n "$EXTRA_ARGS" ]; then
+echo "Extra args:  $EXTRA_ARGS"
+fi
 echo "════════════════════════════════════════════════════════════════════"
 echo ""
 
@@ -125,7 +138,7 @@ run_training() {
     echo "  [$CURRENT_RUN/$TOTAL_RUNS] Training: ${scene_name} - ${experiment_name}"
     echo "════════════════════════════════════════════════════════════════════"
     
-    CMD="python train.py -s $scene_path -m $experiment_name --yaml $YAML_CONFIG --eval --iterations $ITERATIONS --method $method $extra_args"
+    CMD="python train.py -s $scene_path -m $experiment_name --yaml $YAML_CONFIG --eval --iterations $ITERATIONS --method $method $extra_args $EXTRA_ARGS"
     
     echo "Command: $CMD"
     echo "Started: $(date)"

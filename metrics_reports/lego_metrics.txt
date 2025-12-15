@@ -1,7 +1,7 @@
 ################################################################################
 #  SCENE: LEGO
-#  Generated: 2025-12-11 07:38:32
-#  Completed experiments: 7
+#  Generated: 2025-12-15 04:05:35
+#  Completed experiments: 31
 ################################################################################
 
 ================================================================================
@@ -9,13 +9,37 @@
 ================================================================================
 Method       Name                                    PSNR     SSIM         L1   #Img
 --------------------------------------------------------------------------------
+baseline     dec2ftest_baseline                     35.34   0.9800   0.005280    200
 baseline     exp1_baseline                          35.37   0.9800   0.005232    200
+baseline     noc2f_baseline                         35.22   0.9799   0.005349    200
+baseline     nocfmcmc001op001sc1e5ns_baseline       35.15   0.9801   0.005569    200
+cat          dec2ftest_cat0_0_levels                34.91   0.9795   0.005848    200
+cat          dec2ftest_cat1_1_levels                35.45   0.9803   0.005180    200
+cat          dec2ftest_cat2_2_levels                35.49   0.9802   0.005102    200
+cat          dec2ftest_cat3_3_levels                35.51   0.9800   0.005167    200
+cat          dec2ftest_cat4_4_levels                34.99   0.9796   0.005694    200
+cat          dec2ftest_cat5_5_levels                35.22   0.9799   0.005340    200
 cat          exp1_cat0_0_levels                     34.92   0.9796   0.005840    200
 cat          exp1_cat1_1_levels                     35.45   0.9803   0.005163    200
 cat          exp1_cat2_2_levels                     35.44   0.9802   0.005169    200
 cat          exp1_cat4_4_levels                     35.26   0.9799   0.005277    200
 cat          exp1_cat5_5_levels                     35.28   0.9800   0.005284    200
 cat          exp1_cat6_6_levels                     35.01   0.9787   0.005602    200
+cat          fixc2f_5_levels                        35.41   0.9801   0.005281    200
+cat          noc2f_cat0_0_levels                    35.24   0.9799   0.005319    200
+cat          noc2f_cat1_1_levels                    35.36   0.9800   0.005211    200
+cat          noc2f_cat2_2_levels                    35.48   0.9800   0.005151    200
+cat          noc2f_cat3_3_levels                    35.51   0.9802   0.005107    200
+cat          noc2f_cat4_4_levels                    35.41   0.9800   0.005280    200
+cat          noc2f_cat5_5_levels                    35.29   0.9800   0.005247    200
+cat          noc2f_cat6_6_levels                    35.21   0.9790   0.005380    200
+cat          nocfmcmc001op001sc1e5ns_cat0_0_levels    35.44   0.9804   0.005321    200
+cat          nocfmcmc001op001sc1e5ns_cat1_1_levels    35.35   0.9802   0.005170    200
+cat          nocfmcmc001op001sc1e5ns_cat2_2_levels    35.24   0.9800   0.005308    200
+cat          nocfmcmc001op001sc1e5ns_cat3_3_levels    35.29   0.9803   0.005206    200
+cat          nocfmcmc001op001sc1e5ns_cat4_4_levels    35.57   0.9806   0.005093    200
+cat          nocfmcmc001op001sc1e5ns_cat5_5_levels    35.70   0.9815   0.005053    200
+cat          nocfmcmc001op001sc1e5ns_cat6_6_levels    35.58   0.9822   0.005131    200
 ================================================================================
 
 ================================================================================
@@ -23,11 +47,35 @@ cat          exp1_cat6_6_levels                     35.01   0.9787   0.005602   
 ================================================================================
 Method       Name                                    PSNR     SSIM         L1   #Img
 --------------------------------------------------------------------------------
+baseline     dec2ftest_baseline                     39.98   0.9921   0.003380    100
 baseline     exp1_baseline                          39.81   0.9920   0.003346    100
+baseline     noc2f_baseline                         39.82   0.9919   0.003498    100
+baseline     nocfmcmc001op001sc1e5ns_baseline       39.39   0.9916   0.003852    100
+cat          dec2ftest_cat0_0_levels                38.82   0.9912   0.004119    100
+cat          dec2ftest_cat1_1_levels                40.69   0.9928   0.003128    100
+cat          dec2ftest_cat2_2_levels                40.89   0.9930   0.003025    100
+cat          dec2ftest_cat3_3_levels                40.68   0.9927   0.003183    100
+cat          dec2ftest_cat4_4_levels                39.35   0.9914   0.003897    100
+cat          dec2ftest_cat5_5_levels                39.78   0.9911   0.003553    100
 cat          exp1_cat0_0_levels                     38.82   0.9911   0.004137    100
 cat          exp1_cat1_1_levels                     40.59   0.9929   0.003131    100
 cat          exp1_cat2_2_levels                     40.72   0.9929   0.003138    100
 cat          exp1_cat4_4_levels                     40.22   0.9919   0.003342    100
 cat          exp1_cat5_5_levels                     39.86   0.9911   0.003501    100
 cat          exp1_cat6_6_levels                     38.36   0.9873   0.004112    100
+cat          fixc2f_5_levels                        39.61   0.9909   0.003607    100
+cat          noc2f_cat0_0_levels                    39.86   0.9919   0.003407    100
+cat          noc2f_cat1_1_levels                    40.73   0.9929   0.003153    100
+cat          noc2f_cat2_2_levels                    40.78   0.9929   0.003131    100
+cat          noc2f_cat3_3_levels                    40.77   0.9927   0.003106    100
+cat          noc2f_cat4_4_levels                    40.24   0.9920   0.003401    100
+cat          noc2f_cat5_5_levels                    39.90   0.9911   0.003463    100
+cat          noc2f_cat6_6_levels                    38.80   0.9879   0.003803    100
+cat          nocfmcmc001op001sc1e5ns_cat0_0_levels    39.80   0.9921   0.003559    100
+cat          nocfmcmc001op001sc1e5ns_cat1_1_levels    40.84   0.9929   0.003117    100
+cat          nocfmcmc001op001sc1e5ns_cat2_2_levels    40.48   0.9926   0.003307    100
+cat          nocfmcmc001op001sc1e5ns_cat3_3_levels    40.67   0.9926   0.003180    100
+cat          nocfmcmc001op001sc1e5ns_cat4_4_levels    40.65   0.9924   0.003190    100
+cat          nocfmcmc001op001sc1e5ns_cat5_5_levels    40.32   0.9919   0.003325    100
+cat          nocfmcmc001op001sc1e5ns_cat6_6_levels    39.77   0.9909   0.003560    100
 ================================================================================

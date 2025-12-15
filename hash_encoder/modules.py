@@ -74,11 +74,17 @@ class INGP(nn.Module):
         self.is_diffuse_ngp_mode = args is not None and hasattr(args, 'method') and args.method == "diffuse_ngp"
         # Store args for diffuse_offset mode (diffuse SH as xyz offset for hashgrid query)
         self.is_diffuse_offset_mode = args is not None and hasattr(args, 'method') and args.method == "diffuse_offset"
-        
+        # Store args for hybrid_SH mode (activate separately then add)
+        self.is_hybrid_sh_mode = args is not None and hasattr(args, 'method') and args.method == "hybrid_SH"
+        # Store args for hybrid_SH_raw mode (add raw then activate)
+        self.is_hybrid_sh_raw_mode = args is not None and hasattr(args, 'method') and args.method == "hybrid_SH_raw"
+        # Store args for hybrid_SH_post mode (DEPRECATED)
+        self.is_hybrid_sh_post_mode = args is not None and hasattr(args, 'method') and args.method == "hybrid_SH_post"
+
         self.build_encoding(cfg_model.encoding)
         
-        # Diffuse/Specular mode: no MLP needed, just SH-based RGB
-        if self.is_diffuse_mode or self.is_specular_mode:
+        # Diffuse/Specular/hybrid_SH/hybrid_SH_raw/hybrid_SH_post mode: no MLP needed, just SH-based RGB
+        if self.is_diffuse_mode or self.is_specular_mode or self.is_hybrid_sh_mode or self.is_hybrid_sh_raw_mode or self.is_hybrid_sh_post_mode:
             self.feat_dim = 3  # RGB
             self.mlp_rgb = None
             self.view_dep = False  # View dependency handled by SH, not MLP
@@ -224,6 +230,43 @@ class INGP(nn.Module):
                 print('hash config:', config)
                 self.hash_encoding = register_GridEncoder(config)
                 self.resolutions = selected_resolutions
+
+        # hybrid_SH/hybrid_SH_raw/hybrid_SH_post mode: single finest-resolution level, 3D features (DC residuals)
+        elif self.is_hybrid_sh_mode or self.is_hybrid_sh_raw_mode or self.is_hybrid_sh_post_mode:
+            # Override level_dim to 3 for DC residuals (RGB channels)
+            self.level_dim = 3
+
+            # Calculate finest resolution from standard progression
+            finest_resolution = all_resolutions[-1]
+
+            # Create single-level hashgrid
+            self.hashgrid_levels = 1
+            self.hashgrid_disabled = False
+
+            config = SimpleNamespace(
+                device="cuda",
+                otype="HashGrid",
+                n_levels=1,                          # Single level
+                n_features_per_level=3,              # 3D features (RGB DC residual)
+                log2_hashmap_size=cfg_encoding.hashgrid.dict_size,
+                base_resolution=finest_resolution,   # Use finest as base
+                finest_resolution=finest_resolution, # Same as base
+                init_mode='uniform',
+                per_level_scale=1.0,                 # No growth (single level)
+                range=self.voxel_range,
+            )
+
+            print('[HYBRID_SH MODE] Single-level hashgrid configuration:')
+            print(f'  Resolution: {finest_resolution}')
+            print(f'  Features per level: 3 (DC residual)')
+            print(f'  Hashgrid size: 2^{cfg_encoding.hashgrid.dict_size}')
+
+            self.hash_encoding = register_GridEncoder(config)
+            self.resolutions = [finest_resolution]
+
+            # Set active levels
+            self.active_hashgrid_levels = 1
+
         else:
             # Baseline mode: use all levels
             self.hashgrid_levels = num_levels_total
@@ -248,22 +291,30 @@ class INGP(nn.Module):
         
         print(f'hash resolution : {self.resolutions}')
         print(f'init activate level {cfg_encoding.coarse2fine.init_active_level}')
-        
-        encoding_dim = cfg_encoding.hashgrid.dim * cfg_encoding.levels
+
+        # encoding_dim calculation
+        if self.is_hybrid_sh_mode or self.is_hybrid_sh_raw_mode or self.is_hybrid_sh_post_mode:
+            encoding_dim = 3  # 3D features for DC residuals
+        else:
+            encoding_dim = cfg_encoding.hashgrid.dim * cfg_encoding.levels
 
         self.level_mask = cfg_encoding.coarse2fine.enabled
-        # Diffuse_ngp/diffuse_offset: override C2F to disabled
-        if self.is_diffuse_ngp_mode or self.is_diffuse_offset_mode:
-            print(f'If coarse2fine : False (disabled for diffuse_ngp/diffuse_offset mode)')
+        # Diffuse_ngp/diffuse_offset/hybrid_SH/hybrid_SH_raw/hybrid_SH_post: override C2F to disabled
+        if self.is_diffuse_ngp_mode or self.is_diffuse_offset_mode or self.is_hybrid_sh_mode or self.is_hybrid_sh_raw_mode or self.is_hybrid_sh_post_mode:
+            print(f'If coarse2fine : False (disabled for diffuse_ngp/diffuse_offset/hybrid_SH modes)')
+            self.level_mask = False
+            self.init_active_level = 1
+            self.step = 1000  # Dummy value
         else:
             print(f'If coarse2fine : {self.level_mask}')
-        if self.level_mask:
-            self.init_active_level = cfg_encoding.coarse2fine.init_active_level
-            self.step = cfg_encoding.coarse2fine.step
-        
+            if self.level_mask:
+                self.init_active_level = cfg_encoding.coarse2fine.init_active_level
+                self.step = cfg_encoding.coarse2fine.step
+
         # Initialize active_hashgrid_levels (will be updated by set_active_levels)
-        self.active_hashgrid_levels = self.hashgrid_levels
-            
+        if not hasattr(self, 'active_hashgrid_levels'):
+            self.active_hashgrid_levels = self.hashgrid_levels
+
         return encoding_dim
 
     def build_view_enc(self, cfg_view_enc):

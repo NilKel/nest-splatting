@@ -52,9 +52,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset, scene_name, args.yaml, args)
     args.model_path = dataset.model_path
     
-    # Pass method and hybrid_levels to dataset for use in Scene/GaussianModel
+    # Pass method, hybrid_levels, and decompose_mode to dataset for use in Scene/GaussianModel
     dataset.method = args.method
     dataset.hybrid_levels = args.hybrid_levels if hasattr(args, 'hybrid_levels') else 3
+    dataset.decompose_mode = args.decompose_mode if hasattr(args, 'decompose_mode') else None
 
     first_iter = 0
     gaussians = GaussianModel(dataset.sh_degree)
@@ -316,6 +317,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_dist_for_log = 0.0
     ema_normal_for_log = 0.0
     ema_mask_for_log = 0.0
+    ema_mcmc_loss_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -391,9 +393,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             current_bg = background
         
-        render_pkg = render(viewpoint_cam, gaussians, pipe, current_bg, ingp = ingp, 
+        render_pkg = render(viewpoint_cam, gaussians, pipe, current_bg, ingp = ingp,
             beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance,
-            use_xyz_mode = args.use_xyz_mode)
+            use_xyz_mode = args.use_xyz_mode, decompose_mode = dataset.decompose_mode)
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
     
@@ -497,10 +499,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scout_loss = args.scout_lambda * diff_masked.mean()
 
         # MCMC regularization losses - encourage sparsity in opacity and scale
+        # Regularize ACTIVATED values (after sigmoid/exp) - following 3dgrut MCMC implementation
         mcmc_opacity_reg = torch.tensor(0.0, device="cuda")
         mcmc_scale_reg = torch.tensor(0.0, device="cuda")
         if args.mcmc:
+            # Regularize activated opacity (after sigmoid) to encourage low opacity -> sparsity
             mcmc_opacity_reg = args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
+            # Regularize activated scale (after exp) to encourage small scales -> compact Gaussians
             mcmc_scale_reg = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
 
         # loss
@@ -519,11 +524,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_normal_for_log = 0.4 * normal_loss.item() + 0.6 * ema_normal_for_log
             ema_mask_for_log = 0.4 * mask_loss.item() + 0.6 * ema_mask_for_log
             
+            # Track MCMC regularization losses
+            if args.mcmc:
+                mcmc_total = mcmc_opacity_reg.item() + mcmc_scale_reg.item()
+                ema_mcmc_loss_for_log = 0.4 * mcmc_total + 0.6 * ema_mcmc_loss_for_log
+            
             if iteration % 10 == 0:
+                # For MCMC, show alive Gaussians (opacity > 0.005) instead of total
+                if args.mcmc:
+                    n_alive = (gaussians.get_opacity > 0.005).sum().item()
+                    points_str = f"{int(n_alive)}/{len(gaussians.get_xyz)}"
+                else:
+                    points_str = f"{len(gaussians.get_xyz)}"
+                
                 loss_dict = {
                     "Loss": f"{ema_loss_for_log:.{5}f}",
-                    "Points": f"{len(gaussians.get_xyz)}",
+                    "Points": points_str,
                 }
+                # Add MCMC loss to progress bar if enabled
+                if args.mcmc:
+                    loss_dict["OpR"] = f"{mcmc_opacity_reg.item():.{5}f}"
+                    loss_dict["ScR"] = f"{mcmc_scale_reg.item():.{5}f}"
                 progress_bar.set_postfix(loss_dict)
 
                 progress_bar.update(10)
@@ -536,6 +557,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/mask_loss', ema_mask_for_log, iteration)
+                if args.mcmc:
+                    tb_writer.add_scalar('train_loss_patches/mcmc_reg_loss', ema_mcmc_loss_for_log, iteration)
+                    tb_writer.add_scalar('train_loss_patches/mcmc_opacity_reg', mcmc_opacity_reg.item(), iteration)
+                    tb_writer.add_scalar('train_loss_patches/mcmc_scale_reg', mcmc_scale_reg.item(), iteration)
 
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), \
                 ingp_model=ingp, beta = beta, args = args, cfg_model = cfg_model, test_psnr = test_psnr, train_psnr = train_psnr, iter_list = iter_list)
@@ -723,10 +748,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     print("="*70 + "\n")
 
         torch.cuda.empty_cache()
-    
+
+    # Prune dead Gaussians in MCMC mode before final rendering
+    if args.mcmc:
+        print("\n" + "="*70)
+        print("  PRUNING DEAD GAUSSIANS (MCMC MODE)")
+        print("="*70)
+        n_total_before = len(gaussians.get_xyz)
+        dead_mask = (gaussians.get_opacity <= 0.005).squeeze(-1)
+        n_dead = dead_mask.sum().item()
+        n_alive = n_total_before - n_dead
+        print(f"  Total Gaussians: {n_total_before}")
+        print(f"  Alive (opacity > 0.005): {n_alive}")
+        print(f"  Dead (opacity <= 0.005): {n_dead}")
+
+        if n_dead > 0:
+            gaussians.prune_points(dead_mask)
+            print(f"  Pruned {n_dead} dead Gaussians")
+            print(f"  Remaining: {len(gaussians.get_xyz)}")
+        else:
+            print(f"  No dead Gaussians to prune")
+        print("="*70 + "\n")
+
     # Final test and train rendering with stride 1
     final_ingp = ingp_model if ingp_model is not None else ingp
-    
+
     # For random_background mode, use black background during evaluation
     eval_background = black_bg if use_random_bg else background
     
@@ -796,16 +842,26 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
     with open(log_path, 'w') as f:
         f.write("Training Log\n")
         f.write("=" * 50 + "\n\n")
-        
+
         f.write(f"Method: {args.method}\n")
         if args.method == "cat":
             f.write(f"Hybrid Levels: {args.hybrid_levels}\n")
+        if args.mcmc:
+            f.write(f"MCMC Mode: Enabled\n")
+            f.write(f"  - Opacity Reg: {args.opacity_reg}\n")
+            f.write(f"  - Scale Reg: {args.scale_reg}\n")
+            f.write(f"  - Noise LR: {args.noise_lr}\n")
+            f.write(f"  - Cap Max: {args.cap_max}\n")
+            f.write(f"  - Note: Dead Gaussians (opacity ≤ 0.005) pruned before final rendering\n")
         f.write(f"Iterations: {iteration}\n")
         f.write(f"Resolution: {resolution}\n\n")
-        
+
         f.write("Model Statistics\n")
         f.write("-" * 30 + "\n")
-        f.write(f"Number of Gaussians: {num_gaussians:,}\n\n")
+        f.write(f"Number of Gaussians: {num_gaussians:,}\n")
+        if args.mcmc:
+            f.write(f"  (MCMC: only alive Gaussians counted)\n")
+        f.write("\n")
         
         f.write("Performance\n")
         f.write("-" * 30 + "\n")
@@ -833,16 +889,29 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                    and hasattr(args, 'hybrid_levels') and args.hybrid_levels > 0)
     total_levels = ingp.levels if ingp is not None else 0
     
-    # Skip decomposition if hybrid_levels is 0 or equals total_levels (no meaningful decomposition)
-    do_decomposition = is_cat_mode and args.hybrid_levels < total_levels
+    # Check if hybrid_SH or hybrid_SH_raw mode decomposition should be done
+    is_hybrid_sh_mode = (ingp is not None and hasattr(ingp, 'is_hybrid_sh_mode') and ingp.is_hybrid_sh_mode)
+    is_hybrid_sh_raw_mode = (ingp is not None and hasattr(ingp, 'is_hybrid_sh_raw_mode') and ingp.is_hybrid_sh_raw_mode)
     
-    if do_decomposition:
+    # Skip decomposition if hybrid_levels is 0 or equals total_levels (no meaningful decomposition)
+    do_cat_decomposition = is_cat_mode and args.hybrid_levels < total_levels
+    do_hybrid_sh_decomposition = is_hybrid_sh_mode or is_hybrid_sh_raw_mode
+    
+    if do_cat_decomposition:
         # Create directories for decomposed renders
         ngp_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'ngp_only'))
         gaussian_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'gaussian_only'))
         os.makedirs(ngp_output_dir, exist_ok=True)
         os.makedirs(gaussian_output_dir, exist_ok=True)
         print(f"[FINAL] Cat mode decomposition enabled: saving NGP-only and Gaussian-only renders")
+    
+    if do_hybrid_sh_decomposition:
+        # Create directories for hybrid_SH decomposed renders
+        ngp_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'ngp_only'))
+        gaussian_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'gaussians_only'))
+        os.makedirs(ngp_output_dir, exist_ok=True)
+        os.makedirs(gaussian_output_dir, exist_ok=True)
+        print(f"[FINAL] hybrid_SH/hybrid_SH_raw mode decomposition enabled: saving NGP-only and Gaussians-only renders")
     
     if len(cameras) == 0:
         print(f"[FINAL] No cameras available, skipping.")
@@ -900,7 +969,7 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
             save_img_u8(depth_median_color, os.path.join(depth_output_dir, f"{idx:03d}_depth_median.png"))
             
             # Cat mode decomposition: render with masked features
-            if do_decomposition:
+            if do_cat_decomposition:
                 # NGP-only: zero out per-Gaussian features, keep hashgrid
                 ngp_render_pkg = render(viewpoint, gaussians, pipe, background,
                                        ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
@@ -910,6 +979,24 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                 save_img_u8(ngp_rendered_np, os.path.join(ngp_output_dir, f"{idx:03d}_ngp.png"))
                 
                 # Gaussian-only: zero out hashgrid features, keep per-Gaussian
+                gaussian_render_pkg = render(viewpoint, gaussians, pipe, background,
+                                            ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                            decompose_mode='gaussian_only')
+                gaussian_rendered = torch.clamp(gaussian_render_pkg["render"], 0.0, 1.0)
+                gaussian_rendered_np = gaussian_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(gaussian_rendered_np, os.path.join(gaussian_output_dir, f"{idx:03d}_gaussian.png"))
+            
+            # hybrid_SH mode decomposition: render with masked features
+            if do_hybrid_sh_decomposition:
+                # NGP-only: zero out per-Gaussian SH, keep hashgrid DC residual
+                ngp_render_pkg = render(viewpoint, gaussians, pipe, background,
+                                       ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                       decompose_mode='ngp_only')
+                ngp_rendered = torch.clamp(ngp_render_pkg["render"], 0.0, 1.0)
+                ngp_rendered_np = ngp_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(ngp_rendered_np, os.path.join(ngp_output_dir, f"{idx:03d}_ngp.png"))
+                
+                # Gaussian-only: zero out hashgrid DC residual, keep per-Gaussian SH
                 gaussian_render_pkg = render(viewpoint, gaussians, pipe, background,
                                             ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
                                             decompose_mode='gaussian_only')
@@ -933,7 +1020,7 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     print(f"[FINAL] ════════════════════════════════════════")
     print(f"[FINAL] Images saved to: {final_output_dir}")
     print(f"[FINAL] Depth maps saved to: {depth_output_dir}")
-    if do_decomposition:
+    if do_cat_decomposition or do_hybrid_sh_decomposition:
         print(f"[FINAL] NGP-only renders saved to: {ngp_output_dir}")
         print(f"[FINAL] Gaussian-only renders saved to: {gaussian_output_dir}")
     
@@ -1073,12 +1160,15 @@ if __name__ == "__main__":
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
     
-    # Method argument - baseline, cat, adaptive, adaptive_add, diffuse, specular, diffuse_ngp, or diffuse_offset
+    # Method argument - baseline, cat, adaptive, adaptive_add, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, or hybrid_SH_post
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "cat", "adaptive", "adaptive_add", "diffuse", "specular", "diffuse_ngp", "diffuse_offset"],
-                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), or 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query)")
+                        choices=["baseline", "cat", "adaptive", "adaptive_add", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post"],
+                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), or 'hybrid_SH_post' (DEPRECATED)")
     parser.add_argument("--hybrid_levels", type=int, default=3,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
+    parser.add_argument("--decompose_mode", type=str, default=None,
+                        choices=[None, "gaussian_only", "ngp_only"],
+                        help="Decomposition mode for hybrid_SH visualization: 'gaussian_only' (only per-Gaussian SH), 'ngp_only' (only hashgrid DC residual), or None (normal combined rendering)")
     parser.add_argument("--disable_c2f", action="store_true",
                         help="Disable coarse-to-fine for cat mode (all levels active from start)")
     parser.add_argument("--lambda_adaptive", type=float, default=0.001,
