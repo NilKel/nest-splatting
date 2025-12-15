@@ -1230,8 +1230,54 @@ renderCUDAsurfelForward(
 			break;
 		}
 		case 9: {
-			// hybrid_SH_post mode: DEPRECATED - kept for backward compatibility
-			// Use mode 8 or 10 instead
+			// hybrid_SH_post mode: Add DC residual from hashgrid to per-Gaussian SH coefficients
+			// Input: colors_precomp = SH coefficients (N, 48) with memory layout from PyTorch:
+			//   (N, 3, 16).reshape(-1, 48) = [sh0_R..sh15_R, sh0_G..sh15_G, sh0_B..sh15_B]
+			// So DC coefficients are at indices 0 (R), 16 (G), 32 (B)
+			// Output: Modified SH coefficients (48D) with DC residual added
+
+			// Decode level parameter
+			const int decompose_flag = (level >> 24) & 0xFF;   // 0=normal, 1=gaussian_only, 2=ngp_only
+			const int sh_degree = (level >> 16) & 0xFF;        // Active SH degree (0-3)
+			const int hashgrid_levels = (level >> 8) & 0xFF;   // Should be 1
+
+			// 1. Load per-Gaussian SH coefficients from colors buffer (48D)
+			int gauss_id = collected_id[j];
+			float sh_coeffs[48];
+			for(int i = 0; i < 48; i++) {
+				sh_coeffs[i] = rgb[gauss_id * 48 + i];
+			}
+
+			// 2. Query hashgrid for DC residual (3D) at intersection point xyz
+			float dc_residual[3] = {0.0f, 0.0f, 0.0f};
+
+			if (hashgrid_levels > 0 && decompose_flag != 1) {  // Skip if gaussian_only
+				// Query single-level hashgrid at intersection point
+				query_feature<false, 3, 3>(dc_residual, xyz, voxel_min, voxel_max,
+					collec_offsets, appearance_level, hash_features,
+					1, l_scale, Base, align_corners, interp, contract, debug);
+			}
+
+			// 3. Add DC residual to SH DC coefficients
+			// DC indices: 0 (R), 16 (G), 32 (B) due to PyTorch memory layout
+			if (decompose_flag == 2) {
+				// ngp_only mode: Replace DC with hashgrid residual only
+				sh_coeffs[0] = dc_residual[0];   // DC_R
+				sh_coeffs[16] = dc_residual[1];  // DC_G
+				sh_coeffs[32] = dc_residual[2];  // DC_B
+			} else if (decompose_flag != 1) {
+				// Normal mode: Add DC residual to existing DC
+				sh_coeffs[0] += dc_residual[0];   // DC_R
+				sh_coeffs[16] += dc_residual[1];  // DC_G
+				sh_coeffs[32] += dc_residual[2];  // DC_B
+			}
+			// gaussian_only (decompose_flag == 1): keep original SH coefficients
+
+			// 4. Copy all 48 SH coefficients to output feat array
+			for(int i = 0; i < 48; i++) {
+				feat[i] = sh_coeffs[i];
+			}
+
 			break;
 		}
 		case 10: {

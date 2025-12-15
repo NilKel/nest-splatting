@@ -105,7 +105,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 
     // for backward, initialize dy_dx
     float dy_dx[BW ? (D * C) : 1] = {0};
-    if constexpr (BW && C > LD) {
+    if constexpr (BW && C >= LD) {
         #pragma unroll
         for (uint32_t d = 0; d < D; d++) dL_dxyz[d] = 0;
     } 
@@ -113,7 +113,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
     // out of range, no features, no grad update.
 	if (flag_oob) return;
 
-    const uint32_t size = (C > LD) ? C / LD * D : 1;
+    const uint32_t size = (C >= LD) ? C / LD * D : 1;
     float level_pos[size];
     float level_pos_deriv[size]; 
     uint32_t level_pos_grid[size];
@@ -132,7 +132,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 
         float* dL_dgrid = nullptr;
         float* grad_level_feat = nullptr;
-        if constexpr (BW && C > LD) {
+        if constexpr (BW && C >= LD) {
             dL_dgrid = dL_dfeatures + (uint32_t)offsets[level] * LD;
             grad_level_feat = grad_feat + level * LD;
         }
@@ -178,7 +178,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 			}
             
             // update gradiendt
-            if constexpr (BW && C > LD) {
+            if constexpr (BW && C >= LD) {
                 #pragma unroll
                 for (uint32_t ch = 0; ch < LD; ch++) {
                     atomicAdd(&dL_dgrid[index + ch], w * grad_level_feat[ch]);
@@ -193,7 +193,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 			feat[level * LD + ch] = results[ch]; 
 		}
 
-        if constexpr (BW && C > LD) {
+        if constexpr (BW && C >= LD) {
             // save for dy_dx calculate
             #pragma unroll
             for (uint32_t d = 0; d < D; d++) {
@@ -211,7 +211,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 
 	}
 
-    if constexpr (BW && C > LD) {
+    if constexpr (BW && C >= LD) {
         // B L D C
         // D * F (F = L * LD)
         #pragma unroll
@@ -356,7 +356,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 
     // for backward, initialize dy_dx
     float dy_dx[BW ? (D * C) : 1] = {0};
-    if constexpr (BW && C > LD) {
+    if constexpr (BW && C >= LD) {
         #pragma unroll
         for (uint32_t d = 0; d < D; d++) dL_dxyz[d] = 0;
     } 
@@ -364,7 +364,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
     // out of range, no features, no grad update.
 	if (flag_oob) return;
 
-    const uint32_t size = (C > LD) ? C / LD * D : 1;
+    const uint32_t size = (C >= LD) ? C / LD * D : 1;
     float level_pos[size];
     float level_pos_deriv[size]; 
     uint32_t level_pos_grid[size];
@@ -383,7 +383,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 
         float* dL_dgrid = nullptr;
         float* grad_level_feat = nullptr;
-        if constexpr (BW && C > LD) {
+        if constexpr (BW && C >= LD) {
             dL_dgrid = dL_dfeatures + (uint32_t)offsets[level] * LD;
             grad_level_feat = grad_feat + level * LD;
         }
@@ -429,7 +429,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 			}
             
             // update gradiendt
-            if constexpr (BW && C > LD) {
+            if constexpr (BW && C >= LD) {
                 #pragma unroll
                 for (uint32_t ch = 0; ch < LD; ch++) {
                     atomicAdd(&dL_dgrid[index + ch], w * grad_level_feat[ch]);
@@ -444,7 +444,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 			feat[level * LD + ch] = results[ch]; 
 		}
 
-        if constexpr (BW && C > LD) {
+        if constexpr (BW && C >= LD) {
             // save for dy_dx calculate
             #pragma unroll
             for (uint32_t d = 0; d < D; d++) {
@@ -462,7 +462,7 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 
 	}
 
-    if constexpr (BW && C > LD) {
+    if constexpr (BW && C >= LD) {
         // B L D C
         // D * F (F = L * LD)
         #pragma unroll

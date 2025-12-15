@@ -889,13 +889,14 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                    and hasattr(args, 'hybrid_levels') and args.hybrid_levels > 0)
     total_levels = ingp.levels if ingp is not None else 0
     
-    # Check if hybrid_SH or hybrid_SH_raw mode decomposition should be done
+    # Check if hybrid_SH, hybrid_SH_raw, or hybrid_SH_post mode decomposition should be done
     is_hybrid_sh_mode = (ingp is not None and hasattr(ingp, 'is_hybrid_sh_mode') and ingp.is_hybrid_sh_mode)
     is_hybrid_sh_raw_mode = (ingp is not None and hasattr(ingp, 'is_hybrid_sh_raw_mode') and ingp.is_hybrid_sh_raw_mode)
+    is_hybrid_sh_post_mode = (ingp is not None and hasattr(ingp, 'is_hybrid_sh_post_mode') and ingp.is_hybrid_sh_post_mode)
     
     # Skip decomposition if hybrid_levels is 0 or equals total_levels (no meaningful decomposition)
     do_cat_decomposition = is_cat_mode and args.hybrid_levels < total_levels
-    do_hybrid_sh_decomposition = is_hybrid_sh_mode or is_hybrid_sh_raw_mode
+    do_hybrid_sh_decomposition = is_hybrid_sh_mode or is_hybrid_sh_raw_mode or is_hybrid_sh_post_mode
     
     if do_cat_decomposition:
         # Create directories for decomposed renders
@@ -911,7 +912,7 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
         gaussian_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'gaussians_only'))
         os.makedirs(ngp_output_dir, exist_ok=True)
         os.makedirs(gaussian_output_dir, exist_ok=True)
-        print(f"[FINAL] hybrid_SH/hybrid_SH_raw mode decomposition enabled: saving NGP-only and Gaussians-only renders")
+        print(f"[FINAL] hybrid_SH mode decomposition enabled: saving NGP-only and Gaussians-only renders")
     
     if len(cameras) == 0:
         print(f"[FINAL] No cameras available, skipping.")

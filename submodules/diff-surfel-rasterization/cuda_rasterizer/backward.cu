@@ -584,8 +584,8 @@ renderCUDAsurfelBackward(
 			// adaptive_add mode: level = (total_levels << 16) | (active_hashgrid_levels << 8)
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			actual_levels = active_hashgrid_levels;
-		} else if(render_mode == 8 || render_mode == 10){
-			// hybrid_SH and hybrid_SH_raw modes: level encodes (decompose_flag << 24) | (sh_degree << 16) | (1 << 8)
+		} else if(render_mode == 8 || render_mode == 9 || render_mode == 10){
+			// hybrid_SH, hybrid_SH_post, and hybrid_SH_raw modes: level encodes (decompose_flag << 24) | (sh_degree << 16) | (1 << 8)
 			// Don't check level > 16 since we use higher bits for encoding
 			actual_levels = 1;  // Always 1 hashgrid level
 		} else if(level > 16){
@@ -1190,7 +1190,40 @@ renderCUDAsurfelBackward(
 			break;
 		}
 		case 9: {
-			// hybrid_SH_post mode: DEPRECATED
+			// hybrid_SH_post mode backward pass
+			// Forward: sh_coeffs[DC indices] += dc_residual from hashgrid, output all 48 coefficients
+			// DC indices: 0 (R), 16 (G), 32 (B) due to PyTorch memory layout
+			// Backward: grad flows to both SH coefficients and hashgrid
+
+			// Decode level parameter
+			const int decompose_flag = (level >> 24) & 0xFF;   // 0=normal, 1=gaussian_only, 2=ngp_only
+			const int sh_degree = (level >> 16) & 0xFF;        // Active SH degree (0-3)
+			const int hashgrid_levels = (level >> 8) & 0xFF;   // Should be 1
+
+			int gauss_id = collected_id[j];
+
+			// Backprop to SH coefficients
+			// grad_feat contains gradients for all 48 coefficients
+			if (decompose_flag != 2) {  // Not ngp_only - SH coefficients receive gradients
+				for(int i = 0; i < 48; i++) {
+					atomicAdd(&dL_dcolors[gauss_id * 48 + i], alpha * T * grad_feat[i]);
+				}
+			}
+
+			// Backprop to hashgrid through DC residual
+			// DC indices: 0 (R), 16 (G), 32 (B) due to PyTorch memory layout
+			if (hashgrid_levels > 0 && decompose_flag != 1) {  // Not gaussian_only
+				float grad_dc_residual[3];
+				grad_dc_residual[0] = alpha * T * grad_feat[0];   // grad_DC_R
+				grad_dc_residual[1] = alpha * T * grad_feat[16];  // grad_DC_G
+				grad_dc_residual[2] = alpha * T * grad_feat[32];  // grad_DC_B
+
+				float feat_dummy[3];
+				query_feature<true, 3, 3>(feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
+					appearance_level, hash_features, 1, l_scale, Base, align_corners, interp, contract, debug,
+					grad_dc_residual, dL_dfeatures, dL_dxyz);
+			}
+
 			break;
 		}
 		case 10: {
