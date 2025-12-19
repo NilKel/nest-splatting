@@ -1,0 +1,10 @@
+Method,Name,scan24_PSNR,scan24_SSIM,scan24_L1,Avg_PSNR,Avg_SSIM,Avg_L1
+baseline,vanilla,35.85,0.9730,0.009133,35.85,0.9730,0.009133
+baseline,vanilla_baseline,35.01,0.9718,0.010192,35.01,0.9718,0.010192
+cat,vanilla_5_levels,35.47,0.9718,0.009788,35.47,0.9718,0.009788
+cat,vanilla_cat1_1_levels,36.66,0.9745,0.008332,36.66,0.9745,0.008332
+cat,vanilla_cat2_2_levels,36.82,0.9752,0.008225,36.82,0.9752,0.008225
+cat,vanilla_cat3_3_levels,37.09,0.9752,0.008007,37.09,0.9752,0.008007
+cat,vanilla_cat4_4_levels,36.95,0.9744,0.008161,36.95,0.9744,0.008161
+cat,vanilla_cat5_5_levels,35.82,0.9720,0.009473,35.82,0.9720,0.009473
+cat,vanilla_cat6_6_levels,36.20,0.9651,0.009005,36.20,0.9651,0.009005

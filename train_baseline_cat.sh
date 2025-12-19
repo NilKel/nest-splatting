@@ -1,57 +1,85 @@
 #!/bin/bash
 # Script to train Nest-Splatting with baseline and cat modes (hybrid_levels 0-6)
-# Usage: ./train_baseline_cat.sh <base_name> [scene_names] [iterations] [data_dir] [extra_args]
+# Usage: ./train_baseline_cat.sh <dataset> <base_name> [scene_names] [iterations] [extra_args]
 #
 # Example:
-#   ./train_baseline_cat.sh exp1              # Run all scenes
-#   ./train_baseline_cat.sh exp1 drums,mic    # Run specific scenes
-#   ./train_baseline_cat.sh exp1 all 30000    # Run all scenes with 30k iters
-#   ./train_baseline_cat.sh exp1 all 30000 default "--disable_c2f"  # With extra args
+#   ./train_baseline_cat.sh nerf_synthetic exp1              # Run all nerf_synthetic scenes
+#   ./train_baseline_cat.sh DTU exp1 scan24,scan37           # Run specific DTU scenes
+#   ./train_baseline_cat.sh mip_360 exp1 all 30000           # Run all mip_360 scenes with 30k iters
+#   ./train_baseline_cat.sh nerf_synthetic exp1 all 30000 "--disable_c2f"  # With extra args
 
 set -e  # Exit on error
 
 # Default values
 DEFAULT_ITERATIONS=30000
-DEFAULT_DATA_DIR="/home/nilkel/Projects/data/nest_synthetic/nerf_synthetic"
-YAML_CONFIG="./configs/nerfsyn.yaml"
-ALL_SCENES="chair,drums,ficus,hotdog,lego,materials,mic,ship"
+BASE_DATA_DIR="/home/nilkel/Projects/data/nest_synthetic"
+DTU_DATA_DIR="/home/nilkel/Projects/nest-splatting/data/dtu/2DGS_data/DTU"
+MIP360_DATA_DIR="/home/nilkel/Projects/data/mip360"
 
 # Parse arguments
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 <base_name> [scene_names] [iterations] [data_dir] [extra_args]"
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <dataset> <base_name> [scene_names] [iterations] [extra_args]"
     echo ""
     echo "Arguments:"
+    echo "  dataset       Required. Dataset name: nerf_synthetic, DTU, or mip_360"
     echo "  base_name     Required. Base name for experiments (e.g., exp1, test)"
     echo "  scene_names   Optional. Comma-separated scene names or 'all' (default: all)"
     echo "  iterations    Optional. Number of training iterations (default: 30000)"
-    echo "  data_dir      Optional. Base data directory (use 'default' for default path)"
     echo "  extra_args    Optional. Extra arguments to pass to train.py (e.g., '--disable_c2f')"
     echo ""
     echo "Examples:"
-    echo "  $0 exp1                                      # Run all 8 scenes"
-    echo "  $0 exp1 drums,mic                            # Run only drums and mic"
-    echo "  $0 exp1 all 30000                            # Run all scenes with 30k iterations"
-    echo "  $0 exp1 all 30000 default \"--disable_c2f\"   # With --disable_c2f flag"
-    echo "  $0 exp1 chair 30000 default \"--mcmc --cap_max 300000\"  # With MCMC mode"
+    echo "  $0 nerf_synthetic exp1                       # Run all 8 nerf_synthetic scenes"
+    echo "  $0 DTU exp1 scan24,scan37                    # Run specific DTU scenes"
+    echo "  $0 mip_360 exp1 all 30000                    # Run all mip_360 scenes with 30k iters"
+    echo "  $0 nerf_synthetic exp1 all 30000 \"--disable_c2f\"  # With --disable_c2f flag"
+    echo "  $0 DTU exp1 scan24 30000 \"--mcmc --cap_max 300000\"  # With MCMC mode"
     echo ""
     echo "Methods trained per scene:"
     echo "  - baseline"
     echo "  - cat0 through cat6 (hybrid_levels 0-6)"
     echo ""
-    echo "Available scenes: ${ALL_SCENES}"
+    echo "Datasets:"
+    echo "  nerf_synthetic: chair, drums, ficus, hotdog, lego, materials, mic, ship"
+    echo "  DTU: scan24, scan37, scan40, scan55, scan63, scan65, scan69, scan83, scan97, scan105, scan106, scan110, scan114, scan118, scan122"
+    echo "  mip_360: bicycle, bonsai, counter, garden, kitchen, room, stump"
     exit 1
 fi
 
-BASE_NAME=$1
-SCENE_NAMES=${2:-all}
-ITERATIONS=${3:-$DEFAULT_ITERATIONS}
-DATA_DIR=${4:-$DEFAULT_DATA_DIR}
+DATASET=$1
+BASE_NAME=$2
+SCENE_NAMES=${3:-all}
+ITERATIONS=${4:-$DEFAULT_ITERATIONS}
 EXTRA_ARGS=${5:-""}
 
-# Handle "default" keyword for data_dir
-if [ "$DATA_DIR" = "default" ]; then
-    DATA_DIR=$DEFAULT_DATA_DIR
-fi
+# Configure dataset-specific settings
+case "$DATASET" in
+    nerf_synthetic)
+        DATA_DIR="${BASE_DATA_DIR}/nerf_synthetic"
+        YAML_CONFIG="./configs/nerfsyn.yaml"
+        ALL_SCENES="chair,drums,ficus,hotdog,lego,materials,mic,ship"
+        DATASET_PATH="nerf_synthetic"
+        RESOLUTION_ARG=""
+        ;;
+    DTU)
+        DATA_DIR="$DTU_DATA_DIR"
+        YAML_CONFIG="./configs/dtu.yaml"
+        ALL_SCENES="scan24,scan37,scan40,scan55,scan63,scan65,scan69,scan83,scan97,scan105,scan106,scan110,scan114,scan118,scan122"
+        DATASET_PATH="DTU"
+        RESOLUTION_ARG="-r 2"  # DTU uses resolution 2
+        ;;
+    mip_360)
+        DATA_DIR="$MIP360_DATA_DIR"
+        YAML_CONFIG="./configs/360_outdoor.yaml"  # Default to outdoor, can be overridden
+        ALL_SCENES="bicycle,bonsai,counter,garden,kitchen,room,stump"
+        DATASET_PATH="mip_360"
+        RESOLUTION_ARG="-r 2"  # mip_360 uses resolution 2
+        ;;
+    *)
+        echo "ERROR: Unknown dataset '$DATASET'"
+        echo "Available datasets: nerf_synthetic, DTU, mip_360"
+        exit 1
+        ;;
+esac
 
 # Handle "all" keyword
 if [ "$SCENE_NAMES" = "all" ]; then
@@ -76,11 +104,15 @@ fi
 echo "════════════════════════════════════════════════════════════════════"
 echo "  Nest-Splatting - Baseline & Cat Training"
 echo "════════════════════════════════════════════════════════════════════"
+echo "Dataset:     $DATASET"
 echo "Base name:   $BASE_NAME"
 echo "Scenes:      ${SCENES[@]}"
 echo "Iterations:  $ITERATIONS"
 echo "Data dir:    $DATA_DIR"
 echo "Config:      $YAML_CONFIG"
+if [ -n "$RESOLUTION_ARG" ]; then
+echo "Resolution:  ${RESOLUTION_ARG#-r }"
+fi
 if [ -n "$EXTRA_ARGS" ]; then
 echo "Extra args:  $EXTRA_ARGS"
 fi
@@ -113,13 +145,13 @@ run_training() {
         return 0
     fi
     
-    # Path structure: outputs/nerf_synthetic/{scene}/{method}/{name}
+    # Path structure: outputs/{dataset}/{scene}/{method}/{name}
     # For cat mode, train.py appends _{hybrid_levels}_levels to the name
     if [ "$method" = "cat" ]; then
         local hl_suffix=$(echo "$extra_args" | grep -oP '(?<=--hybrid_levels )\d+')
-        OUTPUT_PATH="outputs/nerf_synthetic/${scene_name}/${method}/${experiment_name}_${hl_suffix}_levels"
+        OUTPUT_PATH="outputs/${DATASET_PATH}/${scene_name}/${method}/${experiment_name}_${hl_suffix}_levels"
     else
-        OUTPUT_PATH="outputs/nerf_synthetic/${scene_name}/${method}/${experiment_name}"
+        OUTPUT_PATH="outputs/${DATASET_PATH}/${scene_name}/${method}/${experiment_name}"
     fi
     TEST_METRICS="${OUTPUT_PATH}/test_metrics.txt"
     
@@ -138,7 +170,7 @@ run_training() {
     echo "  [$CURRENT_RUN/$TOTAL_RUNS] Training: ${scene_name} - ${experiment_name}"
     echo "════════════════════════════════════════════════════════════════════"
     
-    CMD="python train.py -s $scene_path -m $experiment_name --yaml $YAML_CONFIG --eval --iterations $ITERATIONS --method $method $extra_args $EXTRA_ARGS"
+    CMD="python train.py -s $scene_path -m $experiment_name --yaml $YAML_CONFIG --eval --iterations $ITERATIONS $RESOLUTION_ARG --method $method $extra_args $EXTRA_ARGS"
     
     echo "Command: $CMD"
     echo "Started: $(date)"
@@ -205,6 +237,7 @@ echo ""
 echo "════════════════════════════════════════════════════════════════════"
 echo "  TRAINING COMPLETE!"
 echo "════════════════════════════════════════════════════════════════════"
+echo "Dataset:         $DATASET"
 echo "Base name:       $BASE_NAME"
 echo "Scenes:          ${SCENES[@]}"
 echo "Total runs:      $TOTAL_RUNS"

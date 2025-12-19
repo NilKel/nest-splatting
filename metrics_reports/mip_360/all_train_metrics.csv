@@ -1,0 +1,4 @@
+Method,Name,bicycle_PSNR,bicycle_SSIM,bicycle_L1,Avg_PSNR,Avg_SSIM,Avg_L1
+baseline,vanilla,25.56,0.8753,0.032858,25.56,0.8753,0.032858
+cat,mco001s001n1e4_5_levels,26.05,0.8329,0.032270,26.05,0.8329,0.032270
+cat,vanilla_5_levels,24.57,0.8628,0.037161,24.57,0.8628,0.037161

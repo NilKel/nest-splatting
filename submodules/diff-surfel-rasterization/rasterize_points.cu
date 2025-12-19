@@ -73,7 +73,8 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& features_diffuse,
 	const torch::Tensor& offsets_diffuse,
 	const torch::Tensor& gridrange_diffuse,
-	const int render_mode)
+	const int render_mode,
+	const torch::Tensor& shape_dims)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 	AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -82,12 +83,21 @@ RasterizeGaussiansCUDA(
   const int P = means3D.size(0);
   const int H = image_height;
   const int W = image_width;
-  uint32_t C = 3;
 
-  // For hybrid_features mode (render_mode=4) and adaptive mode (render_mode=6), 
-  // C will be calculated after determining D from features
-  // For other modes, use colors dimension if available
-  if (colors.numel() != 0 && render_mode != 4 && render_mode != 6) C = colors.size(1);
+  // Extract dimensions from shape_dims tensor [GS, HS, OS]
+  uint32_t GS = 0, HS = 0, OS = 3;  // Defaults
+  
+  if (shape_dims.numel() == 3) {
+    GS = shape_dims[0].item<int>();
+    HS = shape_dims[1].item<int>();
+    OS = shape_dims[2].item<int>();
+    if (debug) {
+      printf("[CUDA] shape_dims: GS=%d, HS=%d, OS=%d, render_mode=%d\n", GS, HS, OS, render_mode);
+    }
+  }
+  
+  // Use OS for output buffer allocation (single or combined output)
+  uint32_t C = OS;
   
   CHECK_INPUT(background);
   CHECK_INPUT(means3D);
@@ -111,103 +121,38 @@ RasterizeGaussiansCUDA(
   CHECK_INPUT(offsets_diffuse);
   CHECK_INPUT(gridrange_diffuse);
 
+  // Keep D for hashgrid feature dimension (still needed for CUDA kernels)
   uint32_t D = 0;
   uint32_t D_diffuse = 0;
   bool has_dual_hashgrid = (features_diffuse.numel() > 0 && offsets_diffuse.numel() > 0);
   
   if(Level > 0){
-	D = features.size(1);  // Main hashgrid features
-	
-	if(has_dual_hashgrid && render_mode == 5){  // surface_rgb mode
-		// Surface RGB mode with two separate hashgrids
-		// Hashgrid 1: 12 per level (surface vectors) -> dot product -> 4 per level
-		// Hashgrid 2: 4 per level (baseline features)
-		// Output: combined features (baseline + surface) per level
-		D_diffuse = features_diffuse.size(1);  // Should be 4 (baseline features)
-		C = (offsets.size(0) - 1) * 4;  // 6 levels × 4 = 24D combined features
+	D = features.size(1);  // Main hashgrid features per level
+	if(has_dual_hashgrid){
+		D_diffuse = features.size(1);  // Diffuse hashgrid features per level
 	}
-	else if(has_dual_hashgrid && render_mode == 2){  // baseline_double mode
-		// baseline_double mode with two 4D hashgrids
-		// Hashgrid 1: 4 per level (queried at xyz, per-sample)
-		// Hashgrid 2: 4 per level (queried at pk, per-Gaussian)
-		// Output: feat1 + feat2 (element-wise), concatenated across levels
-		D_diffuse = features_diffuse.size(1);  // Should be 4
-		// Calculate output dimension from BOTH hashgrids
-		uint32_t num_levels_1 = offsets.size(0) - 1;
-		uint32_t num_levels_2 = offsets_diffuse.size(0) - 1;
-		C = num_levels_1 * D + num_levels_2 * D_diffuse;  // e.g., 3*4 + 3*4 = 24D
-	}
-	else if(has_dual_hashgrid && render_mode == 3){  // baseline_blend_double mode
-		// baseline_blend_double mode with two 4D hashgrids
-		// Hashgrid 1: 4 per level (queried at blended position, AFTER alpha blending)
-		// Hashgrid 2: 4 per level (queried at pk, per-Gaussian, alpha blended)
-		// Output: blended feat_pk + feat_spatial, concatenated across levels
-		D_diffuse = features_diffuse.size(1);  // Should be 4
-		// Calculate output dimension from BOTH hashgrids
-		uint32_t num_levels_1 = offsets.size(0) - 1;
-		uint32_t num_levels_2 = offsets_diffuse.size(0) - 1;
-		C = num_levels_1 * D + num_levels_2 * D_diffuse;  // e.g., 3*4 + 3*4 = 24D
-	}
-	else if(render_mode == 4) {
-		// Hybrid features mode: hybrid_levels×D per-Gaussian + active_hashgrid_levels×D hashgrid
-		// Output dimension: total_levels×D (always constant, e.g., 24D)
-		// Level from Python is encoded as: (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
-		// e.g., for total=6, hybrid=3, active=2: (6 << 16) | (2 << 8) | 3 = 393987
-		// Buffer is always total_levels×D; unused dimensions are zero-padded during coarse-to-fine
-
-		uint32_t total_levels = Level >> 16;  // Extract bits 16-31
-		C = total_levels * D;  // e.g., 6 × 4 = 24D (constant regardless of active_levels)
-	}
-	else if(render_mode == 6) {
-		// Adaptive mode: soft blend per-Gaussian and hashgrid features
-		// Input: colors_precomp = [adaptive_features (total_levels×D) | mask (total_levels×D)]
-		// Output: blended features (total_levels×D)
-		// Output dimension is ALWAYS total_levels * D, same as baseline/cat mode
-		uint32_t num_levels = offsets.size(0) - 1;  // total_levels from hashgrid
-		C = num_levels * D;  // e.g., 6 × 4 = 24D (same as baseline)
-	}
-	else if(render_mode == 7) {
-		// Adaptive_add mode: weighted sum of per-Gaussian and hashgrid features
-		// Input: colors_precomp = [per-Gaussian features (total_levels×D) | weight (1)]
-		// Output: blended features (total_levels×D)
-		// Level encoding: (total_levels << 16) | (active_hashgrid_levels << 8)
-		uint32_t total_levels = Level >> 16;  // Extract bits 16-31
-		C = total_levels * D;  // e.g., 6 × 4 = 24D
-	}
-	else if(render_mode == 8 || render_mode == 10) {
-		// hybrid_SH and hybrid_SH_raw modes: output RGB (3 channels)
-		// Level encodes (decompose_flag << 24) | (hashgrid_levels << 8)
-		C = 3;  // RGB output
-	}
-	else if(render_mode == 9) {
-		// hybrid_SH_post mode: outputs SH coefficients (48 channels for degree 3)
-		// Level encodes (decompose_flag << 24) | (sh_degree << 16) | (hashgrid_levels << 8)
-		C = 48;  // SH coefficients output
-	}
-	else {
-		// Single hashgrid modes
-		// Determine output dimensions based on render_mode
-		uint32_t effective_D = D;
-		if(render_mode == 1) {
-			// Surface mode: 12 vector features -> dot product in CUDA -> 4 scalar features per level
-			effective_D = 4;
-		} else if(render_mode == 5) {
-			// Surface RGB mode: 12 vectors + 3 RGB -> 4 scalars + 3 RGB per level
-			effective_D = 7;
-		} else {
-			// Baseline mode (render_mode == 0): use D as-is (supports surface_blend with D=12)
-			effective_D = D;
-		}
-
-		C = (offsets.size(0) - 1) * effective_D;
+	if (debug) {
+	  printf("[CUDA] D=%d, Level=%d, C=%d, P=%d\n", D, Level, C, P);
 	}
   }
   
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
-//   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
-  torch::Tensor out_color = torch::full({C, H, W}, 0.0, float_opts);
+  // For dual buffer modes (residual_hybrid), allocate separately using GS and HS
+  torch::Tensor out_color;
+  torch::Tensor out_gaussian_rgb;  // For residual_hybrid
+  bool use_dual_buffers = (render_mode == 11 && GS > 0 && HS > 0 && OS == 0);
+  
+  if (use_dual_buffers) {
+    // Residual_hybrid: two separate buffers
+    out_gaussian_rgb = torch::full({GS, H, W}, 0.0, float_opts);
+    out_color = torch::full({HS, H, W}, 0.0, float_opts);
+    C = HS;  // Set C for hashgrid buffer
+  } else {
+    // All other modes: single buffer
+    out_color = torch::full({C, H, W}, 0.0, float_opts);
+  }
   
   int out_dim = 3+3+1+1 + 3 + 3; // record mean_pts & appearance vis color
     if((has_dual_hashgrid && render_mode == 5) || (has_dual_hashgrid && render_mode == 2)) {  // surface_rgb or baseline_double mode
@@ -325,7 +270,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& features_diffuse,
 	const torch::Tensor& offsets_diffuse,
 	const torch::Tensor& gridrange_diffuse,
-	const int render_mode) 
+	const int render_mode,
+	const torch::Tensor& shape_dims) 
 {
 
   CHECK_INPUT(background);
@@ -351,8 +297,18 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   const int P = means3D.size(0);
   const int H = dL_dout_color.size(1);
   const int W = dL_dout_color.size(2);
-  uint32_t C = 3;
-  if (colors.numel() != 0) C = colors.size(1);
+  
+  // Extract dimensions from shape_dims tensor [GS, HS, OS]
+  uint32_t GS = 0, HS = 0, OS = 3;  // Defaults
+  
+  if (shape_dims.numel() == 3) {
+    GS = shape_dims[0].item<int>();
+    HS = shape_dims[1].item<int>();
+    OS = shape_dims[2].item<int>();
+  }
+  
+  // Use OS for output dimension (should match forward pass)
+  uint32_t C = OS;
   
   uint32_t D = 0;
   uint32_t D_diffuse = 0;
@@ -365,78 +321,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	table_size = features.size(0);
 	D = features.size(1);
 	
-	if(has_dual_hashgrid && render_mode == 5){  // surface_rgb mode
-		// Surface RGB mode with two separate hashgrids
-		D_diffuse = features_diffuse.size(1);  // Should be 4 (baseline features)
+	if(has_dual_hashgrid){
+		D_diffuse = features_diffuse.size(1);
 		table_size_diffuse = features_diffuse.size(0);
-		C = (offsets.size(0) - 1) * 4;  // 6 levels × 4 = 24D combined features
 	}
-	else if(has_dual_hashgrid && render_mode == 2){  // baseline_double mode
-		// baseline_double mode with two 4D hashgrids
-		D_diffuse = features_diffuse.size(1);  // Should be 4
-		table_size_diffuse = features_diffuse.size(0);
-		// Calculate output dimension from BOTH hashgrids
-		uint32_t num_levels_1 = offsets.size(0) - 1;
-		uint32_t num_levels_2 = offsets_diffuse.size(0) - 1;
-		C = num_levels_1 * D + num_levels_2 * D_diffuse;  // e.g., 3*4 + 3*4 = 24D
-	}
-	else if(has_dual_hashgrid && render_mode == 3){  // baseline_blend_double mode
-		// baseline_blend_double mode with two 4D hashgrids
-		D_diffuse = features_diffuse.size(1);  // Should be 4
-		table_size_diffuse = features_diffuse.size(0);
-		// Calculate output dimension from BOTH hashgrids
-		uint32_t num_levels_1 = offsets.size(0) - 1;
-		uint32_t num_levels_2 = offsets_diffuse.size(0) - 1;
-		C = num_levels_1 * D + num_levels_2 * D_diffuse;  // e.g., 3*4 + 3*4 = 24D
-	}
-	else if(render_mode == 4) {
-		// Hybrid features mode: hybrid_levels×D per-Gaussian + active_hashgrid_levels×D hashgrid
-		// Output dimension: total_levels×D (always constant, e.g., 24D)
-		// Level from Python is encoded as: (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
-		// e.g., for total=6, hybrid=3, active=2: (6 << 16) | (2 << 8) | 3 = 393987
-		// Buffer is always total_levels×D; unused dimensions are zero-padded during coarse-to-fine
-		uint32_t total_lvls = Level >> 16;
-		C = total_lvls * D;  // e.g., 6 × 4 = 24D
-		uint32_t total_levels = Level >> 16;  // Extract bits 16-31
-		C = total_levels * D;  // e.g., 6 × 4 = 24D (constant regardless of active_levels)
-	}
-	else if(render_mode == 7) {
-		// Adaptive_add mode: weighted sum of per-Gaussian and hashgrid features
-		// Output dimension: total_levels×D
-		// Level encoding: (total_levels << 16) | (active_hashgrid_levels << 8)
-		uint32_t total_levels = Level >> 16;  // Extract bits 16-31
-		C = total_levels * D;  // e.g., 6 × 4 = 24D
-	}
-	else if(render_mode == 8 || render_mode == 10) {
-		// hybrid_SH and hybrid_SH_raw modes: output RGB (3 channels)
-		// Level encodes (decompose_flag << 24) | (hashgrid_levels << 8)
-		C = 3;  // RGB output
-	}
-	else if(render_mode == 9) {
-		// hybrid_SH_post mode: outputs SH coefficients (48 channels for degree 3)
-		// Level encodes (decompose_flag << 24) | (sh_degree << 16) | (hashgrid_levels << 8)
-		C = 48;  // SH coefficients output
-	}
-	else {
-	// Single hashgrid modes
-	// Determine output dimensions based on render_mode
-	uint32_t effective_D = D;
-	if(render_mode == 1) {
-		// Surface mode: 12 vector features -> dot product in CUDA -> 4 scalar features per level
-		effective_D = 4;
-	} else if(render_mode == 5) {
-		// Surface RGB mode: 12 vectors + 3 RGB -> 4 scalars + 3 RGB per level
-		effective_D = 7;
-	} else {
-		// Baseline mode (render_mode == 0): use D as-is (supports surface_blend with D=12)
-		effective_D = D;
-	}
-
-	C = (offsets.size(0) - 1) * effective_D;
-	}
-    // if (Level + 1 != offsets.size(0)) {
-	//   AT_ERROR("offsets shoud have same level with hash features.");
-    // }
+	
+	// NOTE: C is already set from shape_dims[2] (OS) above
+	// Do NOT recalculate C here - use the explicit value from Python
   }
   
   
@@ -449,30 +340,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
-//   torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
-  // For hybrid_features (render_mode=4): dL_dcolors is hybrid_levels×D (per-Gaussian features only)
-  // For adaptive_add (render_mode=7): dL_dcolors is total_levels×D + 1 (features + weight)
-  // For other modes: dL_dcolors is C-dimensional
-  uint32_t colors_dim = C;
-  if (render_mode == 4) {
-	// Decode hybrid_levels from Level parameter
-	// Level encoding: (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
-	uint32_t hybrid_levels = Level & 0xFF;  // Extract bits 0-7
-	colors_dim = hybrid_levels * D;  // e.g., 3 × 4 = 12D
-  } else if (render_mode == 7) {
-	// adaptive_add mode: colors_precomp = [per-Gaussian features (feat_dim) | weight (1)]
-	// Level encoding: (total_levels << 16) | (active_hashgrid_levels << 8)
-	uint32_t total_levels = Level >> 16;  // Extract bits 16-31
-	colors_dim = total_levels * D + 1;  // e.g., 6 × 4 + 1 = 25D
-  } else if (render_mode == 8 || render_mode == 10) {
-	// hybrid_SH and hybrid_SH_raw modes: colors_precomp = pre-evaluated RGB (3 channels)
-	// dL_dcolors needs to match input RGB size
-	colors_dim = 3;  // RGB
-  } else if (render_mode == 9) {
-	// hybrid_SH_post mode: colors_precomp = SH coefficients (48 channels)
-	// dL_dcolors needs to match input SH coefficient size
-	colors_dim = 48;  // SH coefficients
+  // For gradients, use actual input dimension from colors_precomp
+  // This matches whatever was passed in (26D for adaptive_cat, 48D for residual_hybrid, etc.)
+  int colors_dim = 0;
+  
+  if (colors.numel() > 0) {
+    colors_dim = colors.size(1);  // Actual input dimension
   }
+  
   torch::Tensor dL_dcolors = torch::zeros({P, colors_dim}, means3D.options());
   torch::Tensor dL_dnormal = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());

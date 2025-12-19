@@ -128,7 +128,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             features_diffuse,
             offsets_diffuse,
             gridrange_diffuse,
-            render_mode
+            render_mode,
+            hashgrid_settings.shape_dims
         )
 
         # Invoke C++/CUDA rasterizer
@@ -213,7 +214,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 features_diffuse,
                 offsets_diffuse,
                 gridrange_diffuse,
-                render_mode)
+                render_mode,
+                hashgrid_settings.shape_dims)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
@@ -276,6 +278,8 @@ class HashGridSettings(NamedTuple):
     H : int
     align_corners : bool
     interpolation : int
+    shape_dims: torch.Tensor  # [GS, HS, OS] or empty for backward compat
+    shape_dims: torch.Tensor  # [GS, HS, OS] or empty for backward compat
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings, hashgrid_settings):

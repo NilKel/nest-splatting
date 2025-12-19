@@ -3,12 +3,18 @@
 Collect and organize metrics from all completed experiments.
 
 A completed experiment has both test_metrics.txt and train_metrics.txt.
-Outputs one file per scene + one combined file.
+Outputs one file per scene + one combined file per dataset.
+Each dataset gets its own metrics_reports subdirectory.
 
 Usage:
+    # Process all datasets in outputs/
     python collect_metrics.py
-    python collect_metrics.py --output_dir /path/to/outputs/nerf_synthetic
-    python collect_metrics.py --save_dir my_reports
+
+    # Process a specific dataset
+    python collect_metrics.py --dataset nerf_synthetic
+
+    # Custom outputs and save directories
+    python collect_metrics.py --outputs_base_dir /path/to/outputs --save_base_dir my_reports
 """
 
 import os
@@ -334,70 +340,129 @@ def create_csv_summary(all_experiments, save_dir):
     return test_csv_path, train_csv_path
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Collect metrics from completed experiments")
-    parser.add_argument(
-        '--output_dir',
-        type=str,
-        default='/home/nilkel/Projects/nest-splatting/outputs/nerf_synthetic',
-        help='Directory to scan for experiments'
-    )
-    parser.add_argument(
-        '--save_dir',
-        type=str,
-        default='metrics_reports',
-        help='Directory to save reports'
-    )
-    
-    args = parser.parse_args()
-    
+def process_dataset(dataset_name, dataset_path, base_save_dir):
+    """Process a single dataset and create its reports."""
+    save_dir = os.path.join(base_save_dir, dataset_name)
+
     print("=" * 70)
-    print("  Collecting Metrics from Completed Experiments")
+    print(f"  Processing Dataset: {dataset_name}")
     print("=" * 70)
-    print(f"Scanning: {args.output_dir}")
-    print(f"Save to:  {args.save_dir}")
+    print(f"Scanning: {dataset_path}")
+    print(f"Save to:  {save_dir}")
     print("=" * 70)
     print()
-    
+
     # Scan experiments
-    experiments = scan_completed_experiments(args.output_dir)
-    
+    experiments = scan_completed_experiments(dataset_path)
+
     if not experiments:
-        print("No completed experiments found!")
+        print(f"No completed experiments found in {dataset_name}!")
         print("(Completed = has both test_metrics.txt and train_metrics.txt)")
-        return
-    
+        print()
+        return False
+
     # Create output directory
-    os.makedirs(args.save_dir, exist_ok=True)
-    
+    os.makedirs(save_dir, exist_ok=True)
+
     # Report findings
     total = sum(len(v) for v in experiments.values())
     print(f"Found {len(experiments)} scene(s) with {total} completed experiment(s):")
     for scene in sorted(experiments.keys()):
         print(f"  - {scene}: {len(experiments[scene])} experiments")
     print()
-    
+
     # Create per-scene reports
     print("Creating per-scene reports...")
     for scene in sorted(experiments.keys()):
-        filepath = create_scene_report(scene, experiments[scene], args.save_dir)
+        filepath = create_scene_report(scene, experiments[scene], save_dir)
         print(f"  {filepath}")
-    
+
     # Create combined report
     print("\nCreating combined report...")
-    combined_path = create_combined_report(experiments, args.save_dir)
+    combined_path = create_combined_report(experiments, save_dir)
     print(f"  {combined_path}")
-    
+
     # Create CSV files
     print("\nCreating CSV files...")
-    test_csv, train_csv = create_csv_summary(experiments, args.save_dir)
+    test_csv, train_csv = create_csv_summary(experiments, save_dir)
     print(f"  {test_csv}")
     print(f"  {train_csv}")
-    
+
     print("\n" + "=" * 70)
-    print("  COMPLETE!")
+    print(f"  {dataset_name} COMPLETE!")
     print("=" * 70)
-    print(f"\nReports saved to: {args.save_dir}/")
+    print()
+
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Collect metrics from completed experiments")
+    parser.add_argument(
+        '--outputs_base_dir',
+        type=str,
+        default='/home/nilkel/Projects/nest-splatting/outputs',
+        help='Base outputs directory containing dataset subdirectories'
+    )
+    parser.add_argument(
+        '--dataset',
+        type=str,
+        default=None,
+        help='Specific dataset to process (e.g., nerf_synthetic, DTU). If not provided, processes all datasets.'
+    )
+    parser.add_argument(
+        '--save_base_dir',
+        type=str,
+        default='metrics_reports',
+        help='Base directory to save reports (each dataset gets its own subfolder)'
+    )
+
+    args = parser.parse_args()
+
+    outputs_path = Path(args.outputs_base_dir)
+
+    if not outputs_path.exists():
+        print(f"Error: Outputs directory does not exist: {args.outputs_base_dir}")
+        return
+
+    # Find all dataset directories
+    if args.dataset:
+        # Process specific dataset
+        dataset_path = outputs_path / args.dataset
+        if not dataset_path.exists():
+            print(f"Error: Dataset directory does not exist: {dataset_path}")
+            return
+        datasets = [(args.dataset, dataset_path)]
+    else:
+        # Process all datasets
+        datasets = [(d.name, d) for d in outputs_path.iterdir() if d.is_dir()]
+
+    if not datasets:
+        print("No dataset directories found!")
+        return
+
+    print("=" * 70)
+    print("  Collecting Metrics from Completed Experiments")
+    print("=" * 70)
+    print(f"Outputs base: {args.outputs_base_dir}")
+    print(f"Reports base: {args.save_base_dir}")
+    print(f"Datasets to process: {len(datasets)}")
+    for name, _ in datasets:
+        print(f"  - {name}")
+    print("=" * 70)
+    print()
+
+    # Process each dataset
+    processed_count = 0
+    for dataset_name, dataset_path in sorted(datasets):
+        if process_dataset(dataset_name, str(dataset_path), args.save_base_dir):
+            processed_count += 1
+
+    print("\n" + "=" * 70)
+    print("  ALL DATASETS COMPLETE!")
+    print("=" * 70)
+    print(f"Processed {processed_count}/{len(datasets)} dataset(s)")
+    print(f"\nReports saved to: {args.save_base_dir}/<dataset_name>/")
     print(f"  - Per-scene: <scene>_metrics.txt")
     print(f"  - Combined:  all_metrics.txt")
     print(f"  - CSV:       all_test_metrics.csv, all_train_metrics.csv")

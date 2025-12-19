@@ -106,7 +106,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         ### warm-up
         override_color = ingp(points_3D = means3D, with_xyz = False).float()
         feat_dim = ingp.active_levels * ingp.level_dim
-    
+        # Set shape_dims for warmup phase (baseline mode, no hashgrid in CUDA)
+        output_dim = ingp.levels * ingp.level_dim  # Total levels * per_level_dim
+        shape_dims = torch.tensor([0, output_dim, output_dim], dtype=torch.int32, device="cuda")
+        print(f"[WARMUP/BASELINE MODE] Shape dims: GS=0, HS={output_dim}, OS={output_dim}")
+        print(f"[WARMUP] iteration={iteration}, hash_in_CUDA={hash_in_CUDA}")
+    breakpoint()
     if override_color is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
@@ -139,7 +144,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Adaptive_add mode detection (weighted sum of per-Gaussian and hashgrid features)
     is_adaptive_add_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_add_mode') and ingp.is_adaptive_add_mode
     
-    render_mode = 0  # 0 = baseline, 4 = cat, 6 = adaptive, 7 = adaptive_add
+    # Adaptive_cat mode detection (cat with learnable binary blend weights)
+    is_adaptive_cat_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_cat_mode') and ingp.is_adaptive_cat_mode
+    
+    # Residual_hybrid mode detection (per-Gaussian SH RGB + hashgrid MLP residual)
+    is_residual_hybrid_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_residual_hybrid_mode') and ingp.is_residual_hybrid_mode
+    
+    render_mode = 0  # 0 = baseline, 4 = cat, 6 = adaptive, 7 = adaptive_add, 11 = residual_hybrid, 12 = adaptive_cat
+    
+    # Initialize shape_dims tensor [GS, HS, OS] - will be updated per mode
+    # GS = Gaussian shape, HS = Hash shape, OS = Output shape
+    # shape_dims = torch.tensor([0, 0, 3], dtype=torch.int32, device="cuda")  # Default: no shapes specified
+    output_dim = ingp.levels * ingp.level_dim  # Total levels * per_level_dim
+    shape_dims = torch.tensor([0, output_dim, output_dim], dtype=torch.int32, device="cuda")
 
     if hash_in_CUDA:
         # Check if hashgrid is disabled (cat mode with hybrid_levels == total_levels)
@@ -165,6 +182,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         ap_level = pc.get_appearance_level
         contract = ingp.contract
         
+        # Baseline mode: set shape_dims for hashgrid-only rendering
+        # Only set if we're actually using hashgrid (colors_precomp will be set from hashgrid)
+        if not is_cat_mode and not is_adaptive_mode and not is_adaptive_add_mode and not is_adaptive_cat_mode and not is_residual_hybrid_mode:
+            # Check if we're actually using hashgrid (not SH)
+            if colors_precomp is not None or (shs is None and override_color is None):
+                # Baseline with hashgrid: GS=0 (no per-Gaussian), HS=output_dim, OS=output_dim
+                # Use total levels (not active_levels) - buffer is always full size, C2F masks unused channels
+                output_dim = ingp.levels * ingp.level_dim  # Total levels * per_level_dim (e.g., 6*4 = 24D)
+                shape_dims = torch.tensor([0, output_dim, output_dim], dtype=torch.int32, device="cuda")
+                print(f"[BASELINE MODE HASHGRID] Shape dims: GS=0, HS={output_dim}, OS={output_dim}")
+                print(f"[BASELINE MODE HASHGRID] total_levels={ingp.levels}, active_levels={ingp.active_levels}, level_dim={ingp.level_dim}")
+            # else: keep default shape_dims = [0, 0, 3] for SH rendering
+        
         # Cat mode: only activate if hybrid_levels > 0
         # When hybrid_levels == 0, behave identically to baseline
         if is_cat_mode and hybrid_levels > 0:
@@ -185,6 +215,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
                 padded_offsets[:offsets.shape[0]] = offsets
                 offsets = padded_offsets
+            
+            # Cat mode: G + H = O
+            gaussian_dim = hybrid_levels * ingp.level_dim  # e.g., 5*4 = 20
+            hash_dim = active_hashgrid_levels * ingp.level_dim  # e.g., 1*4 = 4
+            output_dim = total_levels * ingp.level_dim  # e.g., 6*4 = 24
+            shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
         
         # Adaptive mode: blend per-Gaussian and hashgrid features in Python, pass 24D to rasterizer
         elif is_adaptive_mode and pc._adaptive_feat_dim > 0:
@@ -230,6 +266,60 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             total_levels = ingp.levels
             active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
             levels = (total_levels << 16) | (active_hashgrid_levels << 8)
+        
+        # Adaptive_cat mode: per-Gaussian features + blend weight, binary decision at inference
+        elif is_adaptive_cat_mode and pc._gaussian_feat_dim > 0:
+            # Pass per-Gaussian features (24D) + blend weight (1D) + inference_flag (1D)
+            gaussian_features = pc.get_gaussian_features  # (N, 24)
+            blend_weight = torch.sigmoid(pc._adaptive_cat_weight)  # (N, 1)
+            
+            # Inference flag: 1 = binary mode (skip intersection or skip Gaussian), 0 = training mode (smooth blend)
+            # Check if inference flag is set in ingp object (stored during initialization)
+            use_inference_mode = hasattr(ingp, 'adaptive_cat_inference') and ingp.adaptive_cat_inference
+            inference_flag = torch.ones((len(blend_weight), 1), device="cuda") if use_inference_mode else torch.zeros((len(blend_weight), 1), device="cuda")
+            
+            colors_precomp = torch.cat([gaussian_features, blend_weight, inference_flag], dim=1)  # (N, 26)
+            shs = None
+            render_mode = 12  # adaptive_cat mode
+            
+            # Encode levels for CUDA: (total_levels << 16) | (1 << 8) for single hashgrid level
+            total_levels = ingp.levels
+            levels = (total_levels << 16) | (1 << 8)
+            
+            # Adaptive_cat: G = O, H = last level only
+            output_dim = total_levels * ingp.level_dim  # 24
+            gaussian_dim = output_dim  # 24 (full feature set)
+            hash_dim = ingp.level_dim  # 4 (single finest level)
+            shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
+        
+        # Residual_hybrid mode: per-Gaussian SH RGB + hashgrid features
+        elif is_residual_hybrid_mode and ingp is not None:
+            # Pass per-Gaussian SH coefficients as colors_precomp for blending
+            # Format: (N, 16, 3) -> flatten to (N, 48)
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            colors_precomp = shs_view.reshape(-1, 48)  # Flatten to (N, 48) - SH coefficients
+            shs = None
+            render_mode = 11
+            
+            # Configure hashgrid: finest (total - hybrid) levels only
+            total_levels = ingp.levels
+            hashgrid_levels = ingp.hashgrid_levels
+            hybrid_levels = ingp.hybrid_levels
+            
+            # Encode levels: (total << 16) | (hashgrid << 8) | hybrid
+            levels = (total_levels << 16) | (hashgrid_levels << 8) | hybrid_levels
+            
+            # Pad offsets to 17 elements (CUDA code expects up to 16 levels + 1)
+            if offsets.shape[0] < 17:
+                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
+                padded_offsets[:offsets.shape[0]] = offsets
+                offsets = padded_offsets
+            
+            # Residual_hybrid: dual buffers, OS=0 to indicate dual mode
+            gaussian_dim = 48  # SH coefficients (will be blended to 48D in allmap)
+            hash_dim = hashgrid_levels * ingp.level_dim  # e.g., 1*4 = 4
+            shape_dims = torch.tensor([gaussian_dim, hash_dim, 0], dtype=torch.int32, device="cuda")
+            # OS=0 signals dual buffer mode
 
         # hybrid_SH mode: Activate separately then add
         # Gaussian SH → RGB (+0.5, clamp) → [0,1]
@@ -319,10 +409,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # For diffuse/diffuse_ngp/diffuse_offset mode, use sh_degree=0 (only DC component)
     # For specular mode, use full active_sh_degree
     # For hybrid_SH/hybrid_SH_post, SH is handled separately (pre or post raster)
-    if is_hybrid_sh_mode or is_hybrid_sh_post_mode:
-        sh_degree_to_use = 0  # SH handled outside standard path
-    else:
-        sh_degree_to_use = 0 if (is_diffuse_mode or is_diffuse_ngp_mode or is_diffuse_offset_mode) else pc.active_sh_degree
+    # if is_hybrid_sh_mode or is_hybrid_sh_post_mode:
+    #     sh_degree_to_use = 0  # SH handled outside standard path
+    # else:
+    sh_degree_to_use = 0 if (is_diffuse_mode or is_diffuse_ngp_mode or is_diffuse_offset_mode) else pc.active_sh_degree
     
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
@@ -342,13 +432,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         record_transmittance = record_transmittance,
         # pipe.debug
     )
-
+    
     hashgrid_settings = HashGridSettings(
         L = levels,
         S = math.log2(per_level_scale), 
         H = base_resolution,
         align_corners = align_corners,
         interpolation = interpolation,
+        shape_dims = shape_dims
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
@@ -512,8 +603,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     # Diffuse/Specular mode: no MLP decoding needed, rendered_image is already RGB from SH
     # Baseline mode: decode hashgrid features through MLP
-    elif ingp is not None and not is_diffuse_mode and not is_specular_mode and not is_diffuse_ngp_mode and not is_diffuse_offset_mode:
-        # if hash_in_CUDA:
+    # ONLY when hash_in_CUDA is True (not during warmup SH rendering)
+    elif ingp is not None and hash_in_CUDA and not is_diffuse_mode and not is_specular_mode and not is_diffuse_ngp_mode and not is_diffuse_offset_mode:
+        # Hashgrid rendering active:
         rays_d, rays_o = cam2rays(viewpoint_camera)
         W, H = viewpoint_camera.image_width, viewpoint_camera.image_height
         ray_unit = torch_F.normalize(rays_d, dim=-1).float().detach()
@@ -554,8 +646,47 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 # Zero out per-Gaussian features (first gaussian_feat_dim channels)
                 rendered_image[:gaussian_feat_dim, :, :] = 0
         
+        # Residual_hybrid mode: combine SH RGB with MLP-decoded hashgrid features
+        if is_residual_hybrid_mode:
+            # The rasterizer outputs two buffers:
+            # - rendered_image: (hashgrid_feat_dim, H, W) - blended hashgrid features
+            # - allmap[14:14+48]: (48, H, W) - blended SH coefficients
+            
+            render_mask = (render_alpha > 0)
+            
+            # Extract blended SH coefficients (48D per pixel)
+            sh_flat = allmap[14:14+48]  # (48, H, W)
+            sh_flat = sh_flat.view(48, -1).permute(1, 0)  # (H*W, 48)
+            sh_degree = pc.active_sh_degree
+            sh_coeffs = sh_flat.view(-1, 3, (sh_degree+1)**2)  # (H*W, 3, 16) for degree 3
+
+            # Get view directions for each pixel
+            rays_d, rays_o = cam2rays(viewpoint_camera)
+            W, H = viewpoint_camera.image_width, viewpoint_camera.image_height
+            ray_unit = torch_F.normalize(rays_d, dim=-1).float()
+            
+            # Evaluate SH per-pixel to get RGB
+            sh_rgb = eval_sh(sh_degree, sh_coeffs, ray_unit)  # (H*W, 3)
+            sh_rgb = torch.clamp_min(sh_rgb + 0.5, 0.0)  # Standard 2DGS activation
+            sh_rgb = sh_rgb.view(H, W, 3).permute(2, 0, 1)  # (3, H, W)
+
+            # Decode hashgrid features through MLP
+            feat_dim = rendered_image.shape[0]
+            mlp_rgb = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), ray_unit)
+            mlp_rgb = mlp_rgb.view(H, W, 3).permute(2, 0, 1)  # (3, H, W)
+
+            # Apply mask
+            sh_rgb = sh_rgb * render_mask
+            mlp_rgb = mlp_rgb * render_mask
+            
+            # Combine: clamp(SH_RGB + MLP_RGB, 0, 1)
+            rendered_image = torch.clamp(sh_rgb + mlp_rgb, 0.0, 1.0)
+            
+            # Store separate outputs for visualization/debugging
+            rets['sh_rgb'] = sh_rgb
+            rets['mlp_rgb'] = mlp_rgb
         # hybrid_SH and hybrid_SH_raw modes: rasterizer outputs activated RGB
-        if is_hybrid_sh_mode or is_hybrid_sh_raw_mode:
+        elif is_hybrid_sh_mode or is_hybrid_sh_raw_mode:
             # Activation already done in CUDA rasterizer
             rendered_image = rendered_image * render_mask
         elif is_hybrid_sh_post_mode:

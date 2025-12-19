@@ -64,7 +64,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     warmup_checkpoint_path = os.path.join(dataset.source_path, "warmup_checkpoint.pth")
     loaded_from_warmup = False
     
-    if checkpoint:
+    # Cold start mode: skip all checkpoint loading
+    if args.cold:
+        print("\n" + "="*70)
+        print("  COLD START MODE")
+        print("="*70)
+        print("  Skipping 2DGS warmup phase and all checkpoint loading")
+        print("  Training Nest representation from scratch with hash_in_CUDA=True")
+        print("="*70 + "\n")
+        scene = Scene(dataset, gaussians)
+        gaussians.training_setup(opt)
+    elif checkpoint:
         # User-specified checkpoint takes priority
         scene = Scene(dataset, gaussians)
         gaussians.training_setup(opt)
@@ -141,6 +151,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"[ADAPTIVE_ADD MODE] Initialized {len(gaussians.get_xyz)} Gaussians")
             print(f"[ADAPTIVE_ADD MODE] Per-Gaussian features: {gaussians._adaptive_feat_dim}D")
             print(f"[ADAPTIVE_ADD MODE] Blend weight (gamma): 1D per Gaussian")
+        elif args.method == "adaptive_cat":
+            # adaptive_cat mode: per-Gaussian features (total_levels × D) + blend weight
+            num_levels = cfg_model.encoding.levels
+            per_level_dim = cfg_model.encoding.hashgrid.dim
+            gaussians._gaussian_feat_dim = num_levels * per_level_dim
+            
+            # Initialize per-Gaussian features to small random values
+            gaussian_feats = torch.randn((len(gaussians.get_xyz), gaussians._gaussian_feat_dim), device="cuda").float() * 0.01
+            gaussians._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+            
+            # Initialize blend weight to 0.0 (sigmoid(0) = 0.5, equal blend initially)
+            blend_weight = torch.zeros((len(gaussians.get_xyz), 1), device="cuda").float()
+            gaussians._adaptive_cat_weight = nn.Parameter(blend_weight.requires_grad_(True))
+            
+            print(f"[ADAPTIVE_CAT MODE] Initialized {len(gaussians.get_xyz)} Gaussians")
+            print(f"[ADAPTIVE_CAT MODE] Per-Gaussian features: {gaussians._gaussian_feat_dim}D")
+            print(f"[ADAPTIVE_CAT MODE] Blend weight: 1D per Gaussian (starts at 0.5)")
         else:
             gaussians._adaptive_feat_dim = 0
             gaussians._adaptive_num_levels = 0
@@ -249,8 +276,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.training_setup(opt)
         
         # Load optimizer state from warmup checkpoint
-        # For cat/adaptive/diffuse mode, new params won't be in saved state - they train from scratch
-        if args.method not in ["cat", "adaptive", "diffuse"]:
+        # For cat/adaptive/adaptive_cat/diffuse mode, new params won't be in saved state - they train from scratch
+        if args.method not in ["cat", "adaptive", "adaptive_cat", "diffuse"]:
             gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
         
         # Move optimizer state to GPU
@@ -304,10 +331,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     black_bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
     use_alternating_bg = args.method in ["diffuse_ngp", "diffuse_offset"]
     
-    # Random background mode: use random per-pixel background during training for unbiased opacity
+    # Random background mode: use black BG until 15k iters, then random uniform background
     use_random_bg = args.random_background
+    random_bg_start_iter = 15000
     if use_random_bg:
-        print("Using random per-pixel background during training (eval will use black background)")
+        print(f"Using black background until iteration {random_bg_start_iter}, then random uniform background (eval will use black background)")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -340,6 +368,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         densification_interval = opt.densification_interval
         if ingp_model is None:
             ingp = None
+            densify_grad_threshold = cfg_model.training_cfg.densify_grad_threshold
+            appearance_update_threshold = 0.0
+        elif args.cold:
+            # Cold start: enable ingp from the start, skip warmup phase
+            # Use warmup phase densification settings (same as during initialize phase)
+            ingp = ingp_model
             densify_grad_threshold = cfg_model.training_cfg.densify_grad_threshold
             appearance_update_threshold = 0.0
         elif iteration <= cfg_model.ingp_stage.initialize:
@@ -401,10 +435,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
         gt_image = viewpoint_cam.original_image.cuda()
         
-        # Apply random per-pixel background for unbiased opacity training
-        if use_random_bg:
+        # Apply random background for unbiased opacity training
+        if use_random_bg and iteration >= random_bg_start_iter:
             H, W = image.shape[1], image.shape[2]
-            random_bg = torch.rand(3, H, W, device="cuda")
+            # Generate a single random RGB value for the entire background
+            # Changes every 100 iterations
+            torch.manual_seed(iteration // 100)
+            random_bg_color = torch.rand(3, 1, 1, device="cuda")
+            random_bg = random_bg_color.expand(3, H, W)
             rend_alpha = render_pkg["rend_alpha"]
             
             # Apply random background to rendered image
@@ -439,7 +477,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if cfg_model.settings.gs_alpha and ingp is not None:
                 gt_alpha = viewpoint_cam.gs_alpha_mask.cuda().float()
         except:
-            if not loaded_from_warmup:
+            if not loaded_from_warmup and not args.cold:
                 print(f"Error! no gs alpha for {viewpoint_cam.image_name} .")
             pass
 
@@ -508,8 +546,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Regularize activated scale (after exp) to encourage small scales -> compact Gaussians
             mcmc_scale_reg = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
 
+        # Adaptive_cat entropy regularization - encourage binary blend weights (0 or 1)
+        adaptive_cat_reg_loss = torch.tensor(0.0, device="cuda")
+        if args.method == "adaptive_cat" and hasattr(gaussians, '_adaptive_cat_weight') and gaussians._adaptive_cat_weight.numel() > 0:
+            # Compute annealing factor (ramps from 0 to 1 starting at anneal_start iteration)
+            if iteration >= args.adaptive_cat_anneal_start:
+                progress = (iteration - args.adaptive_cat_anneal_start) / (opt.iterations - args.adaptive_cat_anneal_start)
+                anneal_factor = min(1.0, progress)  # Linear ramp from 0 to 1
+            else:
+                anneal_factor = 0.0
+            
+            # Entropy regularization: -w*log(w) - (1-w)*log(1-w)
+            # This penalizes weights near 0.5 and encourages weights near 0 or 1
+            weight = torch.sigmoid(gaussians._adaptive_cat_weight)
+            eps = 1e-7
+            entropy = -(weight * torch.log(weight + eps) + (1 - weight) * torch.log(1 - weight + eps))
+            adaptive_cat_reg_loss = args.lambda_adaptive_cat * anneal_factor * entropy.mean()
+
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss
 
         total_loss.backward()
 
@@ -545,6 +600,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if args.mcmc:
                     loss_dict["OpR"] = f"{mcmc_opacity_reg.item():.{5}f}"
                     loss_dict["ScR"] = f"{mcmc_scale_reg.item():.{5}f}"
+                # Add adaptive_cat metrics to progress bar
+                if args.method == "adaptive_cat" and hasattr(gaussians, '_adaptive_cat_weight') and gaussians._adaptive_cat_weight.numel() > 0:
+                    mean_weight = torch.sigmoid(gaussians._adaptive_cat_weight).mean().item()
+                    pct_gaussian = (torch.sigmoid(gaussians._adaptive_cat_weight) > 0.5).float().mean().item() * 100
+                    loss_dict["W"] = f"{mean_weight:.2f}"
+                    loss_dict["G%"] = f"{pct_gaussian:.0f}"
+                    if adaptive_cat_reg_loss.item() > 0:
+                        loss_dict["AdR"] = f"{adaptive_cat_reg_loss.item():.{5}f}"
                 progress_bar.set_postfix(loss_dict)
 
                 progress_bar.update(10)
@@ -561,6 +624,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tb_writer.add_scalar('train_loss_patches/mcmc_reg_loss', ema_mcmc_loss_for_log, iteration)
                     tb_writer.add_scalar('train_loss_patches/mcmc_opacity_reg', mcmc_opacity_reg.item(), iteration)
                     tb_writer.add_scalar('train_loss_patches/mcmc_scale_reg', mcmc_scale_reg.item(), iteration)
+                if args.method == "adaptive_cat" and hasattr(gaussians, '_adaptive_cat_weight') and gaussians._adaptive_cat_weight.numel() > 0:
+                    mean_weight = torch.sigmoid(gaussians._adaptive_cat_weight).mean().item()
+                    pct_gaussian = (torch.sigmoid(gaussians._adaptive_cat_weight) > 0.5).float().mean().item() * 100
+                    tb_writer.add_scalar('adaptive_cat/mean_weight', mean_weight, iteration)
+                    tb_writer.add_scalar('adaptive_cat/pct_gaussian', pct_gaussian, iteration)
+                    tb_writer.add_scalar('adaptive_cat/reg_loss', adaptive_cat_reg_loss.item(), iteration)
 
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), \
                 ingp_model=ingp, beta = beta, args = args, cfg_model = cfg_model, test_psnr = test_psnr, train_psnr = train_psnr, iter_list = iter_list)
@@ -684,41 +753,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     network_gui.conn = None
 
         with torch.no_grad():
-        
-            if iteration == cfg_model.ingp_stage.initialize and cfg_model.settings.gs_alpha:   
-                print('--- Generating mask by 2DGS.')
-                from utils.image_utils import bilateral_filter_opencv
 
-                if not os.path.exists(os.path.join(scene.model_path, "gs_alpha")):
-                    os.mkdir(os.path.join(scene.model_path, "gs_alpha"))
-
-                if not os.path.exists(os.path.join(scene.model_path, "gt_alpha")):
-                    os.mkdir(os.path.join(scene.model_path, "gt_alpha"))
-
-                # Collect gs_alpha masks for all cameras
+            # At initialize iteration, optionally generate gs_alpha masks and save warmup checkpoint
+            # Skip in cold start mode since there's no warmup phase
+            if iteration == cfg_model.ingp_stage.initialize and not args.cold:
                 gs_alpha_masks = {}
-                train_stack = scene.getTrainCameras()
-                for cam in tqdm(train_stack, desc="Generating masks"):
-                    cam_name = cam.image_name + '.png'
-                    render_pkg = render(cam, gaussians, pipe, background, ingp = ingp, \
-                        beta = beta, iteration = iteration, cfg = cfg_model)
-                    alpha_image = render_pkg["rend_alpha"]
-                    bila_alpha = bilateral_filter_opencv(alpha_image.detach().cpu())
-                    cam.gs_alpha_mask = bila_alpha.cpu().float()
-                    gs_alpha_masks[cam.image_name] = bila_alpha.cpu().float()
 
-                    alpha_name = os.path.join(scene.model_path, 'gs_alpha', cam_name)
-                    save_img_u8(bila_alpha.permute(1,2,0).expand(-1,-1,3).numpy(), alpha_name)
+                # Optionally generate gs_alpha masks if enabled
+                if cfg_model.settings.gs_alpha:
+                    print('--- Generating mask by 2DGS.')
+                    from utils.image_utils import bilateral_filter_opencv
 
-                    alpha_name = os.path.join(scene.model_path, 'gt_alpha', cam_name)
-                    save_img_u8(cam.gt_alpha_mask.permute(1,2,0).expand(-1,-1,3).detach().cpu().numpy(), alpha_name)
-                
-                # Save warmup checkpoint (only if training from scratch)
-                if not loaded_from_warmup:
+                    if not os.path.exists(os.path.join(scene.model_path, "gs_alpha")):
+                        os.mkdir(os.path.join(scene.model_path, "gs_alpha"))
+
+                    if not os.path.exists(os.path.join(scene.model_path, "gt_alpha")):
+                        os.mkdir(os.path.join(scene.model_path, "gt_alpha"))
+
+                    # Collect gs_alpha masks for all cameras
+                    train_stack = scene.getTrainCameras()
+                    for cam in tqdm(train_stack, desc="Generating masks"):
+                        cam_name = cam.image_name + '.png'
+                        render_pkg = render(cam, gaussians, pipe, background, ingp = ingp, \
+                            beta = beta, iteration = iteration, cfg = cfg_model)
+                        alpha_image = render_pkg["rend_alpha"]
+                        bila_alpha = bilateral_filter_opencv(alpha_image.detach().cpu())
+                        cam.gs_alpha_mask = bila_alpha.cpu().float()
+                        gs_alpha_masks[cam.image_name] = bila_alpha.cpu().float()
+
+                        alpha_name = os.path.join(scene.model_path, 'gs_alpha', cam_name)
+                        save_img_u8(bila_alpha.permute(1,2,0).expand(-1,-1,3).numpy(), alpha_name)
+
+                        alpha_name = os.path.join(scene.model_path, 'gt_alpha', cam_name)
+                        save_img_u8(cam.gt_alpha_mask.permute(1,2,0).expand(-1,-1,3).detach().cpu().numpy(), alpha_name)
+
+                # Save warmup checkpoint (only if training from scratch and if_ingp is enabled)
+                if not loaded_from_warmup and cfg_model.settings.if_ingp:
                     print("\n" + "="*70)
                     print("  SAVING 2DGS WARMUP CHECKPOINT")
                     print("="*70)
-                    
+
                     warmup_ckpt = {
                         'iteration': iteration,
                         'n_gaussians': len(gaussians.get_xyz),
@@ -739,7 +813,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         'feat_gradient_accum': gaussians.feat_gradient_accum.detach().cpu(),
                         'denom': gaussians.denom.detach().cpu(),
                     }
-                    
+
                     torch.save(warmup_ckpt, warmup_checkpoint_path)
                     print(f"  Saved to: {warmup_checkpoint_path}")
                     print(f"  Gaussians: {warmup_ckpt['n_gaussians']}")
@@ -1129,8 +1203,14 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
         torch.cuda.empty_cache()
 
 def merge_cfg_to_args(args, cfg):
-    """Merge specific sections from config into args"""
+    """Merge specific sections from config into args
+    
+    Note: For white_background, CLI flag takes precedence over config
+    """
     target_sections = ['training_cfg', 'settings', 'loss']
+    
+    # Store CLI white_background value before merging
+    cli_white_background = args.white_background if hasattr(args, 'white_background') else None
     
     for section in target_sections:
         if hasattr(cfg, section):
@@ -1138,6 +1218,10 @@ def merge_cfg_to_args(args, cfg):
             if isinstance(section_dict, dict):
                 for k, v in section_dict.items():
                     setattr(args, k, v)
+    
+    # Restore CLI white_background if it was explicitly set
+    if cli_white_background is not None and cli_white_background:
+        args.white_background = cli_white_background
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
@@ -1161,10 +1245,10 @@ if __name__ == "__main__":
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
     
-    # Method argument - baseline, cat, adaptive, adaptive_add, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, or hybrid_SH_post
+    # Method argument - baseline, cat, adaptive, adaptive_add, adaptive_cat, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "cat", "adaptive", "adaptive_add", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post"],
-                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), or 'hybrid_SH_post' (DEPRECATED)")
+                        choices=["baseline", "cat", "adaptive", "adaptive_add", "adaptive_cat", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid"],
+                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), or 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual)")
     parser.add_argument("--hybrid_levels", type=int, default=3,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
     parser.add_argument("--decompose_mode", type=str, default=None,
@@ -1182,6 +1266,16 @@ if __name__ == "__main__":
                         help="Weight for scout loss in diffuse_offset xyz mode (moves Gaussians toward offset target)")
     parser.add_argument("--random_background", action="store_true",
                         help="Use random per-pixel background during training for unbiased opacity learning. Eval uses black background.")
+    parser.add_argument("--cold", action="store_true",
+                        help="Cold start: skip 2DGS warmup phase and optimize Nest representation from scratch (no checkpoint loading, hash_in_CUDA always on)")
+    
+    # Adaptive_cat arguments
+    parser.add_argument("--lambda_adaptive_cat", type=float, default=0.01,
+                        help="Entropy regularization weight for adaptive_cat binarization (pushes weights toward 0 or 1)")
+    parser.add_argument("--adaptive_cat_anneal_start", type=int, default=15000,
+                        help="Iteration to start annealing adaptive_cat entropy regularization (ramps from 0 to full strength)")
+    parser.add_argument("--adaptive_cat_inference", action="store_true",
+                        help="Use binary decisions at inference (weight>0.5 uses Gaussian only, skips intersection; weight<=0.5 uses hashgrid only)")
     
     # MCMC arguments - based on "3D Gaussian Splatting as Markov Chain Monte Carlo"
     parser.add_argument("--mcmc", action="store_true",
@@ -1203,6 +1297,11 @@ if __name__ == "__main__":
         print(f"Hybrid levels: {args.hybrid_levels} (per-Gaussian features for coarse levels)")
         if args.disable_c2f:
             print(f"C2F disabled: all levels active from start")
+    elif args.method == "adaptive_cat":
+        print(f"Adaptive Cat mode: learnable binary blend weights (smooth training, binary inference)")
+        print(f"  - Entropy regularization: {args.lambda_adaptive_cat} (anneals from iter {args.adaptive_cat_anneal_start})")
+        print(f"  - Inference mode: {'BINARY (skip intersection or skip Gaussian)' if args.adaptive_cat_inference else 'SMOOTH (blending)'}")
+        print(f"  - Single-level hashgrid at finest resolution")
     elif args.method == "diffuse":
         print(f"Diffuse mode: SH degree 0, no viewdir, no hashgrid")
     elif args.method == "specular":
@@ -1216,6 +1315,20 @@ if __name__ == "__main__":
 
     cfg_model = Config(args.yaml)
     merge_cfg_to_args(args, cfg_model)
+    
+    # Cold start mode: override config to enable hash_in_CUDA from start
+    if args.cold:
+        if not cfg_model.settings.if_ingp:
+            print("\n[WARNING] --cold flag requires if_ingp=True in config. This will likely fail.")
+        print("\n[COLD START] Overriding config:")
+        print(f"  ingp_stage.initialize: {cfg_model.ingp_stage.initialize} -> 0")
+        print(f"  ingp_stage.switch_iter: {cfg_model.ingp_stage.switch_iter} -> 0")
+        cfg_model.ingp_stage.initialize = 0
+        cfg_model.ingp_stage.switch_iter = 0
+        print("  hash_in_CUDA will be enabled from iteration 1")
+        if cfg_model.settings.gs_alpha:
+            print("  Note: gs_alpha masks will not be generated in cold mode")
+        print()
 
     print("args: ", args)
 

@@ -713,6 +713,7 @@ renderCUDAsurfelForward(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	float SH_RGB[3] = { 0 };  // Separate accumulator for residual_hybrid SH RGB (render_mode==11)
 	uint32_t render_number = 0;
 	float vis_appearance[3] = {0};
 
@@ -1334,6 +1335,133 @@ renderCUDAsurfelForward(
 			
 			break;
 		}
+		case 11: {
+			// residual_hybrid mode: Dual output buffers
+			// Buffer 1 (SH_RGB[]): Per-Gaussian SH→RGB (accumulated separately after switch)
+			// Buffer 2 (feat[] → C[]): Alpha-blended hashgrid features for MLP
+			
+			// Decode level parameter: (total << 16) | (hashgrid << 8) | hybrid
+			const int hybrid_levels = level & 0xFF;
+			const int hashgrid_levels = (level >> 8) & 0xFF;
+			const int per_level_dim = l_dim;
+			const int hashgrid_dim = hashgrid_levels * per_level_dim;
+			
+			// Initialize feat array for hashgrid features
+			for(int i = 0; i < CHANNELS; i++) feat[i] = 0.0f;
+			
+			// Query hashgrid at 3D intersection point
+			if (hashgrid_levels > 0) {
+				float feat_hashgrid[16 * 4];
+				
+				// Query hashgrid (already configured with finest levels in Python)
+				if (l_dim == 2) {
+					query_feature<false, 16*4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max, 
+						collec_offsets, appearance_level, hash_features, hashgrid_levels, 
+						l_scale, Base, align_corners, interp, contract, debug);
+				} else if (l_dim == 4) {
+					query_feature<false, 16*4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max, 
+						collec_offsets, appearance_level, hash_features, hashgrid_levels, 
+						l_scale, Base, align_corners, interp, contract, debug);
+				} else if (l_dim == 8) {
+					query_feature<false, 16*4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max, 
+						collec_offsets, appearance_level, hash_features, hashgrid_levels, 
+						l_scale, Base, align_corners, interp, contract, debug);
+				} else if (l_dim == 12) {
+					query_feature<false, 16*4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max, 
+						collec_offsets, appearance_level, hash_features, hashgrid_levels, 
+						l_scale, Base, align_corners, interp, contract, debug);
+				} else {
+					if (debug) printf("FW unsupported level dim : %d\n", l_dim);
+				}
+				
+				// Store hashgrid features in feat array for alpha blending
+				for (int i = 0; i < hashgrid_dim && i < CHANNELS; i++) {
+					feat[i] = feat_hashgrid[i];
+				}
+			}
+			
+			// Note: SH→RGB evaluation happens in accumulation loop below (after switch)
+			// This allows us to use the same xyz and w (alpha weight) for both outputs
+			
+			break;
+		}
+		case 12: {
+			// adaptive_cat mode: blend last level during training, binary decision at inference
+			// rgb buffer: [N, 26] = [24D features | 1D weight | 1D inference_flag]
+			
+			const int total_levels = (level >> 16) & 0xFF;  // e.g., 6
+			const int per_level_dim = l_dim;  // 4
+			const int total_dim = total_levels * per_level_dim;  // 24
+			
+			int gauss_id = collected_id[j];
+			const float* gauss_feat = &rgb[gauss_id * (total_dim + 2)];
+			const float weight = gauss_feat[total_dim];  // Blend weight (sigmoid output)
+			const float inference_flag = gauss_feat[total_dim + 1];  // 0=training, 1=inference
+			
+			// Binary decision at inference
+			bool use_gaussian_only = (inference_flag > 0.5f) && (weight > 0.5f);
+			bool use_hashgrid_only = (inference_flag > 0.5f) && (weight <= 0.5f);
+			
+			// Initialize feat array
+			for(int i = 0; i < CHANNELS; i++) feat[i] = 0.0f;
+			
+			if (use_gaussian_only) {
+				// FAST PATH: Use all per-Gaussian features, skip 3D intersection
+				// This is like the original 2DGS path (no hashgrid query needed)
+				for(int i = 0; i < total_dim; i++) {
+					feat[i] = gauss_feat[i];
+				}
+			}
+			else if (use_hashgrid_only) {
+				// HASHGRID PATH: Use first (total_levels-1) from Gaussian, last level from hashgrid
+				// Copy first (total_levels - 1) levels directly
+				for(int i = 0; i < (total_levels - 1) * per_level_dim; i++) {
+					feat[i] = gauss_feat[i];
+				}
+				
+				// Query hashgrid for last level (requires 3D intersection - already computed)
+				float hash_feat[4];
+				if(l_dim == 4) {
+					query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, 
+					                           collec_offsets, appearance_level, hash_features, 
+					                           1, l_scale, Base, align_corners, interp, contract, debug);
+				} else {
+					if (debug) printf("adaptive_cat unsupported level dim: %d\n", l_dim);
+				}
+				
+				// Use ONLY hashgrid for last level (weight is near 0)
+				const int last_level_start = (total_levels - 1) * per_level_dim;
+				for(int i = 0; i < per_level_dim; i++) {
+					feat[last_level_start + i] = hash_feat[i];
+				}
+			}
+			else {
+				// TRAINING PATH: Smooth blending
+				// Copy first (total_levels - 1) levels directly
+				for(int i = 0; i < (total_levels - 1) * per_level_dim; i++) {
+					feat[i] = gauss_feat[i];
+				}
+				
+				// Query hashgrid for last level
+				float hash_feat[4];
+				if(l_dim == 4) {
+					query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, 
+					                           collec_offsets, appearance_level, hash_features, 
+					                           1, l_scale, Base, align_corners, interp, contract, debug);
+				} else {
+					if (debug) printf("adaptive_cat unsupported level dim: %d\n", l_dim);
+				}
+				
+				// Blend last level: weight * gaussian + (1-weight) * hash
+				const int last_level_start = (total_levels - 1) * per_level_dim;
+				for(int i = 0; i < per_level_dim; i++) {
+					feat[last_level_start + i] = weight * gauss_feat[last_level_start + i] 
+					                            + (1.0f - weight) * hash_feat[i];
+				}
+			}
+			
+			break;
+		}
 		case 1: {
 			// Surface mode with optional per-Gaussian baseline features
 			// Surface hashgrid: 12 features per level → dot product → 4 scalars per level
@@ -1423,8 +1551,36 @@ renderCUDAsurfelForward(
 					break;
 			}
 
+				// Accumulate hashgrid features
 				for (int ch = 0; ch < CHANNELS; ch++)
 					C[ch] += feat[ch] * w;
+				
+				// For residual_hybrid (render_mode=11): also accumulate SH RGB separately
+				// This evaluates per-Gaussian SH and accumulates into SH_RGB[]
+				// SH coefficients format: [sh0_r, sh0_g, sh0_b, sh1_r, sh1_g, sh1_b, ...] (interleaved)
+				// For degree 3: 16 coefficients per channel = 48 total per Gaussian
+				if (render_mode == 11 && rgb != nullptr) {
+					int gauss_id = collected_id[j];
+					const int sh_max_coeffs = 16;  // Degree 3 = 16 coefficients per channel
+					const int sh_degree = 3;  // Fixed degree 3 for residual_hybrid mode
+					const float* sh_coeffs = &rgb[gauss_id * sh_max_coeffs * 3];
+					
+					// Compute view direction from Gaussian center to intersection point
+					// (approximation for per-pixel view-dependent rendering)
+					const float3 pk = collected_pk[j];
+					float3 ray_dir = {xyz.x - pk.x, xyz.y - pk.y, xyz.z - pk.z};
+					float inv_len = rsqrtf(ray_dir.x*ray_dir.x + ray_dir.y*ray_dir.y + ray_dir.z*ray_dir.z);
+					ray_dir.x *= inv_len; ray_dir.y *= inv_len; ray_dir.z *= inv_len;
+					
+					// Evaluate SH using inline function (interleaved format)
+					float result[3];
+					eval_sh_inline(sh_degree, sh_coeffs, ray_dir, result);
+					
+					// Activate and accumulate (eval_sh_inline already adds +0.5)
+					SH_RGB[0] += w * result[0];
+					SH_RGB[1] += w * result[1];
+					SH_RGB[2] += w * result[2];
+				}
 				
 				// max level is 6
 				float ap_color[3] = {0};
@@ -1519,6 +1675,14 @@ renderCUDAsurfelForward(
 		out_others[pix_id + (VIS_OFFSET + 0) * H * W] = vis_appearance[0];
 		out_others[pix_id + (VIS_OFFSET + 1) * H * W] = vis_appearance[1];
 		out_others[pix_id + (VIS_OFFSET + 2) * H * W] = vis_appearance[2];
+		
+		// For residual_hybrid mode (render_mode=11): store SH RGB in out_others[14:16]
+		// This is written separately from the main C[] output which contains hashgrid features
+		if (render_mode == 11) {
+			out_others[pix_id + (DIFFUSE_RGB_OFFSET + 0) * H * W] = SH_RGB[0];  // SH R
+			out_others[pix_id + (DIFFUSE_RGB_OFFSET + 1) * H * W] = SH_RGB[1];  // SH G
+			out_others[pix_id + (DIFFUSE_RGB_OFFSET + 2) * H * W] = SH_RGB[2];  // SH B
+		}
 		// out_others[pix_id + MEDIAN_WEIGHT_OFFSET * H * W] = median_weight;
 #endif
 	}

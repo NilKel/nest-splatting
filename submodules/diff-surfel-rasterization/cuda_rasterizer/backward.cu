@@ -1300,6 +1300,148 @@ renderCUDAsurfelBackward(
 			
 			break;
 		}
+		case 11: {
+			// residual_hybrid mode backward: Gradients for dual outputs
+			// Per-Gaussian SH→RGB (precomputed) + MLP(alpha-blended hashgrid features)
+			// grad_feat[C] contains gradients w.r.t. hashgrid features from MLP backward pass
+
+			// Decode level parameter
+			const int hybrid_levels = level & 0xFF;
+			const int hashgrid_levels = (level >> 8) & 0xFF;
+			const int hashgrid_dim = hashgrid_levels * l_dim;
+
+			// Backprop through hashgrid query at 3D intersection point
+			// grad_feat[C] should contain gradients for first hashgrid_dim channels
+			if (hashgrid_levels > 0 && hashgrid_dim <= C) {
+				float feat_hashgrid[16 * 4];
+				float grad_hashgrid[16 * 4] = {0.0f};
+				float dL_dxyz_local[3] = {0.0f};
+				
+				// Copy gradients for hashgrid features (first hashgrid_dim elements)
+				for(int i = 0; i < hashgrid_dim && i < C; i++) {
+					grad_hashgrid[i] = grad_feat[i];
+				}
+
+				if(l_dim == 2) {
+					query_feature<true, 16 * 4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max,
+						collec_offsets, appearance_level, hash_features, hashgrid_levels,
+						l_scale, Base, align_corners, interp, contract, debug,
+						grad_hashgrid, dL_dfeatures, dL_dxyz_local);
+				} else if(l_dim == 4) {
+					query_feature<true, 16 * 4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max,
+						collec_offsets, appearance_level, hash_features, hashgrid_levels,
+						l_scale, Base, align_corners, interp, contract, debug,
+						grad_hashgrid, dL_dfeatures, dL_dxyz_local);
+				} else if(l_dim == 8) {
+					query_feature<true, 16 * 4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max,
+						collec_offsets, appearance_level, hash_features, hashgrid_levels,
+						l_scale, Base, align_corners, interp, contract, debug,
+						grad_hashgrid, dL_dfeatures, dL_dxyz_local);
+				} else if(l_dim == 12) {
+					query_feature<true, 16 * 4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max,
+						collec_offsets, appearance_level, hash_features, hashgrid_levels,
+						l_scale, Base, align_corners, interp, contract, debug,
+						grad_hashgrid, dL_dfeatures, dL_dxyz_local);
+				}
+				
+				// Note: dL_dxyz_local gradients could be accumulated if needed for position gradients
+				// For now, we don't use them since xyz is computed from Gaussian parameters
+			}
+
+			// Note: SH RGB gradients handled separately in accumulation loop
+			// (SH coefficients are precomputed in Python, gradients flow via autograd)
+
+			break;
+		}
+		case 12: {
+			// adaptive_cat mode backward: Gradients for blend weight and features
+			// Three paths: gaussian_only, hashgrid_only, or smooth blending
+			
+			const int total_levels = (level >> 16) & 0xFF;
+			const int per_level_dim = l_dim;
+			const int total_dim = total_levels * per_level_dim;
+			
+			int gauss_id = collected_id[j];
+			const float weight = colors[gauss_id * (total_dim + 2) + total_dim];
+			const float inference_flag = colors[gauss_id * (total_dim + 2) + total_dim + 1];
+			
+			bool use_gaussian_only = (inference_flag > 0.5f) && (weight > 0.5f);
+			bool use_hashgrid_only = (inference_flag > 0.5f) && (weight <= 0.5f);
+			
+			if (use_gaussian_only) {
+				// Gaussian-only: all gradients go to per-Gaussian features
+				for(int i = 0; i < total_dim; i++) {
+					atomicAdd(&dL_dcolors[gauss_id * (total_dim + 2) + i], grad_feat[i]);
+				}
+				// No gradient for weight (frozen at inference)
+			}
+			else if (use_hashgrid_only) {
+				// Hashgrid-only: first levels to Gaussian, last level to hashgrid
+				for(int i = 0; i < (total_levels - 1) * per_level_dim; i++) {
+					atomicAdd(&dL_dcolors[gauss_id * (total_dim + 2) + i], grad_feat[i]);
+				}
+				
+				// Gradient for hashgrid (last level)
+				float grad_hash[4];
+				const int last_start = (total_levels - 1) * per_level_dim;
+				for(int i = 0; i < per_level_dim; i++) {
+					grad_hash[i] = grad_feat[last_start + i];
+				}
+				
+				if(l_dim == 4) {
+					float hash_feat[4];  // Need to re-query for backward pass
+					query_feature<true, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, 
+					                          collec_offsets, appearance_level, hash_features, 
+					                          1, l_scale, Base, align_corners, interp, contract, debug, 
+					                          grad_hash, dL_dfeatures, dL_dxyz);
+				}
+			}
+			else {
+				// Training: smooth blending with weight gradients
+				// Gradient for per-Gaussian features (first total_levels-1 direct, last level weighted)
+				for(int i = 0; i < (total_levels - 1) * per_level_dim; i++) {
+					atomicAdd(&dL_dcolors[gauss_id * (total_dim + 2) + i], grad_feat[i]);
+				}
+				
+				// Re-query hashgrid for last level (needed for gradient computation)
+				float hash_feat[4];
+				if(l_dim == 4) {
+					query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, 
+					                           collec_offsets, appearance_level, hash_features, 
+					                           1, l_scale, Base, align_corners, interp, contract, debug);
+				}
+				
+				// Gradient for last level Gaussian features (scaled by weight)
+				const int last_start = (total_levels - 1) * per_level_dim;
+				for(int i = 0; i < per_level_dim; i++) {
+					atomicAdd(&dL_dcolors[gauss_id * (total_dim + 2) + last_start + i], 
+					          weight * grad_feat[last_start + i]);
+				}
+				
+				// Gradient for blend weight
+				float dL_dweight = 0.0f;
+				const float* gauss_last = &colors[gauss_id * (total_dim + 2) + last_start];
+				for(int i = 0; i < per_level_dim; i++) {
+					dL_dweight += grad_feat[last_start + i] * (gauss_last[i] - hash_feat[i]);
+				}
+				atomicAdd(&dL_dcolors[gauss_id * (total_dim + 2) + total_dim], dL_dweight);
+				
+				// Gradient for hashgrid (scaled by 1-weight)
+				float grad_hash[4];
+				for(int i = 0; i < per_level_dim; i++) {
+					grad_hash[i] = (1.0f - weight) * grad_feat[last_start + i];
+				}
+				
+				if(l_dim == 4) {
+					query_feature<true, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, 
+					                          collec_offsets, appearance_level, hash_features, 
+					                          1, l_scale, Base, align_corners, interp, contract, debug, 
+					                          grad_hash, dL_dfeatures, dL_dxyz);
+				}
+			}
+			
+			break;
+		}
 		case 1: {
 		// Surface mode backward with optional baseline features
 		// Forward: feat = ReLU(-dot(vec, normal) + baseline)

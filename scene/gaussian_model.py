@@ -106,12 +106,35 @@ class GaussianModel:
             self._adaptive_feat_dim,
             self._adaptive_num_levels,
             self.temperature,
+            self._adaptive_cat_weight if hasattr(self, '_adaptive_cat_weight') else torch.empty(0, device="cuda"),
         )
     
     def restore(self, model_args, training_args):
         # Handle multiple checkpoint formats
-        if len(model_args) == 19:
-            # Format with adaptive mode (no diffuse)
+        if len(model_args) == 20:
+            # Format with adaptive_cat mode
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale,
+            self._gaussian_features,
+            self._gaussian_feat_dim,
+            self._gamma,
+            self._adaptive_features,
+            self._adaptive_feat_dim,
+            self._adaptive_num_levels,
+            self.temperature,
+            self._adaptive_cat_weight) = model_args
+        elif len(model_args) == 19:
+            # Format with adaptive mode (no adaptive_cat)
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
@@ -131,6 +154,7 @@ class GaussianModel:
             self._adaptive_feat_dim,
             self._adaptive_num_levels,
             self.temperature) = model_args
+            self._adaptive_cat_weight = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
         elif len(model_args) == 14:
             # Cat mode format
             (self.active_sh_degree, 
@@ -151,6 +175,7 @@ class GaussianModel:
             self._adaptive_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             self._adaptive_feat_dim = 0
             self._adaptive_num_levels = 0
+            self._adaptive_cat_weight = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
         else:
             # Old format without gaussian_features
             (self.active_sh_degree, 
@@ -171,6 +196,7 @@ class GaussianModel:
             self._adaptive_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             self._adaptive_feat_dim = 0
             self._adaptive_num_levels = 0
+            self._adaptive_cat_weight = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
         
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
@@ -337,6 +363,22 @@ class GaussianModel:
             self._gamma = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             self._adaptive_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
         
+        # Initialize adaptive_cat mode parameters (similar to cat, but with blend weight)
+        if hasattr(args, 'method') and args.method == "adaptive_cat":
+            per_level_dim = 4  # From config encoding.hashgrid.dim
+            num_levels = 6  # Total levels from config (will be overridden by warmup if loaded)
+            self._gaussian_feat_dim = num_levels * per_level_dim  # 24D
+            
+            # Initialize per-Gaussian features to small random values
+            gaussian_feats = torch.randn((self.get_xyz.shape[0], self._gaussian_feat_dim), device="cuda").float() * 0.01
+            self._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+            
+            # Initialize blend weight to 0.0 (sigmoid(0) = 0.5, equal blend initially)
+            blend_weight = torch.zeros((self.get_xyz.shape[0], 1), device="cuda").float()
+            self._adaptive_cat_weight = nn.Parameter(blend_weight.requires_grad_(True))
+        else:
+            self._adaptive_cat_weight = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+        
         # Diffuse mode flag (uses SH degree 0, no hashgrid)
         self._diffuse_mode = hasattr(args, 'method') and args.method == "diffuse"
 
@@ -375,6 +417,10 @@ class GaussianModel:
         if self._adaptive_feat_dim > 0:
             l.append({'params': [self._gamma], 'lr': training_args.opacity_lr, "name": "gamma"})
             l.append({'params': [self._adaptive_features], 'lr': training_args.feature_lr, "name": "adaptive_features"})
+        
+        # Add adaptive_cat blend weight (if present)
+        if hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0:
+            l.append({'params': [self._adaptive_cat_weight], 'lr': training_args.opacity_lr, "name": "adaptive_cat_weight"})
         
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale*xyz_lr_scale,
@@ -566,6 +612,8 @@ class GaussianModel:
             self._gamma = optimizable_tensors["gamma"]
         if "adaptive_features" in optimizable_tensors:
             self._adaptive_features = optimizable_tensors["adaptive_features"]
+        if "adaptive_cat_weight" in optimizable_tensors:
+            self._adaptive_cat_weight = optimizable_tensors["adaptive_cat_weight"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.feat_gradient_accum = self.feat_gradient_accum[valid_points_mask]
@@ -602,7 +650,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -620,6 +668,10 @@ class GaussianModel:
             d["gamma"] = new_gamma
         if new_adaptive_features is not None and self._adaptive_feat_dim > 0:
             d["adaptive_features"] = new_adaptive_features
+        
+        # Add adaptive_cat blend weight
+        if new_adaptive_cat_weight is not None and hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0:
+            d["adaptive_cat_weight"] = new_adaptive_cat_weight
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -635,6 +687,8 @@ class GaussianModel:
             self._gamma = optimizable_tensors["gamma"]
         if "adaptive_features" in optimizable_tensors:
             self._adaptive_features = optimizable_tensors["adaptive_features"]
+        if "adaptive_cat_weight" in optimizable_tensors:
+            self._adaptive_cat_weight = optimizable_tensors["adaptive_cat_weight"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.feat_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -676,7 +730,12 @@ class GaussianModel:
             new_gamma = self._gamma[selected_pts_mask].repeat(N,1)
             new_adaptive_features = self._adaptive_features[selected_pts_mask].repeat(N,1)
         
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features)
+        # Handle adaptive_cat blend weight
+        new_adaptive_cat_weight = None
+        if hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0:
+            new_adaptive_cat_weight = self._adaptive_cat_weight[selected_pts_mask].repeat(N,1)
+        
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -708,7 +767,12 @@ class GaussianModel:
             new_gamma = self._gamma[selected_pts_mask]
             new_adaptive_features = self._adaptive_features[selected_pts_mask]
         
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features)
+        # Handle adaptive_cat blend weight
+        new_adaptive_cat_weight = None
+        if hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0:
+            new_adaptive_cat_weight = self._adaptive_cat_weight[selected_pts_mask]
+        
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, ap_update, act_level, densify_tag = True, prune_tag = True):
         
@@ -795,6 +859,11 @@ class GaussianModel:
             gamma = self._gamma[idxs]
             adaptive_features = self._adaptive_features[idxs]
         
+        # Handle adaptive_cat blend weight
+        adaptive_cat_weight = None
+        if hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0:
+            adaptive_cat_weight = self._adaptive_cat_weight[idxs]
+        
         return (
             self._xyz[idxs],
             self._features_dc[idxs],
@@ -805,7 +874,8 @@ class GaussianModel:
             self._appearance_level[idxs],
             gaussian_features,
             gamma,
-            adaptive_features
+            adaptive_features,
+            adaptive_cat_weight
         )
 
     def _mcmc_sample_alives(self, probs, num, alive_indices=None):
@@ -869,7 +939,8 @@ class GaussianModel:
             new_ap_level,
             new_gaussian_features,
             new_gamma,
-            new_adaptive_features
+            new_adaptive_features,
+            new_adaptive_cat_weight
         ) = self._mcmc_update_params(reinit_idx, ratio=ratio)
         
         # Reset optimizer state for sampled indices FIRST (before updating)
@@ -897,6 +968,9 @@ class GaussianModel:
                 self._gamma.data[dead_indices] = new_gamma
             if new_adaptive_features is not None:
                 self._adaptive_features.data[dead_indices] = new_adaptive_features
+
+        if hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0 and new_adaptive_cat_weight is not None:
+            self._adaptive_cat_weight.data[dead_indices] = new_adaptive_cat_weight
 
         # Reset optimizer state for dead indices (they got completely new values)
         self._reset_optimizer_state_for_indices(dead_indices)
@@ -937,7 +1011,8 @@ class GaussianModel:
             new_ap_level,
             new_gaussian_features,
             new_gamma,
-            new_adaptive_features
+            new_adaptive_features,
+            new_adaptive_cat_weight
         ) = self._mcmc_update_params(add_idx, ratio=ratio)
         
         # Update source Gaussians (they gave away some of their "mass")
@@ -948,7 +1023,7 @@ class GaussianModel:
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacity, 
             new_scaling, new_rotation, new_ap_level, 
-            new_gaussian_features, new_gamma, new_adaptive_features
+            new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight
         )
         
         # Reset optimizer state for modified source indices
