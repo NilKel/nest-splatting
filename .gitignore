@@ -46,6 +46,7 @@ cache/
 *.pt
 *.safetensors
 *.npy
+data/
 
 # -----------------------------
 # System files

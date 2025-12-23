@@ -570,7 +570,7 @@ renderCUDAsurfelBackward(
 	float voxel_min = 0.0f;
 	float voxel_max = 0.0f;
 	if(level > 0){
-		// For hybrid_features (render_mode==4) and adaptive_add (render_mode==7), level is encoded as:
+		// For hybrid_features (render_mode==4), adaptive_add (render_mode==7), and adaptive_cat (render_mode==12), level is encoded as:
 		// (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 		// Decode to get actual hashgrid levels for offset copying
 		int actual_levels = level;
@@ -582,6 +582,11 @@ renderCUDAsurfelBackward(
 			actual_levels = active_hashgrid_levels;  // Use ACTIVE hashgrid levels for coarse-to-fine
 		} else if(render_mode == 7){
 			// adaptive_add mode: level = (total_levels << 16) | (active_hashgrid_levels << 8)
+			int active_hashgrid_levels = (level >> 8) & 0xFF;
+			actual_levels = active_hashgrid_levels;
+		} else if((render_mode & 0xFF) == 12){
+			// adaptive_cat mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+			// Note: render_mode may have inference flag in upper bits, so mask to get base mode
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			actual_levels = active_hashgrid_levels;
 		} else if(render_mode == 8 || render_mode == 9 || render_mode == 10){
@@ -1354,92 +1359,102 @@ renderCUDAsurfelBackward(
 			break;
 		}
 		case 12: {
-			// adaptive_cat mode backward: Gradients for blend weight and features
-			// Three paths: gaussian_only, hashgrid_only, or smooth blending
-			
+			/* adaptive_cat mode backward: Additive blending gradients
+			 * Forward: coarse *= w, fine = w * gauss + (1-w) * hash
+			 * Gradients flow to: gaussian features (scaled by w), weight, and hashgrid
+			 */
+
 			const int total_levels = (level >> 16) & 0xFF;
+			const int hashgrid_levels = (level >> 8) & 0xFF;
+			const int hybrid_levels = level & 0xFF;
 			const int per_level_dim = l_dim;
 			const int total_dim = total_levels * per_level_dim;
-			
+
+			// Validate decoded values are reasonable
+			if (total_levels == 0 || total_levels > 32 || hashgrid_levels > 32 || hybrid_levels > 32) {
+				if (debug) {
+					printf("BW Error: Invalid decoded level values. level=%d, total=%d, hash=%d, hybrid=%d\n",
+					       level, total_levels, hashgrid_levels, hybrid_levels);
+				}
+				break;
+			}
+
 			int gauss_id = collected_id[j];
-			const float weight = colors[gauss_id * (total_dim + 2) + total_dim];
-			const float inference_flag = colors[gauss_id * (total_dim + 2) + total_dim + 1];
-			
-			bool use_gaussian_only = (inference_flag > 0.5f) && (weight > 0.5f);
-			bool use_hashgrid_only = (inference_flag > 0.5f) && (weight <= 0.5f);
-			
-			if (use_gaussian_only) {
-				// Gaussian-only: all gradients go to per-Gaussian features
-				for(int i = 0; i < total_dim; i++) {
-					atomicAdd(&dL_dcolors[gauss_id * (total_dim + 2) + i], grad_feat[i]);
-				}
-				// No gradient for weight (frozen at inference)
+			const float weight = colors[gauss_id * (total_dim + 1) + total_dim];
+			const float* gauss_feat = &colors[gauss_id * (total_dim + 1)];
+
+			// Coarse levels: dL/dgauss = w * dL/dfeat
+			for(int i = 0; i < hybrid_levels * per_level_dim; i++) {
+				atomicAdd(&dL_dcolors[gauss_id * (total_dim + 1) + i], weight * grad_feat[i]);
 			}
-			else if (use_hashgrid_only) {
-				// Hashgrid-only: first levels to Gaussian, last level to hashgrid
-				for(int i = 0; i < (total_levels - 1) * per_level_dim; i++) {
-					atomicAdd(&dL_dcolors[gauss_id * (total_dim + 2) + i], grad_feat[i]);
-				}
-				
-				// Gradient for hashgrid (last level)
-				float grad_hash[4];
-				const int last_start = (total_levels - 1) * per_level_dim;
-				for(int i = 0; i < per_level_dim; i++) {
-					grad_hash[i] = grad_feat[last_start + i];
-				}
-				
-				if(l_dim == 4) {
-					float hash_feat[4];  // Need to re-query for backward pass
-					query_feature<true, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, 
-					                          collec_offsets, appearance_level, hash_features, 
-					                          1, l_scale, Base, align_corners, interp, contract, debug, 
-					                          grad_hash, dL_dfeatures, dL_dxyz);
-				}
+
+			// Gradient for weight from coarse levels: dL/dw = sum(gauss * dL/dfeat)
+			float dL_dweight = 0.0f;
+			for(int i = 0; i < hybrid_levels * per_level_dim; i++) {
+				dL_dweight += gauss_feat[i] * grad_feat[i];
 			}
-			else {
-				// Training: smooth blending with weight gradients
-				// Gradient for per-Gaussian features (first total_levels-1 direct, last level weighted)
-				for(int i = 0; i < (total_levels - 1) * per_level_dim; i++) {
-					atomicAdd(&dL_dcolors[gauss_id * (total_dim + 2) + i], grad_feat[i]);
+
+			// Fine levels: blend gradients
+			if (hashgrid_levels > 0) {
+				// Re-query hashgrid for gradient computation
+				float hash_feat[16 * 4];
+
+				if(l_dim == 2) {
+					query_feature<false, 16*4, 2>(hash_feat, xyz, voxel_min, voxel_max,
+					                               collec_offsets, appearance_level, hash_features,
+					                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				} else if(l_dim == 4) {
+					query_feature<false, 16*4, 4>(hash_feat, xyz, voxel_min, voxel_max,
+					                               collec_offsets, appearance_level, hash_features,
+					                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				} else if(l_dim == 8) {
+					query_feature<false, 16*4, 8>(hash_feat, xyz, voxel_min, voxel_max,
+					                               collec_offsets, appearance_level, hash_features,
+					                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
 				}
-				
-				// Re-query hashgrid for last level (needed for gradient computation)
-				float hash_feat[4];
-				if(l_dim == 4) {
-					query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, 
-					                           collec_offsets, appearance_level, hash_features, 
-					                           1, l_scale, Base, align_corners, interp, contract, debug);
+
+				const int fine_start = hybrid_levels * per_level_dim;
+
+				// Gradient for per-Gaussian fine features: dL/dgauss_fine = w * dL/dfeat_fine
+				for(int i = 0; i < hashgrid_levels * per_level_dim; i++) {
+					atomicAdd(&dL_dcolors[gauss_id * (total_dim + 1) + fine_start + i],
+					          weight * grad_feat[fine_start + i]);
 				}
-				
-				// Gradient for last level Gaussian features (scaled by weight)
-				const int last_start = (total_levels - 1) * per_level_dim;
-				for(int i = 0; i < per_level_dim; i++) {
-					atomicAdd(&dL_dcolors[gauss_id * (total_dim + 2) + last_start + i], 
-					          weight * grad_feat[last_start + i]);
+
+				// Gradient for weight from fine levels: dL/dw += sum((gauss - hash) * dL/dfeat)
+				for(int i = 0; i < hashgrid_levels * per_level_dim; i++) {
+					dL_dweight += (gauss_feat[fine_start + i] - hash_feat[i]) * grad_feat[fine_start + i];
 				}
-				
-				// Gradient for blend weight
-				float dL_dweight = 0.0f;
-				const float* gauss_last = &colors[gauss_id * (total_dim + 2) + last_start];
-				for(int i = 0; i < per_level_dim; i++) {
-					dL_dweight += grad_feat[last_start + i] * (gauss_last[i] - hash_feat[i]);
+
+				// Gradient for hashgrid: dL/dhash = (1-w) * dL/dfeat
+				float grad_hash[16 * 4];
+				for(int i = 0; i < hashgrid_levels * per_level_dim; i++) {
+					grad_hash[i] = (1.0f - weight) * grad_feat[fine_start + i];
 				}
-				atomicAdd(&dL_dcolors[gauss_id * (total_dim + 2) + total_dim], dL_dweight);
-				
-				// Gradient for hashgrid (scaled by 1-weight)
-				float grad_hash[4];
-				for(int i = 0; i < per_level_dim; i++) {
-					grad_hash[i] = (1.0f - weight) * grad_feat[last_start + i];
-				}
-				
-				if(l_dim == 4) {
-					query_feature<true, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, 
-					                          collec_offsets, appearance_level, hash_features, 
-					                          1, l_scale, Base, align_corners, interp, contract, debug, 
-					                          grad_hash, dL_dfeatures, dL_dxyz);
+
+				// Backprop through hashgrid
+				float hash_feat_dummy[16 * 4];
+				if(l_dim == 2) {
+					query_feature<true, 16*4, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max,
+					                              collec_offsets, appearance_level, hash_features,
+					                              hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+					                              grad_hash, dL_dfeatures, dL_dxyz);
+				} else if(l_dim == 4) {
+					query_feature<true, 16*4, 4>(hash_feat_dummy, xyz, voxel_min, voxel_max,
+					                              collec_offsets, appearance_level, hash_features,
+					                              hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+					                              grad_hash, dL_dfeatures, dL_dxyz);
+				} else if(l_dim == 8) {
+					query_feature<true, 16*4, 8>(hash_feat_dummy, xyz, voxel_min, voxel_max,
+					                              collec_offsets, appearance_level, hash_features,
+					                              hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+					                              grad_hash, dL_dfeatures, dL_dxyz);
 				}
 			}
-			
+
+			// Write weight gradient
+			atomicAdd(&dL_dcolors[gauss_id * (total_dim + 1) + total_dim], dL_dweight);
+
 			break;
 		}
 		case 1: {

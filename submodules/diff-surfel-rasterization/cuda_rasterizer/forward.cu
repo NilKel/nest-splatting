@@ -412,16 +412,19 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		return;
 
 	// Compute colors
+	// NOTE: In baseline hashgrid mode (render_mode=0, level>0), colors_precomp is empty
+	// and we skip this entirely - colors come from hashgrid query in render kernel
 	if (colors_precomp == nullptr) {
-		// printf("Error , colors precomp is nullptr.\n");
+		// SH mode: evaluate spherical harmonics to RGB
 		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
 		rgb[idx * C + 0] = result.x;
 		rgb[idx * C + 1] = result.y;
 		rgb[idx * C + 2] = result.z;
 	}
 	else {
-		// For hybrid_features mode: colors_precomp contains per-Gaussian learned features
-		// Copy them to rgb buffer so they're accessible in the render kernel
+		// Per-Gaussian features mode (cat, adaptive, etc.): copy precomputed features
+		// For empty colors_precomp (baseline hashgrid), skip this - rgb buffer won't be used
+		// Only copy if C matches expected dimension (otherwise it's a size mismatch)
 		for(int i = 0; i < C; i++){
 			rgb[idx * C + i] = colors_precomp[idx * C + i];
 		}
@@ -747,6 +750,15 @@ renderCUDAsurfelForward(
 			int hybrid_levels = level;
 			// Hashgrid levels determined from offsets during query
 			hashgrid_levels = 16;  // Max possible, will be clamped by actual offsets
+		} else if(render_mode == 7){
+			// adaptive_add mode: level = (total_levels << 16) | (active_hashgrid_levels << 8)
+			int active_hashgrid_levels = (level >> 8) & 0xFF;
+			hashgrid_levels = active_hashgrid_levels;
+		} else if((render_mode & 0xFF) == 12){
+			// adaptive_cat mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+			// Note: render_mode may have inference flag in upper bits, so mask to get base mode
+			int active_hashgrid_levels = (level >> 8) & 0xFF;
+			hashgrid_levels = active_hashgrid_levels;
 		} else if(render_mode == 8 || render_mode == 9 || render_mode == 10){
 			// hybrid_SH/hybrid_SH_post mode: level encodes (decompose_flag << 24) | (sh_degree << 16) | (1 << 8)
 			// Don't check level > 16 since we use higher bits for encoding
@@ -1386,80 +1398,125 @@ renderCUDAsurfelForward(
 			break;
 		}
 		case 12: {
-			// adaptive_cat mode: blend last level during training, binary decision at inference
-			// rgb buffer: [N, 26] = [24D features | 1D weight | 1D inference_flag]
-			
+			/* adaptive_cat mode: Additive blending with learned weight
+			 * rgb buffer: [N, 25] = [24D gaussian_features | 1D weight]
+			 *
+			 * Training mode (inference_flag=0):
+			 *   Coarse levels (0 to hybrid_levels-1): gaussian_feat * w
+			 *   Fine levels (hybrid_levels to total-1): gaussian_feat * w + hashgrid * (1-w)
+			 *
+			 * Inference mode (inference_flag=1):
+			 *   If w > 0.5: Use all per-Gaussian features (no hashgrid query, skip 3D intersection)
+			 *   If w <= 0.5: Use hashgrid for fine levels, per-Gaussian for coarse
+			 */
+
+			const int base_render_mode = render_mode & 0xFF;  // 12
+			const bool use_inference = (render_mode >> 8) & 0x1;  // Extract inference flag
+
 			const int total_levels = (level >> 16) & 0xFF;  // e.g., 6
+			const int hashgrid_levels = (level >> 8) & 0xFF;  // e.g., 1 (finest N levels)
+			const int hybrid_levels = level & 0xFF;  // e.g., 5 (coarse M levels)
 			const int per_level_dim = l_dim;  // 4
 			const int total_dim = total_levels * per_level_dim;  // 24
-			
+
+			if (debug && j == 0) {
+				printf("[adaptive_cat] total=%d, hash=%d, hybrid=%d, inference=%d\n",
+				       total_levels, hashgrid_levels, hybrid_levels, use_inference);
+			}
+
+			// Validate decoded values are reasonable
+			if (total_levels == 0 || total_levels > 32 || hashgrid_levels > 32 || hybrid_levels > 32) {
+				if (debug) {
+					printf("Error: Invalid decoded level values. level=%d, total=%d, hash=%d, hybrid=%d\n",
+					       level, total_levels, hashgrid_levels, hybrid_levels);
+				}
+				break;
+			}
+
 			int gauss_id = collected_id[j];
-			const float* gauss_feat = &rgb[gauss_id * (total_dim + 2)];
-			const float weight = gauss_feat[total_dim];  // Blend weight (sigmoid output)
-			const float inference_flag = gauss_feat[total_dim + 1];  // 0=training, 1=inference
-			
-			// Binary decision at inference
-			bool use_gaussian_only = (inference_flag > 0.5f) && (weight > 0.5f);
-			bool use_hashgrid_only = (inference_flag > 0.5f) && (weight <= 0.5f);
-			
+			const float* gauss_feat = &rgb[gauss_id * (total_dim + 1)];
+			const float weight = gauss_feat[total_dim];  // Blend weight (sigmoid output, 0-1)
+
 			// Initialize feat array
 			for(int i = 0; i < CHANNELS; i++) feat[i] = 0.0f;
-			
-			if (use_gaussian_only) {
-				// FAST PATH: Use all per-Gaussian features, skip 3D intersection
-				// This is like the original 2DGS path (no hashgrid query needed)
-				for(int i = 0; i < total_dim; i++) {
-					feat[i] = gauss_feat[i];
-				}
-			}
-			else if (use_hashgrid_only) {
-				// HASHGRID PATH: Use first (total_levels-1) from Gaussian, last level from hashgrid
-				// Copy first (total_levels - 1) levels directly
-				for(int i = 0; i < (total_levels - 1) * per_level_dim; i++) {
-					feat[i] = gauss_feat[i];
-				}
-				
-				// Query hashgrid for last level (requires 3D intersection - already computed)
-				float hash_feat[4];
-				if(l_dim == 4) {
-					query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, 
-					                           collec_offsets, appearance_level, hash_features, 
-					                           1, l_scale, Base, align_corners, interp, contract, debug);
+
+			if (use_inference) {
+				// INFERENCE MODE: Binary selection based on weight
+				if (weight > 0.5f) {
+					// Use Gaussian-only: Copy all per-Gaussian features, skip hashgrid
+					for(int i = 0; i < total_dim; i++) {
+						feat[i] = gauss_feat[i];
+					}
+					// No hashgrid query needed - saves computation
 				} else {
-					if (debug) printf("adaptive_cat unsupported level dim: %d\n", l_dim);
+					// Use hashgrid for fine levels, Gaussian for coarse
+					// Coarse levels: per-Gaussian features
+					for(int i = 0; i < hybrid_levels * per_level_dim; i++) {
+						feat[i] = gauss_feat[i];
+					}
+
+					// Fine levels: hashgrid only (overwrite Gaussian features)
+					if (hashgrid_levels > 0) {
+						float hash_feat[16 * 4];
+
+						if(l_dim == 2) {
+							query_feature<false, 16*4, 2>(hash_feat, xyz, voxel_min, voxel_max,
+							                               collec_offsets, appearance_level, hash_features,
+							                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+						} else if(l_dim == 4) {
+							query_feature<false, 16*4, 4>(hash_feat, xyz, voxel_min, voxel_max,
+							                               collec_offsets, appearance_level, hash_features,
+							                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+						} else if(l_dim == 8) {
+							query_feature<false, 16*4, 8>(hash_feat, xyz, voxel_min, voxel_max,
+							                               collec_offsets, appearance_level, hash_features,
+							                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+						}
+
+						// Overwrite fine levels with hashgrid
+						const int fine_start = hybrid_levels * per_level_dim;
+						for(int i = 0; i < hashgrid_levels * per_level_dim; i++) {
+							feat[fine_start + i] = hash_feat[i];
+						}
+					}
 				}
-				
-				// Use ONLY hashgrid for last level (weight is near 0)
-				const int last_level_start = (total_levels - 1) * per_level_dim;
-				for(int i = 0; i < per_level_dim; i++) {
-					feat[last_level_start + i] = hash_feat[i];
+			} else {
+				// TRAINING MODE: Smooth blending
+				// Coarse levels: per-Gaussian only, scaled by weight
+				for(int i = 0; i < hybrid_levels * per_level_dim; i++) {
+					feat[i] = gauss_feat[i] * weight;
+				}
+
+				// Fine levels: blend per-Gaussian with hashgrid
+				if (hashgrid_levels > 0) {
+					// Query hashgrid for finest levels
+					float hash_feat[16 * 4];  // Max 16 levels * 4D
+
+					if(l_dim == 2) {
+						query_feature<false, 16*4, 2>(hash_feat, xyz, voxel_min, voxel_max,
+						                               collec_offsets, appearance_level, hash_features,
+						                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+					} else if(l_dim == 4) {
+						query_feature<false, 16*4, 4>(hash_feat, xyz, voxel_min, voxel_max,
+						                               collec_offsets, appearance_level, hash_features,
+						                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+					} else if(l_dim == 8) {
+						query_feature<false, 16*4, 8>(hash_feat, xyz, voxel_min, voxel_max,
+						                               collec_offsets, appearance_level, hash_features,
+						                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+					} else {
+						if (debug) printf("adaptive_cat unsupported level dim: %d\n", l_dim);
+					}
+
+					// Blend fine levels: w * gaussian + (1-w) * hash
+					const int fine_start = hybrid_levels * per_level_dim;
+					for(int i = 0; i < hashgrid_levels * per_level_dim; i++) {
+						feat[fine_start + i] = weight * gauss_feat[fine_start + i]
+						                     + (1.0f - weight) * hash_feat[i];
+					}
 				}
 			}
-			else {
-				// TRAINING PATH: Smooth blending
-				// Copy first (total_levels - 1) levels directly
-				for(int i = 0; i < (total_levels - 1) * per_level_dim; i++) {
-					feat[i] = gauss_feat[i];
-				}
-				
-				// Query hashgrid for last level
-				float hash_feat[4];
-				if(l_dim == 4) {
-					query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, 
-					                           collec_offsets, appearance_level, hash_features, 
-					                           1, l_scale, Base, align_corners, interp, contract, debug);
-				} else {
-					if (debug) printf("adaptive_cat unsupported level dim: %d\n", l_dim);
-				}
-				
-				// Blend last level: weight * gaussian + (1-weight) * hash
-				const int last_level_start = (total_levels - 1) * per_level_dim;
-				for(int i = 0; i < per_level_dim; i++) {
-					feat[last_level_start + i] = weight * gauss_feat[last_level_start + i] 
-					                            + (1.0f - weight) * hash_feat[i];
-				}
-			}
-			
+
 			break;
 		}
 		case 1: {

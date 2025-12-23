@@ -31,7 +31,7 @@ except ImportError:
 
 from hash_encoder.modules import INGP
 from hash_encoder.config import Config
-from utils.render_utils import save_img_u8, convert_gray_to_cmap
+from utils.render_utils import save_img_u8, convert_gray_to_cmap, create_intersection_heatmap, create_intersection_histogram
 from utils.render_utils import gsnum_trans_color
 import open3d as o3d
 import datetime
@@ -563,8 +563,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             entropy = -(weight * torch.log(weight + eps) + (1 - weight) * torch.log(1 - weight + eps))
             adaptive_cat_reg_loss = args.lambda_adaptive_cat * anneal_factor * entropy.mean()
 
+        # BCE opacity regularization - encourage binary opacity (0 or 1) to reduce foggy Gaussians
+        # Applied only in the last bce_iter iterations
+        bce_opacity_loss = torch.tensor(0.0, device="cuda")
+        if args.bce and iteration > (opt.iterations - args.bce_iter):
+            # Get activated opacity (after sigmoid, in [0, 1])
+            opacity = gaussians.get_opacity.squeeze()  # (N,)
+            eps = 1e-7
+            # BCE with target=opacity encourages opacity to be 0 or 1
+            # BCE(p, p) = -p*log(p) - (1-p)*log(1-p) = entropy
+            # This is minimized when p is 0 or 1
+            bce = -(opacity * torch.log(opacity + eps) + (1 - opacity) * torch.log(1 - opacity + eps))
+            bce_opacity_loss = args.bce_lambda * bce.mean()
+
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + bce_opacity_loss
 
         total_loss.backward()
 
@@ -608,6 +621,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_dict["G%"] = f"{pct_gaussian:.0f}"
                     if adaptive_cat_reg_loss.item() > 0:
                         loss_dict["AdR"] = f"{adaptive_cat_reg_loss.item():.{5}f}"
+                # Add BCE opacity loss to progress bar if active
+                if args.bce and bce_opacity_loss.item() > 0:
+                    loss_dict["BCE"] = f"{bce_opacity_loss.item():.{5}f}"
                 progress_bar.set_postfix(loss_dict)
 
                 progress_bar.update(10)
@@ -630,6 +646,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tb_writer.add_scalar('adaptive_cat/mean_weight', mean_weight, iteration)
                     tb_writer.add_scalar('adaptive_cat/pct_gaussian', pct_gaussian, iteration)
                     tb_writer.add_scalar('adaptive_cat/reg_loss', adaptive_cat_reg_loss.item(), iteration)
+                if args.bce:
+                    tb_writer.add_scalar('train_loss_patches/bce_opacity_loss', bce_opacity_loss.item(), iteration)
 
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), \
                 ingp_model=ingp, beta = beta, args = args, cfg_model = cfg_model, test_psnr = test_psnr, train_psnr = train_psnr, iter_list = iter_list)
@@ -927,6 +945,10 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
             f.write(f"  - Noise LR: {args.noise_lr}\n")
             f.write(f"  - Cap Max: {args.cap_max}\n")
             f.write(f"  - Note: Dead Gaussians (opacity ≤ 0.005) pruned before final rendering\n")
+        if args.bce:
+            f.write(f"BCE Opacity Regularization: Enabled\n")
+            f.write(f"  - Lambda: {args.bce_lambda}\n")
+            f.write(f"  - Active for last {args.bce_iter} iterations\n")
         f.write(f"Iterations: {iteration}\n")
         f.write(f"Resolution: {resolution}\n\n")
 
@@ -957,6 +979,10 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     # Create depth output directory
     depth_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'depths'))
     os.makedirs(depth_output_dir, exist_ok=True)
+
+    # Create intersection heatmap output directory
+    intersection_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'intersection'))
+    os.makedirs(intersection_output_dir, exist_ok=True)
     
     # Check if cat mode decomposition should be done
     is_cat_mode = (ingp is not None and hasattr(ingp, 'is_cat_mode') and ingp.is_cat_mode 
@@ -1042,7 +1068,14 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
             
             save_img_u8(depth_expected_color, os.path.join(depth_output_dir, f"{idx:03d}_depth_expected.png"))
             save_img_u8(depth_median_color, os.path.join(depth_output_dir, f"{idx:03d}_depth_median.png"))
-            
+
+            # Save intersection count heatmap (turbo colormap, max_display=200 for consistency)
+            gaussian_num = render_pkg['gaussian_num']  # (1, H, W)
+            intersection_heatmap, min_count, max_count = create_intersection_heatmap(gaussian_num, max_display=200)
+            histogram_img, stats = create_intersection_histogram(gaussian_num, max_display=200)
+            save_img_u8(intersection_heatmap, os.path.join(intersection_output_dir, f"{idx:03d}_intersection.png"))
+            save_img_u8(histogram_img, os.path.join(intersection_output_dir, f"{idx:03d}_histogram.png"))
+
             # Cat mode decomposition: render with masked features
             if do_cat_decomposition:
                 # NGP-only: zero out per-Gaussian features, keep hashgrid
@@ -1095,6 +1128,7 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     print(f"[FINAL] ════════════════════════════════════════")
     print(f"[FINAL] Images saved to: {final_output_dir}")
     print(f"[FINAL] Depth maps saved to: {depth_output_dir}")
+    print(f"[FINAL] Intersection heatmaps saved to: {intersection_output_dir}")
     if do_cat_decomposition or do_hybrid_sh_decomposition:
         print(f"[FINAL] NGP-only renders saved to: {ngp_output_dir}")
         print(f"[FINAL] Gaussian-only renders saved to: {gaussian_output_dir}")
@@ -1289,6 +1323,14 @@ if __name__ == "__main__":
     parser.add_argument("--noise_lr", type=float, default=5e5,
                         help="SGLD noise learning rate multiplier (MCMC mode)")
 
+    # BCE opacity regularization - reduce semi-transparent foggy Gaussians
+    parser.add_argument("--bce", action="store_true",
+                        help="Enable BCE regularization on opacity to reduce semi-transparent Gaussians")
+    parser.add_argument("--bce_iter", type=int, default=5000,
+                        help="Apply BCE regularization for the last N iterations (default: 5000)")
+    parser.add_argument("--bce_lambda", type=float, default=0.01,
+                        help="BCE regularization weight (default: 0.01)")
+
     args = parser.parse_args(sys.argv[1:])
     
     print("Optimizing " + args.model_path)
@@ -1312,6 +1354,9 @@ if __name__ == "__main__":
         print(f"Diffuse+Offset mode: diffuse SH as xyz offset, hashgrid MLP for final RGB")
     elif args.method == "adaptive_add":
         print(f"Adaptive Add mode: weighted sum of per-Gaussian features and hashgrid features")
+
+    if args.bce:
+        print(f"BCE opacity regularization: enabled for last {args.bce_iter} iterations (lambda={args.bce_lambda})")
 
     cfg_model = Config(args.yaml)
     merge_cfg_to_args(args, cfg_model)

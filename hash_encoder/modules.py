@@ -58,9 +58,7 @@ class INGP(nn.Module):
         # Store args for cat mode configuration
         self.args = args
         self.is_cat_mode = args is not None and hasattr(args, 'method') and args.method == "cat"
-        self.hybrid_levels = args.hybrid_levels if self.is_cat_mode and hasattr(args, 'hybrid_levels') else 0
-        self.disable_c2f = args is not None and hasattr(args, 'disable_c2f') and args.disable_c2f
-        
+
         # Store args for adaptive mode configuration
         self.is_adaptive_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive"
         # Store args for adaptive_add mode configuration (weighted sum of per-Gaussian and hashgrid)
@@ -68,6 +66,18 @@ class INGP(nn.Module):
         # Store args for adaptive_cat mode configuration (cat with learnable binary blend weights)
         self.is_adaptive_cat_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive_cat"
         self.adaptive_cat_inference = args is not None and hasattr(args, 'adaptive_cat_inference') and args.adaptive_cat_inference
+
+        # hybrid_levels is used by both cat and adaptive_cat modes
+        self.hybrid_levels = args.hybrid_levels if (self.is_cat_mode or self.is_adaptive_cat_mode) and hasattr(args, 'hybrid_levels') else 0
+
+        # Determine method - baseline uses C2F, all other methods disable it
+        self.method = args.method if args is not None and hasattr(args, 'method') else "baseline"
+        self.is_baseline_mode = (self.method == "baseline")
+
+        # Auto-enable disable_c2f for all methods except baseline
+        # Baseline is the only method that benefits from coarse-to-fine scheduling
+        explicit_disable_c2f = args is not None and hasattr(args, 'disable_c2f') and args.disable_c2f
+        self.disable_c2f = explicit_disable_c2f or (not self.is_baseline_mode)
         
         # Store args for diffuse mode configuration (per-Gaussian RGB, no viewdir, no hashgrid)
         self.is_diffuse_mode = args is not None and hasattr(args, 'method') and args.method == "diffuse"
@@ -281,40 +291,52 @@ class INGP(nn.Module):
             # Set active levels
             self.active_hashgrid_levels = 1
 
-        # adaptive_cat mode: single finest-resolution level for blending with per-Gaussian features
+        # adaptive_cat mode: multi-level hashgrid for blending with per-Gaussian features
+        # Same structure as cat mode but with learned blend weights
         elif self.is_adaptive_cat_mode:
-            # Calculate finest resolution from standard progression
-            finest_resolution = all_resolutions[-1]
-
-            # Create single-level hashgrid at finest resolution
-            self.hashgrid_levels = 1
+            # Use finest (total - hybrid) levels for hashgrid, just like cat mode
+            self.hashgrid_levels = num_levels_total - self.hybrid_levels
             self.hashgrid_disabled = False
+
+            # Extract the finest hashgrid_levels resolutions
+            hashgrid_resolutions = all_resolutions[-self.hashgrid_levels:]
+            base_resolution = hashgrid_resolutions[0]
+            finest_resolution = hashgrid_resolutions[-1]
+
+            # Calculate growth rate for the hashgrid
+            if self.hashgrid_levels > 1:
+                hash_growth_rate = np.exp((np.log(finest_resolution) - np.log(base_resolution)) / (self.hashgrid_levels - 1))
+            else:
+                hash_growth_rate = 1.0
 
             config = SimpleNamespace(
                 device="cuda",
                 otype="HashGrid",
-                n_levels=1,                          # Single level
-                n_features_per_level=cfg_encoding.hashgrid.dim,  # 4D features (same as standard)
+                n_levels=self.hashgrid_levels,
+                n_features_per_level=cfg_encoding.hashgrid.dim,
                 log2_hashmap_size=cfg_encoding.hashgrid.dict_size,
-                base_resolution=finest_resolution,   # Use finest as base
-                finest_resolution=finest_resolution, # Same as base
+                base_resolution=base_resolution,
+                finest_resolution=finest_resolution,
                 init_mode='uniform',
-                per_level_scale=1.0,                 # No growth (single level)
+                per_level_scale=hash_growth_rate,
                 range=self.voxel_range,
             )
 
-            print('[ADAPTIVE_CAT MODE] Single-level hashgrid configuration:')
-            print(f'  Resolution: {finest_resolution}')
+            print('[ADAPTIVE_CAT MODE] Multi-level hashgrid configuration:')
+            print(f'  Total levels: {num_levels_total}')
+            print(f'  Hybrid (per-Gaussian) levels: {self.hybrid_levels}')
+            print(f'  Hashgrid levels: {self.hashgrid_levels}')
+            print(f'  Resolutions: {base_resolution} -> {finest_resolution}')
             print(f'  Features per level: {cfg_encoding.hashgrid.dim}D')
             print(f'  Hashgrid size: 2^{cfg_encoding.hashgrid.dict_size}')
             print(f'  Per-Gaussian features: {num_levels_total}×{cfg_encoding.hashgrid.dim} = {num_levels_total * cfg_encoding.hashgrid.dim}D')
-            print(f'  Blend: Last level only (training=smooth, inference=binary)')
+            print(f'  Blend: Learned per-Gaussian weights (training=smooth, inference=binary)')
 
             self.hash_encoding = register_GridEncoder(config)
-            self.resolutions = [finest_resolution]
+            self.resolutions = hashgrid_resolutions
 
-            # Set active levels (always 1 for adaptive_cat, no C2F)
-            self.active_hashgrid_levels = 1
+            # Set active levels (all hashgrid levels active, no C2F for adaptive_cat)
+            self.active_hashgrid_levels = self.hashgrid_levels
 
         # For residual_hybrid mode: hashgrid uses only finest (total - hybrid) levels
         # Similar to cat mode but outputs both SH RGB and hash features
@@ -397,14 +419,17 @@ class INGP(nn.Module):
             encoding_dim = cfg_encoding.hashgrid.dim * cfg_encoding.levels
 
         self.level_mask = cfg_encoding.coarse2fine.enabled
-        # Override C2F if disable_c2f flag is set or for special modes
-        disable_c2f = self.disable_c2f  # Use stored flag from __init__
-        # Diffuse_ngp/diffuse_offset/hybrid_SH/hybrid_SH_raw/hybrid_SH_post/adaptive_cat: override C2F to disabled
-        if disable_c2f or self.is_diffuse_ngp_mode or self.is_diffuse_offset_mode or self.is_hybrid_sh_mode or self.is_hybrid_sh_raw_mode or self.is_hybrid_sh_post_mode or self.is_adaptive_cat_mode:
-            if disable_c2f:
-                print(f'If coarse2fine : False (disabled by --disable_c2f flag)')
-            else:
-                print(f'If coarse2fine : False (disabled for diffuse_ngp/diffuse_offset/hybrid_SH/adaptive_cat modes)')
+        # Override C2F for non-baseline methods (baseline always uses C2F from config)
+        # disable_c2f is auto-set for all non-baseline methods in __init__
+        if self.is_baseline_mode:
+            # Baseline mode: always respect config, ignore disable_c2f flag
+            print(f'If coarse2fine : {self.level_mask} (baseline mode)')
+            if self.level_mask:
+                self.init_active_level = cfg_encoding.coarse2fine.init_active_level
+                self.step = cfg_encoding.coarse2fine.step
+        elif self.disable_c2f:
+            # Non-baseline modes: C2F is disabled
+            print(f'If coarse2fine : False (disabled for {self.method} mode)')
             self.level_mask = False
             self.init_active_level = 1
             self.step = 1000  # Dummy value
@@ -457,19 +482,9 @@ class INGP(nn.Module):
         return feat.float()
 
     def get_color(self, feat, ray_unit=None):
-        # Debug BEFORE viewdir encoding
-        print(f"[DEBUG get_color] feat input shape={feat.shape}")
-        
         if self.encoder_dir :
             enc_dir = self._encode_view(ray_unit)
-            print(f"[DEBUG get_color] enc_dir.shape={enc_dir.shape}")
             feat = torch.cat([feat, enc_dir], dim=-1)
-        
-        # Debug: check MLP input dimension
-        print(f"[DEBUG get_color] final feat.shape={feat.shape}, mlp expects={self.mlp_rgb.n_input_dims}")
-        if feat.shape[1] != self.mlp_rgb.n_input_dims:
-            print(f"[MLP ERROR] Dimension mismatch!")
-            breakpoint()
         
         h = self.mlp_rgb(feat).float()
         rgb = torch.sigmoid(h)[:, :3]
@@ -501,9 +516,9 @@ class INGP(nn.Module):
             self.active_hashgrid_levels = self.levels
             # Skip C2F annealing - all levels active from start
         elif self.is_adaptive_cat_mode:
-            # Adaptive_cat mode: Single hashgrid level, always active (no C2F)
+            # Adaptive_cat mode: All hashgrid levels active (no C2F)
             self.active_levels = self.levels  # Total levels (for MLP input size)
-            self.active_hashgrid_levels = 1  # Single hashgrid level
+            self.active_hashgrid_levels = self.hashgrid_levels  # All hashgrid levels active
             self.optim_gaussian = True  # Train Gaussians throughout
         elif self.is_residual_hybrid_mode:
             # Residual_hybrid mode: No C2F, all hashgrid levels active from start

@@ -109,9 +109,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # Set shape_dims for warmup phase (baseline mode, no hashgrid in CUDA)
         output_dim = ingp.levels * ingp.level_dim  # Total levels * per_level_dim
         shape_dims = torch.tensor([0, output_dim, output_dim], dtype=torch.int32, device="cuda")
-        print(f"[WARMUP/BASELINE MODE] Shape dims: GS=0, HS={output_dim}, OS={output_dim}")
-        print(f"[WARMUP] iteration={iteration}, hash_in_CUDA={hash_in_CUDA}")
-    breakpoint()
+    
     if override_color is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
@@ -136,29 +134,33 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Cat mode detection and setup
     is_cat_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_cat_mode') and ingp.is_cat_mode
-    hybrid_levels = ingp.hybrid_levels if is_cat_mode else 0
+
+    # Adaptive_cat mode detection (need to check early for hybrid_levels)
+    is_adaptive_cat_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_cat_mode') and ingp.is_adaptive_cat_mode
+
+    hybrid_levels = ingp.hybrid_levels if (is_cat_mode or is_adaptive_cat_mode) else 0
     
     # Adaptive mode detection
     is_adaptive_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_mode') and ingp.is_adaptive_mode
     
     # Adaptive_add mode detection (weighted sum of per-Gaussian and hashgrid features)
     is_adaptive_add_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_add_mode') and ingp.is_adaptive_add_mode
-    
-    # Adaptive_cat mode detection (cat with learnable binary blend weights)
-    is_adaptive_cat_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_cat_mode') and ingp.is_adaptive_cat_mode
-    
+
     # Residual_hybrid mode detection (per-Gaussian SH RGB + hashgrid MLP residual)
     is_residual_hybrid_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_residual_hybrid_mode') and ingp.is_residual_hybrid_mode
     
     render_mode = 0  # 0 = baseline, 4 = cat, 6 = adaptive, 7 = adaptive_add, 11 = residual_hybrid, 12 = adaptive_cat
-    
+
     # Initialize shape_dims tensor [GS, HS, OS] - will be updated per mode
     # GS = Gaussian shape, HS = Hash shape, OS = Output shape
-    # shape_dims = torch.tensor([0, 0, 3], dtype=torch.int32, device="cuda")  # Default: no shapes specified
-    output_dim = ingp.levels * ingp.level_dim  # Total levels * per_level_dim
-    shape_dims = torch.tensor([0, output_dim, output_dim], dtype=torch.int32, device="cuda")
+    # Default for SH rendering (no hashgrid): GS=0, HS=0, OS=3 (RGB)
+    # This will be overwritten for warmup mode (line 111) or hash_in_CUDA modes (below)
+    shape_dims = torch.tensor([0, 0, 3], dtype=torch.int32, device="cuda")
 
     if hash_in_CUDA:
+        # Initialize shape_dims for hash_in_CUDA modes
+        output_dim = ingp.levels * ingp.level_dim  # Total levels * per_level_dim
+        shape_dims = torch.tensor([0, output_dim, output_dim], dtype=torch.int32, device="cuda")
         # Check if hashgrid is disabled (cat mode with hybrid_levels == total_levels)
         if hasattr(ingp, 'hashgrid_disabled') and ingp.hashgrid_disabled:
             # No hashgrid - pure per-Gaussian mode
@@ -177,23 +179,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 = ingp.hash_encoding.get_params()
             gridrange = ingp.gridrange
             levels = ingp.active_levels
-        
+
         homotrans = pc.get_homotrans()
         ap_level = pc.get_appearance_level
         contract = ingp.contract
-        
+
         # Baseline mode: set shape_dims for hashgrid-only rendering
-        # Only set if we're actually using hashgrid (colors_precomp will be set from hashgrid)
+        # NOTE: We keep SH for preprocessing (it evaluates to 3-channel RGB in geomState.rgb)
+        # but the rendering kernel will ignore it when level > 0 and query hashgrid instead
+        # shape_dims tells CUDA to allocate 24-channel output buffer for hashgrid features
         if not is_cat_mode and not is_adaptive_mode and not is_adaptive_add_mode and not is_adaptive_cat_mode and not is_residual_hybrid_mode:
-            # Check if we're actually using hashgrid (not SH)
-            if colors_precomp is not None or (shs is None and override_color is None):
-                # Baseline with hashgrid: GS=0 (no per-Gaussian), HS=output_dim, OS=output_dim
-                # Use total levels (not active_levels) - buffer is always full size, C2F masks unused channels
-                output_dim = ingp.levels * ingp.level_dim  # Total levels * per_level_dim (e.g., 6*4 = 24D)
-                shape_dims = torch.tensor([0, output_dim, output_dim], dtype=torch.int32, device="cuda")
-                print(f"[BASELINE MODE HASHGRID] Shape dims: GS=0, HS={output_dim}, OS={output_dim}")
-                print(f"[BASELINE MODE HASHGRID] total_levels={ingp.levels}, active_levels={ingp.active_levels}, level_dim={ingp.level_dim}")
-            # else: keep default shape_dims = [0, 0, 3] for SH rendering
+            # Baseline with hashgrid: GS=0 (no per-Gaussian), HS=output_dim, OS=output_dim
+            # Use total levels (not active_levels) - buffer is always full size, C2F masks unused channels
+            output_dim = ingp.levels * ingp.level_dim  # Total levels * per_level_dim (e.g., 6*4 = 24D)
+            shape_dims = torch.tensor([0, output_dim, output_dim], dtype=torch.int32, device="cuda")
         
         # Cat mode: only activate if hybrid_levels > 0
         # When hybrid_levels == 0, behave identically to baseline
@@ -267,29 +266,42 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
             levels = (total_levels << 16) | (active_hashgrid_levels << 8)
         
-        # Adaptive_cat mode: per-Gaussian features + blend weight, binary decision at inference
-        elif is_adaptive_cat_mode and pc._gaussian_feat_dim > 0:
-            # Pass per-Gaussian features (24D) + blend weight (1D) + inference_flag (1D)
-            gaussian_features = pc.get_gaussian_features  # (N, 24)
+        # Adaptive_cat mode: per-Gaussian features + blend weight
+        # Training: Coarse levels (0 to hybrid_levels-1): per_gaussian * w
+        #           Fine levels (hybrid_levels to total-1): per_gaussian * w + hashgrid * (1-w)
+        # Inference: Binary selection based on weight (w > 0.5 → use Gaussian only, w <= 0.5 → use hashgrid)
+        elif is_adaptive_cat_mode and hybrid_levels > 0:
+            # Pass per-Gaussian features (24D) + blend weight (1D)
+            gaussian_features = pc.get_gaussian_features  # (N, 24D)
             blend_weight = torch.sigmoid(pc._adaptive_cat_weight)  # (N, 1)
-            
-            # Inference flag: 1 = binary mode (skip intersection or skip Gaussian), 0 = training mode (smooth blend)
-            # Check if inference flag is set in ingp object (stored during initialization)
-            use_inference_mode = hasattr(ingp, 'adaptive_cat_inference') and ingp.adaptive_cat_inference
-            inference_flag = torch.ones((len(blend_weight), 1), device="cuda") if use_inference_mode else torch.zeros((len(blend_weight), 1), device="cuda")
-            
-            colors_precomp = torch.cat([gaussian_features, blend_weight, inference_flag], dim=1)  # (N, 26)
+
+            colors_precomp = torch.cat([gaussian_features, blend_weight], dim=1)  # (N, 25D)
             shs = None
-            render_mode = 12  # adaptive_cat mode
-            
-            # Encode levels for CUDA: (total_levels << 16) | (1 << 8) for single hashgrid level
+
+            # Encode inference flag in render_mode: (inference_flag << 8) | base_mode
+            # Check if inference flag is set in ingp object
+            use_inference_mode = hasattr(ingp, 'adaptive_cat_inference') and ingp.adaptive_cat_inference
+            inference_flag = 1 if use_inference_mode else 0
+            render_mode = 12 | (inference_flag << 8)  # Base mode 12, inference in bit 8
+
+            # Encode levels for CUDA: (total << 16) | (active_hashgrid << 8) | hybrid
+            # Uses active_hashgrid_levels for C2F (progressively enables hashgrid levels)
             total_levels = ingp.levels
-            levels = (total_levels << 16) | (1 << 8)
-            
-            # Adaptive_cat: G = O, H = last level only
-            output_dim = total_levels * ingp.level_dim  # 24
-            gaussian_dim = output_dim  # 24 (full feature set)
-            hash_dim = ingp.level_dim  # 4 (single finest level)
+            active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
+            levels = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+
+            # Pad offsets to 17 elements (CUDA code expects up to 16 levels + 1)
+            if offsets.shape[0] < 17:
+                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
+                padded_offsets[:offsets.shape[0]] = offsets
+                offsets = padded_offsets
+
+            # Adaptive_cat: GS = full 24D, HS = active hashgrid levels, OS = 24D
+            # Unlike cat mode where GS = hybrid_levels * level_dim (partial),
+            # adaptive_cat has GS = total_levels * level_dim (full feature set)
+            gaussian_dim = total_levels * ingp.level_dim  # e.g., 6*4 = 24D (full)
+            hash_dim = active_hashgrid_levels * ingp.level_dim  # e.g., 1*4 = 4D (C2F aware)
+            output_dim = total_levels * ingp.level_dim  # e.g., 6*4 = 24D
             shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
         
         # Residual_hybrid mode: per-Gaussian SH RGB + hashgrid features
@@ -327,7 +339,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # Add and clamp in CUDA
         is_hybrid_sh_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_hybrid_sh_mode') and ingp.is_hybrid_sh_mode
 
-        if is_hybrid_sh_mode:
+        # Only activate hybrid_SH if we're not already in another mode
+        if is_hybrid_sh_mode and not (is_cat_mode or is_adaptive_mode or is_adaptive_add_mode or is_adaptive_cat_mode or is_residual_hybrid_mode):
             # Evaluate Gaussian SH to raw RGB (NO +0.5, NO clamp yet - done in CUDA)
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
@@ -358,7 +371,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # Add and sigmoid in CUDA
         is_hybrid_sh_raw_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_hybrid_sh_raw_mode') and ingp.is_hybrid_sh_raw_mode
 
-        if is_hybrid_sh_raw_mode:
+        # Only activate hybrid_SH_raw if we're not already in another mode
+        if is_hybrid_sh_raw_mode and not (is_cat_mode or is_adaptive_mode or is_adaptive_add_mode or is_adaptive_cat_mode or is_residual_hybrid_mode or is_hybrid_sh_mode):
             # Evaluate Gaussian SH to raw RGB (NO activation)
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
@@ -386,7 +400,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # hybrid_SH_post mode: pass raw SH coefficients, add DC residual in CUDA, eval SH in Python post-raster
         is_hybrid_sh_post_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_hybrid_sh_post_mode') and ingp.is_hybrid_sh_post_mode
 
-        if is_hybrid_sh_post_mode:
+        # Only activate hybrid_SH_post if we're not already in another mode
+        if is_hybrid_sh_post_mode and not (is_cat_mode or is_adaptive_mode or is_adaptive_add_mode or is_adaptive_cat_mode or is_residual_hybrid_mode or is_hybrid_sh_mode or is_hybrid_sh_raw_mode):
             # Pass per-Gaussian SH coefficients as colors_precomp
             # Format: (N, 16, 3) -> flatten to (N, 48)
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
@@ -432,10 +447,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         record_transmittance = record_transmittance,
         # pipe.debug
     )
-    
+
     hashgrid_settings = HashGridSettings(
         L = levels,
-        S = math.log2(per_level_scale), 
+        S = math.log2(per_level_scale),
         H = base_resolution,
         align_corners = align_corners,
         interpolation = interpolation,

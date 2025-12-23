@@ -91,9 +91,6 @@ RasterizeGaussiansCUDA(
     GS = shape_dims[0].item<int>();
     HS = shape_dims[1].item<int>();
     OS = shape_dims[2].item<int>();
-    if (debug) {
-      printf("[CUDA] shape_dims: GS=%d, HS=%d, OS=%d, render_mode=%d\n", GS, HS, OS, render_mode);
-    }
   }
   
   // Use OS for output buffer allocation (single or combined output)
@@ -130,9 +127,6 @@ RasterizeGaussiansCUDA(
 	D = features.size(1);  // Main hashgrid features per level
 	if(has_dual_hashgrid){
 		D_diffuse = features.size(1);  // Diffuse hashgrid features per level
-	}
-	if (debug) {
-	  printf("[CUDA] D=%d, Level=%d, C=%d, P=%d\n", D, Level, C, P);
 	}
   }
   
@@ -186,6 +180,9 @@ RasterizeGaussiansCUDA(
 		M = sh.size(1);
 	  }
 
+	  // For baseline hashgrid mode, colors is empty - pass nullptr instead of invalid pointer
+	  const float* colors_ptr = (colors.numel() > 0) ? colors.contiguous().data<float>() : nullptr;
+
 	  rendered = CudaRasterizer::Rasterizer::forward(
 		geomFunc,
 		binningFunc,
@@ -195,7 +192,7 @@ RasterizeGaussiansCUDA(
 		W, H, C, Level, D, LevelScale, Base, align_corners, interp, if_contract, record_transmittance,
 		means3D.contiguous().data<float>(),
 		sh.contiguous().data_ptr<float>(),
-		colors.contiguous().data<float>(), 
+		colors_ptr, 
 		opacity.contiguous().data<float>(), 
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
@@ -226,6 +223,7 @@ RasterizeGaussiansCUDA(
 		gridrange_diffuse.contiguous().data<float>(),
 		render_mode);
   }
+  
   return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg);
 }
 
@@ -348,6 +346,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     colors_dim = colors.size(1);  // Actual input dimension
   }
   
+  // For baseline mode with no colors_precomp, allocate dummy dL_dcolors to avoid empty tensor access
+  // The kernel will write to it but we won't use the gradients
+  // Must allocate at least C columns since kernel indexes as [global_id * C + ch]
+  if (colors_dim == 0) {
+    colors_dim = C;  // Match output channels to avoid illegal access
+  }
   torch::Tensor dL_dcolors = torch::zeros({P, colors_dim}, means3D.options());
   torch::Tensor dL_dnormal = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
@@ -363,13 +367,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_gradsum = torch::zeros({P, 1}, means3D.options());
   
   if(P != 0)
-  {  
+  {
+	  // For baseline hashgrid mode, colors is empty - pass nullptr instead of invalid pointer
+	  const float* colors_ptr_bw = (colors.numel() > 0) ? colors.contiguous().data<float>() : nullptr;
+
 	  CudaRasterizer::Rasterizer::backward(P, degree, M, R,
 	  background.contiguous().data<float>(),
-	  W, H, C, Level, D, LevelScale, Base, align_corners, interp, if_contract, 
+	  W, H, C, Level, D, LevelScale, Base, align_corners, interp, if_contract,
 	  means3D.contiguous().data<float>(),
 	  sh.contiguous().data<float>(),
-	  colors.contiguous().data<float>(),
+	  colors_ptr_bw,
 	  scales.data_ptr<float>(),
 	  scale_modifier,
 	  rotations.data_ptr<float>(),

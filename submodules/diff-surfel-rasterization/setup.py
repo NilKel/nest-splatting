@@ -13,10 +13,12 @@ from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
 import sys
-os.path.dirname(os.path.abspath(__file__))
+_src_path = os.path.dirname(os.path.abspath(__file__))
 
 # Get conda environment include path
 conda_include = os.path.join(sys.prefix, 'include')
+# Get glm include path
+glm_include = os.path.join(_src_path, 'third_party', 'glm')
 
 setup(
     name="diff_surfel_rasterization",
@@ -32,7 +34,7 @@ setup(
             "cuda_rasterizer/utils.cu",
             "rasterize_points.cu",
             "ext.cpp"],
-            extra_compile_args={"nvcc": ["-I" + conda_include]})
+            extra_compile_args={"nvcc": ["-I" + conda_include, "-I" + glm_include]})
         ],
     cmdclass={
         'build_ext': BuildExtension

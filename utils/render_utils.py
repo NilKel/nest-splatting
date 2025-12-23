@@ -308,7 +308,7 @@ def gsnum_trans_color(gs_num, MAX_N = 30):
 def convert_gray_to_cmap(img_gray, map_mode = 'jet', revert = False, vmax = None):
 
     img_gray = copy.deepcopy(img_gray)
-    shape = img_gray.shape  
+    shape = img_gray.shape
     cmap = plt.get_cmap(map_mode)
     if vmax is not None:
         img_gray = (img_gray / vmax).clip(0,1)
@@ -316,7 +316,219 @@ def convert_gray_to_cmap(img_gray, map_mode = 'jet', revert = False, vmax = None
         img_gray = img_gray / (np.max(img_gray)+1e-6)
     if revert:
         img_gray = 1- img_gray
-    colors = cmap(img_gray.reshape(-1))[:, :3]  
+    colors = cmap(img_gray.reshape(-1))[:, :3]
     # visualization
     colors = colors.reshape(shape+tuple([3])) #*255
     return colors
+
+
+def create_intersection_heatmap(gaussian_num, legend_width=80, max_display=200, colormap='turbo'):
+    """
+    Create a heatmap visualization of per-pixel Gaussian intersection counts.
+
+    Args:
+        gaussian_num: Tensor or array of shape (1, H, W) or (H, W) containing
+                     the number of Gaussians that contributed to each pixel.
+        legend_width: Width of the legend bar on the right side (default 80px).
+        max_display: Fixed maximum for colormap normalization (default 200).
+                    Values above this are clipped and shown as "outliers".
+        colormap: Matplotlib colormap name (default 'turbo' - perceptually uniform).
+
+    Returns:
+        heatmap_img: numpy array of shape (H, W + legend_width, 3) in [0, 1] range
+        min_count: minimum intersection count (excluding background)
+        max_count: maximum intersection count (actual, may exceed max_display)
+
+    Colormap: Black (BG, count=0) -> colormap[0..max_display]
+    """
+    # Convert to numpy if tensor
+    if hasattr(gaussian_num, 'cpu'):
+        gs_count = gaussian_num.squeeze().cpu().numpy()
+    else:
+        gs_count = np.squeeze(gaussian_num)
+
+    H, W = gs_count.shape
+
+    # Find actual min/max excluding zeros (background)
+    valid_mask = gs_count > 0
+    if valid_mask.any():
+        min_count = int(gs_count[valid_mask].min())
+        max_count = int(gs_count[valid_mask].max())
+    else:
+        min_count, max_count = 0, 1
+
+    # Normalize to [0, 1] using fixed max_display (not actual max)
+    # This ensures consistent coloring across all views
+    normalized = np.zeros_like(gs_count, dtype=np.float32)
+    normalized[valid_mask] = gs_count[valid_mask] / max_display
+    normalized = np.clip(normalized, 0, 1)
+
+    # Apply colormap (turbo is perceptually uniform and good for heatmaps)
+    cmap = plt.get_cmap(colormap)
+    heatmap_rgba = cmap(normalized)  # (H, W, 4)
+    heatmap = heatmap_rgba[..., :3].astype(np.float32)
+
+    # Set background (count=0) to black
+    heatmap[~valid_mask] = 0.0
+
+    # Create legend bar with colormap gradient
+    legend = np.zeros((H, legend_width, 3), dtype=np.float32)
+
+    # Gradient bar (centered, with padding)
+    bar_start = int(H * 0.08)
+    bar_end = int(H * 0.92)
+    bar_height = bar_end - bar_start
+    bar_x_start = 15
+    bar_x_end = legend_width - 15
+
+    # Create vertical gradient using the colormap
+    for y in range(bar_start, bar_end):
+        t = 1.0 - (y - bar_start) / max(bar_height - 1, 1)  # 1 at top, 0 at bottom
+        color = cmap(t)[:3]
+        legend[y, bar_x_start:bar_x_end, :] = color
+
+    # Combine heatmap and legend
+    heatmap_with_legend = np.concatenate([heatmap, legend], axis=1)
+
+    # Add text labels using matplotlib figure
+    fig, ax = plt.subplots(figsize=(((W + legend_width) / 100), (H / 100)), dpi=100)
+    ax.imshow(heatmap_with_legend)
+    ax.axis('off')
+
+    # Add labels on the legend
+    text_x = W + legend_width // 2
+
+    # Show max_display at top, 0 at bottom
+    ax.text(text_x, bar_start - 8, f'{max_display}+', fontsize=9, ha='center', va='bottom',
+            color='white', fontweight='bold')
+    ax.text(text_x, bar_end + 8, '1', fontsize=9, ha='center', va='top',
+            color='white', fontweight='bold')
+
+    # Title
+    ax.text(text_x, H * 0.03, 'Intersections', fontsize=8, ha='center', va='center', color='white')
+
+    # Show actual stats at bottom
+    outlier_count = np.sum(gs_count > max_display)
+    outlier_pct = 100.0 * outlier_count / np.sum(valid_mask) if valid_mask.any() else 0
+    ax.text(text_x, H * 0.96, f'max:{max_count}', fontsize=7, ha='center', va='center', color='yellow')
+    if outlier_pct > 0.1:
+        ax.text(text_x, H * 0.99, f'>{max_display}: {outlier_pct:.1f}%', fontsize=6,
+                ha='center', va='center', color='red')
+
+    # Render figure to numpy array
+    fig.tight_layout(pad=0)
+    fig.canvas.draw()
+
+    # Get the RGBA buffer and convert to RGB
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+    result = buf[..., :3].astype(np.float32) / 255.0
+
+    plt.close(fig)
+
+    # Resize to original dimensions if needed (matplotlib may change size slightly)
+    if result.shape[0] != H or result.shape[1] != W + legend_width:
+        from PIL import Image as PILImage
+        result_pil = PILImage.fromarray((result * 255).astype(np.uint8))
+        result_pil = result_pil.resize((W + legend_width, H), PILImage.LANCZOS)
+        result = np.array(result_pil).astype(np.float32) / 255.0
+
+    return result, min_count, max_count
+
+
+def create_intersection_histogram(gaussian_num, max_display=200, num_bins=50):
+    """
+    Create a histogram visualization showing the distribution of intersection counts.
+    Useful for identifying outliers and understanding the distribution.
+
+    Args:
+        gaussian_num: Tensor or array of shape (1, H, W) or (H, W)
+        max_display: X-axis maximum (values beyond shown in overflow bin)
+        num_bins: Number of histogram bins
+
+    Returns:
+        histogram_img: numpy array of shape (400, 600, 3) in [0, 1] range
+        stats: dict with min, max, mean, median, std, outlier_pct
+    """
+    # Convert to numpy if tensor
+    if hasattr(gaussian_num, 'cpu'):
+        gs_count = gaussian_num.squeeze().cpu().numpy()
+    else:
+        gs_count = np.squeeze(gaussian_num)
+
+    # Get valid (non-background) pixels
+    valid_mask = gs_count > 0
+    valid_counts = gs_count[valid_mask].flatten()
+
+    if len(valid_counts) == 0:
+        # Return empty histogram
+        fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
+        ax.text(0.5, 0.5, 'No valid pixels', ha='center', va='center', transform=ax.transAxes)
+        fig.tight_layout()
+        fig.canvas.draw()
+        buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+        result = buf[..., :3].astype(np.float32) / 255.0
+        plt.close(fig)
+        return result, {'min': 0, 'max': 0, 'mean': 0, 'median': 0, 'std': 0, 'outlier_pct': 0}
+
+    # Compute statistics
+    stats = {
+        'min': int(valid_counts.min()),
+        'max': int(valid_counts.max()),
+        'mean': float(valid_counts.mean()),
+        'median': float(np.median(valid_counts)),
+        'std': float(valid_counts.std()),
+        'outlier_pct': 100.0 * np.sum(valid_counts > max_display) / len(valid_counts)
+    }
+
+    # Create histogram
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
+
+    # Clip values for histogram but track overflow
+    clipped_counts = np.clip(valid_counts, 0, max_display)
+
+    # Create bins
+    bins = np.linspace(0, max_display, num_bins + 1)
+
+    # Plot histogram
+    n, bins_out, patches = ax.hist(clipped_counts, bins=bins, color='steelblue',
+                                    edgecolor='black', alpha=0.7)
+
+    # Color the last bin red if there are outliers
+    if stats['outlier_pct'] > 0:
+        patches[-1].set_facecolor('red')
+
+    # Add vertical lines for statistics
+    ax.axvline(stats['mean'], color='green', linestyle='--', linewidth=2, label=f"Mean: {stats['mean']:.1f}")
+    ax.axvline(stats['median'], color='orange', linestyle='--', linewidth=2, label=f"Median: {stats['median']:.1f}")
+
+    # Add percentile lines
+    p90 = np.percentile(valid_counts, 90)
+    p99 = np.percentile(valid_counts, 99)
+    ax.axvline(p90, color='yellow', linestyle=':', linewidth=1.5, label=f"P90: {p90:.0f}")
+    ax.axvline(p99, color='red', linestyle=':', linewidth=1.5, label=f"P99: {p99:.0f}")
+
+    ax.set_xlabel('Intersection Count', fontsize=10)
+    ax.set_ylabel('Pixel Count', fontsize=10)
+    ax.set_title(f'Distribution of Gaussian Intersections per Pixel\n'
+                 f'Range: [{stats["min"]}, {stats["max"]}], Outliers (>{max_display}): {stats["outlier_pct"]:.2f}%',
+                 fontsize=10)
+    ax.legend(loc='upper right', fontsize=8)
+    ax.set_xlim(0, max_display)
+
+    # Use log scale for y-axis if range is large
+    if n.max() / (n[n > 0].min() + 1) > 100:
+        ax.set_yscale('log')
+
+    fig.tight_layout()
+    fig.canvas.draw()
+
+    # Get the RGBA buffer and convert to RGB
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+    result = buf[..., :3].astype(np.float32) / 255.0
+
+    plt.close(fig)
+
+    return result, stats
