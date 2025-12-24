@@ -1,7 +1,7 @@
 ################################################################################
 #  SCENE: LEGO
-#  Generated: 2025-12-22 08:45:35
-#  Completed experiments: 31
+#  Generated: 2025-12-24 11:36:45
+#  Completed experiments: 33
 ################################################################################
 
 ================================================================================
@@ -9,10 +9,12 @@
 ================================================================================
 Method       Name                                    PSNR     SSIM         L1   #Img
 --------------------------------------------------------------------------------
+baseline     bcemc001op001sc1e4ns_baseline          34.89   0.9794   0.005722    200
 baseline     dec2ftest_baseline                     35.34   0.9800   0.005280    200
 baseline     exp1_baseline                          35.37   0.9800   0.005232    200
 baseline     noc2f_baseline                         35.22   0.9799   0.005349    200
 baseline     nocfmcmc001op001sc1e5ns_baseline       35.15   0.9801   0.005569    200
+cat          bcemc001op001sc1e4ns_cat0_0_levels     34.89   0.9786   0.005784    200
 cat          dec2ftest_cat0_0_levels                34.91   0.9795   0.005848    200
 cat          dec2ftest_cat1_1_levels                35.45   0.9803   0.005180    200
 cat          dec2ftest_cat2_2_levels                35.49   0.9802   0.005102    200
@@ -47,10 +49,12 @@ cat          nocfmcmc001op001sc1e5ns_cat6_6_levels    35.58   0.9822   0.005131 
 ================================================================================
 Method       Name                                    PSNR     SSIM         L1   #Img
 --------------------------------------------------------------------------------
+baseline     bcemc001op001sc1e4ns_baseline          39.03   0.9911   0.003967    100
 baseline     dec2ftest_baseline                     39.98   0.9921   0.003380    100
 baseline     exp1_baseline                          39.81   0.9920   0.003346    100
 baseline     noc2f_baseline                         39.82   0.9919   0.003498    100
 baseline     nocfmcmc001op001sc1e5ns_baseline       39.39   0.9916   0.003852    100
+cat          bcemc001op001sc1e4ns_cat0_0_levels     39.18   0.9913   0.003951    100
 cat          dec2ftest_cat0_0_levels                38.82   0.9912   0.004119    100
 cat          dec2ftest_cat1_1_levels                40.69   0.9928   0.003128    100
 cat          dec2ftest_cat2_2_levels                40.89   0.9930   0.003025    100

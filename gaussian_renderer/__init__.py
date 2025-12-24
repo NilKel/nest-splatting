@@ -275,12 +275,21 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             gaussian_features = pc.get_gaussian_features  # (N, 24D)
             blend_weight = torch.sigmoid(pc._adaptive_cat_weight)  # (N, 1)
 
+            # Decompose mode: override blend weights for visualization
+            if decompose_mode == 'gaussian_only':
+                # Force all Gaussians to use per-Gaussian features (skip hashgrid)
+                blend_weight = torch.ones_like(blend_weight)
+            elif decompose_mode == 'ngp_only':
+                # Force all Gaussians to use hashgrid for fine level
+                blend_weight = torch.zeros_like(blend_weight)
+
             colors_precomp = torch.cat([gaussian_features, blend_weight], dim=1)  # (N, 25D)
             shs = None
 
             # Encode inference flag in render_mode: (inference_flag << 8) | base_mode
             # Check if inference flag is set in ingp object
-            use_inference_mode = hasattr(ingp, 'adaptive_cat_inference') and ingp.adaptive_cat_inference
+            # Also force inference mode when decompose_mode is set (for clean visualization)
+            use_inference_mode = (hasattr(ingp, 'adaptive_cat_inference') and ingp.adaptive_cat_inference) or (decompose_mode is not None)
             inference_flag = 1 if use_inference_mode else 0
             render_mode = 12 | (inference_flag << 8)  # Base mode 12, inference in bit 8
 

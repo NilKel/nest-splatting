@@ -997,7 +997,11 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     # Skip decomposition if hybrid_levels is 0 or equals total_levels (no meaningful decomposition)
     do_cat_decomposition = is_cat_mode and args.hybrid_levels < total_levels
     do_hybrid_sh_decomposition = is_hybrid_sh_mode or is_hybrid_sh_raw_mode or is_hybrid_sh_post_mode
-    
+
+    # Adaptive_cat decomposition: visualize per-Gaussian vs hashgrid contributions
+    is_adaptive_cat_mode = (ingp is not None and hasattr(ingp, 'is_adaptive_cat_mode') and ingp.is_adaptive_cat_mode)
+    do_adaptive_cat_decomposition = is_adaptive_cat_mode
+
     if do_cat_decomposition:
         # Create directories for decomposed renders
         ngp_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'ngp_only'))
@@ -1013,7 +1017,15 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
         os.makedirs(ngp_output_dir, exist_ok=True)
         os.makedirs(gaussian_output_dir, exist_ok=True)
         print(f"[FINAL] hybrid_SH mode decomposition enabled: saving NGP-only and Gaussians-only renders")
-    
+
+    if do_adaptive_cat_decomposition:
+        # Create directories for adaptive_cat decomposed renders
+        ngp_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'ngp_only'))
+        gaussian_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'gaussian_only'))
+        os.makedirs(ngp_output_dir, exist_ok=True)
+        os.makedirs(gaussian_output_dir, exist_ok=True)
+        print(f"[FINAL] Adaptive_cat mode decomposition enabled: saving NGP-only (weight=0) and Gaussian-only (weight=1) renders")
+
     if len(cameras) == 0:
         print(f"[FINAL] No cameras available, skipping.")
         return
@@ -1103,7 +1115,7 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                 ngp_rendered = torch.clamp(ngp_render_pkg["render"], 0.0, 1.0)
                 ngp_rendered_np = ngp_rendered.permute(1, 2, 0).cpu().numpy()
                 save_img_u8(ngp_rendered_np, os.path.join(ngp_output_dir, f"{idx:03d}_ngp.png"))
-                
+
                 # Gaussian-only: zero out hashgrid DC residual, keep per-Gaussian SH
                 gaussian_render_pkg = render(viewpoint, gaussians, pipe, background,
                                             ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
@@ -1111,7 +1123,25 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                 gaussian_rendered = torch.clamp(gaussian_render_pkg["render"], 0.0, 1.0)
                 gaussian_rendered_np = gaussian_rendered.permute(1, 2, 0).cpu().numpy()
                 save_img_u8(gaussian_rendered_np, os.path.join(gaussian_output_dir, f"{idx:03d}_gaussian.png"))
-            
+
+            # Adaptive_cat mode decomposition: render with forced weights
+            if do_adaptive_cat_decomposition:
+                # NGP-only: force weight=0 so all Gaussians use hashgrid for fine level
+                ngp_render_pkg = render(viewpoint, gaussians, pipe, background,
+                                       ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                       decompose_mode='ngp_only')
+                ngp_rendered = torch.clamp(ngp_render_pkg["render"], 0.0, 1.0)
+                ngp_rendered_np = ngp_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(ngp_rendered_np, os.path.join(ngp_output_dir, f"{idx:03d}_ngp.png"))
+
+                # Gaussian-only: force weight=1 so all Gaussians use per-Gaussian features
+                gaussian_render_pkg = render(viewpoint, gaussians, pipe, background,
+                                            ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                            decompose_mode='gaussian_only')
+                gaussian_rendered = torch.clamp(gaussian_render_pkg["render"], 0.0, 1.0)
+                gaussian_rendered_np = gaussian_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(gaussian_rendered_np, os.path.join(gaussian_output_dir, f"{idx:03d}_gaussian.png"))
+
             cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
             print(f"[FINAL] Idx {idx:3d} ({cam_name}): PSNR={psnr_val:.2f} SSIM={ssim_val:.4f}")
     

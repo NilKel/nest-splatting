@@ -1,7 +1,7 @@
 ################################################################################
 #  SCENE: FICUS
-#  Generated: 2025-12-22 08:45:35
-#  Completed experiments: 45
+#  Generated: 2025-12-24 11:36:45
+#  Completed experiments: 53
 ################################################################################
 
 ================================================================================
@@ -9,10 +9,18 @@
 ================================================================================
 Method       Name                                    PSNR     SSIM         L1   #Img
 --------------------------------------------------------------------------------
+baseline     bcemc001op001sc1e4ns_baseline          35.88   0.9867   0.004237    200
 baseline     dec2ftest_baseline                     36.07   0.9878   0.004224    200
 baseline     exp1_baseline                          35.90   0.9876   0.004317    200
 baseline     noc2f_baseline                         35.27   0.9874   0.004713    200
 baseline     nocfmcmc001op001sc1e5ns_baseline       17.09   0.8371   0.046954    200
+cat          bcemc001op001sc1e4ns_cat0_0_levels     35.67   0.9858   0.004369    200
+cat          bcemc001op001sc1e4ns_cat1_1_levels     35.33   0.9849   0.004575    200
+cat          bcemc001op001sc1e4ns_cat2_2_levels     35.87   0.9855   0.004196    200
+cat          bcemc001op001sc1e4ns_cat3_3_levels     35.89   0.9856   0.004252    200
+cat          bcemc001op001sc1e4ns_cat4_4_levels     36.12   0.9863   0.004107    200
+cat          bcemc001op001sc1e4ns_cat5_5_levels     36.10   0.9870   0.004150    200
+cat          bcemc001op001sc1e4ns_cat6_6_levels     35.83   0.9866   0.004345    200
 cat          c2ftest_3_levels                       35.98   0.9873   0.004297    200
 cat          dec2ftest_cat0_0_levels                36.18   0.9881   0.004129    200
 cat          dec2ftest_cat1_1_levels                36.06   0.9879   0.004207    200
@@ -61,10 +69,18 @@ diffuse      c2ftest                                32.28   0.9763   0.006619   
 ================================================================================
 Method       Name                                    PSNR     SSIM         L1   #Img
 --------------------------------------------------------------------------------
+baseline     bcemc001op001sc1e4ns_baseline          38.39   0.9940   0.003008    100
 baseline     dec2ftest_baseline                     38.67   0.9947   0.002992    100
 baseline     exp1_baseline                          38.09   0.9944   0.003288    100
 baseline     noc2f_baseline                         37.59   0.9944   0.003461    100
 baseline     nocfmcmc001op001sc1e5ns_baseline       17.40   0.8488   0.042731    100
+cat          bcemc001op001sc1e4ns_cat0_0_levels     38.46   0.9938   0.003036    100
+cat          bcemc001op001sc1e4ns_cat1_1_levels     37.99   0.9930   0.003233    100
+cat          bcemc001op001sc1e4ns_cat2_2_levels     38.81   0.9936   0.002826    100
+cat          bcemc001op001sc1e4ns_cat3_3_levels     38.45   0.9934   0.002990    100
+cat          bcemc001op001sc1e4ns_cat4_4_levels     38.58   0.9934   0.002886    100
+cat          bcemc001op001sc1e4ns_cat5_5_levels     38.25   0.9933   0.003030    100
+cat          bcemc001op001sc1e4ns_cat6_6_levels     37.48   0.9924   0.003392    100
 cat          c2ftest_3_levels                       38.86   0.9949   0.002955    100
 cat          dec2ftest_cat0_0_levels                38.63   0.9948   0.003013    100
 cat          dec2ftest_cat1_1_levels                39.03   0.9952   0.002865    100

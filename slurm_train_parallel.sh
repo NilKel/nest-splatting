@@ -1,0 +1,385 @@
+#!/bin/bash
+#=============================================================================
+# SLURM Parallel Training Script for Nest-Splatting
+#=============================================================================
+# This script runs baseline and cat experiments in parallel using SLURM job arrays.
+#
+# PHASE 1: All baseline experiments run first (creates warmup checkpoints)
+# PHASE 2: All cat experiments run after baseline completes (uses warmup checkpoints)
+#
+# Usage:
+#   ./slurm_train_parallel.sh <dataset> <base_name> [scene_names] [iterations] [extra_args]
+#
+# Examples:
+#   ./slurm_train_parallel.sh nerf_synthetic exp1              # All nerf_synthetic scenes
+#   ./slurm_train_parallel.sh DTU exp1 scan24,scan37           # Specific DTU scenes
+#   ./slurm_train_parallel.sh mip_360 exp1 all 30000           # All mip_360 with 30k iters
+#
+# The script will:
+#   1. Generate job configuration files
+#   2. Submit baseline jobs as a job array (Phase 1)
+#   3. Submit cat jobs as a job array with dependency on Phase 1 (Phase 2)
+#=============================================================================
+
+set -e
+
+# Default values
+DEFAULT_ITERATIONS=30000
+BASE_DATA_DIR="/home/nilkel/Projects/data/nest_synthetic"
+DTU_DATA_DIR="/home/nilkel/Projects/nest-splatting/data/dtu/2DGS_data/DTU"
+MIP360_DATA_DIR="/home/nilkel/Projects/data/mip360"
+
+# SLURM settings - adjust these as needed
+PARTITION="a100-4gpu-40gb"
+ACCOUNT="rctcd82061"
+TIME_LIMIT="24:00:00"  # 24 hours per job
+
+# Parse arguments
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <dataset> <base_name> [scene_names] [iterations] [extra_args]"
+    echo ""
+    echo "Arguments:"
+    echo "  dataset       Required. Dataset name: nerf_synthetic, DTU, or mip_360"
+    echo "  base_name     Required. Base name for experiments (e.g., exp1, test)"
+    echo "  scene_names   Optional. Comma-separated scene names or 'all' (default: all)"
+    echo "  iterations    Optional. Number of training iterations (default: 30000)"
+    echo "  extra_args    Optional. Extra arguments to pass to train.py"
+    echo ""
+    echo "Examples:"
+    echo "  $0 nerf_synthetic exp1"
+    echo "  $0 DTU exp1 scan24,scan37"
+    echo "  $0 mip_360 exp1 all 30000"
+    echo ""
+    echo "SLURM settings (edit script to change):"
+    echo "  Partition: $PARTITION"
+    echo "  Account:   $ACCOUNT"
+    echo "  Time:      $TIME_LIMIT"
+    exit 1
+fi
+
+DATASET=$1
+BASE_NAME=$2
+SCENE_NAMES=${3:-all}
+ITERATIONS=${4:-$DEFAULT_ITERATIONS}
+EXTRA_ARGS=${5:-""}
+
+# Configure dataset-specific settings
+case "$DATASET" in
+    nerf_synthetic)
+        DATA_DIR="${BASE_DATA_DIR}/nerf_synthetic"
+        YAML_CONFIG="./configs/nerfsyn.yaml"
+        ALL_SCENES="chair,drums,ficus,hotdog,lego,materials,mic,ship"
+        DATASET_PATH="nerf_synthetic"
+        RESOLUTION_ARG=""
+        ;;
+    DTU)
+        DATA_DIR="$DTU_DATA_DIR"
+        YAML_CONFIG="./configs/dtu.yaml"
+        ALL_SCENES="scan24,scan37,scan40,scan55,scan63,scan65,scan69,scan83,scan97,scan105,scan106,scan110,scan114,scan118,scan122"
+        DATASET_PATH="DTU"
+        RESOLUTION_ARG="-r 2"
+        ;;
+    mip_360)
+        DATA_DIR="$MIP360_DATA_DIR"
+        YAML_CONFIG="./configs/360_outdoor.yaml"
+        ALL_SCENES="bicycle,bonsai,counter,garden,kitchen,room,stump"
+        DATASET_PATH="mip_360"
+        RESOLUTION_ARG="-r 2"
+        ;;
+    *)
+        echo "ERROR: Unknown dataset '$DATASET'"
+        exit 1
+        ;;
+esac
+
+# Handle "all" keyword
+if [ "$SCENE_NAMES" = "all" ]; then
+    SCENE_NAMES=$ALL_SCENES
+fi
+
+# Convert comma-separated list to array
+IFS=',' read -ra SCENES <<< "$SCENE_NAMES"
+NUM_SCENES=${#SCENES[@]}
+
+# Create job config directory
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+JOB_DIR="slurm_jobs/${BASE_NAME}_${TIMESTAMP}"
+mkdir -p "$JOB_DIR"
+
+echo "════════════════════════════════════════════════════════════════════"
+echo "  Nest-Splatting SLURM Parallel Training"
+echo "════════════════════════════════════════════════════════════════════"
+echo "Dataset:     $DATASET"
+echo "Base name:   $BASE_NAME"
+echo "Scenes:      ${SCENES[@]}"
+echo "Iterations:  $ITERATIONS"
+echo "Data dir:    $DATA_DIR"
+echo "Config:      $YAML_CONFIG"
+echo "Job dir:     $JOB_DIR"
+echo "════════════════════════════════════════════════════════════════════"
+echo ""
+
+#=============================================================================
+# Generate job configuration files
+#=============================================================================
+
+# Phase 1: Baseline jobs (one per scene)
+echo "Generating Phase 1 (baseline) job configs..."
+BASELINE_CONFIG="$JOB_DIR/baseline_jobs.txt"
+> "$BASELINE_CONFIG"
+
+for scene in "${SCENES[@]}"; do
+    echo "$scene baseline ${BASE_NAME}_baseline" >> "$BASELINE_CONFIG"
+done
+
+# Phase 2: Cat jobs (7 per scene: cat0-cat6)
+echo "Generating Phase 2 (cat) job configs..."
+CAT_CONFIG="$JOB_DIR/cat_jobs.txt"
+> "$CAT_CONFIG"
+
+for scene in "${SCENES[@]}"; do
+    for hl in {0..6}; do
+        echo "$scene cat ${BASE_NAME}_cat${hl} --hybrid_levels $hl" >> "$CAT_CONFIG"
+    done
+done
+
+NUM_BASELINE_JOBS=$(wc -l < "$BASELINE_CONFIG")
+NUM_CAT_JOBS=$(wc -l < "$CAT_CONFIG")
+
+echo "Phase 1 jobs: $NUM_BASELINE_JOBS (baseline experiments)"
+echo "Phase 2 jobs: $NUM_CAT_JOBS (cat experiments)"
+echo ""
+
+#=============================================================================
+# Create the worker script that each SLURM task will run
+#=============================================================================
+
+WORKER_SCRIPT="$JOB_DIR/worker.sh"
+cat > "$WORKER_SCRIPT" << 'WORKER_EOF'
+#!/bin/bash
+#=============================================================================
+# Worker script - runs a single training experiment
+#=============================================================================
+
+# Arguments passed via environment:
+# JOB_CONFIG_FILE - path to job config file
+# SLURM_ARRAY_TASK_ID - which line to read from config
+# DATA_DIR, YAML_CONFIG, DATASET_PATH, RESOLUTION_ARG, ITERATIONS, EXTRA_ARGS
+
+set -e
+
+# Read the job specification from the config file
+JOB_LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$JOB_CONFIG_FILE")
+if [ -z "$JOB_LINE" ]; then
+    echo "ERROR: No job found at line $SLURM_ARRAY_TASK_ID in $JOB_CONFIG_FILE"
+    exit 1
+fi
+
+# Parse job line: scene method experiment_name [extra_method_args]
+read -r SCENE METHOD EXPERIMENT_NAME METHOD_ARGS <<< "$JOB_LINE"
+
+echo "════════════════════════════════════════════════════════════════════"
+echo "  SLURM Job: Task $SLURM_ARRAY_TASK_ID"
+echo "════════════════════════════════════════════════════════════════════"
+echo "Scene:       $SCENE"
+echo "Method:      $METHOD"
+echo "Experiment:  $EXPERIMENT_NAME"
+echo "Method args: $METHOD_ARGS"
+echo "Host:        $(hostname)"
+echo "GPU:         $CUDA_VISIBLE_DEVICES"
+echo "Started:     $(date)"
+echo "════════════════════════════════════════════════════════════════════"
+
+SCENE_PATH="${DATA_DIR}/${SCENE}"
+
+# Check if scene exists
+if [ ! -d "$SCENE_PATH" ]; then
+    echo "ERROR: Scene path does not exist: $SCENE_PATH"
+    exit 1
+fi
+
+# Determine output path and check for completion
+if [ "$METHOD" = "cat" ]; then
+    HL_SUFFIX=$(echo "$METHOD_ARGS" | grep -oP '(?<=--hybrid_levels )\d+')
+    OUTPUT_PATH="outputs/${DATASET_PATH}/${SCENE}/${METHOD}/${EXPERIMENT_NAME}_${HL_SUFFIX}_levels"
+else
+    OUTPUT_PATH="outputs/${DATASET_PATH}/${SCENE}/${METHOD}/${EXPERIMENT_NAME}"
+fi
+TEST_METRICS="${OUTPUT_PATH}/test_metrics.txt"
+
+# Skip if already completed
+if [ -f "$TEST_METRICS" ]; then
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  SKIPPING - Already completed"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "Found: $TEST_METRICS"
+    echo "Finished: $(date)"
+    exit 0
+fi
+
+# Run training
+CMD="python train.py -s $SCENE_PATH -m $EXPERIMENT_NAME --yaml $YAML_CONFIG --eval --iterations $ITERATIONS $RESOLUTION_ARG --method $METHOD $METHOD_ARGS $EXTRA_ARGS"
+
+echo ""
+echo "Command: $CMD"
+echo ""
+
+$CMD
+
+EXIT_CODE=$?
+
+echo ""
+echo "════════════════════════════════════════════════════════════════════"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "  ✓ SUCCESS"
+else
+    echo "  ✗ FAILED (exit code: $EXIT_CODE)"
+fi
+echo "════════════════════════════════════════════════════════════════════"
+echo "Finished: $(date)"
+
+exit $EXIT_CODE
+WORKER_EOF
+
+chmod +x "$WORKER_SCRIPT"
+
+#=============================================================================
+# Create SLURM submission scripts
+#=============================================================================
+
+# Phase 1: Baseline jobs
+BASELINE_SBATCH="$JOB_DIR/submit_baseline.sbatch"
+cat > "$BASELINE_SBATCH" << EOF
+#!/bin/bash
+#SBATCH --partition=$PARTITION
+#SBATCH --account=$ACCOUNT
+#SBATCH --gres=gpu:1
+#SBATCH --job-name=nest_baseline_${BASE_NAME}
+#SBATCH --output=$JOB_DIR/logs/baseline_%a.out
+#SBATCH --error=$JOB_DIR/logs/baseline_%a.err
+#SBATCH --time=$TIME_LIMIT
+#SBATCH --array=1-${NUM_BASELINE_JOBS}
+
+# Setup environment
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate nest_splatting
+
+# Export environment variables for worker
+export JOB_CONFIG_FILE="$BASELINE_CONFIG"
+export DATA_DIR="$DATA_DIR"
+export YAML_CONFIG="$YAML_CONFIG"
+export DATASET_PATH="$DATASET_PATH"
+export RESOLUTION_ARG="$RESOLUTION_ARG"
+export ITERATIONS="$ITERATIONS"
+export EXTRA_ARGS="$EXTRA_ARGS"
+
+# Change to project directory
+cd /home/nilkel/Projects/nest-splatting
+
+# Run worker
+$WORKER_SCRIPT
+EOF
+
+# Phase 2: Cat jobs
+CAT_SBATCH="$JOB_DIR/submit_cat.sbatch"
+cat > "$CAT_SBATCH" << EOF
+#!/bin/bash
+#SBATCH --partition=$PARTITION
+#SBATCH --account=$ACCOUNT
+#SBATCH --gres=gpu:1
+#SBATCH --job-name=nest_cat_${BASE_NAME}
+#SBATCH --output=$JOB_DIR/logs/cat_%a.out
+#SBATCH --error=$JOB_DIR/logs/cat_%a.err
+#SBATCH --time=$TIME_LIMIT
+#SBATCH --array=1-${NUM_CAT_JOBS}
+
+# Setup environment
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate nest_splatting
+
+# Export environment variables for worker
+export JOB_CONFIG_FILE="$CAT_CONFIG"
+export DATA_DIR="$DATA_DIR"
+export YAML_CONFIG="$YAML_CONFIG"
+export DATASET_PATH="$DATASET_PATH"
+export RESOLUTION_ARG="$RESOLUTION_ARG"
+export ITERATIONS="$ITERATIONS"
+export EXTRA_ARGS="$EXTRA_ARGS"
+
+# Change to project directory
+cd /home/nilkel/Projects/nest-splatting
+
+# Run worker
+$WORKER_SCRIPT
+EOF
+
+# Create logs directory
+mkdir -p "$JOB_DIR/logs"
+
+#=============================================================================
+# Submit jobs
+#=============================================================================
+
+echo "════════════════════════════════════════════════════════════════════"
+echo "  Submitting SLURM Jobs"
+echo "════════════════════════════════════════════════════════════════════"
+
+# Submit Phase 1 (baseline)
+echo "Submitting Phase 1 (baseline) jobs..."
+BASELINE_JOB_ID=$(sbatch --parsable "$BASELINE_SBATCH")
+echo "  Baseline job array ID: $BASELINE_JOB_ID"
+
+# Submit Phase 2 (cat) with dependency on Phase 1
+echo "Submitting Phase 2 (cat) jobs with dependency on Phase 1..."
+CAT_JOB_ID=$(sbatch --parsable --dependency=afterok:${BASELINE_JOB_ID} "$CAT_SBATCH")
+echo "  Cat job array ID: $CAT_JOB_ID"
+
+echo ""
+echo "════════════════════════════════════════════════════════════════════"
+echo "  Jobs Submitted Successfully!"
+echo "════════════════════════════════════════════════════════════════════"
+echo ""
+echo "Phase 1 (baseline): Job $BASELINE_JOB_ID"
+echo "  - $NUM_BASELINE_JOBS tasks (one per scene)"
+echo "  - Creates warmup_checkpoint.pth in each scene's data directory"
+echo ""
+echo "Phase 2 (cat): Job $CAT_JOB_ID"
+echo "  - $NUM_CAT_JOBS tasks (7 cat levels × $NUM_SCENES scenes)"
+echo "  - Depends on Phase 1 completion"
+echo "  - Uses warmup checkpoints from Phase 1"
+echo ""
+echo "Monitor jobs:"
+echo "  squeue -u \$USER"
+echo "  squeue -j $BASELINE_JOB_ID"
+echo "  squeue -j $CAT_JOB_ID"
+echo ""
+echo "View logs:"
+echo "  tail -f $JOB_DIR/logs/baseline_*.out"
+echo "  tail -f $JOB_DIR/logs/cat_*.out"
+echo ""
+echo "Cancel all jobs:"
+echo "  scancel $BASELINE_JOB_ID $CAT_JOB_ID"
+echo ""
+
+# Save job info for later reference
+cat > "$JOB_DIR/job_info.txt" << EOF
+Submission time: $(date)
+Dataset: $DATASET
+Base name: $BASE_NAME
+Scenes: ${SCENES[@]}
+Iterations: $ITERATIONS
+Extra args: $EXTRA_ARGS
+
+Phase 1 (baseline):
+  Job ID: $BASELINE_JOB_ID
+  Tasks: $NUM_BASELINE_JOBS
+
+Phase 2 (cat):
+  Job ID: $CAT_JOB_ID
+  Tasks: $NUM_CAT_JOBS
+  Dependency: afterok:$BASELINE_JOB_ID
+EOF
+
+echo "Job info saved to: $JOB_DIR/job_info.txt"
+echo ""
