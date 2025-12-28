@@ -174,10 +174,6 @@ cat > "$WORKER_SCRIPT" << 'WORKER_EOF'
 
 set -e
 
-# Retry settings
-MAX_RETRIES=${MAX_RETRIES:-3}
-RETRY_DELAY=30  # seconds between retries
-
 # mip_360 scene classification
 MIP360_OUTDOOR_SCENES="bicycle flowers garden stump treehill"
 MIP360_INDOOR_SCENES="room counter kitchen bonsai"
@@ -214,6 +210,41 @@ except Exception as e:
     return $?
 }
 
+#=============================================================================
+# Request requeue on bad GPU - exits with special code to trigger SLURM requeue
+#=============================================================================
+MAX_REQUEUES=5  # Maximum times a job can be requeued
+
+request_requeue() {
+    local reason=$1
+
+    # Track requeue count using SLURM's restart count
+    REQUEUE_COUNT=${SLURM_RESTART_COUNT:-0}
+
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  REQUESTING REQUEUE - Bad GPU/Node detected"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "Reason: $reason"
+    echo "Host: $(hostname)"
+    echo "GPU: $CUDA_VISIBLE_DEVICES"
+    echo "Requeue attempt: $((REQUEUE_COUNT + 1))/$MAX_REQUEUES"
+    echo ""
+
+    if [ $REQUEUE_COUNT -ge $MAX_REQUEUES ]; then
+        echo "ERROR: Max requeue attempts ($MAX_REQUEUES) reached!"
+        echo "This job has failed on $MAX_REQUEUES different GPUs."
+        echo "Manual intervention required."
+        echo "════════════════════════════════════════════════════════════════════"
+        exit 1
+    fi
+
+    echo "Exiting with code 99 to trigger SLURM requeue..."
+    echo "Job will be rescheduled on a different node."
+    echo "════════════════════════════════════════════════════════════════════"
+    exit 99
+}
+
 # Read the job specification from the config file
 JOB_LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$JOB_CONFIG_FILE")
 if [ -z "$JOB_LINE" ]; then
@@ -240,8 +271,12 @@ if [ "$DATASET_PATH" = "mip_360" ]; then
     fi
 fi
 
+REQUEUE_COUNT=${SLURM_RESTART_COUNT:-0}
 echo "════════════════════════════════════════════════════════════════════"
 echo "  SLURM Job: Task $SLURM_ARRAY_TASK_ID"
+if [ $REQUEUE_COUNT -gt 0 ]; then
+    echo "  (Requeue attempt $REQUEUE_COUNT/$MAX_REQUEUES)"
+fi
 echo "════════════════════════════════════════════════════════════════════"
 echo "Scene:       $SCENE"
 echo "Method:      $METHOD"
@@ -285,68 +320,44 @@ fi
 # Assign unique port per task to avoid conflicts when multiple jobs run on same node
 PORT=$((6009 + SLURM_ARRAY_TASK_ID))
 
-# Run training with retry logic
+# Validate GPU BEFORE running - request requeue if bad
+if ! validate_gpu; then
+    request_requeue "GPU validation failed (tinycudann import or CUDA test)"
+fi
+
+# Run training
 CMD="python train.py -s $SCENE_PATH -m $EXPERIMENT_NAME --yaml $SCENE_YAML_CONFIG --eval --iterations $ITERATIONS $SCENE_RESOLUTION_ARG --method $METHOD --port $PORT $METHOD_ARGS $EXTRA_ARGS"
 
 echo ""
 echo "Command: $CMD"
 echo ""
 
-# Retry loop
-ATTEMPT=1
-while [ $ATTEMPT -le $MAX_RETRIES ]; do
-    echo ""
-    echo "[Attempt $ATTEMPT/$MAX_RETRIES] Starting at $(date)"
-    echo ""
-
-    # Validate GPU before each attempt
-    if ! validate_gpu; then
-        echo ""
-        echo "[Attempt $ATTEMPT/$MAX_RETRIES] GPU validation failed!"
-        if [ $ATTEMPT -lt $MAX_RETRIES ]; then
-            echo "Waiting ${RETRY_DELAY}s before retry..."
-            sleep $RETRY_DELAY
-            ATTEMPT=$((ATTEMPT + 1))
-            continue
-        else
-            echo "Max retries reached. Giving up."
-            exit 1
-        fi
-    fi
-
-    # Run the training command
-    set +e  # Don't exit on error
-    $CMD
-    EXIT_CODE=$?
-    set -e
-
-    if [ $EXIT_CODE -eq 0 ]; then
-        echo ""
-        echo "════════════════════════════════════════════════════════════════════"
-        echo "  ✓ SUCCESS (attempt $ATTEMPT/$MAX_RETRIES)"
-        echo "════════════════════════════════════════════════════════════════════"
-        echo "Finished: $(date)"
-        exit 0
-    fi
-
-    echo ""
-    echo "[Attempt $ATTEMPT/$MAX_RETRIES] FAILED with exit code $EXIT_CODE"
-
-    if [ $ATTEMPT -lt $MAX_RETRIES ]; then
-        echo "Waiting ${RETRY_DELAY}s before retry..."
-        sleep $RETRY_DELAY
-    fi
-
-    ATTEMPT=$((ATTEMPT + 1))
-done
+set +e  # Don't exit on error
+$CMD
+EXIT_CODE=$?
+set -e
 
 echo ""
 echo "════════════════════════════════════════════════════════════════════"
-echo "  ✗ FAILED after $MAX_RETRIES attempts"
-echo "════════════════════════════════════════════════════════════════════"
-echo "Finished: $(date)"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "  ✓ SUCCESS"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "Finished: $(date)"
+    exit 0
+fi
 
-exit 1
+# Check if this looks like a GPU error (common CUDA errors)
+# If so, request requeue to try on a different GPU
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "  ✗ FAILED (exit code: $EXIT_CODE)"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo ""
+    echo "Checking if this is a GPU-related failure..."
+
+    # Request requeue for GPU-related failures
+    # The job will be rescheduled on a different node
+    request_requeue "Training failed with exit code $EXIT_CODE (likely GPU issue)"
+fi
 WORKER_EOF
 
 chmod +x "$WORKER_SCRIPT"
@@ -367,6 +378,11 @@ cat > "$BASELINE_SBATCH" << EOF
 #SBATCH --error=$JOB_DIR/logs/baseline_%a.err
 #SBATCH --time=$TIME_LIMIT
 #SBATCH --array=1-${NUM_BASELINE_JOBS}%${NUM_BASELINE_JOBS}
+#SBATCH --requeue
+#SBATCH --open-mode=append
+
+# Handle requeue signal - SLURM sends SIGUSR1 before requeueing
+trap 'echo "Received requeue signal, job will be rescheduled..."' SIGUSR1
 
 # Setup environment
 source ~/userdir/miniconda3/etc/profile.d/conda.sh
@@ -384,8 +400,18 @@ export EXTRA_ARGS="$EXTRA_ARGS"
 # Change to project directory
 cd /data/rg_data/aig/users/z0051beu/Projects/nest-splatting
 
-# Run worker
+# Run worker - exit code 99 triggers requeue via scontrol
 $WORKER_SCRIPT
+EXIT_CODE=\$?
+
+# If worker requested requeue (exit 99), tell SLURM to requeue this job
+if [ \$EXIT_CODE -eq 99 ]; then
+    echo "Worker requested requeue, notifying SLURM..."
+    scontrol requeue \$SLURM_JOB_ID
+    exit 0
+fi
+
+exit \$EXIT_CODE
 EOF
 
 # Phase 2: Cat jobs
@@ -400,6 +426,11 @@ cat > "$CAT_SBATCH" << EOF
 #SBATCH --error=$JOB_DIR/logs/cat_%a.err
 #SBATCH --time=$TIME_LIMIT
 #SBATCH --array=1-${NUM_CAT_JOBS}%${NUM_CAT_JOBS}
+#SBATCH --requeue
+#SBATCH --open-mode=append
+
+# Handle requeue signal - SLURM sends SIGUSR1 before requeueing
+trap 'echo "Received requeue signal, job will be rescheduled..."' SIGUSR1
 
 # Setup environment
 source ~/userdir/miniconda3/etc/profile.d/conda.sh
@@ -417,12 +448,42 @@ export EXTRA_ARGS="$EXTRA_ARGS"
 # Change to project directory
 cd /data/rg_data/aig/users/z0051beu/Projects/nest-splatting
 
-# Run worker
+# Run worker - exit code 99 triggers requeue via scontrol
 $WORKER_SCRIPT
+EXIT_CODE=\$?
+
+# If worker requested requeue (exit 99), tell SLURM to requeue this job
+if [ \$EXIT_CODE -eq 99 ]; then
+    echo "Worker requested requeue, notifying SLURM..."
+    scontrol requeue \$SLURM_JOB_ID
+    exit 0
+fi
+
+exit \$EXIT_CODE
 EOF
 
 # Create logs directory
 mkdir -p "$JOB_DIR/logs"
+
+#=============================================================================
+# Check for existing warmup checkpoints
+#=============================================================================
+
+echo "Checking for existing warmup checkpoints..."
+ALL_CHECKPOINTS_EXIST=true
+MISSING_CHECKPOINTS=""
+
+for scene in "${SCENES[@]}"; do
+    CKPT_PATH="${DATA_DIR}/${scene}/warmup_checkpoint.pth"
+    if [ -f "$CKPT_PATH" ]; then
+        echo "  ✓ $scene: checkpoint exists"
+    else
+        echo "  ✗ $scene: checkpoint missing"
+        ALL_CHECKPOINTS_EXIST=false
+        MISSING_CHECKPOINTS="$MISSING_CHECKPOINTS $scene"
+    fi
+done
+echo ""
 
 #=============================================================================
 # Submit jobs
@@ -432,29 +493,63 @@ echo "════════════════════════�
 echo "  Submitting SLURM Jobs"
 echo "════════════════════════════════════════════════════════════════════"
 
-# Submit Phase 1 (baseline)
-echo "Submitting Phase 1 (baseline) jobs..."
-BASELINE_JOB_ID=$(sbatch --parsable "$BASELINE_SBATCH")
-echo "  Baseline job array ID: $BASELINE_JOB_ID"
+if [ "$ALL_CHECKPOINTS_EXIST" = true ]; then
+    echo ""
+    echo "All warmup checkpoints found! Running baseline and cat jobs in PARALLEL."
+    echo "(Baseline jobs will skip training since checkpoints exist)"
+    echo ""
 
-# Submit Phase 2 (cat) with dependency on Phase 1
-echo "Submitting Phase 2 (cat) jobs with dependency on Phase 1..."
-CAT_JOB_ID=$(sbatch --parsable --dependency=afterok:${BASELINE_JOB_ID} "$CAT_SBATCH")
-echo "  Cat job array ID: $CAT_JOB_ID"
+    # Submit both phases without dependency - they run in parallel
+    echo "Submitting baseline jobs..."
+    BASELINE_JOB_ID=$(sbatch --parsable "$BASELINE_SBATCH")
+    echo "  Baseline job array ID: $BASELINE_JOB_ID"
 
-echo ""
-echo "════════════════════════════════════════════════════════════════════"
-echo "  Jobs Submitted Successfully!"
-echo "════════════════════════════════════════════════════════════════════"
-echo ""
-echo "Phase 1 (baseline): Job $BASELINE_JOB_ID"
-echo "  - $NUM_BASELINE_JOBS tasks (one per scene)"
-echo "  - Creates warmup_checkpoint.pth in each scene's data directory"
-echo ""
-echo "Phase 2 (cat): Job $CAT_JOB_ID"
-echo "  - $NUM_CAT_JOBS tasks (7 cat levels × $NUM_SCENES scenes)"
-echo "  - Depends on Phase 1 completion"
-echo "  - Uses warmup checkpoints from Phase 1"
+    echo "Submitting cat jobs (NO dependency - running in parallel)..."
+    CAT_JOB_ID=$(sbatch --parsable "$CAT_SBATCH")
+    echo "  Cat job array ID: $CAT_JOB_ID"
+
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  Jobs Submitted Successfully! (PARALLEL MODE)"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo ""
+    echo "Baseline jobs: $BASELINE_JOB_ID"
+    echo "  - $NUM_BASELINE_JOBS tasks (will skip - checkpoints exist)"
+    echo ""
+    echo "Cat jobs: $CAT_JOB_ID"
+    echo "  - $NUM_CAT_JOBS tasks (running in parallel with baseline)"
+    echo ""
+else
+    echo ""
+    echo "Some warmup checkpoints missing:$MISSING_CHECKPOINTS"
+    echo "Running baseline FIRST, then cat jobs."
+    echo ""
+
+    # Submit Phase 1 (baseline)
+    echo "Submitting Phase 1 (baseline) jobs..."
+    BASELINE_JOB_ID=$(sbatch --parsable "$BASELINE_SBATCH")
+    echo "  Baseline job array ID: $BASELINE_JOB_ID"
+
+    # Submit Phase 2 (cat) with dependency on Phase 1
+    echo "Submitting Phase 2 (cat) jobs with dependency on Phase 1..."
+    CAT_JOB_ID=$(sbatch --parsable --dependency=afterok:${BASELINE_JOB_ID} "$CAT_SBATCH")
+    echo "  Cat job array ID: $CAT_JOB_ID"
+
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  Jobs Submitted Successfully! (SEQUENTIAL MODE)"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo ""
+    echo "Phase 1 (baseline): Job $BASELINE_JOB_ID"
+    echo "  - $NUM_BASELINE_JOBS tasks (one per scene)"
+    echo "  - Creates warmup_checkpoint.pth in each scene's data directory"
+    echo ""
+    echo "Phase 2 (cat): Job $CAT_JOB_ID"
+    echo "  - $NUM_CAT_JOBS tasks (7 cat levels × $NUM_SCENES scenes)"
+    echo "  - Depends on Phase 1 completion"
+    echo "  - Uses warmup checkpoints from Phase 1"
+fi
+
 echo ""
 echo "Monitor jobs:"
 echo "  squeue -u \$USER"
