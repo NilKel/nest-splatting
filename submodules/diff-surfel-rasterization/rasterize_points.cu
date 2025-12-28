@@ -74,7 +74,8 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& offsets_diffuse,
 	const torch::Tensor& gridrange_diffuse,
 	const int render_mode,
-	const torch::Tensor& shape_dims)
+	const torch::Tensor& shape_dims,
+	const int max_intersections)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 	AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -221,9 +222,10 @@ RasterizeGaussiansCUDA(
 		features_diffuse.contiguous().data<float>(),
 		offsets_diffuse.contiguous().data<int>(),
 		gridrange_diffuse.contiguous().data<float>(),
-		render_mode);
+		render_mode,
+		(uint32_t)max_intersections);
   }
-  
+
   return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg);
 }
 

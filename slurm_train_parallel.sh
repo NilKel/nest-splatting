@@ -25,9 +25,13 @@ set -e
 
 # Default values
 DEFAULT_ITERATIONS=30000
-BASE_DATA_DIR="/home/nilkel/Projects/data/nest_synthetic"
-DTU_DATA_DIR="/home/nilkel/Projects/nest-splatting/data/dtu/2DGS_data/DTU"
-MIP360_DATA_DIR="/home/nilkel/Projects/data/mip360"
+BASE_DATA_DIR="/data/rg_data/aig/users/z0051beu/Projects/data/nest_synthetic"
+DTU_DATA_DIR="/data/rg_data/aig/users/z0051beu/Projects/data/dtu/2DGS_data/DTU"
+MIP360_DATA_DIR="/data/rg_data/aig/users/z0051beu/Projects/data/mip_360"
+
+# mip_360 scene classification (for correct resolution/config)
+MIP360_OUTDOOR_SCENES="bicycle,flowers,garden,stump,treehill"
+MIP360_INDOOR_SCENES="room,counter,kitchen,bonsai"
 
 # SLURM settings - adjust these as needed
 PARTITION="a100-4gpu-40gb"
@@ -81,10 +85,12 @@ case "$DATASET" in
         ;;
     mip_360)
         DATA_DIR="$MIP360_DATA_DIR"
-        YAML_CONFIG="./configs/360_outdoor.yaml"
+        # YAML_CONFIG is set per-scene (indoor vs outdoor) in the worker
+        YAML_CONFIG="PER_SCENE"
         ALL_SCENES="bicycle,bonsai,counter,garden,kitchen,room,stump"
         DATASET_PATH="mip_360"
-        RESOLUTION_ARG="-r 2"
+        # RESOLUTION_ARG is set per-scene (-i images_4 outdoor, -i images_2 indoor) in the worker
+        RESOLUTION_ARG="PER_SCENE"
         ;;
     *)
         echo "ERROR: Unknown dataset '$DATASET'"
@@ -168,6 +174,46 @@ cat > "$WORKER_SCRIPT" << 'WORKER_EOF'
 
 set -e
 
+# Retry settings
+MAX_RETRIES=${MAX_RETRIES:-3}
+RETRY_DELAY=30  # seconds between retries
+
+# mip_360 scene classification
+MIP360_OUTDOOR_SCENES="bicycle flowers garden stump treehill"
+MIP360_INDOOR_SCENES="room counter kitchen bonsai"
+
+#=============================================================================
+# GPU Validation Function
+#=============================================================================
+validate_gpu() {
+    echo "[GPU Check] Validating CUDA availability..."
+    python -c "
+import torch
+import sys
+
+if not torch.cuda.is_available():
+    print('[GPU Check] FATAL: No CUDA device available')
+    sys.exit(1)
+
+try:
+    # Test basic CUDA operations
+    device = torch.device('cuda')
+    x = torch.randn(100, 100, device=device)
+    y = x @ x.T
+    torch.cuda.synchronize()
+
+    # Try importing tinycudann (common failure point)
+    import tinycudann as tcnn
+
+    print(f'[GPU Check] OK - {torch.cuda.get_device_name(0)}')
+    print(f'[GPU Check] CUDA {torch.version.cuda}, Compute Capability {torch.cuda.get_device_capability(0)}')
+except Exception as e:
+    print(f'[GPU Check] FATAL: GPU test failed - {e}')
+    sys.exit(1)
+"
+    return $?
+}
+
 # Read the job specification from the config file
 JOB_LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$JOB_CONFIG_FILE")
 if [ -z "$JOB_LINE" ]; then
@@ -178,6 +224,22 @@ fi
 # Parse job line: scene method experiment_name [extra_method_args]
 read -r SCENE METHOD EXPERIMENT_NAME METHOD_ARGS <<< "$JOB_LINE"
 
+# Handle per-scene config for mip_360
+SCENE_YAML_CONFIG="$YAML_CONFIG"
+SCENE_RESOLUTION_ARG="$RESOLUTION_ARG"
+
+if [ "$DATASET_PATH" = "mip_360" ]; then
+    # Check if scene is indoor or outdoor
+    if echo "$MIP360_INDOOR_SCENES" | grep -qw "$SCENE"; then
+        SCENE_YAML_CONFIG="./configs/360_indoor.yaml"
+        SCENE_RESOLUTION_ARG="-i images_2"
+    else
+        # Default to outdoor for any scene in outdoor list or unknown
+        SCENE_YAML_CONFIG="./configs/360_outdoor.yaml"
+        SCENE_RESOLUTION_ARG="-i images_4"
+    fi
+fi
+
 echo "════════════════════════════════════════════════════════════════════"
 echo "  SLURM Job: Task $SLURM_ARRAY_TASK_ID"
 echo "════════════════════════════════════════════════════════════════════"
@@ -185,6 +247,8 @@ echo "Scene:       $SCENE"
 echo "Method:      $METHOD"
 echo "Experiment:  $EXPERIMENT_NAME"
 echo "Method args: $METHOD_ARGS"
+echo "YAML config: $SCENE_YAML_CONFIG"
+echo "Resolution:  $SCENE_RESOLUTION_ARG"
 echo "Host:        $(hostname)"
 echo "GPU:         $CUDA_VISIBLE_DEVICES"
 echo "Started:     $(date)"
@@ -218,28 +282,71 @@ if [ -f "$TEST_METRICS" ]; then
     exit 0
 fi
 
-# Run training
-CMD="python train.py -s $SCENE_PATH -m $EXPERIMENT_NAME --yaml $YAML_CONFIG --eval --iterations $ITERATIONS $RESOLUTION_ARG --method $METHOD $METHOD_ARGS $EXTRA_ARGS"
+# Assign unique port per task to avoid conflicts when multiple jobs run on same node
+PORT=$((6009 + SLURM_ARRAY_TASK_ID))
+
+# Run training with retry logic
+CMD="python train.py -s $SCENE_PATH -m $EXPERIMENT_NAME --yaml $SCENE_YAML_CONFIG --eval --iterations $ITERATIONS $SCENE_RESOLUTION_ARG --method $METHOD --port $PORT $METHOD_ARGS $EXTRA_ARGS"
 
 echo ""
 echo "Command: $CMD"
 echo ""
 
-$CMD
+# Retry loop
+ATTEMPT=1
+while [ $ATTEMPT -le $MAX_RETRIES ]; do
+    echo ""
+    echo "[Attempt $ATTEMPT/$MAX_RETRIES] Starting at $(date)"
+    echo ""
 
-EXIT_CODE=$?
+    # Validate GPU before each attempt
+    if ! validate_gpu; then
+        echo ""
+        echo "[Attempt $ATTEMPT/$MAX_RETRIES] GPU validation failed!"
+        if [ $ATTEMPT -lt $MAX_RETRIES ]; then
+            echo "Waiting ${RETRY_DELAY}s before retry..."
+            sleep $RETRY_DELAY
+            ATTEMPT=$((ATTEMPT + 1))
+            continue
+        else
+            echo "Max retries reached. Giving up."
+            exit 1
+        fi
+    fi
+
+    # Run the training command
+    set +e  # Don't exit on error
+    $CMD
+    EXIT_CODE=$?
+    set -e
+
+    if [ $EXIT_CODE -eq 0 ]; then
+        echo ""
+        echo "════════════════════════════════════════════════════════════════════"
+        echo "  ✓ SUCCESS (attempt $ATTEMPT/$MAX_RETRIES)"
+        echo "════════════════════════════════════════════════════════════════════"
+        echo "Finished: $(date)"
+        exit 0
+    fi
+
+    echo ""
+    echo "[Attempt $ATTEMPT/$MAX_RETRIES] FAILED with exit code $EXIT_CODE"
+
+    if [ $ATTEMPT -lt $MAX_RETRIES ]; then
+        echo "Waiting ${RETRY_DELAY}s before retry..."
+        sleep $RETRY_DELAY
+    fi
+
+    ATTEMPT=$((ATTEMPT + 1))
+done
 
 echo ""
 echo "════════════════════════════════════════════════════════════════════"
-if [ $EXIT_CODE -eq 0 ]; then
-    echo "  ✓ SUCCESS"
-else
-    echo "  ✗ FAILED (exit code: $EXIT_CODE)"
-fi
+echo "  ✗ FAILED after $MAX_RETRIES attempts"
 echo "════════════════════════════════════════════════════════════════════"
 echo "Finished: $(date)"
 
-exit $EXIT_CODE
+exit 1
 WORKER_EOF
 
 chmod +x "$WORKER_SCRIPT"
@@ -259,10 +366,10 @@ cat > "$BASELINE_SBATCH" << EOF
 #SBATCH --output=$JOB_DIR/logs/baseline_%a.out
 #SBATCH --error=$JOB_DIR/logs/baseline_%a.err
 #SBATCH --time=$TIME_LIMIT
-#SBATCH --array=1-${NUM_BASELINE_JOBS}
+#SBATCH --array=1-${NUM_BASELINE_JOBS}%${NUM_BASELINE_JOBS}
 
 # Setup environment
-source ~/miniconda3/etc/profile.d/conda.sh
+source ~/userdir/miniconda3/etc/profile.d/conda.sh
 conda activate nest_splatting
 
 # Export environment variables for worker
@@ -275,7 +382,7 @@ export ITERATIONS="$ITERATIONS"
 export EXTRA_ARGS="$EXTRA_ARGS"
 
 # Change to project directory
-cd /home/nilkel/Projects/nest-splatting
+cd /data/rg_data/aig/users/z0051beu/Projects/nest-splatting
 
 # Run worker
 $WORKER_SCRIPT
@@ -292,10 +399,10 @@ cat > "$CAT_SBATCH" << EOF
 #SBATCH --output=$JOB_DIR/logs/cat_%a.out
 #SBATCH --error=$JOB_DIR/logs/cat_%a.err
 #SBATCH --time=$TIME_LIMIT
-#SBATCH --array=1-${NUM_CAT_JOBS}
+#SBATCH --array=1-${NUM_CAT_JOBS}%${NUM_CAT_JOBS}
 
 # Setup environment
-source ~/miniconda3/etc/profile.d/conda.sh
+source ~/userdir/miniconda3/etc/profile.d/conda.sh
 conda activate nest_splatting
 
 # Export environment variables for worker
@@ -308,7 +415,7 @@ export ITERATIONS="$ITERATIONS"
 export EXTRA_ARGS="$EXTRA_ARGS"
 
 # Change to project directory
-cd /home/nilkel/Projects/nest-splatting
+cd /data/rg_data/aig/users/z0051beu/Projects/nest-splatting
 
 # Run worker
 $WORKER_SCRIPT

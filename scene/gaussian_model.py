@@ -73,7 +73,17 @@ class GaussianModel:
         self._adaptive_num_levels = 0
         self.temperature = 1.0
         self.min_temperature = 0.01
-        
+
+        # Adaptive_zero mode weight (per-Gaussian, controls hash vs zeros for fine levels)
+        self._adaptive_zero_weight = torch.empty(0)  # (N, 1) learnable weight
+
+        # Adaptive_gate mode: gate logits for binary hash selection
+        # Gumbel-STE always binary: sigmoid(logit) > 0.5 → use hash, else zeros
+        self._gate_logits = torch.empty(0)  # (N, 1) gate logits
+
+        # Relocation mode for adaptive weights: 'clone' (copy from source) or 'reset' (initialize to 0)
+        self._relocation_mode = "clone"
+
         # Diffuse mode flag (uses SH degree 0, no hashgrid)
         self._diffuse_mode = False
         # Specular mode flag (full 2DGS with SH, no hashgrid)
@@ -421,7 +431,15 @@ class GaussianModel:
         # Add adaptive_cat blend weight (if present)
         if hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0:
             l.append({'params': [self._adaptive_cat_weight], 'lr': training_args.opacity_lr, "name": "adaptive_cat_weight"})
-        
+
+        # Add adaptive_zero weight (if present)
+        if hasattr(self, '_adaptive_zero_weight') and self._adaptive_zero_weight.numel() > 0:
+            l.append({'params': [self._adaptive_zero_weight], 'lr': training_args.opacity_lr, "name": "adaptive_zero_weight"})
+
+        # Add adaptive_gate parameter (if present)
+        if hasattr(self, '_gate_logits') and self._gate_logits.numel() > 0:
+            l.append({'params': [self._gate_logits], 'lr': training_args.opacity_lr, "name": "gate_logits"})
+
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale*xyz_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale*xyz_lr_scale,
@@ -614,6 +632,10 @@ class GaussianModel:
             self._adaptive_features = optimizable_tensors["adaptive_features"]
         if "adaptive_cat_weight" in optimizable_tensors:
             self._adaptive_cat_weight = optimizable_tensors["adaptive_cat_weight"]
+        if "adaptive_zero_weight" in optimizable_tensors:
+            self._adaptive_zero_weight = optimizable_tensors["adaptive_zero_weight"]
+        if "gate_logits" in optimizable_tensors:
+            self._gate_logits = optimizable_tensors["gate_logits"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.feat_gradient_accum = self.feat_gradient_accum[valid_points_mask]
@@ -650,28 +672,36 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None, new_adaptive_zero_weight=None, new_gate_logits=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
-        "rotation" : new_rotation, 
+        "rotation" : new_rotation,
         "ap_level" : new_ap_level}
-        
+
         # Add gaussian_features if present (cat mode)
         if new_gaussian_features is not None and self._gaussian_feat_dim > 0:
             d["gaussian_features"] = new_gaussian_features
-        
+
         # Add adaptive mode parameters
         if new_gamma is not None and self._adaptive_feat_dim > 0:
             d["gamma"] = new_gamma
         if new_adaptive_features is not None and self._adaptive_feat_dim > 0:
             d["adaptive_features"] = new_adaptive_features
-        
+
         # Add adaptive_cat blend weight
         if new_adaptive_cat_weight is not None and hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0:
             d["adaptive_cat_weight"] = new_adaptive_cat_weight
+
+        # Add adaptive_zero blend weight
+        if new_adaptive_zero_weight is not None and hasattr(self, '_adaptive_zero_weight') and self._adaptive_zero_weight.numel() > 0:
+            d["adaptive_zero_weight"] = new_adaptive_zero_weight
+
+        # Add adaptive_gate parameter
+        if new_gate_logits is not None and hasattr(self, '_gate_logits') and self._gate_logits.numel() > 0:
+            d["gate_logits"] = new_gate_logits
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -689,6 +719,10 @@ class GaussianModel:
             self._adaptive_features = optimizable_tensors["adaptive_features"]
         if "adaptive_cat_weight" in optimizable_tensors:
             self._adaptive_cat_weight = optimizable_tensors["adaptive_cat_weight"]
+        if "adaptive_zero_weight" in optimizable_tensors:
+            self._adaptive_zero_weight = optimizable_tensors["adaptive_zero_weight"]
+        if "gate_logits" in optimizable_tensors:
+            self._gate_logits = optimizable_tensors["gate_logits"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.feat_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -733,9 +767,31 @@ class GaussianModel:
         # Handle adaptive_cat blend weight
         new_adaptive_cat_weight = None
         if hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0:
-            new_adaptive_cat_weight = self._adaptive_cat_weight[selected_pts_mask].repeat(N,1)
-        
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight)
+            if self._relocation_mode == "reset":
+                num_new = selected_pts_mask.sum().item() * N
+                new_adaptive_cat_weight = torch.zeros((num_new, 1), device="cuda")
+            else:  # clone
+                new_adaptive_cat_weight = self._adaptive_cat_weight[selected_pts_mask].repeat(N, 1)
+
+        # Handle adaptive_zero blend weight
+        new_adaptive_zero_weight = None
+        if hasattr(self, '_adaptive_zero_weight') and self._adaptive_zero_weight.numel() > 0:
+            if self._relocation_mode == "reset":
+                num_new = selected_pts_mask.sum().item() * N
+                new_adaptive_zero_weight = torch.zeros((num_new, 1), device="cuda")
+            else:  # clone
+                new_adaptive_zero_weight = self._adaptive_zero_weight[selected_pts_mask].repeat(N, 1)
+
+        # Handle adaptive_gate parameter
+        new_gate_logits = None
+        if hasattr(self, '_gate_logits') and self._gate_logits.numel() > 0:
+            if self._relocation_mode == "reset":
+                num_new = selected_pts_mask.sum().item() * N
+                new_gate_logits = torch.zeros((num_new, 1), device="cuda")
+            else:  # clone
+                new_gate_logits = self._gate_logits[selected_pts_mask].repeat(N, 1)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -770,9 +826,31 @@ class GaussianModel:
         # Handle adaptive_cat blend weight
         new_adaptive_cat_weight = None
         if hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0:
-            new_adaptive_cat_weight = self._adaptive_cat_weight[selected_pts_mask]
-        
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight)
+            if self._relocation_mode == "reset":
+                num_new = selected_pts_mask.sum().item()
+                new_adaptive_cat_weight = torch.zeros((num_new, 1), device="cuda")
+            else:  # clone
+                new_adaptive_cat_weight = self._adaptive_cat_weight[selected_pts_mask]
+
+        # Handle adaptive_zero blend weight
+        new_adaptive_zero_weight = None
+        if hasattr(self, '_adaptive_zero_weight') and self._adaptive_zero_weight.numel() > 0:
+            if self._relocation_mode == "reset":
+                num_new = selected_pts_mask.sum().item()
+                new_adaptive_zero_weight = torch.zeros((num_new, 1), device="cuda")
+            else:  # clone
+                new_adaptive_zero_weight = self._adaptive_zero_weight[selected_pts_mask]
+
+        # Handle adaptive_gate parameter
+        new_gate_logits = None
+        if hasattr(self, '_gate_logits') and self._gate_logits.numel() > 0:
+            if self._relocation_mode == "reset":
+                num_new = selected_pts_mask.sum().item()
+                new_gate_logits = torch.zeros((num_new, 1), device="cuda")
+            else:  # clone
+                new_gate_logits = self._gate_logits[selected_pts_mask]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, ap_update, act_level, densify_tag = True, prune_tag = True):
         
@@ -862,8 +940,27 @@ class GaussianModel:
         # Handle adaptive_cat blend weight
         adaptive_cat_weight = None
         if hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0:
-            adaptive_cat_weight = self._adaptive_cat_weight[idxs]
-        
+            if self._relocation_mode == "reset":
+                adaptive_cat_weight = torch.zeros((len(idxs), 1), device="cuda")
+            else:  # clone
+                adaptive_cat_weight = self._adaptive_cat_weight[idxs]
+
+        # Handle adaptive_zero weight
+        adaptive_zero_weight = None
+        if hasattr(self, '_adaptive_zero_weight') and self._adaptive_zero_weight.numel() > 0:
+            if self._relocation_mode == "reset":
+                adaptive_zero_weight = torch.zeros((len(idxs), 1), device="cuda")
+            else:  # clone
+                adaptive_zero_weight = self._adaptive_zero_weight[idxs]
+
+        # Handle adaptive_gate parameter
+        gate_logits = None
+        if hasattr(self, '_gate_logits') and self._gate_logits.numel() > 0:
+            if self._relocation_mode == "reset":
+                gate_logits = torch.zeros((len(idxs), 1), device="cuda")
+            else:  # clone
+                gate_logits = self._gate_logits[idxs]
+
         return (
             self._xyz[idxs],
             self._features_dc[idxs],
@@ -875,7 +972,9 @@ class GaussianModel:
             gaussian_features,
             gamma,
             adaptive_features,
-            adaptive_cat_weight
+            adaptive_cat_weight,
+            adaptive_zero_weight,
+            gate_logits
         )
 
     def _mcmc_sample_alives(self, probs, num, alive_indices=None):
@@ -940,9 +1039,11 @@ class GaussianModel:
             new_gaussian_features,
             new_gamma,
             new_adaptive_features,
-            new_adaptive_cat_weight
+            new_adaptive_cat_weight,
+            new_adaptive_zero_weight,
+            new_gate_logits
         ) = self._mcmc_update_params(reinit_idx, ratio=ratio)
-        
+
         # Reset optimizer state for sampled indices FIRST (before updating)
         # This is critical - we zero out momentum for source Gaussians that are giving away mass
         self._reset_optimizer_state_for_indices(reinit_idx.unique())
@@ -971,6 +1072,12 @@ class GaussianModel:
 
         if hasattr(self, '_adaptive_cat_weight') and self._adaptive_cat_weight.numel() > 0 and new_adaptive_cat_weight is not None:
             self._adaptive_cat_weight.data[dead_indices] = new_adaptive_cat_weight
+
+        if hasattr(self, '_adaptive_zero_weight') and self._adaptive_zero_weight.numel() > 0 and new_adaptive_zero_weight is not None:
+            self._adaptive_zero_weight.data[dead_indices] = new_adaptive_zero_weight
+
+        if hasattr(self, '_gate_logits') and self._gate_logits.numel() > 0 and new_gate_logits is not None:
+            self._gate_logits.data[dead_indices] = new_gate_logits
 
         # Reset optimizer state for dead indices (they got completely new values)
         self._reset_optimizer_state_for_indices(dead_indices)
@@ -1012,18 +1119,21 @@ class GaussianModel:
             new_gaussian_features,
             new_gamma,
             new_adaptive_features,
-            new_adaptive_cat_weight
+            new_adaptive_cat_weight,
+            new_adaptive_zero_weight,
+            new_gate_logits
         ) = self._mcmc_update_params(add_idx, ratio=ratio)
-        
+
         # Update source Gaussians (they gave away some of their "mass")
         self._opacity.data[add_idx] = new_opacity
         self._scaling.data[add_idx] = new_scaling
-        
+
         # Add new Gaussians using existing densification_postfix
         self.densification_postfix(
-            new_xyz, new_features_dc, new_features_rest, new_opacity, 
-            new_scaling, new_rotation, new_ap_level, 
-            new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight
+            new_xyz, new_features_dc, new_features_rest, new_opacity,
+            new_scaling, new_rotation, new_ap_level,
+            new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight,
+            new_adaptive_zero_weight, new_gate_logits
         )
         
         # Reset optimizer state for modified source indices

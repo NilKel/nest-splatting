@@ -1,0 +1,7 @@
+bicycle baseline mcop001sc001ns1e3bc_baseline
+bonsai baseline mcop001sc001ns1e3bc_baseline
+counter baseline mcop001sc001ns1e3bc_baseline
+garden baseline mcop001sc001ns1e3bc_baseline
+kitchen baseline mcop001sc001ns1e3bc_baseline
+room baseline mcop001sc001ns1e3bc_baseline
+stump baseline mcop001sc001ns1e3bc_baseline

@@ -66,9 +66,15 @@ class INGP(nn.Module):
         # Store args for adaptive_cat mode configuration (cat with learnable binary blend weights)
         self.is_adaptive_cat_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive_cat"
         self.adaptive_cat_inference = args is not None and hasattr(args, 'adaptive_cat_inference') and args.adaptive_cat_inference
+        # Store args for adaptive_zero mode configuration (cat + weighted hash vs zeros)
+        self.is_adaptive_zero_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive_zero"
+        self.adaptive_zero_inference = args is not None and hasattr(args, 'adaptive_zero_inference') and args.adaptive_zero_inference
+        # Store args for adaptive_gate mode configuration (VQ-AD style gating: soft -> STE -> hard)
+        self.is_adaptive_gate_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive_gate"
+        self.adaptive_gate_inference = args is not None and hasattr(args, 'adaptive_gate_inference') and args.adaptive_gate_inference
 
-        # hybrid_levels is used by both cat and adaptive_cat modes
-        self.hybrid_levels = args.hybrid_levels if (self.is_cat_mode or self.is_adaptive_cat_mode) and hasattr(args, 'hybrid_levels') else 0
+        # hybrid_levels is used by cat, adaptive_cat, adaptive_zero, and adaptive_gate modes
+        self.hybrid_levels = args.hybrid_levels if (self.is_cat_mode or self.is_adaptive_cat_mode or self.is_adaptive_zero_mode or self.is_adaptive_gate_mode) and hasattr(args, 'hybrid_levels') else 0
 
         # Determine method - baseline uses C2F, all other methods disable it
         self.method = args.method if args is not None and hasattr(args, 'method') else "baseline"
@@ -338,6 +344,101 @@ class INGP(nn.Module):
             # Set active levels (all hashgrid levels active, no C2F for adaptive_cat)
             self.active_hashgrid_levels = self.hashgrid_levels
 
+        # adaptive_zero mode: same hashgrid structure as cat/adaptive_cat
+        # Uses per-Gaussian features for coarse levels, hashgrid for fine levels
+        # Weight controls whether to query hash (1) or use zeros (0)
+        elif self.is_adaptive_zero_mode:
+            # Use finest (total - hybrid) levels for hashgrid, just like cat mode
+            self.hashgrid_levels = num_levels_total - self.hybrid_levels
+            self.hashgrid_disabled = False
+
+            # Extract the finest hashgrid_levels resolutions
+            hashgrid_resolutions = all_resolutions[-self.hashgrid_levels:]
+            base_resolution = hashgrid_resolutions[0]
+            finest_resolution = hashgrid_resolutions[-1]
+
+            # Calculate growth rate for the hashgrid
+            if self.hashgrid_levels > 1:
+                hash_growth_rate = np.exp((np.log(finest_resolution) - np.log(base_resolution)) / (self.hashgrid_levels - 1))
+            else:
+                hash_growth_rate = 1.0
+
+            config = SimpleNamespace(
+                device="cuda",
+                otype="HashGrid",
+                n_levels=self.hashgrid_levels,
+                n_features_per_level=cfg_encoding.hashgrid.dim,
+                log2_hashmap_size=cfg_encoding.hashgrid.dict_size,
+                base_resolution=base_resolution,
+                finest_resolution=finest_resolution,
+                init_mode='uniform',
+                per_level_scale=hash_growth_rate,
+                range=self.voxel_range,
+            )
+
+            print('[ADAPTIVE_ZERO MODE] Multi-level hashgrid configuration:')
+            print(f'  Total levels: {num_levels_total}')
+            print(f'  Hybrid (per-Gaussian) levels: {self.hybrid_levels}')
+            print(f'  Hashgrid levels: {self.hashgrid_levels}')
+            print(f'  Resolutions: {base_resolution} -> {finest_resolution}')
+            print(f'  Features per level: {cfg_encoding.hashgrid.dim}D')
+            print(f'  Hashgrid size: 2^{cfg_encoding.hashgrid.dict_size}')
+            print(f'  Per-Gaussian features: {self.hybrid_levels}×{cfg_encoding.hashgrid.dim} = {self.hybrid_levels * cfg_encoding.hashgrid.dim}D')
+            print(f'  Weight: 0 = zeros (no hash query), 1 = query hash')
+
+            self.hash_encoding = register_GridEncoder(config)
+            self.resolutions = hashgrid_resolutions
+
+            # Set active levels (all hashgrid levels active, no C2F for adaptive_zero)
+            self.active_hashgrid_levels = self.hashgrid_levels
+
+        # adaptive_gate mode: VQ-AD style gating with three-phase training
+        # Same hashgrid structure as adaptive_zero, but different gating logic in Python
+        elif self.is_adaptive_gate_mode:
+            # Use finest (total - hybrid) levels for hashgrid, just like cat mode
+            self.hashgrid_levels = num_levels_total - self.hybrid_levels
+            self.hashgrid_disabled = False
+
+            # Extract the finest hashgrid_levels resolutions
+            hashgrid_resolutions = all_resolutions[-self.hashgrid_levels:]
+            base_resolution = hashgrid_resolutions[0]
+            finest_resolution = hashgrid_resolutions[-1]
+
+            # Calculate growth rate for the hashgrid
+            if self.hashgrid_levels > 1:
+                hash_growth_rate = np.exp((np.log(finest_resolution) - np.log(base_resolution)) / (self.hashgrid_levels - 1))
+            else:
+                hash_growth_rate = 1.0
+
+            config = SimpleNamespace(
+                device="cuda",
+                otype="HashGrid",
+                n_levels=self.hashgrid_levels,
+                n_features_per_level=cfg_encoding.hashgrid.dim,
+                log2_hashmap_size=cfg_encoding.hashgrid.dict_size,
+                base_resolution=base_resolution,
+                finest_resolution=finest_resolution,
+                init_mode='uniform',
+                per_level_scale=hash_growth_rate,
+                range=self.voxel_range,
+            )
+
+            print('[ADAPTIVE_GATE MODE] VQ-AD style gating configuration:')
+            print(f'  Total levels: {num_levels_total}')
+            print(f'  Hybrid (per-Gaussian) levels: {self.hybrid_levels}')
+            print(f'  Hashgrid levels: {self.hashgrid_levels}')
+            print(f'  Resolutions: {base_resolution} -> {finest_resolution}')
+            print(f'  Features per level: {cfg_encoding.hashgrid.dim}D')
+            print(f'  Hashgrid size: 2^{cfg_encoding.hashgrid.dict_size}')
+            print(f'  Per-Gaussian features: {self.hybrid_levels}×{cfg_encoding.hashgrid.dim} = {self.hybrid_levels * cfg_encoding.hashgrid.dim}D')
+            print(f'  Three-phase gating: soft -> STE -> hard')
+
+            self.hash_encoding = register_GridEncoder(config)
+            self.resolutions = hashgrid_resolutions
+
+            # Set active levels (all hashgrid levels active, no C2F for adaptive_gate)
+            self.active_hashgrid_levels = self.hashgrid_levels
+
         # For residual_hybrid mode: hashgrid uses only finest (total - hybrid) levels
         # Similar to cat mode but outputs both SH RGB and hash features
         elif self.is_residual_hybrid_mode and hasattr(self.args, 'hybrid_levels') and self.args.hybrid_levels > 0:
@@ -517,6 +618,16 @@ class INGP(nn.Module):
             # Skip C2F annealing - all levels active from start
         elif self.is_adaptive_cat_mode:
             # Adaptive_cat mode: All hashgrid levels active (no C2F)
+            self.active_levels = self.levels  # Total levels (for MLP input size)
+            self.active_hashgrid_levels = self.hashgrid_levels  # All hashgrid levels active
+            self.optim_gaussian = True  # Train Gaussians throughout
+        elif self.is_adaptive_zero_mode:
+            # Adaptive_zero mode: All hashgrid levels active (no C2F)
+            self.active_levels = self.levels  # Total levels (for MLP input size)
+            self.active_hashgrid_levels = self.hashgrid_levels  # All hashgrid levels active
+            self.optim_gaussian = True  # Train Gaussians throughout
+        elif self.is_adaptive_gate_mode:
+            # Adaptive_gate mode: VQ-AD gating, all hashgrid levels active (no C2F)
             self.active_levels = self.levels  # Total levels (for MLP input size)
             self.active_hashgrid_levels = self.hashgrid_levels  # All hashgrid levels active
             self.optim_gaussian = True  # Train Gaussians throughout

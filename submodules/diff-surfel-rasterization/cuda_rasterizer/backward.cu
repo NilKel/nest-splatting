@@ -584,9 +584,14 @@ renderCUDAsurfelBackward(
 			// adaptive_add mode: level = (total_levels << 16) | (active_hashgrid_levels << 8)
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			actual_levels = active_hashgrid_levels;
-		} else if((render_mode & 0xFF) == 12){
-			// adaptive_cat mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+		} else if((render_mode & 0xFF) == 12 || (render_mode & 0xFF) == 13){
+			// adaptive_cat mode (12) and adaptive_cat_fast mode (13):
+			// level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 			// Note: render_mode may have inference flag in upper bits, so mask to get base mode
+			int active_hashgrid_levels = (level >> 8) & 0xFF;
+			actual_levels = active_hashgrid_levels;
+		} else if((render_mode & 0xFF) == 14){
+			// adaptive_zero mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			actual_levels = active_hashgrid_levels;
 		} else if(render_mode == 8 || render_mode == 9 || render_mode == 10){
@@ -817,7 +822,8 @@ renderCUDAsurfelBackward(
 
 			// hashgrid feature interpolation
 			// in BW, query_feature will update dL_dfeatures & dL_dxyz
-			switch (render_mode){
+			// Note: render_mode may have flags in upper bits (e.g., inference flag), so mask to get base mode
+			switch (render_mode & 0xFF){
 				case 0:
 					// Baseline mode: use l_dim directly (includes surface_blend with 12D features)
 					if(l_dim == 2) {
@@ -1454,6 +1460,95 @@ renderCUDAsurfelBackward(
 
 			// Write weight gradient
 			atomicAdd(&dL_dcolors[gauss_id * (total_dim + 1) + total_dim], dL_dweight);
+
+			break;
+		}
+		case 14: {
+			/* adaptive_zero mode backward:
+			 * Forward: coarse = gauss (no weight), fine = weight * hash
+			 * Gradients:
+			 *   d_gauss_coarse = grad_coarse (no weight scaling)
+			 *   d_hash = weight * grad_fine
+			 *   d_weight = sum(hash * grad_fine)
+			 */
+
+			const int total_levels = (level >> 16) & 0xFF;
+			const int hashgrid_levels = (level >> 8) & 0xFF;
+			const int hybrid_levels = level & 0xFF;
+			const int per_level_dim = l_dim;
+			const int per_gaussian_dim = hybrid_levels * per_level_dim;
+
+			// Validate decoded values
+			if (total_levels == 0 || total_levels > 32 || hashgrid_levels > 32 || hybrid_levels > 32) {
+				if (debug) {
+					printf("BW Error: adaptive_zero invalid level values. level=%d, total=%d, hash=%d, hybrid=%d\n",
+					       level, total_levels, hashgrid_levels, hybrid_levels);
+				}
+				break;
+			}
+
+			int gauss_id = collected_id[j];
+			// Layout: [coarse_features (per_gaussian_dim) | weight (1)]
+			const float weight = colors[gauss_id * (per_gaussian_dim + 1) + per_gaussian_dim];
+
+			// Coarse levels: dL/dgauss = dL/dfeat (NO weight scaling, unlike adaptive_cat)
+			for(int i = 0; i < per_gaussian_dim; i++) {
+				atomicAdd(&dL_dcolors[gauss_id * (per_gaussian_dim + 1) + i], grad_feat[i]);
+			}
+
+			// Fine levels: gradient for weight and hashgrid
+			float dL_dweight = 0.0f;
+			if (hashgrid_levels > 0 && weight > 1e-6f) {
+				// Re-query hashgrid for gradient computation
+				float hash_feat[16 * 4];
+
+				if(l_dim == 2) {
+					query_feature<false, 16*4, 2>(hash_feat, xyz, voxel_min, voxel_max,
+					                               collec_offsets, appearance_level, hash_features,
+					                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				} else if(l_dim == 4) {
+					query_feature<false, 16*4, 4>(hash_feat, xyz, voxel_min, voxel_max,
+					                               collec_offsets, appearance_level, hash_features,
+					                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				} else if(l_dim == 8) {
+					query_feature<false, 16*4, 8>(hash_feat, xyz, voxel_min, voxel_max,
+					                               collec_offsets, appearance_level, hash_features,
+					                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+				}
+
+				// Gradient for weight: dL/dw = sum(hash * dL/dfeat_fine)
+				for(int i = 0; i < hashgrid_levels * per_level_dim; i++) {
+					dL_dweight += hash_feat[i] * grad_feat[per_gaussian_dim + i];
+				}
+
+				// Gradient for hashgrid: dL/dhash = weight * dL/dfeat_fine
+				float grad_hash[16 * 4];
+				for(int i = 0; i < hashgrid_levels * per_level_dim; i++) {
+					grad_hash[i] = weight * grad_feat[per_gaussian_dim + i];
+				}
+
+				// Backprop through hashgrid
+				float hash_feat_dummy[16 * 4];
+				if(l_dim == 2) {
+					query_feature<true, 16*4, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max,
+					                              collec_offsets, appearance_level, hash_features,
+					                              hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+					                              grad_hash, dL_dfeatures, dL_dxyz);
+				} else if(l_dim == 4) {
+					query_feature<true, 16*4, 4>(hash_feat_dummy, xyz, voxel_min, voxel_max,
+					                              collec_offsets, appearance_level, hash_features,
+					                              hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+					                              grad_hash, dL_dfeatures, dL_dxyz);
+				} else if(l_dim == 8) {
+					query_feature<true, 16*4, 8>(hash_feat_dummy, xyz, voxel_min, voxel_max,
+					                              collec_offsets, appearance_level, hash_features,
+					                              hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+					                              grad_hash, dL_dfeatures, dL_dxyz);
+				}
+			}
+
+			// Write weight gradient
+			atomicAdd(&dL_dcolors[gauss_id * (per_gaussian_dim + 1) + per_gaussian_dim], dL_dweight);
 
 			break;
 		}

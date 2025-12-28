@@ -129,7 +129,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             offsets_diffuse,
             gridrange_diffuse,
             render_mode,
-            hashgrid_settings.shape_dims
+            hashgrid_settings.shape_dims,
+            raster_settings.max_intersections
         )
 
         # Invoke C++/CUDA rasterizer
@@ -257,7 +258,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
-    image_width: int 
+    image_width: int
     tanfovx : float
     tanfovy : float
     bg : torch.Tensor
@@ -271,6 +272,7 @@ class GaussianRasterizationSettings(NamedTuple):
     beta : float
     if_contract : bool
     record_transmittance : bool
+    max_intersections : int = 0  # 0 means no limit
 
 class HashGridSettings(NamedTuple):
     L: int

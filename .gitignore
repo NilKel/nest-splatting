@@ -36,6 +36,7 @@ docker-compose.override.yml
 # -----------------------------
 output/
 outputs/
+metrics_reports/
 checkpoints/
 logs/
 tmp/

@@ -292,7 +292,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* hash_features_diffuse,
 	const int* level_offsets_diffuse,
 	const float* gridrange_diffuse,
-	const int render_mode)
+	const int render_mode,
+	const uint32_t max_intersections)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -428,7 +429,8 @@ int CudaRasterizer::Rasterizer::forward(
 		hash_features_diffuse,
 		level_offsets_diffuse,
 		gridrange_diffuse,
-		render_mode), debug)
+		render_mode,
+		max_intersections), debug)
 
 	return num_rendered;
 }

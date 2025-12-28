@@ -69,7 +69,8 @@ namespace CudaRasterizer
 			const float* hash_features_diffuse = nullptr,
 			const int* level_offsets_diffuse = nullptr,
 			const float* gridrange_diffuse = nullptr,
-			const int render_mode = 0);
+			const int render_mode = 0,
+			const uint32_t max_intersections = 0);
 
 		static void backward(
 			const int P, int D, int M, int R,

@@ -21,14 +21,18 @@ import time
 from utils.general_utils import MEM_PRINT
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
-    beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False, decompose_mode = None):
+    beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False, decompose_mode = None, max_intersections = 0,
+    skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2):
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
-    
+
     decompose_mode: None (normal), 'gaussian_only' (zero hashgrid features), 'ngp_only' (zero per-Gaussian features)
                    Only used in cat mode for visualization/debugging.
+    max_intersections: Max ray-Gaussian intersections per pixel. 0 means no limit.
+    skip_mlp: If True, skip MLP decode and return zeros for RGB (for benchmarking).
+    force_no_hash_cuda: If True, disable hash_in_CUDA (use plain 2DGS rasterizer, no hash query).
     """
 
     render_start_time = time.time()
@@ -98,6 +102,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # Diffuse_ngp/diffuse_offset: also don't use hash_in_CUDA (we query hashgrid in Python on unprojected depth)
         if is_diffuse_mode or is_specular_mode or is_diffuse_ngp_mode or is_diffuse_offset_mode:
             hash_in_CUDA = False
+        # Force disable for benchmarking
+        if force_no_hash_cuda:
+            hash_in_CUDA = False
     except:
         pass
     
@@ -138,7 +145,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Adaptive_cat mode detection (need to check early for hybrid_levels)
     is_adaptive_cat_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_cat_mode') and ingp.is_adaptive_cat_mode
 
-    hybrid_levels = ingp.hybrid_levels if (is_cat_mode or is_adaptive_cat_mode) else 0
+    # Adaptive_zero mode detection (cat-like features + weighted hash, zeros when weight=0)
+    is_adaptive_zero_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_zero_mode') and ingp.is_adaptive_zero_mode
+
+    # Adaptive_gate mode detection (VQ-AD style gating: soft→STE→hard)
+    is_adaptive_gate_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_gate_mode') and ingp.is_adaptive_gate_mode
+
+    hybrid_levels = ingp.hybrid_levels if (is_cat_mode or is_adaptive_cat_mode or is_adaptive_zero_mode or is_adaptive_gate_mode) else 0
     
     # Adaptive mode detection
     is_adaptive_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_mode') and ingp.is_adaptive_mode
@@ -149,7 +162,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Residual_hybrid mode detection (per-Gaussian SH RGB + hashgrid MLP residual)
     is_residual_hybrid_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_residual_hybrid_mode') and ingp.is_residual_hybrid_mode
     
-    render_mode = 0  # 0 = baseline, 4 = cat, 6 = adaptive, 7 = adaptive_add, 11 = residual_hybrid, 12 = adaptive_cat
+    render_mode = 0  # 0 = baseline, 4 = cat, 6 = adaptive, 7 = adaptive_add, 11 = residual_hybrid, 12 = adaptive_cat, 14 = adaptive_zero
 
     # Initialize shape_dims tensor [GS, HS, OS] - will be updated per mode
     # GS = Gaussian shape, HS = Hash shape, OS = Output shape
@@ -275,13 +288,37 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             gaussian_features = pc.get_gaussian_features  # (N, 24D)
             blend_weight = torch.sigmoid(pc._adaptive_cat_weight)  # (N, 1)
 
-            # Decompose mode: override blend weights for visualization
+            # Decompose mode: override features/opacity for visualization
+            opacity_override = None
+            disable_hash_query = False  # Flag to disable hash grid query in CUDA
+
             if decompose_mode == 'gaussian_only':
                 # Force all Gaussians to use per-Gaussian features (skip hashgrid)
                 blend_weight = torch.ones_like(blend_weight)
             elif decompose_mode == 'ngp_only':
                 # Force all Gaussians to use hashgrid for fine level
                 blend_weight = torch.zeros_like(blend_weight)
+            elif decompose_mode == 'pure_gaussian':
+                # Render ONLY Gaussians that don't use hash (weight > 0.5)
+                # Zero opacity for hash-using Gaussians
+                opacity_override = opacity.clone()
+                opacity_override[blend_weight.squeeze(-1) <= 0.5] = 0.0
+            elif decompose_mode == 'hybrid_gaussian_part':
+                # Render ONLY the Gaussian contribution of hybrid Gaussians (weight <= 0.5)
+                # Zero opacity for pure Gaussians, disable hash query
+                opacity_override = opacity.clone()
+                opacity_override[blend_weight.squeeze(-1) > 0.5] = 0.0
+                disable_hash_query = True  # Will set active_hashgrid_levels = 0
+            elif decompose_mode == 'hybrid_hash_part':
+                # Render ONLY the hash contribution of hybrid Gaussians (weight <= 0.5)
+                # Zero opacity for pure Gaussians, zero out Gaussian features
+                opacity_override = opacity.clone()
+                opacity_override[blend_weight.squeeze(-1) > 0.5] = 0.0
+                gaussian_features = torch.zeros_like(gaussian_features)  # Zero Gaussian features
+
+            # Apply opacity override
+            if opacity_override is not None:
+                opacity = opacity_override
 
             colors_precomp = torch.cat([gaussian_features, blend_weight], dim=1)  # (N, 25D)
             shs = None
@@ -291,12 +328,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             # Also force inference mode when decompose_mode is set (for clean visualization)
             use_inference_mode = (hasattr(ingp, 'adaptive_cat_inference') and ingp.adaptive_cat_inference) or (decompose_mode is not None)
             inference_flag = 1 if use_inference_mode else 0
-            render_mode = 12 | (inference_flag << 8)  # Base mode 12, inference in bit 8
+            # Mode 12: adaptive_cat (training mode, full gradients)
+            # Mode 13: adaptive_cat_fast (inference only, skips 3D intersection for Gaussian-only primitives)
+            base_mode = 13 if use_inference_mode else 12
+            render_mode = base_mode | (inference_flag << 8)
 
             # Encode levels for CUDA: (total << 16) | (active_hashgrid << 8) | hybrid
             # Uses active_hashgrid_levels for C2F (progressively enables hashgrid levels)
             total_levels = ingp.levels
             active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
+            # Disable hash query for decomposition mode
+            if disable_hash_query:
+                active_hashgrid_levels = 0
             levels = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 
             # Pad offsets to 17 elements (CUDA code expects up to 16 levels + 1)
@@ -312,7 +355,163 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             hash_dim = active_hashgrid_levels * ingp.level_dim  # e.g., 1*4 = 4D (C2F aware)
             output_dim = total_levels * ingp.level_dim  # e.g., 6*4 = 24D
             shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
-        
+
+        # Adaptive_zero mode: cat-like features + weighted hash (zeros when weight=0)
+        elif is_adaptive_zero_mode and hybrid_levels > 0:
+            # Same feature layout as cat mode: per-Gaussian for coarse, hash for fine
+            # But with a weight that controls whether to query hash or use zeros
+            gaussian_features = pc.get_gaussian_features  # (N, hybrid_levels * D)
+
+            # Apply temperature scaling to sigmoid (higher temp = sharper sigmoid)
+            blend_weight = torch.sigmoid(pc._adaptive_zero_weight * temperature)  # (N, 1)
+
+            # Determine if we're in inference mode
+            use_inference_mode = (hasattr(ingp, 'adaptive_zero_inference') and ingp.adaptive_zero_inference) or (decompose_mode is not None)
+
+            # Decompose mode: override features/opacity for visualization
+            opacity_override = None
+            disable_hash_query = False
+
+            if decompose_mode == 'gaussian_only':
+                # Show only Gaussians with weight < 0.5 (they use zeros for fine levels)
+                opacity_override = opacity.clone()
+                opacity_override[blend_weight.squeeze(-1) >= 0.5] = 0.0
+            elif decompose_mode == 'hybrid_gaussian_only':
+                # Show Gaussians with weight >= 0.5, but mask out hashgrid
+                opacity_override = opacity.clone()
+                opacity_override[blend_weight.squeeze(-1) < 0.5] = 0.0
+                disable_hash_query = True  # Will set active_hashgrid_levels = 0
+            elif decompose_mode == 'hybrid_hash_only':
+                # Show Gaussians with weight >= 0.5, but mask out gaussian features
+                opacity_override = opacity.clone()
+                opacity_override[blend_weight.squeeze(-1) < 0.5] = 0.0
+                gaussian_features = torch.zeros_like(gaussian_features)
+
+            if opacity_override is not None:
+                opacity = opacity_override
+
+            # Concatenate: [coarse_features | weight]
+            colors_precomp = torch.cat([gaussian_features, blend_weight], dim=1)
+            shs = None
+
+            # Use mode 14 for adaptive_zero
+            inference_flag = 1 if use_inference_mode else 0
+            render_mode = 14 | (inference_flag << 8)
+
+            # Level encoding same as cat: (total << 16) | (active_hashgrid << 8) | hybrid
+            total_levels = ingp.levels
+            active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
+            if disable_hash_query:
+                active_hashgrid_levels = 0  # Disable hash query for hybrid_gaussian_only mode
+            levels = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+
+            # Pad offsets to 17 elements (CUDA code expects up to 16 levels + 1)
+            if offsets.shape[0] < 17:
+                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
+                padded_offsets[:offsets.shape[0]] = offsets
+                offsets = padded_offsets
+
+            # Shape dims: GS = coarse features + weight, HS = fine hash, OS = total output
+            gaussian_dim = hybrid_levels * ingp.level_dim  # e.g., 5*4 = 20D (coarse only)
+            hash_dim = active_hashgrid_levels * ingp.level_dim  # e.g., 1*4 = 4D
+            output_dim = total_levels * ingp.level_dim  # e.g., 6*4 = 24D
+            shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
+
+        # Adaptive_gate mode: Gumbel-STE with forced training for binary hash selection
+        # Always binary masking (0 or 1) to prevent scale compensation artifacts
+        # Uses same CUDA kernel as adaptive_zero (mode 14)
+        elif is_adaptive_gate_mode and hybrid_levels > 0:
+            gaussian_features = pc.get_gaussian_features  # (N, hybrid_levels * D)
+            gate_logits = pc._gate_logits  # (N, 1)
+
+            use_inference_mode = hasattr(ingp, 'adaptive_gate_inference') and ingp.adaptive_gate_inference
+
+            if use_inference_mode or (decompose_mode is not None):
+                # INFERENCE: Hard threshold on probability (prob > 0.5 → use hash)
+                effective_mask = (torch.sigmoid(gate_logits) > 0.5).float()
+            else:
+                # TRAINING: Gumbel-STE + Forced Training
+
+                # 1. Gumbel noise for stochastic exploration
+                uniform = torch.rand_like(gate_logits).clamp(1e-6, 1 - 1e-6)
+                gumbel_noise = -torch.log(-torch.log(uniform))
+                noisy_logits = (gate_logits + gumbel_noise) / temperature
+
+                # 2. STE: hard forward, soft backward
+                soft_gate = torch.sigmoid(noisy_logits)
+                hard_gate = (soft_gate > 0.5).float() - soft_gate.detach() + soft_gate
+
+                # 3. Forced training: force some Gaussians to use hash (detached, not learnable)
+                force_mask = (torch.rand_like(gate_logits) < force_ratio).float().detach()
+
+                # 4. Combine: max ensures binary output (0 or 1)
+                effective_mask = torch.max(hard_gate, force_mask)
+
+            # Handle decompose modes for visualization
+            opacity_override = None
+            disable_hash_query = False
+
+            if decompose_mode == 'gaussian_only':
+                # Force all gates closed (Gaussian-only rendering)
+                effective_mask = torch.zeros_like(effective_mask)
+            elif decompose_mode == 'ngp_only':
+                # Force all gates open (hash for all)
+                effective_mask = torch.ones_like(effective_mask)
+            elif decompose_mode == 'gate_closed':
+                # Show only Gaussians with gate closed (not using hash)
+                gate_prob = torch.sigmoid(gate_logits)
+                opacity_override = opacity.clone()
+                opacity_override[gate_prob.squeeze(-1) > 0.5] = 0.0  # Hide gate-open Gaussians
+                effective_mask = torch.zeros_like(effective_mask)  # All use Gaussian-only
+            elif decompose_mode == 'gate_open':
+                # Show only Gaussians with gate open (using hash)
+                gate_prob = torch.sigmoid(gate_logits)
+                opacity_override = opacity.clone()
+                opacity_override[gate_prob.squeeze(-1) <= 0.5] = 0.0  # Hide gate-closed Gaussians
+                effective_mask = torch.ones_like(effective_mask)  # All use hash
+            elif decompose_mode == 'hybrid_gaussian_only':
+                # Show Gaussians with gate open, but mask out hashgrid
+                gate_prob = torch.sigmoid(gate_logits)
+                opacity_override = opacity.clone()
+                opacity_override[gate_prob.squeeze(-1) <= 0.5] = 0.0
+                disable_hash_query = True
+            elif decompose_mode == 'hybrid_hash_only':
+                # Show Gaussians with gate open, but mask out gaussian features
+                gate_prob = torch.sigmoid(gate_logits)
+                opacity_override = opacity.clone()
+                opacity_override[gate_prob.squeeze(-1) <= 0.5] = 0.0
+                gaussian_features = torch.zeros_like(gaussian_features)
+
+            if opacity_override is not None:
+                opacity = opacity_override
+
+            # Concatenate: [coarse_features | mask]
+            colors_precomp = torch.cat([gaussian_features, effective_mask], dim=1)
+            shs = None
+
+            # Use mode 14 (same CUDA kernel as adaptive_zero)
+            inference_flag = 1 if (use_inference_mode or decompose_mode is not None) else 0
+            render_mode = 14 | (inference_flag << 8)
+
+            # Level encoding same as cat: (total << 16) | (active_hashgrid << 8) | hybrid
+            total_levels = ingp.levels
+            active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
+            if disable_hash_query:
+                active_hashgrid_levels = 0
+            levels = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+
+            # Pad offsets to 17 elements
+            if offsets.shape[0] < 17:
+                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
+                padded_offsets[:offsets.shape[0]] = offsets
+                offsets = padded_offsets
+
+            # Shape dims: GS = coarse features + mask, HS = fine hash, OS = total output
+            gaussian_dim = hybrid_levels * ingp.level_dim
+            hash_dim = active_hashgrid_levels * ingp.level_dim
+            output_dim = total_levels * ingp.level_dim
+            shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
+
         # Residual_hybrid mode: per-Gaussian SH RGB + hashgrid features
         elif is_residual_hybrid_mode and ingp is not None:
             # Pass per-Gaussian SH coefficients as colors_precomp for blending
@@ -454,6 +653,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         beta=beta,
         if_contract = contract,
         record_transmittance = record_transmittance,
+        max_intersections = max_intersections,
         # pipe.debug
     )
 
@@ -732,9 +932,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rendered_image = rgb.view(H, W, 3).permute(2, 0, 1)  # (3, H, W)
             rendered_image = rendered_image * render_mask
         else:
-            rendered_image = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), rays_dir)
-            rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
-            rendered_image = rendered_image * render_mask
+            if skip_mlp:
+                # Skip MLP decode, just return zeros (for benchmarking rasterizer only)
+                rendered_image = torch.zeros(3, H, W, device="cuda")
+            else:
+                rendered_image = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), rays_dir)
+                rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
+                rendered_image = rendered_image * render_mask
 
         vis_appearance_level = allmap[11:14]
 

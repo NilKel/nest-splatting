@@ -671,7 +671,8 @@ renderCUDAsurfelForward(
 	const int* __restrict__ level_offsets_diffuse = nullptr,
 	const float* __restrict__ gridrange_diffuse = nullptr,
 	const int render_mode = 0,
-	const float* __restrict__ rgb = nullptr)
+	const float* __restrict__ rgb = nullptr,
+	const uint32_t max_intersections = 0)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -754,9 +755,15 @@ renderCUDAsurfelForward(
 			// adaptive_add mode: level = (total_levels << 16) | (active_hashgrid_levels << 8)
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			hashgrid_levels = active_hashgrid_levels;
-		} else if((render_mode & 0xFF) == 12){
-			// adaptive_cat mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+		} else if((render_mode & 0xFF) == 12 || (render_mode & 0xFF) == 13){
+			// adaptive_cat mode (12) and adaptive_cat_fast mode (13):
+			// level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 			// Note: render_mode may have inference flag in upper bits, so mask to get base mode
+			int active_hashgrid_levels = (level >> 8) & 0xFF;
+			hashgrid_levels = active_hashgrid_levels;
+		} else if((render_mode & 0xFF) == 14){
+			// adaptive_zero mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+			// Same encoding as adaptive_cat, but different blending logic
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			hashgrid_levels = active_hashgrid_levels;
 		} else if(render_mode == 8 || render_mode == 9 || render_mode == 10){
@@ -872,9 +879,15 @@ renderCUDAsurfelForward(
 		}
 
 		float w = alpha * T;
-		
+
 		render_number++;
-			
+
+		// Early termination if max_intersections is set and reached
+		if (max_intersections > 0 && render_number >= max_intersections)
+		{
+			done = true;
+		}
+
 #if RENDER_AXUTILITY
 			// Render depth distortion map
 			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
@@ -899,6 +912,134 @@ renderCUDAsurfelForward(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			// MyGs, now color calculation is in ngp part.
 
+			// Special handling for adaptive_cat_fast (mode 13): check weight BEFORE 3D intersection
+			// This allows skipping expensive intersection computation for Gaussian-only primitives
+			const int base_mode = render_mode & 0xFF;
+			if (base_mode == 13) {
+				// adaptive_cat_fast: Skip 3D intersection for Gaussian-only primitives
+				const bool use_inference = (render_mode >> 8) & 0x1;
+				const int total_levels = (level >> 16) & 0xFF;
+				const int hashgrid_levels = (level >> 8) & 0xFF;
+				const int hybrid_levels = level & 0xFF;
+				const int per_level_dim = l_dim;
+				const int total_dim = total_levels * per_level_dim;
+
+				int gauss_id = collected_id[j];
+				const float* gauss_feat = &rgb[gauss_id * (total_dim + 1)];
+				const float weight = gauss_feat[total_dim];
+
+				float feat[CHANNELS];
+				for(int i = 0; i < CHANNELS; i++) feat[i] = 0.0f;
+
+				if (use_inference && weight > 0.5f) {
+					// FAST PATH: Gaussian-only, skip 3D intersection entirely
+					// Just copy per-Gaussian features, no hash query needed
+					for(int i = 0; i < total_dim && i < CHANNELS; i++) {
+						feat[i] = gauss_feat[i];
+					}
+				} else {
+					// SLOW PATH: Need 3D intersection for hash query
+					const float3 pk = collected_pk[j];
+					float3 xyz;
+					if(rho3d <= rho2d){
+						const float3 sutu = collected_SuTu[j];
+						const float3 svtv = collected_SvTv[j];
+						xyz = {s.x * sutu.x + s.y * svtv.x + pk.x,
+							s.x * sutu.y + s.y * svtv.y + pk.y,
+							s.x * sutu.z + s.y * svtv.z + pk.z};
+					}
+					else xyz = pk;
+
+					// Accumulate weighted position (for visualization)
+					pos_x += w * xyz.x;
+					pos_y += w * xyz.y;
+					pos_z += w * xyz.z;
+
+					uint32_t appearance_level = collected_ap_level[j];
+					bool contract = if_contract;
+					bool debug = false;
+
+					if (use_inference) {
+						// Inference: Use hashgrid for fine levels, Gaussian for coarse
+						for(int i = 0; i < hybrid_levels * per_level_dim && i < CHANNELS; i++) {
+							feat[i] = gauss_feat[i];
+						}
+
+						if (hashgrid_levels > 0) {
+							float hash_feat[16 * 4];
+							float voxel_min = gridrange[0];
+							float voxel_max = gridrange[1];
+							int collec_offsets[17];
+							for(int lv = 0; lv <= hashgrid_levels; lv++){
+								collec_offsets[lv] = level_offsets[lv];
+							}
+
+							if(l_dim == 4) {
+								query_feature<false, 16*4, 4>(hash_feat, xyz, voxel_min, voxel_max,
+								                               collec_offsets, appearance_level, hash_features,
+								                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+							} else if(l_dim == 2) {
+								query_feature<false, 16*4, 2>(hash_feat, xyz, voxel_min, voxel_max,
+								                               collec_offsets, appearance_level, hash_features,
+								                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+							} else if(l_dim == 8) {
+								query_feature<false, 16*4, 8>(hash_feat, xyz, voxel_min, voxel_max,
+								                               collec_offsets, appearance_level, hash_features,
+								                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+							}
+
+							const int fine_start = hybrid_levels * per_level_dim;
+							for(int i = 0; i < hashgrid_levels * per_level_dim && (fine_start + i) < CHANNELS; i++) {
+								feat[fine_start + i] = hash_feat[i];
+							}
+						}
+					} else {
+						// Training: Smooth blending
+						for(int i = 0; i < hybrid_levels * per_level_dim && i < CHANNELS; i++) {
+							feat[i] = gauss_feat[i] * weight;
+						}
+
+						if (hashgrid_levels > 0) {
+							float hash_feat[16 * 4];
+							float voxel_min = gridrange[0];
+							float voxel_max = gridrange[1];
+							int collec_offsets[17];
+							for(int lv = 0; lv <= hashgrid_levels; lv++){
+								collec_offsets[lv] = level_offsets[lv];
+							}
+
+							if(l_dim == 4) {
+								query_feature<false, 16*4, 4>(hash_feat, xyz, voxel_min, voxel_max,
+								                               collec_offsets, appearance_level, hash_features,
+								                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+							} else if(l_dim == 2) {
+								query_feature<false, 16*4, 2>(hash_feat, xyz, voxel_min, voxel_max,
+								                               collec_offsets, appearance_level, hash_features,
+								                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+							} else if(l_dim == 8) {
+								query_feature<false, 16*4, 8>(hash_feat, xyz, voxel_min, voxel_max,
+								                               collec_offsets, appearance_level, hash_features,
+								                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+							}
+
+							const int fine_start = hybrid_levels * per_level_dim;
+							for(int i = 0; i < hashgrid_levels * per_level_dim && (fine_start + i) < CHANNELS; i++) {
+								feat[fine_start + i] = weight * gauss_feat[fine_start + i]
+								                     + (1.0f - weight) * hash_feat[i];
+							}
+						}
+					}
+				}
+
+				// Accumulate features
+				for (int ch = 0; ch < CHANNELS; ch++)
+					C[ch] += feat[ch] * w;
+
+				// Skip the rest of the normal processing
+				T = T * (1 - alpha);
+				continue;
+			}
+
 			if(level == 0){
 				for (int ch = 0; ch < CHANNELS; ch++)
 					C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
@@ -907,7 +1048,7 @@ renderCUDAsurfelForward(
 
 				const float3 pk = collected_pk[j];
 				float3 xyz;
-				// intersection pts xyz 
+				// intersection pts xyz
 				if(rho3d <= rho2d){
 					const float3 sutu = collected_SuTu[j];
 					const float3 svtv = collected_SvTv[j];
@@ -929,9 +1070,11 @@ renderCUDAsurfelForward(
 				// bool contract = false;
 				// bool contract = true;
 				bool contract = if_contract;
-				
+
 				// hashgrid feature interpolation
-			switch (render_mode){
+				// Note: render_mode may have flags encoded in upper bits (e.g., inference flag for adaptive_cat)
+				// Extract base mode for switch, keep full value for mode-specific flag extraction
+			switch (render_mode & 0xFF){
 				case 0:
 					// Baseline mode: use l_dim directly (includes surface_blend with 12D features)
 					if(l_dim == 2) {
@@ -1442,7 +1585,8 @@ renderCUDAsurfelForward(
 
 			if (use_inference) {
 				// INFERENCE MODE: Binary selection based on weight
-				if (weight > 0.5f) {
+				// Threshold 0.9: conservative - only skip hash if weight is very high (Gaussian-only)
+				if (weight >= 0.9f) {
 					// Use Gaussian-only: Copy all per-Gaussian features, skip hashgrid
 					for(int i = 0; i < total_dim; i++) {
 						feat[i] = gauss_feat[i];
@@ -1515,6 +1659,115 @@ renderCUDAsurfelForward(
 						                     + (1.0f - weight) * hash_feat[i];
 					}
 				}
+			}
+
+			break;
+		}
+		case 14: {
+			/* adaptive_zero mode: cat-like features with weighted hash (or zeros)
+			 * rgb buffer: [N, per_gaussian_dim + 1] = [coarse_features | weight]
+			 *
+			 * Training mode (inference_flag=0):
+			 *   Coarse levels: per-Gaussian features (no weight scaling)
+			 *   Fine levels: weight * hash_features (zeros when weight=0)
+			 *
+			 * Inference mode (inference_flag=1):
+			 *   If w >= 0.5: Query hash for fine levels
+			 *   If w < 0.5: Use zeros for fine levels (FAST PATH, no hash query)
+			 */
+
+			const bool use_inference = (render_mode >> 8) & 0x1;
+
+			const int total_levels = (level >> 16) & 0xFF;  // e.g., 6
+			const int hashgrid_levels = (level >> 8) & 0xFF;  // e.g., 1 (finest N levels)
+			const int hybrid_levels = level & 0xFF;  // e.g., 5 (coarse M levels)
+			const int per_level_dim = l_dim;  // 4
+			const int per_gaussian_dim = hybrid_levels * per_level_dim;  // 20
+			const int total_dim = total_levels * per_level_dim;  // 24
+
+			if (debug && j == 0) {
+				printf("[adaptive_zero] total=%d, hash=%d, hybrid=%d, inference=%d\n",
+				       total_levels, hashgrid_levels, hybrid_levels, use_inference);
+			}
+
+			// Validate decoded values
+			if (total_levels == 0 || total_levels > 32 || hashgrid_levels > 32 || hybrid_levels > 32) {
+				if (debug) {
+					printf("Error: adaptive_zero invalid level values. level=%d, total=%d, hash=%d, hybrid=%d\n",
+					       level, total_levels, hashgrid_levels, hybrid_levels);
+				}
+				break;
+			}
+
+			int gauss_id = collected_id[j];
+			// Layout: [coarse_features (per_gaussian_dim) | weight (1)]
+			const float* gauss_feat = &rgb[gauss_id * (per_gaussian_dim + 1)];
+			const float weight = gauss_feat[per_gaussian_dim];  // Blend weight (sigmoid output, 0-1)
+
+			// Initialize feat array to zeros
+			for(int i = 0; i < CHANNELS; i++) feat[i] = 0.0f;
+
+			// Coarse levels: ALWAYS use per-Gaussian features (no weight scaling)
+			for(int i = 0; i < per_gaussian_dim && i < CHANNELS; i++) {
+				feat[i] = gauss_feat[i];
+			}
+
+			// Fine levels: conditional hash query
+			// weight=0 → zeros (fast), weight=1 → hash (slow)
+			if (use_inference) {
+				// INFERENCE: Binary decision at threshold 0.1 (conservative - only skip hash if weight is very low)
+				if (weight >= 0.1f && hashgrid_levels > 0) {
+					// Query hash and use it (weight >= 0.1 means "use hash")
+					float hash_feat[16 * 4];
+
+					if(l_dim == 2) {
+						query_feature<false, 16*4, 2>(hash_feat, xyz, voxel_min, voxel_max,
+						                               collec_offsets, appearance_level, hash_features,
+						                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+					} else if(l_dim == 4) {
+						query_feature<false, 16*4, 4>(hash_feat, xyz, voxel_min, voxel_max,
+						                               collec_offsets, appearance_level, hash_features,
+						                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+					} else if(l_dim == 8) {
+						query_feature<false, 16*4, 8>(hash_feat, xyz, voxel_min, voxel_max,
+						                               collec_offsets, appearance_level, hash_features,
+						                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+					}
+
+					// Copy hash features to fine levels
+					for(int i = 0; i < hashgrid_levels * per_level_dim && (per_gaussian_dim + i) < CHANNELS; i++) {
+						feat[per_gaussian_dim + i] = hash_feat[i];
+					}
+				}
+				// else: fine levels stay zero (no hash query needed!) - FAST PATH
+			} else {
+				// TRAINING: Weighted hash (weight * hash)
+				// When weight→0, hash contribution→0
+				if (hashgrid_levels > 0 && weight > 1e-6f) {
+					float hash_feat[16 * 4];
+
+					if(l_dim == 2) {
+						query_feature<false, 16*4, 2>(hash_feat, xyz, voxel_min, voxel_max,
+						                               collec_offsets, appearance_level, hash_features,
+						                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+					} else if(l_dim == 4) {
+						query_feature<false, 16*4, 4>(hash_feat, xyz, voxel_min, voxel_max,
+						                               collec_offsets, appearance_level, hash_features,
+						                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+					} else if(l_dim == 8) {
+						query_feature<false, 16*4, 8>(hash_feat, xyz, voxel_min, voxel_max,
+						                               collec_offsets, appearance_level, hash_features,
+						                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
+					} else {
+						if (debug) printf("adaptive_zero unsupported level dim: %d\n", l_dim);
+					}
+
+					// Weighted hash features for fine levels
+					for(int i = 0; i < hashgrid_levels * per_level_dim && (per_gaussian_dim + i) < CHANNELS; i++) {
+						feat[per_gaussian_dim + i] = weight * hash_feat[i];
+					}
+				}
+				// else: fine levels stay zero (weight is near 0)
 			}
 
 			break;
@@ -1780,7 +2033,8 @@ void FORWARD::render(
 	const float* hash_features_diffuse,
 	const int* level_offsets_diffuse,
 	const float* gridrange_diffuse,
-	const int render_mode)
+	const int render_mode,
+	const uint32_t max_intersections)
 {
 	// Determine D_DIFFUSE template parameter for kernel dispatch
 	// For dual hashgrid modes (baseline_double, baseline_blend_double, surface_rgb), use D_diffuse
@@ -1793,19 +2047,19 @@ void FORWARD::render(
 			renderCUDAsurfelForward<3, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
 			break;
 		case 8:
 			renderCUDAsurfelForward<8, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
 			break;
 		case 16:
 			renderCUDAsurfelForward<16, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
 			break;
 	case 24:
 		// Always use D_DIFFUSE=0 template and handle dual hashgrids at runtime
@@ -1813,37 +2067,37 @@ void FORWARD::render(
 		renderCUDAsurfelForward<24, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
 		break;
 	case 32:
 		renderCUDAsurfelForward<32, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
 		break;
 	case 42:
 		renderCUDAsurfelForward<42, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
 		break;
 	case 48:
 		renderCUDAsurfelForward<48, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
 		break;
 	case 72:
 		renderCUDAsurfelForward<72, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
 		break;
 	case 90:
 		renderCUDAsurfelForward<90, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
 		break;
 	default:
 		printf("Unsupported channel count: %d\n", C);

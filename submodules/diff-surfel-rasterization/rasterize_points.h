@@ -53,7 +53,8 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& offsets_diffuse,
 	const torch::Tensor& gridrange_diffuse,
 	const int render_mode,
-	const torch::Tensor& shape_dims);
+	const torch::Tensor& shape_dims,
+	const int max_intersections);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(

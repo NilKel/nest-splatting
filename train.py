@@ -21,6 +21,7 @@ from utils.general_utils import safe_state, build_scaling_rotation
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
+from lpipsPyTorch import lpips
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -156,18 +157,63 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             num_levels = cfg_model.encoding.levels
             per_level_dim = cfg_model.encoding.hashgrid.dim
             gaussians._gaussian_feat_dim = num_levels * per_level_dim
-            
+
             # Initialize per-Gaussian features to small random values
             gaussian_feats = torch.randn((len(gaussians.get_xyz), gaussians._gaussian_feat_dim), device="cuda").float() * 0.01
             gaussians._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
-            
+
             # Initialize blend weight to 0.0 (sigmoid(0) = 0.5, equal blend initially)
             blend_weight = torch.zeros((len(gaussians.get_xyz), 1), device="cuda").float()
             gaussians._adaptive_cat_weight = nn.Parameter(blend_weight.requires_grad_(True))
-            
+
             print(f"[ADAPTIVE_CAT MODE] Initialized {len(gaussians.get_xyz)} Gaussians")
             print(f"[ADAPTIVE_CAT MODE] Per-Gaussian features: {gaussians._gaussian_feat_dim}D")
             print(f"[ADAPTIVE_CAT MODE] Blend weight: 1D per Gaussian (starts at 0.5)")
+        elif args.method == "adaptive_zero":
+            # adaptive_zero mode: cat-like features (hybrid_levels × D) + blend weight for hash
+            num_levels = cfg_model.encoding.levels
+            hybrid_levels = args.hybrid_levels  # From CLI, like cat mode
+            per_level_dim = cfg_model.encoding.hashgrid.dim
+            gaussians._gaussian_feat_dim = hybrid_levels * per_level_dim  # Same as cat mode
+
+            # Initialize per-Gaussian features (coarse levels only)
+            gaussian_feats = torch.randn((len(gaussians.get_xyz), gaussians._gaussian_feat_dim), device="cuda").float() * 0.01
+            gaussians._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+
+            # Initialize weight to 0.0 (sigmoid(0) = 0.5)
+            # weight=0 → zeros for fine levels, weight=1 → query hash
+            weight = torch.zeros((len(gaussians.get_xyz), 1), device="cuda").float()
+            gaussians._adaptive_zero_weight = nn.Parameter(weight.requires_grad_(True))
+
+            print(f"[ADAPTIVE_ZERO MODE] Initialized {len(gaussians.get_xyz)} Gaussians")
+            print(f"[ADAPTIVE_ZERO MODE] Per-Gaussian features (coarse): {gaussians._gaussian_feat_dim}D")
+            print(f"[ADAPTIVE_ZERO MODE] Hash weight: 1D per Gaussian (w=0→zeros, w=1→hash)")
+        elif args.method == "adaptive_gate":
+            # adaptive_gate mode: Gumbel-STE with forced training for binary hash selection
+            # Always binary masking (0 or 1) to prevent scale compensation artifacts
+            hybrid_levels = args.hybrid_levels
+            per_level_dim = cfg_model.encoding.hashgrid.dim
+            gaussians._gaussian_feat_dim = hybrid_levels * per_level_dim
+
+            # Initialize per-Gaussian features (coarse levels)
+            gaussian_feats = torch.randn((len(gaussians.get_xyz), gaussians._gaussian_feat_dim), device="cuda").float() * 0.01
+            gaussians._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+
+            # Initialize gate logits to negative value for sparse start
+            # sigmoid(-2.0) ≈ 0.12, sigmoid(-3.0) ≈ 0.05
+            # Start sparse: mostly Gaussian-only, only turn on hash where needed
+            gate_logits = torch.full((len(gaussians.get_xyz), 1), args.gate_init, device="cuda").float()
+            gaussians._gate_logits = nn.Parameter(gate_logits.requires_grad_(True))
+
+            print(f"[ADAPTIVE_GATE] Initialized {len(gaussians.get_xyz)} Gaussians with sparse gating")
+            print(f"[ADAPTIVE_GATE] Per-Gaussian features (coarse): {gaussians._gaussian_feat_dim}D")
+            print(f"[ADAPTIVE_GATE] Gate init: {args.gate_init} (sigmoid={torch.sigmoid(torch.tensor(args.gate_init)).item():.2f})")
+            print(f"[ADAPTIVE_GATE] Force ratio: {args.force_ratio} ({args.force_ratio*100:.0f}% forced hash during training)")
+
+        # Set relocation mode for adaptive weights (clone from source or reset to 0)
+        if args.method in ["adaptive_cat", "adaptive_zero", "adaptive_gate"]:
+            gaussians._relocation_mode = args.relocation
+            print(f"[RELOCATION MODE] {args.relocation} - new Gaussians will {'copy weights from source' if args.relocation == 'clone' else 'reset weights to 0 (sigmoid=0.5)'}")
         else:
             gaussians._adaptive_feat_dim = 0
             gaussians._adaptive_num_levels = 0
@@ -276,8 +322,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.training_setup(opt)
         
         # Load optimizer state from warmup checkpoint
-        # For cat/adaptive/adaptive_cat/diffuse mode, new params won't be in saved state - they train from scratch
-        if args.method not in ["cat", "adaptive", "adaptive_cat", "diffuse"]:
+        # For cat/adaptive/adaptive_cat/adaptive_zero/adaptive_gate/diffuse mode, new params won't be in saved state - they train from scratch
+        if args.method not in ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse"]:
             gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
         
         # Move optimizer state to GPU
@@ -331,11 +377,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     black_bg = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
     use_alternating_bg = args.method in ["diffuse_ngp", "diffuse_offset"]
     
-    # Random background mode: use black BG until 15k iters, then random uniform background
+    # Random background mode: use black BG until 10k iters, then random uniform background until 20k, then black again
     use_random_bg = args.random_background
-    random_bg_start_iter = 15000
+    random_bg_start_iter = 10000
+    random_bg_end_iter = 12000
     if use_random_bg:
-        print(f"Using black background until iteration {random_bg_start_iter}, then random uniform background (eval will use black background)")
+        print(f"Using black background until iteration {random_bg_start_iter}, then random uniform background until {random_bg_end_iter}, then black background (eval will use black background)")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -426,10 +473,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             current_bg = white_bg if (iteration // 10) % 2 == 0 else black_bg
         else:
             current_bg = background
-        
+
+        # Compute temperature for adaptive modes (sigmoid sharpening)
+        if args.temp_end > args.temp_start:
+            if iteration < args.temp_anneal_start:
+                temperature = args.temp_start
+            elif iteration >= args.temp_anneal_end:
+                temperature = args.temp_end
+            else:
+                progress = (iteration - args.temp_anneal_start) / (args.temp_anneal_end - args.temp_anneal_start)
+                temperature = args.temp_start + progress * (args.temp_end - args.temp_start)
+        else:
+            temperature = 1.0
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, current_bg, ingp = ingp,
             beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance,
-            use_xyz_mode = args.use_xyz_mode, decompose_mode = dataset.decompose_mode)
+            use_xyz_mode = args.use_xyz_mode, decompose_mode = dataset.decompose_mode,
+            temperature = temperature, force_ratio = args.force_ratio)
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
     
@@ -563,6 +623,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             entropy = -(weight * torch.log(weight + eps) + (1 - weight) * torch.log(1 - weight + eps))
             adaptive_cat_reg_loss = args.lambda_adaptive_cat * anneal_factor * entropy.mean()
 
+        # Adaptive_zero entropy regularization - encourage binary hash weights (0 or 1)
+        adaptive_zero_reg_loss = torch.tensor(0.0, device="cuda")
+        if args.method == "adaptive_zero" and hasattr(gaussians, '_adaptive_zero_weight') and gaussians._adaptive_zero_weight.numel() > 0:
+            # Compute annealing factor (ramps from 0 to 1 starting at anneal_start iteration)
+            if iteration >= args.adaptive_zero_anneal_start:
+                progress = (iteration - args.adaptive_zero_anneal_start) / (opt.iterations - args.adaptive_zero_anneal_start)
+                anneal_factor = min(1.0, progress)  # Linear ramp from 0 to 1
+            else:
+                anneal_factor = 0.0
+
+            # BCE regularization with configurable threshold
+            # Loss: -(t * log(w) + (1-t) * log(1-w))
+            # Minimized when w = t, so pushes weights away from threshold t
+            # t=0.5: symmetric push to 0 or 1
+            # t=0.1: asymmetric, strongly pushes w<0.1 toward 0, w>0.1 toward 1
+            # Use temperature-scaled sigmoid to match rendering
+            weight = torch.sigmoid(gaussians._adaptive_zero_weight * temperature)
+            eps = 1e-7
+            t = args.bce_threshold
+            bce = -(t * torch.log(weight + eps) + (1 - t) * torch.log(1 - weight + eps))
+            bce_loss = args.lambda_adaptive_zero * anneal_factor * bce.mean()
+
+            # Hash bias regularization: push weights toward 1 (favor hash queries)
+            # L1 on (1 - weight) penalizes weights near 0, encouraging hash usage
+            hash_bias_loss = args.hash_lambda * anneal_factor * (1 - weight).mean()
+
+            # Parabola regularization: w*(1-w), max at 0.5, zero at 0 or 1
+            parabola_loss = torch.tensor(0.0, device="cuda")
+            if args.lambda_parabola > 0:
+                parabola_loss = args.lambda_parabola * anneal_factor * (weight * (1 - weight)).mean()
+
+            adaptive_zero_reg_loss = bce_loss + hash_bias_loss + parabola_loss
+
+        # Adaptive_gate sparsity regularization
+        # Penalize gate probability to encourage sparse hash usage (gates stay closed by default)
+        adaptive_gate_reg_loss = torch.tensor(0.0, device="cuda")
+        if args.method == "adaptive_gate" and hasattr(gaussians, '_gate_logits') and gaussians._gate_logits.numel() > 0:
+            # Sparsity loss: penalize gate probability (not the mask)
+            # This encourages gates to stay closed, only open where needed for quality
+            gate_prob = torch.sigmoid(gaussians._gate_logits)
+            adaptive_gate_reg_loss = args.lambda_sparsity * gate_prob.mean()
+
         # BCE opacity regularization - encourage binary opacity (0 or 1) to reduce foggy Gaussians
         # Applied only in the last bce_iter iterations
         bce_opacity_loss = torch.tensor(0.0, device="cuda")
@@ -577,7 +679,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             bce_opacity_loss = args.bce_lambda * bce.mean()
 
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + bce_opacity_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss
 
         total_loss.backward()
 
@@ -615,12 +717,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     loss_dict["ScR"] = f"{mcmc_scale_reg.item():.{5}f}"
                 # Add adaptive_cat metrics to progress bar
                 if args.method == "adaptive_cat" and hasattr(gaussians, '_adaptive_cat_weight') and gaussians._adaptive_cat_weight.numel() > 0:
-                    mean_weight = torch.sigmoid(gaussians._adaptive_cat_weight).mean().item()
-                    pct_gaussian = (torch.sigmoid(gaussians._adaptive_cat_weight) > 0.5).float().mean().item() * 100
-                    loss_dict["W"] = f"{mean_weight:.2f}"
-                    loss_dict["G%"] = f"{pct_gaussian:.0f}"
+                    weights = torch.sigmoid(gaussians._adaptive_cat_weight)
+                    pct_high = (weights > 0.9).float().mean().item() * 100  # Gaussian-dominant
+                    pct_low = (weights < 0.1).float().mean().item() * 100   # Hash-dominant
+                    loss_dict["G>0.9"] = f"{pct_high:.0f}%"
+                    loss_dict["H<0.1"] = f"{pct_low:.0f}%"
                     if adaptive_cat_reg_loss.item() > 0:
                         loss_dict["AdR"] = f"{adaptive_cat_reg_loss.item():.{5}f}"
+                # Add adaptive_zero metrics to progress bar
+                if args.method == "adaptive_zero" and hasattr(gaussians, '_adaptive_zero_weight') and gaussians._adaptive_zero_weight.numel() > 0:
+                    weights = torch.sigmoid(gaussians._adaptive_zero_weight)
+                    pct_zero = (weights < 0.1).float().mean().item() * 100  # Using zeros (fast)
+                    pct_hash = (weights > 0.9).float().mean().item() * 100  # Using hash (slow)
+                    loss_dict["Z<0.1"] = f"{pct_zero:.0f}%"
+                    loss_dict["H>0.9"] = f"{pct_hash:.0f}%"
+                    if adaptive_zero_reg_loss.item() > 0:
+                        loss_dict["AzR"] = f"{adaptive_zero_reg_loss.item():.{5}f}"
+                # Add adaptive_gate metrics to progress bar
+                if args.method == "adaptive_gate" and hasattr(gaussians, '_gate_logits') and gaussians._gate_logits.numel() > 0:
+                    gate_prob = torch.sigmoid(gaussians._gate_logits)
+                    pct_open = (gate_prob > 0.5).float().mean().item() * 100  # Using hash (gate open)
+                    avg_prob = gate_prob.mean().item()
+                    loss_dict["Gate"] = f"{pct_open:.0f}%"
+                    loss_dict["AvgP"] = f"{avg_prob:.2f}"
+                    if adaptive_gate_reg_loss.item() > 0:
+                        loss_dict["Spr"] = f"{adaptive_gate_reg_loss.item():.{5}f}"
                 # Add BCE opacity loss to progress bar if active
                 if args.bce and bce_opacity_loss.item() > 0:
                     loss_dict["BCE"] = f"{bce_opacity_loss.item():.{5}f}"
@@ -641,10 +762,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tb_writer.add_scalar('train_loss_patches/mcmc_opacity_reg', mcmc_opacity_reg.item(), iteration)
                     tb_writer.add_scalar('train_loss_patches/mcmc_scale_reg', mcmc_scale_reg.item(), iteration)
                 if args.method == "adaptive_cat" and hasattr(gaussians, '_adaptive_cat_weight') and gaussians._adaptive_cat_weight.numel() > 0:
-                    mean_weight = torch.sigmoid(gaussians._adaptive_cat_weight).mean().item()
-                    pct_gaussian = (torch.sigmoid(gaussians._adaptive_cat_weight) > 0.5).float().mean().item() * 100
+                    weights = torch.sigmoid(gaussians._adaptive_cat_weight)
+                    mean_weight = weights.mean().item()
+                    pct_high = (weights > 0.9).float().mean().item() * 100  # Gaussian-dominant
+                    pct_low = (weights < 0.1).float().mean().item() * 100   # Hash-dominant
                     tb_writer.add_scalar('adaptive_cat/mean_weight', mean_weight, iteration)
-                    tb_writer.add_scalar('adaptive_cat/pct_gaussian', pct_gaussian, iteration)
+                    tb_writer.add_scalar('adaptive_cat/pct_gaussian_above_0.9', pct_high, iteration)
+                    tb_writer.add_scalar('adaptive_cat/pct_hash_below_0.1', pct_low, iteration)
                     tb_writer.add_scalar('adaptive_cat/reg_loss', adaptive_cat_reg_loss.item(), iteration)
                 if args.bce:
                     tb_writer.add_scalar('train_loss_patches/bce_opacity_loss', bce_opacity_loss.item(), iteration)
@@ -878,7 +1002,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     print(" "*20 + "FINAL TRAIN RENDERING")
     print("="*70)
     render_final_images(scene, gaussians, pipe, eval_background, final_ingp, beta, iteration, cfg_model, args,
-                        cameras=scene.getTrainCameras(), output_subdir='final_train_renders', metrics_file='train_metrics.txt')
+                        cameras=scene.getTrainCameras(), output_subdir='final_train_renders', metrics_file='train_metrics.txt',
+                        skip_decomposition=True)
     
     # Save training log with point count and framerate
     save_training_log(scene, gaussians, final_ingp, pipe, args, cfg_model, iteration)
@@ -887,11 +1012,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
     """Save training statistics to training_log.txt."""
     import time
-    
+
     log_path = os.path.join(scene.model_path, 'training_log.txt')
-    
+
     # Count Gaussians
     num_gaussians = len(gaussians.get_xyz)
+
+    # Compute weight distribution for adaptive_zero mode
+    weight_below_01 = None
+    weight_above_09 = None
+    if args.method in ["adaptive_zero", "adaptive_gate"] and hasattr(gaussians, '_adaptive_zero_weight'):
+        with torch.no_grad():
+            weights = torch.sigmoid(gaussians._adaptive_zero_weight).squeeze()
+            weight_below_01 = (weights < 0.1).sum().item()
+            weight_above_09 = (weights > 0.9).sum().item()
+            pct_below_01 = 100.0 * weight_below_01 / num_gaussians
+            pct_above_09 = 100.0 * weight_above_09 / num_gaussians
+            print(f"[LOG] Adaptive weight distribution:")
+            print(f"[LOG]   Below 0.1 (Gaussian-only): {weight_below_01:,} ({pct_below_01:.1f}%)")
+            print(f"[LOG]   Above 0.9 (Hash-enhanced): {weight_above_09:,} ({pct_above_09:.1f}%)")
+            print(f"[LOG]   Middle (0.1-0.9):          {num_gaussians - weight_below_01 - weight_above_09:,} ({100 - pct_below_01 - pct_above_09:.1f}%)")
     
     # Estimate framerate by timing a few renders
     print("\n[LOG] Measuring render framerate...")
@@ -958,7 +1098,19 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
         if args.mcmc:
             f.write(f"  (MCMC: only alive Gaussians counted)\n")
         f.write("\n")
-        
+
+        # Weight distribution for adaptive modes
+        if weight_below_01 is not None:
+            pct_below = 100.0 * weight_below_01 / num_gaussians
+            pct_above = 100.0 * weight_above_09 / num_gaussians
+            pct_middle = 100 - pct_below - pct_above
+            f.write("Adaptive Weight Distribution\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"Below 0.1 (Gaussian-only): {weight_below_01:,} ({pct_below:.1f}%)\n")
+            f.write(f"Above 0.9 (Hash-enhanced): {weight_above_09:,} ({pct_above:.1f}%)\n")
+            f.write(f"Middle (0.1-0.9):          {num_gaussians - weight_below_01 - weight_above_09:,} ({pct_middle:.1f}%)\n")
+            f.write("\n")
+
         f.write("Performance\n")
         f.write("-" * 30 + "\n")
         f.write(f"Render FPS: {fps:.2f}\n")
@@ -969,8 +1121,8 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
     print(f"[LOG] Render FPS: {fps:.2f} ({ms_per_frame:.2f} ms/frame)")
 
 
-def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args, 
-                        cameras, output_subdir, metrics_file, stride=1):
+def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args,
+                        cameras, output_subdir, metrics_file, stride=1, skip_decomposition=False):
     """Render images and compute metrics."""
     
     final_output_dir = os.path.join(scene.model_path, output_subdir)
@@ -995,12 +1147,20 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     is_hybrid_sh_post_mode = (ingp is not None and hasattr(ingp, 'is_hybrid_sh_post_mode') and ingp.is_hybrid_sh_post_mode)
     
     # Skip decomposition if hybrid_levels is 0 or equals total_levels (no meaningful decomposition)
-    do_cat_decomposition = is_cat_mode and args.hybrid_levels < total_levels
-    do_hybrid_sh_decomposition = is_hybrid_sh_mode or is_hybrid_sh_raw_mode or is_hybrid_sh_post_mode
+    do_cat_decomposition = is_cat_mode and args.hybrid_levels < total_levels and not skip_decomposition
+    do_hybrid_sh_decomposition = (is_hybrid_sh_mode or is_hybrid_sh_raw_mode or is_hybrid_sh_post_mode) and not skip_decomposition
 
     # Adaptive_cat decomposition: visualize per-Gaussian vs hashgrid contributions
     is_adaptive_cat_mode = (ingp is not None and hasattr(ingp, 'is_adaptive_cat_mode') and ingp.is_adaptive_cat_mode)
-    do_adaptive_cat_decomposition = is_adaptive_cat_mode
+    do_adaptive_cat_decomposition = is_adaptive_cat_mode and not skip_decomposition
+
+    # Adaptive_zero decomposition: visualize zeros-only vs hash contributors
+    is_adaptive_zero_mode = (ingp is not None and hasattr(ingp, 'is_adaptive_zero_mode') and ingp.is_adaptive_zero_mode)
+    do_adaptive_zero_decomposition = is_adaptive_zero_mode and not skip_decomposition
+
+    # Adaptive_gate decomposition: visualize gate-closed vs gate-open Gaussians
+    is_adaptive_gate_mode = (ingp is not None and hasattr(ingp, 'is_adaptive_gate_mode') and ingp.is_adaptive_gate_mode)
+    do_adaptive_gate_decomposition = is_adaptive_gate_mode and not skip_decomposition
 
     if do_cat_decomposition:
         # Create directories for decomposed renders
@@ -1020,11 +1180,48 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
 
     if do_adaptive_cat_decomposition:
         # Create directories for adaptive_cat decomposed renders
-        ngp_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'ngp_only'))
-        gaussian_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'gaussian_only'))
-        os.makedirs(ngp_output_dir, exist_ok=True)
-        os.makedirs(gaussian_output_dir, exist_ok=True)
-        print(f"[FINAL] Adaptive_cat mode decomposition enabled: saving NGP-only (weight=0) and Gaussian-only (weight=1) renders")
+        # New decomposition: separate by weight threshold (0.5)
+        pure_gaussian_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'pure_gaussian'))
+        hybrid_gaussian_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'hybrid_gaussian_part'))
+        hybrid_hash_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'hybrid_hash_part'))
+        os.makedirs(pure_gaussian_dir, exist_ok=True)
+        os.makedirs(hybrid_gaussian_dir, exist_ok=True)
+        os.makedirs(hybrid_hash_dir, exist_ok=True)
+        print(f"[FINAL] Adaptive_cat decomposition: pure_gaussian (w>0.5), hybrid_gaussian_part (w<=0.5, hash=0), hybrid_hash_part (w<=0.5, gauss=0)")
+
+    if do_adaptive_zero_decomposition:
+        # Create directories for adaptive_zero decomposed renders
+        # gaussian_only: Gaussians with weight < 0.5 (use zeros for fine levels)
+        # hybrid_gaussian_only: Gaussians with weight >= 0.5, hashgrid masked out
+        # hybrid_hash_only: Gaussians with weight >= 0.5, gaussian features masked out
+        # training_mode: render with smooth blending (no hard threshold)
+        # force_hash: render with all weights forced to 1 (all Gaussians use hash)
+        gaussian_only_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'gaussian_only'))
+        hybrid_gaussian_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'hybrid_gaussian_only'))
+        hybrid_hash_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'hybrid_hash_only'))
+        training_mode_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'training_mode'))
+        force_hash_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'force_hash'))
+        os.makedirs(gaussian_only_dir, exist_ok=True)
+        os.makedirs(hybrid_gaussian_dir, exist_ok=True)
+        os.makedirs(hybrid_hash_dir, exist_ok=True)
+        os.makedirs(training_mode_dir, exist_ok=True)
+        os.makedirs(force_hash_dir, exist_ok=True)
+
+    if do_adaptive_gate_decomposition:
+        # Create directories for adaptive_gate decomposed renders
+        # gate_closed: Gaussians with gate probability <= 0.5 (not using hash)
+        # gate_open: Gaussians with gate probability > 0.5 (using hash)
+        # gaussian_only: Force all gates closed
+        # ngp_only: Force all gates open
+        gate_closed_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'gate_closed'))
+        gate_open_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'gate_open'))
+        gate_gaussian_only_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'gaussian_only'))
+        gate_ngp_only_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'ngp_only'))
+        os.makedirs(gate_closed_dir, exist_ok=True)
+        os.makedirs(gate_open_dir, exist_ok=True)
+        os.makedirs(gate_gaussian_only_dir, exist_ok=True)
+        os.makedirs(gate_ngp_only_dir, exist_ok=True)
+        print(f"[FINAL] Adaptive_gate decomposition: gate_closed (prob<=0.5), gate_open (prob>0.5), gaussian_only, ngp_only")
 
     if len(cameras) == 0:
         print(f"[FINAL] No cameras available, skipping.")
@@ -1032,28 +1229,80 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     
     psnr_values = []
     ssim_values = []
+    lpips_values = []
     l1_values = []
     rendered_indices = []
-    
+
+    # For adaptive modes, also track training mode (soft) metrics
+    training_mode_psnr = []
+    training_mode_ssim = []
+    training_mode_lpips = []
+    training_mode_l1 = []
+
+    # For adaptive_zero mode, use hard gating (inference mode) for final renders
+    # This ensures binary decisions at weight threshold 0.1
+    old_adaptive_zero_inference = None
+    if is_adaptive_zero_mode and ingp is not None:
+        old_adaptive_zero_inference = getattr(ingp, 'adaptive_zero_inference', False)
+        ingp.adaptive_zero_inference = True
+        print(f"[FINAL] Adaptive_zero: Using inference mode (hard gating at w>=0.1)")
+
+    # For adaptive_cat mode, use hard gating (inference mode) for final renders
+    # This ensures binary decisions at weight threshold 0.9
+    old_adaptive_cat_inference = None
+    if is_adaptive_cat_mode and ingp is not None:
+        old_adaptive_cat_inference = getattr(ingp, 'adaptive_cat_inference', False)
+        ingp.adaptive_cat_inference = True
+        print(f"[FINAL] Adaptive_cat: Using inference mode (hard gating at w>=0.9)")
+
     with torch.no_grad():
         for idx, viewpoint in enumerate(cameras):
             if idx % stride != 0:
                 continue
-            
-            render_pkg = render(viewpoint, gaussians, pipe, background, 
+
+            render_pkg = render(viewpoint, gaussians, pipe, background,
                               ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
-            
+
             rendered = torch.clamp(render_pkg["render"], 0.0, 1.0)
             gt = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-            
+
             psnr_val = psnr(rendered, gt).mean().item()
             ssim_val = ssim(rendered, gt).mean().item()
+            lpips_val = lpips(rendered.unsqueeze(0), gt.unsqueeze(0), net_type='vgg').item()
             l1_val = l1_loss(rendered, gt).mean().item()
-            
+
             psnr_values.append(psnr_val)
             ssim_values.append(ssim_val)
+            lpips_values.append(lpips_val)
             l1_values.append(l1_val)
             rendered_indices.append(idx)
+
+            # For adaptive modes, also compute training mode (soft) metrics
+            if is_adaptive_zero_mode and ingp is not None:
+                # Temporarily switch to training mode
+                ingp.adaptive_zero_inference = False
+                training_pkg = render(viewpoint, gaussians, pipe, background,
+                                      ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
+                ingp.adaptive_zero_inference = True  # Restore inference mode
+
+                training_rendered = torch.clamp(training_pkg["render"], 0.0, 1.0)
+                training_mode_psnr.append(psnr(training_rendered, gt).mean().item())
+                training_mode_ssim.append(ssim(training_rendered, gt).mean().item())
+                training_mode_lpips.append(lpips(training_rendered.unsqueeze(0), gt.unsqueeze(0), net_type='vgg').item())
+                training_mode_l1.append(l1_loss(training_rendered, gt).mean().item())
+
+            if is_adaptive_cat_mode and ingp is not None:
+                # Temporarily switch to training mode
+                ingp.adaptive_cat_inference = False
+                training_pkg = render(viewpoint, gaussians, pipe, background,
+                                      ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
+                ingp.adaptive_cat_inference = True  # Restore inference mode
+
+                training_rendered = torch.clamp(training_pkg["render"], 0.0, 1.0)
+                training_mode_psnr.append(psnr(training_rendered, gt).mean().item())
+                training_mode_ssim.append(ssim(training_rendered, gt).mean().item())
+                training_mode_lpips.append(lpips(training_rendered.unsqueeze(0), gt.unsqueeze(0), net_type='vgg').item())
+                training_mode_l1.append(l1_loss(training_rendered, gt).mean().item())
             
             # Save images with consistent index naming
             rendered_np = rendered.permute(1, 2, 0).cpu().numpy()
@@ -1124,37 +1373,158 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                 gaussian_rendered_np = gaussian_rendered.permute(1, 2, 0).cpu().numpy()
                 save_img_u8(gaussian_rendered_np, os.path.join(gaussian_output_dir, f"{idx:03d}_gaussian.png"))
 
-            # Adaptive_cat mode decomposition: render with forced weights
+            # Adaptive_cat mode decomposition: separate by weight threshold
             if do_adaptive_cat_decomposition:
-                # NGP-only: force weight=0 so all Gaussians use hashgrid for fine level
-                ngp_render_pkg = render(viewpoint, gaussians, pipe, background,
+                # Pure Gaussian: only Gaussians with weight > 0.5 (don't use hash)
+                pure_gauss_pkg = render(viewpoint, gaussians, pipe, background,
                                        ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
-                                       decompose_mode='ngp_only')
-                ngp_rendered = torch.clamp(ngp_render_pkg["render"], 0.0, 1.0)
-                ngp_rendered_np = ngp_rendered.permute(1, 2, 0).cpu().numpy()
-                save_img_u8(ngp_rendered_np, os.path.join(ngp_output_dir, f"{idx:03d}_ngp.png"))
+                                       decompose_mode='pure_gaussian')
+                pure_gauss_rendered = torch.clamp(pure_gauss_pkg["render"], 0.0, 1.0)
+                pure_gauss_np = pure_gauss_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(pure_gauss_np, os.path.join(pure_gaussian_dir, f"{idx:03d}_pure_gaussian.png"))
 
-                # Gaussian-only: force weight=1 so all Gaussians use per-Gaussian features
-                gaussian_render_pkg = render(viewpoint, gaussians, pipe, background,
-                                            ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
-                                            decompose_mode='gaussian_only')
-                gaussian_rendered = torch.clamp(gaussian_render_pkg["render"], 0.0, 1.0)
-                gaussian_rendered_np = gaussian_rendered.permute(1, 2, 0).cpu().numpy()
-                save_img_u8(gaussian_rendered_np, os.path.join(gaussian_output_dir, f"{idx:03d}_gaussian.png"))
+                # Hybrid Gaussian part: Gaussians with weight <= 0.5, but hash features zeroed
+                hybrid_gauss_pkg = render(viewpoint, gaussians, pipe, background,
+                                         ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                         decompose_mode='hybrid_gaussian_part')
+                hybrid_gauss_rendered = torch.clamp(hybrid_gauss_pkg["render"], 0.0, 1.0)
+                hybrid_gauss_np = hybrid_gauss_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(hybrid_gauss_np, os.path.join(hybrid_gaussian_dir, f"{idx:03d}_hybrid_gaussian.png"))
+
+                # Hybrid Hash part: Gaussians with weight <= 0.5, but Gaussian features zeroed
+                hybrid_hash_pkg = render(viewpoint, gaussians, pipe, background,
+                                        ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                        decompose_mode='hybrid_hash_part')
+                hybrid_hash_rendered = torch.clamp(hybrid_hash_pkg["render"], 0.0, 1.0)
+                hybrid_hash_np = hybrid_hash_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(hybrid_hash_np, os.path.join(hybrid_hash_dir, f"{idx:03d}_hybrid_hash.png"))
+
+            # Adaptive_zero mode decomposition: separate by weight threshold
+            if do_adaptive_zero_decomposition:
+                # Training mode: render with smooth blending (no hard threshold)
+                # Temporarily disable inference mode
+                old_inference = ingp.adaptive_zero_inference if hasattr(ingp, 'adaptive_zero_inference') else False
+                ingp.adaptive_zero_inference = False
+                training_pkg = render(viewpoint, gaussians, pipe, background,
+                                      ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                      decompose_mode=None)  # No decompose, just training mode
+                ingp.adaptive_zero_inference = old_inference
+                training_rendered = torch.clamp(training_pkg["render"], 0.0, 1.0)
+                training_np = training_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(training_np, os.path.join(training_mode_dir, f"{idx:03d}_training.png"))
+
+                # Gaussian only: Gaussians with weight < 0.5 (use zeros for fine levels)
+                gauss_pkg = render(viewpoint, gaussians, pipe, background,
+                                   ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                   decompose_mode='gaussian_only')
+                gauss_rendered = torch.clamp(gauss_pkg["render"], 0.0, 1.0)
+                gauss_np = gauss_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(gauss_np, os.path.join(gaussian_only_dir, f"{idx:03d}_gaussian_only.png"))
+
+                # Hybrid Gaussian only: Gaussians with weight >= 0.5, hashgrid masked out
+                hybrid_gauss_pkg = render(viewpoint, gaussians, pipe, background,
+                                          ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                          decompose_mode='hybrid_gaussian_only')
+                hybrid_gauss_rendered = torch.clamp(hybrid_gauss_pkg["render"], 0.0, 1.0)
+                hybrid_gauss_np = hybrid_gauss_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(hybrid_gauss_np, os.path.join(hybrid_gaussian_dir, f"{idx:03d}_hybrid_gaussian.png"))
+
+                # Hybrid Hash only: Gaussians with weight >= 0.5, gaussian features masked out
+                hybrid_hash_pkg = render(viewpoint, gaussians, pipe, background,
+                                         ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                         decompose_mode='hybrid_hash_only')
+                hybrid_hash_rendered = torch.clamp(hybrid_hash_pkg["render"], 0.0, 1.0)
+                hybrid_hash_np = hybrid_hash_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(hybrid_hash_np, os.path.join(hybrid_hash_dir, f"{idx:03d}_hybrid_hash.png"))
+
+                # Force hash: render with all weights set to 1 (all Gaussians use hash)
+                # This helps verify if hash features are saturating to compensate for low weights
+                old_weights = gaussians._adaptive_zero_weight.data.clone()
+                # Set logits to large positive value so sigmoid(logit) ≈ 1
+                gaussians._adaptive_zero_weight.data.fill_(10.0)  # sigmoid(10) ≈ 0.99995
+                force_hash_pkg = render(viewpoint, gaussians, pipe, background,
+                                        ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                        decompose_mode=None)
+                gaussians._adaptive_zero_weight.data.copy_(old_weights)  # Restore original weights
+                force_hash_rendered = torch.clamp(force_hash_pkg["render"], 0.0, 1.0)
+                force_hash_np = force_hash_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(force_hash_np, os.path.join(force_hash_dir, f"{idx:03d}_force_hash.png"))
+
+            # Adaptive_gate mode decomposition: separate by gate probability threshold
+            if do_adaptive_gate_decomposition:
+                # Gate closed: only Gaussians with gate probability <= 0.5 (not using hash)
+                gate_closed_pkg = render(viewpoint, gaussians, pipe, background,
+                                        ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                        decompose_mode='gate_closed')
+                gate_closed_rendered = torch.clamp(gate_closed_pkg["render"], 0.0, 1.0)
+                gate_closed_np = gate_closed_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(gate_closed_np, os.path.join(gate_closed_dir, f"{idx:03d}_gate_closed.png"))
+
+                # Gate open: only Gaussians with gate probability > 0.5 (using hash)
+                gate_open_pkg = render(viewpoint, gaussians, pipe, background,
+                                      ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                      decompose_mode='gate_open')
+                gate_open_rendered = torch.clamp(gate_open_pkg["render"], 0.0, 1.0)
+                gate_open_np = gate_open_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(gate_open_np, os.path.join(gate_open_dir, f"{idx:03d}_gate_open.png"))
+
+                # Gaussian only: Force all gates closed (all Gaussians use Gaussian-only)
+                gauss_only_pkg = render(viewpoint, gaussians, pipe, background,
+                                       ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                       decompose_mode='gaussian_only')
+                gauss_only_rendered = torch.clamp(gauss_only_pkg["render"], 0.0, 1.0)
+                gauss_only_np = gauss_only_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(gauss_only_np, os.path.join(gate_gaussian_only_dir, f"{idx:03d}_gaussian_only.png"))
+
+                # NGP only: Force all gates open (all Gaussians use hash)
+                ngp_only_pkg = render(viewpoint, gaussians, pipe, background,
+                                     ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                     decompose_mode='ngp_only')
+                ngp_only_rendered = torch.clamp(ngp_only_pkg["render"], 0.0, 1.0)
+                ngp_only_np = ngp_only_rendered.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(ngp_only_np, os.path.join(gate_ngp_only_dir, f"{idx:03d}_ngp_only.png"))
 
             cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
-            print(f"[FINAL] Idx {idx:3d} ({cam_name}): PSNR={psnr_val:.2f} SSIM={ssim_val:.4f}")
-    
+            print(f"[FINAL] Idx {idx:3d} ({cam_name}): PSNR={psnr_val:.2f} SSIM={ssim_val:.4f} LPIPS={lpips_val:.4f}")
+
     # Summary
     avg_psnr = np.mean(psnr_values)
     avg_ssim = np.mean(ssim_values)
+    avg_lpips = np.mean(lpips_values)
     avg_l1 = np.mean(l1_values)
-    
+
+    # Training mode metrics for adaptive modes
+    avg_train_psnr = np.mean(training_mode_psnr) if training_mode_psnr else None
+    avg_train_ssim = np.mean(training_mode_ssim) if training_mode_ssim else None
+    avg_train_lpips = np.mean(training_mode_lpips) if training_mode_lpips else None
+    avg_train_l1 = np.mean(training_mode_l1) if training_mode_l1 else None
+
+    # Check if we're in any adaptive mode
+    is_any_adaptive_mode = is_adaptive_zero_mode or is_adaptive_cat_mode
+
     print(f"\n[FINAL] ════════════════════════════════════════")
-    print(f"[FINAL] Metrics ({len(psnr_values)} images):")
-    print(f"[FINAL]   Average PSNR: {avg_psnr:.2f} dB")
-    print(f"[FINAL]   Average SSIM: {avg_ssim:.4f}")
-    print(f"[FINAL]   Average L1:   {avg_l1:.6f}")
+    if is_adaptive_zero_mode:
+        print(f"[FINAL] INFERENCE MODE Metrics ({len(psnr_values)} images) [threshold w>=0.1]:")
+    elif is_adaptive_cat_mode:
+        print(f"[FINAL] INFERENCE MODE Metrics ({len(psnr_values)} images) [threshold w>=0.9]:")
+    else:
+        print(f"[FINAL] Metrics ({len(psnr_values)} images):")
+    print(f"[FINAL]   Average PSNR:  {avg_psnr:.2f} dB")
+    print(f"[FINAL]   Average SSIM:  {avg_ssim:.4f}")
+    print(f"[FINAL]   Average LPIPS: {avg_lpips:.4f}")
+    print(f"[FINAL]   Average L1:    {avg_l1:.6f}")
+    if is_any_adaptive_mode and avg_train_psnr is not None:
+        print(f"[FINAL] ────────────────────────────────────────")
+        print(f"[FINAL] TRAINING MODE Metrics (soft blending):")
+        print(f"[FINAL]   Average PSNR:  {avg_train_psnr:.2f} dB")
+        print(f"[FINAL]   Average SSIM:  {avg_train_ssim:.4f}")
+        print(f"[FINAL]   Average LPIPS: {avg_train_lpips:.4f}")
+        print(f"[FINAL]   Average L1:    {avg_train_l1:.6f}")
+        print(f"[FINAL] ────────────────────────────────────────")
+        print(f"[FINAL] Gap (inference - training):")
+        print(f"[FINAL]   PSNR:  {avg_psnr - avg_train_psnr:+.2f} dB")
+        print(f"[FINAL]   SSIM:  {avg_ssim - avg_train_ssim:+.4f}")
+        print(f"[FINAL]   LPIPS: {avg_lpips - avg_train_lpips:+.4f}")
     print(f"[FINAL] ════════════════════════════════════════")
     print(f"[FINAL] Images saved to: {final_output_dir}")
     print(f"[FINAL] Depth maps saved to: {depth_output_dir}")
@@ -1162,23 +1532,67 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     if do_cat_decomposition or do_hybrid_sh_decomposition:
         print(f"[FINAL] NGP-only renders saved to: {ngp_output_dir}")
         print(f"[FINAL] Gaussian-only renders saved to: {gaussian_output_dir}")
-    
+    if do_adaptive_zero_decomposition:
+        print(f"[FINAL] Training mode renders saved to: {training_mode_dir}")
+        print(f"[FINAL] Gaussian-only renders saved to: {gaussian_only_dir}")
+        print(f"[FINAL] Hybrid-gaussian renders saved to: {hybrid_gaussian_dir}")
+        print(f"[FINAL] Hybrid-hash renders saved to: {hybrid_hash_dir}")
+        print(f"[FINAL] Force-hash renders saved to: {force_hash_dir}")
+    if do_adaptive_gate_decomposition:
+        print(f"[FINAL] Gate-closed renders saved to: {gate_closed_dir}")
+        print(f"[FINAL] Gate-open renders saved to: {gate_open_dir}")
+        print(f"[FINAL] Gaussian-only renders saved to: {gate_gaussian_only_dir}")
+        print(f"[FINAL] NGP-only renders saved to: {gate_ngp_only_dir}")
+
+    # Restore original inference states
+    if old_adaptive_zero_inference is not None and ingp is not None:
+        ingp.adaptive_zero_inference = old_adaptive_zero_inference
+    if old_adaptive_cat_inference is not None and ingp is not None:
+        ingp.adaptive_cat_inference = old_adaptive_cat_inference
+
     # Save metrics file in output root
     metrics_path = os.path.join(scene.model_path, metrics_file)
     with open(metrics_path, 'w') as f:
         f.write(f"Final Evaluation (stride={stride})\n")
         f.write(f"════════════════════════════════════════\n")
-        f.write(f"Images rendered: {len(psnr_values)}\n")
+        f.write(f"Images rendered: {len(psnr_values)}\n\n")
+
+        if is_adaptive_zero_mode:
+            f.write(f"INFERENCE MODE (hard gating at w>=0.1):\n")
+        elif is_adaptive_cat_mode:
+            f.write(f"INFERENCE MODE (hard gating at w>=0.9):\n")
         f.write(f"Average PSNR:    {avg_psnr:.2f} dB\n")
         f.write(f"Average SSIM:    {avg_ssim:.4f}\n")
+        f.write(f"Average LPIPS:   {avg_lpips:.4f}\n")
         f.write(f"Average L1:      {avg_l1:.6f}\n\n")
-        f.write(f"Per-image results:\n")
-        f.write(f"{'Index':<10} {'PSNR (dB)':<12} {'SSIM':<12} {'L1':<12}\n")
-        f.write(f"{'-'*46}\n")
-        
+
+        # Training mode metrics for adaptive modes
+        if is_any_adaptive_mode and avg_train_psnr is not None:
+            f.write(f"TRAINING MODE (soft blending):\n")
+            f.write(f"Average PSNR:    {avg_train_psnr:.2f} dB\n")
+            f.write(f"Average SSIM:    {avg_train_ssim:.4f}\n")
+            f.write(f"Average LPIPS:   {avg_train_lpips:.4f}\n")
+            f.write(f"Average L1:      {avg_train_l1:.6f}\n\n")
+            f.write(f"Gap (inference - training):\n")
+            f.write(f"  PSNR:  {avg_psnr - avg_train_psnr:+.2f} dB\n")
+            f.write(f"  SSIM:  {avg_ssim - avg_train_ssim:+.4f}\n")
+            f.write(f"  LPIPS: {avg_lpips - avg_train_lpips:+.4f}\n\n")
+
+        f.write(f"Per-image results (inference mode):\n")
+        f.write(f"{'Index':<10} {'PSNR (dB)':<12} {'SSIM':<12} {'LPIPS':<12} {'L1':<12}\n")
+        f.write(f"{'-'*58}\n")
+
         for i, idx in enumerate(rendered_indices):
-            f.write(f"{idx:<10} {psnr_values[i]:>10.2f} {ssim_values[i]:>10.4f} {l1_values[i]:>12.6f}\n")
-    
+            f.write(f"{idx:<10} {psnr_values[i]:>10.2f} {ssim_values[i]:>10.4f} {lpips_values[i]:>10.4f} {l1_values[i]:>12.6f}\n")
+
+        # Per-image training mode metrics
+        if is_any_adaptive_mode and training_mode_psnr:
+            f.write(f"\nPer-image results (training mode):\n")
+            f.write(f"{'Index':<10} {'PSNR (dB)':<12} {'SSIM':<12} {'LPIPS':<12} {'L1':<12}\n")
+            f.write(f"{'-'*58}\n")
+            for i, idx in enumerate(rendered_indices):
+                f.write(f"{idx:<10} {training_mode_psnr[i]:>10.2f} {training_mode_ssim[i]:>10.4f} {training_mode_lpips[i]:>10.4f} {training_mode_l1[i]:>12.6f}\n")
+
     print(f"[FINAL] Metrics saved to: {metrics_path}")
 
 
@@ -1309,10 +1723,10 @@ if __name__ == "__main__":
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
     
-    # Method argument - baseline, cat, adaptive, adaptive_add, adaptive_cat, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
+    # Method argument - baseline, cat, adaptive, adaptive_add, adaptive_cat, adaptive_zero, adaptive_gate, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "cat", "adaptive", "adaptive_add", "adaptive_cat", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid"],
-                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), or 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual)")
+                        choices=["baseline", "cat", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid"],
+                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'adaptive_zero' (cat with weighted hash vs zeros - w=0 skips hash query), 'adaptive_gate' (VQ-AD style gating: soft→STE→hard, L1 regularization toward zeros), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), or 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual)")
     parser.add_argument("--hybrid_levels", type=int, default=3,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
     parser.add_argument("--decompose_mode", type=str, default=None,
@@ -1339,8 +1753,47 @@ if __name__ == "__main__":
     parser.add_argument("--adaptive_cat_anneal_start", type=int, default=15000,
                         help="Iteration to start annealing adaptive_cat entropy regularization (ramps from 0 to full strength)")
     parser.add_argument("--adaptive_cat_inference", action="store_true",
-                        help="Use binary decisions at inference (weight>0.5 uses Gaussian only, skips intersection; weight<=0.5 uses hashgrid only)")
-    
+                        help="Use binary decisions at inference (weight>=threshold uses Gaussian only, skips intersection; weight<threshold uses hashgrid)")
+    parser.add_argument("--adaptive_cat_threshold", type=float, default=0.9,
+                        help="Inference threshold for adaptive_cat: weight>=threshold uses Gaussian-only (default 0.9, conservative)")
+
+    # Adaptive_zero arguments
+    parser.add_argument("--lambda_adaptive_zero", type=float, default=0.0,
+                        help="BCE entropy regularization weight for adaptive_zero binarization (pushes hash weights toward 0 or 1)")
+    parser.add_argument("--bce_threshold", type=float, default=0.5,
+                        help="Threshold for BCE regularization repulsion point (default 0.5, try 0.1 to push weights away from inference threshold)")
+    parser.add_argument("--hash_lambda", type=float, default=0.0,
+                        help="L1 regularization weight pushing adaptive_zero weights toward 1 (favor hash queries over zeros)")
+    parser.add_argument("--adaptive_zero_anneal_start", type=int, default=15000,
+                        help="Iteration to start annealing adaptive_zero entropy regularization (ramps from 0 to full strength)")
+    parser.add_argument("--relocation", type=str, default="clone", choices=["clone", "reset"],
+                        help="How to handle adaptive weights for new/relocated Gaussians: 'clone' copies from source, 'reset' initializes to 0 (sigmoid=0.5)")
+
+    # Adaptive_gate arguments (Gumbel-STE with forced training)
+    parser.add_argument("--lambda_sparsity", type=float, default=0.005,
+                        help="Sparsity penalty on gate probability (encourages gates to stay closed)")
+    parser.add_argument("--force_ratio", type=float, default=0.2,
+                        help="Fraction of Gaussians forced to use hash during training (0.2 = 20%%)")
+    parser.add_argument("--gate_init", type=float, default=2.0,
+                        help="Initial gate logit value (positive = favor hash, sigmoid(2)≈0.88)")
+    parser.add_argument("--adaptive_gate_inference", action="store_true",
+                        help="Use hard gating at inference (probability>0.5 uses hash, otherwise zeros)")
+
+    # Temperature annealing (for adaptive_zero and adaptive_gate)
+    parser.add_argument("--temp_start", type=float, default=1.0,
+                        help="Initial temperature for sigmoid (1.0 = normal sigmoid)")
+    parser.add_argument("--temp_end", type=float, default=1.0,
+                        help="Final temperature for sigmoid (>1 makes sigmoid sharper, e.g., 10.0)")
+    parser.add_argument("--temp_anneal_start", type=int, default=3000,
+                        help="Iteration to start temperature annealing")
+    parser.add_argument("--temp_anneal_end", type=int, default=25000,
+                        help="Iteration to reach final temperature")
+
+
+    # Parabola regularization (additive with BCE)
+    parser.add_argument("--lambda_parabola", type=float, default=0.0,
+                        help="Weight for w*(1-w) penalty pushing weights away from 0.5 (additive with BCE)")
+
     # MCMC arguments - based on "3D Gaussian Splatting as Markov Chain Monte Carlo"
     parser.add_argument("--mcmc", action="store_true",
                         help="Enable MCMC-based Gaussian management (replaces traditional densification)")
