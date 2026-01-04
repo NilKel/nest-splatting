@@ -65,6 +65,34 @@ Thumbs.db
 *.iml
 
 # -----------------------------
+# BULLETPROOF PROTECTION - NEVER TRACK THESE
+# -----------------------------
+# Experiment outputs
+test_metrics.txt
+train_metrics.txt
+point_cloud.ply
+render_*.png
+render_*.jpg
+
+# Additional model files
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.mat
+*.bin
+
+# Wandb and tensorboard
+wandb/
+tensorboard/
+runs/
+
+# SLURM job files
+slurm_jobs/
+*.out
+*.err
+
+# -----------------------------
 # Misc
 # -----------------------------
 *.zip
