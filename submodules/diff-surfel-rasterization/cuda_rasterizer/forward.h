@@ -57,7 +57,7 @@ namespace FORWARD
 		const float beta,
 		int W, int H,
 		uint32_t c_dim, uint32_t level, uint32_t l_dim, float l_scale, uint32_t Base,
-		bool align_corners, uint32_t interp, 
+		bool align_corners, uint32_t interp,
 		const bool if_contract, const bool record_transmittance,
 		float focal_x, float focal_y,
 		const glm::vec2* scales,
@@ -78,14 +78,16 @@ namespace FORWARD
 		float* out_color,
 		float* out_others,
 		int* out_index,
-		float* cover_pixels, 
+		float* cover_pixels,
 		float* trans_avg,
 		const uint32_t D_diffuse = 0,
 		const float* hash_features_diffuse = nullptr,
 		const int* level_offsets_diffuse = nullptr,
 		const float* gridrange_diffuse = nullptr,
 		const int render_mode = 0,
-		const uint32_t max_intersections = 0);
+		const uint32_t max_intersections = 0,
+		const float* shapes = nullptr,
+		const int kernel_type = 0);
 }
 
 

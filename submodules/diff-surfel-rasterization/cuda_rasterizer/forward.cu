@@ -672,7 +672,9 @@ renderCUDAsurfelForward(
 	const float* __restrict__ gridrange_diffuse = nullptr,
 	const int render_mode = 0,
 	const float* __restrict__ rgb = nullptr,
-	const uint32_t max_intersections = 0)
+	const uint32_t max_intersections = 0,
+	const float* __restrict__ shapes = nullptr,
+	const int kernel_type = 0)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -706,7 +708,8 @@ renderCUDAsurfelForward(
 	__shared__ float3 collected_SvTv[BLOCK_SIZE];
 	__shared__ float3 collected_pk[BLOCK_SIZE];
 	__shared__ uint32_t collected_ap_level[BLOCK_SIZE];
-	
+	__shared__ float collected_shapes[BLOCK_SIZE];  // Beta kernel shape parameter
+
 	// Shared memory for per-Gaussian baseline features (dual hashgrid mode)
 	// NOTE: Disabled for baseline_double/baseline_blend_double due to shared memory limits
 	// We query on-demand instead (less efficient but fits in shared memory)
@@ -816,7 +819,11 @@ renderCUDAsurfelForward(
 		if(ap_level != nullptr){
 			collected_ap_level[block.thread_rank()] = floorf(ap_level[coll_id]);
 		}
-		
+		// Collect shape for beta kernel (only when using beta kernel)
+		if(shapes != nullptr){
+			collected_shapes[block.thread_rank()] = shapes[coll_id];
+		}
+
 		// NOTE: Per-Gaussian feature caching disabled due to shared memory limits
 		// Features are now queried on-demand in the per-pixel loop (cases 4, 5, 12)
 
@@ -853,20 +860,63 @@ renderCUDAsurfelForward(
 		float normal[3] = {nor_o.x, nor_o.y, nor_o.z};  // Already normalized in preprocessing
 		float opa = nor_o.w;
 
-		float power = -0.5f * rho ;
-		if (power > 0.0f)
-			continue;
+		float alpha;
+		if (kernel_type == 1) {
+			// Beta kernel: alpha = opacity * pow(1 - r², shape)
+			// Use rho (min of rho3d, rho2d) for anti-aliasing
+			if (rho >= 1.0f)
+				continue;  // Strict cutoff at unit circle
 
-		// Eq. (2) from 3D Gaussian splatting paper.
-		// Obtain alpha by multiplying with Gaussian opacity
-		// and its exponential falloff from mean.
-		// Avoid numerical instabilities (see paper appendix). 
-		float G = exp(power);
+			float base = 1.0f - rho;
+			float shape = collected_shapes[j];
+			alpha = min(0.99f, opa * powf(base, shape));
+		} else if (kernel_type == 2) {
+			// Flex kernel: Standard Gaussian with per-Gaussian learnable beta
+			// Same formula as Gaussian but beta comes from shapes array instead of global config
+			float power = -0.5f * rho;
+			if (power > 0.0f)
+				continue;
 
-		if(beta > 0.0)
-			G = (1.0 + beta) * G / (1.0 + beta * G);
-		
-		float alpha = min(0.99f, opa * G);
+			float G = exp(power);
+			float per_gaussian_beta = collected_shapes[j];  // shapes array holds per-Gaussian beta
+			if (per_gaussian_beta > 0.0f)
+				G = (1.0f + per_gaussian_beta) * G / (1.0f + per_gaussian_beta * G);
+
+			alpha = min(0.99f, opa * G);
+		} else if (kernel_type == 3) {
+			// General kernel: Isotropic Generalized Gaussian
+			// Formula: G = exp(-0.5 * (r²)^(β/2))
+			// β = 2.0: standard Gaussian, β = 8.0: super-Gaussian (box-like)
+			float beta_param = collected_shapes[j];  // shapes array holds beta in range [2.0, 8.0]
+			float exponent = 0.5f * beta_param;  // β/2
+
+			// Avoid numerical issues with rho=0
+			float rho_safe = fmaxf(rho, 1e-8f);
+			float pow_term = powf(rho_safe, exponent);  // (r²)^(β/2)
+			float power = -0.5f * pow_term;
+
+			if (power > 0.0f)
+				continue;
+
+			float G = expf(power);
+			alpha = min(0.99f, opa * G);
+		} else {
+			// Standard Gaussian kernel
+			float power = -0.5f * rho;
+			if (power > 0.0f)
+				continue;
+
+			// Eq. (2) from 3D Gaussian splatting paper.
+			// Obtain alpha by multiplying with Gaussian opacity
+			// and its exponential falloff from mean.
+			// Avoid numerical instabilities (see paper appendix).
+			float G = exp(power);
+
+			if(beta > 0.0)
+				G = (1.0 + beta) * G / (1.0 + beta * G);
+
+			alpha = min(0.99f, opa * G);
+		}
 
 		if (alpha < 1.0f / 255.0f)
 			continue;
@@ -1626,9 +1676,9 @@ renderCUDAsurfelForward(
 				}
 			} else {
 				// TRAINING MODE: Smooth blending
-				// Coarse levels: per-Gaussian only, scaled by weight
+				// Coarse levels: per-Gaussian only (NO weight scaling, same as cat mode)
 				for(int i = 0; i < hybrid_levels * per_level_dim; i++) {
-					feat[i] = gauss_feat[i] * weight;
+					feat[i] = gauss_feat[i];
 				}
 
 				// Fine levels: blend per-Gaussian with hashgrid
@@ -1734,9 +1784,9 @@ renderCUDAsurfelForward(
 						                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
 					}
 
-					// Copy hash features to fine levels
+					// Weighted hash features to fine levels (same as training for consistency)
 					for(int i = 0; i < hashgrid_levels * per_level_dim && (per_gaussian_dim + i) < CHANNELS; i++) {
-						feat[per_gaussian_dim + i] = hash_feat[i];
+						feat[per_gaussian_dim + i] = weight * hash_feat[i];
 					}
 				}
 				// else: fine levels stay zero (no hash query needed!) - FAST PATH
@@ -2027,14 +2077,16 @@ void FORWARD::render(
 	float* out_color,
 	float* out_others,
 	int* out_index,
-	float* cover_pixels, 
+	float* cover_pixels,
 	float* trans_avg,
 	const uint32_t D_diffuse,
 	const float* hash_features_diffuse,
 	const int* level_offsets_diffuse,
 	const float* gridrange_diffuse,
 	const int render_mode,
-	const uint32_t max_intersections)
+	const uint32_t max_intersections,
+	const float* shapes,
+	const int kernel_type)
 {
 	// Determine D_DIFFUSE template parameter for kernel dispatch
 	// For dual hashgrid modes (baseline_double, baseline_blend_double, surface_rgb), use D_diffuse
@@ -2047,19 +2099,19 @@ void FORWARD::render(
 			renderCUDAsurfelForward<3, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type);
 			break;
 		case 8:
 			renderCUDAsurfelForward<8, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type);
 			break;
 		case 16:
 			renderCUDAsurfelForward<16, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type);
 			break;
 	case 24:
 		// Always use D_DIFFUSE=0 template and handle dual hashgrids at runtime
@@ -2067,37 +2119,37 @@ void FORWARD::render(
 		renderCUDAsurfelForward<24, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type);
 		break;
 	case 32:
 		renderCUDAsurfelForward<32, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type);
 		break;
 	case 42:
 		renderCUDAsurfelForward<42, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type);
 		break;
 	case 48:
 		renderCUDAsurfelForward<48, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type);
 		break;
 	case 72:
 		renderCUDAsurfelForward<72, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type);
 		break;
 	case 90:
 		renderCUDAsurfelForward<90, 0> <<<grid, block>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections);
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type);
 		break;
 	default:
 		printf("Unsupported channel count: %d\n", C);

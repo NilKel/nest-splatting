@@ -483,7 +483,10 @@ renderCUDAsurfelBackward(
 	const int* __restrict__ level_offsets_diffuse = nullptr,
 	const float* __restrict__ gridrange_diffuse = nullptr,
 	float* __restrict__ dL_dfeatures_diffuse = nullptr,
-	const int render_mode = 0)
+	const int render_mode = 0,
+	const float* __restrict__ shapes = nullptr,
+	const int kernel_type = 0,
+	float* __restrict__ dL_dshapes = nullptr)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -518,7 +521,8 @@ renderCUDAsurfelBackward(
 	__shared__ float3 collected_SvTv[BLOCK_SIZE];
 	__shared__ float3 collected_pk[BLOCK_SIZE];
 	__shared__ uint32_t collected_ap_level[BLOCK_SIZE];
-	
+	__shared__ float collected_shapes[BLOCK_SIZE];  // Beta kernel shape parameter
+
 	// Shared memory for per-Gaussian baseline features (dual hashgrid mode)
 	// NOTE: Disabled for baseline_double/baseline_blend_double due to shared memory limits  
 	// We query on-demand instead (less efficient but fits in shared memory)
@@ -704,7 +708,11 @@ renderCUDAsurfelBackward(
 			if(ap_level != nullptr){
 				collected_ap_level[block.thread_rank()] = floorf(ap_level[coll_id]);
 			}
-			
+			// Collect shape for beta kernel (only when using beta kernel)
+			if(shapes != nullptr){
+				collected_shapes[block.thread_rank()] = shapes[coll_id];
+			}
+
 		// NOTE: Per-Gaussian feature caching disabled due to shared memory limits
 		// Features are now queried on-demand in the per-pixel loop (cases 4, 5, 12)
 		}
@@ -745,21 +753,71 @@ renderCUDAsurfelBackward(
 
 		// accumulations
 
-		float power = -0.5f * rho;
-		if (power > 0.0f)
-			continue;
+		float alpha, G = 0.0f, demon = 1.0f;
+		float shape_val = 0.0f;  // For beta kernel gradient
+		float base = 0.0f;       // For beta kernel gradient
+		float per_gaussian_beta = 0.0f;  // For flex kernel gradient
+		float G_raw = 0.0f;  // For flex kernel gradient (raw Gaussian before beta transform)
+		float general_beta = 0.0f;  // For general kernel gradient
+		float general_pow_term = 0.0f;  // For general kernel gradient: (r²)^(β/2)
+		float general_rho_safe = 0.0f;  // For general kernel gradient: max(rho, 1e-8)
 
-		float G = exp(power), demon = 1.0;
-			// const float beta = 0.0f;
+		if (kernel_type == 1) {
+			// Beta kernel: alpha = opacity * pow(1 - r², shape)
+			if (rho >= 1.0f)
+				continue;  // Strict cutoff at unit circle
+
+			base = 1.0f - rho;
+			shape_val = collected_shapes[j];
+			G = powf(base, shape_val);
+			alpha = min(0.99f, opa * G);
+		} else if (kernel_type == 2) {
+			// Flex kernel: Standard Gaussian with per-Gaussian learnable beta
+			float power = -0.5f * rho;
+			if (power > 0.0f)
+				continue;
+
+			G_raw = exp(power);
+			per_gaussian_beta = collected_shapes[j];  // shapes array holds per-Gaussian beta
+			if (per_gaussian_beta > 0.0f) {
+				demon = 1.0f + per_gaussian_beta * G_raw;
+				G = (1.0f + per_gaussian_beta) * G_raw / demon;
+			} else {
+				G = G_raw;
+			}
+			alpha = min(0.99f, opa * G);
+		} else if (kernel_type == 3) {
+			// General kernel: Isotropic Generalized Gaussian
+			// Formula: G = exp(-0.5 * (r²)^(β/2))
+			general_beta = collected_shapes[j];  // beta in range [2.0, 8.0]
+			float exponent = 0.5f * general_beta;  // β/2
+
+			general_rho_safe = fmaxf(rho, 1e-8f);
+			general_pow_term = powf(general_rho_safe, exponent);  // (r²)^(β/2)
+			float power = -0.5f * general_pow_term;
+
+			if (power > 0.0f)
+				continue;
+
+			G = expf(power);
+			alpha = min(0.99f, opa * G);
+		} else {
+			// Standard Gaussian kernel
+			float power = -0.5f * rho;
+			if (power > 0.0f)
+				continue;
+
+			G = exp(power);
 			if(beta > 0.0){
 				demon = 1.0 + beta * G;
 				G = (1.0 + beta) * G / demon;
 			}
-			
-			float alpha = min(0.99f, opa * G);
-			
-			if (alpha < 1.0f / 255.0f)
-				continue;
+
+			alpha = min(0.99f, opa * G);
+		}
+
+		if (alpha < 1.0f / 255.0f)
+			continue;
 
 			T = T / (1.f - alpha);
 			const float dchannel_dcolor = alpha * T;
@@ -1389,16 +1447,13 @@ renderCUDAsurfelBackward(
 			const float weight = colors[gauss_id * (total_dim + 1) + total_dim];
 			const float* gauss_feat = &colors[gauss_id * (total_dim + 1)];
 
-			// Coarse levels: dL/dgauss = w * dL/dfeat
+			// Coarse levels: dL/dgauss = dL/dfeat (NO weight scaling, same as cat mode)
 			for(int i = 0; i < hybrid_levels * per_level_dim; i++) {
-				atomicAdd(&dL_dcolors[gauss_id * (total_dim + 1) + i], weight * grad_feat[i]);
+				atomicAdd(&dL_dcolors[gauss_id * (total_dim + 1) + i], grad_feat[i]);
 			}
 
-			// Gradient for weight from coarse levels: dL/dw = sum(gauss * dL/dfeat)
+			// NO gradient for weight from coarse levels (coarse is not weighted in forward)
 			float dL_dweight = 0.0f;
-			for(int i = 0; i < hybrid_levels * per_level_dim; i++) {
-				dL_dweight += gauss_feat[i] * grad_feat[i];
-			}
 
 			// Fine levels: blend gradients
 			if (hashgrid_levels > 0) {
@@ -1806,12 +1861,57 @@ renderCUDAsurfelBackward(
 			// Helpful reusable temporary variables
 			float dL_dG = nor_o.w * dL_dalpha;
 
-			if(beta > 0.0){
-				// with beta activation
-				const float dG_dg = (1.0 + beta) / (demon * demon); 
+			if (kernel_type == 1) {
+				// Beta kernel: G = pow(base, shape), dG/dbase = shape * pow(base, shape-1)
+				// dL_dG is dL/dG, need to propagate to dL/drho
+				// For shape gradient: dG/dshape = G * ln(base)
+				if (dL_dshapes != nullptr && base > 1e-7f) {
+					// dL/dshape = dL/dalpha * dalpha/dG * dG/dshape
+					//           = dL/dalpha * opacity * G * ln(base)
+					float dL_dshape = dL_dalpha * opa * G * logf(base);
+					atomicAdd(&dL_dshapes[global_id], dL_dshape);
+				}
+				// dL_dG stays as nor_o.w * dL_dalpha for position gradient propagation
+			} else if (kernel_type == 2 && per_gaussian_beta > 0.0f) {
+				// Flex kernel: G = (1+beta)*G_raw / (1+beta*G_raw)
+				// dG/dG_raw = (1+beta) / demon^2
+				// dG/dbeta = G_raw * (1 - G_raw) / demon^2
+				const float dG_dg_raw = (1.0f + per_gaussian_beta) / (demon * demon);
+				dL_dG *= dG_dg_raw;  // dL_dG now refers to G_raw for position gradient
+
+				// Gradient w.r.t. per-Gaussian beta (stored in shapes array)
+				if (dL_dshapes != nullptr) {
+					// dL/dbeta = dL/dalpha * dalpha/dG * dG/dbeta
+					// dG/dbeta = G_raw * (1 - G_raw) / demon^2
+					float dG_dbeta = G_raw * (1.0f - G_raw) / (demon * demon);
+					float dL_dbeta = dL_dalpha * opa * dG_dbeta;
+					atomicAdd(&dL_dshapes[global_id], dL_dbeta);
+				}
+			} else if (kernel_type == 3) {
+				// General kernel: G = exp(-0.5 * (r²)^(β/2))
+				// Let pow_term = (r²)^(β/2), then G = exp(-0.5 * pow_term)
+				// dG/d(pow_term) = -0.5 * G
+				// d(pow_term)/d(r²) = (β/2) * (r²)^(β/2 - 1) = (β/2) * pow_term / r²
+				// d(pow_term)/dβ = 0.5 * pow_term * ln(r²)
+
+				// Position gradients will be computed later using dG_factor
+				// dL_dG stays as nor_o.w * dL_dalpha
+
+				// Gradient w.r.t. β (stored in shapes array)
+				if (dL_dshapes != nullptr) {
+					// dG/dβ = dG/d(pow_term) * d(pow_term)/dβ
+					//       = -0.5 * G * 0.5 * pow_term * ln(r²)
+					//       = -0.25 * G * pow_term * ln(r²)
+					float log_rho = logf(general_rho_safe);
+					float dG_dbeta = -0.25f * G * general_pow_term * log_rho;
+					float dL_dbeta = dL_dalpha * opa * dG_dbeta;
+					atomicAdd(&dL_dshapes[global_id], dL_dbeta);
+				}
+			} else if(beta > 0.0){
+				// with beta activation (Gaussian kernel only)
+				const float dG_dg = (1.0 + beta) / (demon * demon);
 				dL_dG *=  dG_dg; // dL_dg now infact
 			}
-			// dL_dG *= 0.8;
 
 
 #if RENDER_AXUTILITY
@@ -1855,11 +1955,35 @@ renderCUDAsurfelBackward(
 
 			if (rho3d <= rho2d) {
 				// Update gradients w.r.t. covariance of Gaussian 3x3 (T)
+				// For Gaussian kernel: dG/ds.x = -G * s.x (from exp(-0.5*(s.x²+s.y²)))
+				// For Beta kernel: dG/ds.x = -shape * G / base * s.x (from pow(1-rho, shape))
+				// For Flex kernel: same as Gaussian but use G_raw (already accounted for in dL_dG)
+				// For General kernel: dG/drho = -0.25 * β * G * pow_term / rho
+				float dG_factor;
+				if (kernel_type == 1) {
+					// Beta kernel: dG/drho = -shape * G / base, drho/ds.x = 2*s.x
+					dG_factor = (base > 1e-7f) ? -shape_val * G / base : 0.0f;
+				} else if (kernel_type == 2) {
+					// Flex kernel: same as Gaussian, use G_raw for position gradient
+					// dL_dG has already been adjusted in the gradient section above
+					dG_factor = -G_raw;
+				} else if (kernel_type == 3) {
+					// General kernel: dG/ds.x = dG/drho * drho/ds.x
+					// dG/drho = -0.5 * G * (β/2) * pow_term / rho = -0.25 * β * G * pow_term / rho
+					// drho/ds.x = 2 * s.x, so dG/ds.x = dG/drho * 2 * s.x
+					// dG_factor should satisfy: dG_factor * s.x = dG/ds.x
+					// Therefore: dG_factor = dG/drho * 2 = -0.5 * β * G * pow_term / rho
+					dG_factor = -0.5f * general_beta * G * general_pow_term / general_rho_safe;
+				} else {
+					// Gaussian kernel: dG/drho = -0.5 * G, drho/ds.x = 2*s.x
+					// Combined: dG/ds.x = -G * s.x
+					dG_factor = -G;
+				}
 				float2 dL_ds = {
-					dL_dG * -G * s.x + dL_dz * Tw.x,
-					dL_dG * -G * s.y + dL_dz * Tw.y
+					dL_dG * dG_factor * s.x + dL_dz * Tw.x,
+					dL_dG * dG_factor * s.y + dL_dz * Tw.y
 				};
-				
+
 				dL_ds.x += dL_duv.x;
 				dL_ds.y += dL_duv.y;
 
@@ -1889,9 +2013,32 @@ renderCUDAsurfelBackward(
 				atomicAdd(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
 				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
 			} else {
-				// // Update gradients w.r.t. center of Gaussian 2D mean position
-				const float dG_ddelx = -G * FilterInvSquare * d.x;
-				const float dG_ddely = -G * FilterInvSquare * d.y;
+				// Update gradients w.r.t. center of Gaussian 2D mean position
+				// For rho2d case: rho2d = FilterInvSquare * (d.x² + d.y²)
+				// For Gaussian kernel: dG/dd.x = -G * FilterInvSquare * d.x
+				// For Beta kernel: dG/dd.x = -shape * G / base * FilterInvSquare * d.x
+				// For Flex kernel: same as Gaussian but use G_raw
+				// For General kernel: dG/dd.x = dG/drho * FilterInvSquare * d.x
+				float dG_factor_2d;
+				if (kernel_type == 1) {
+					// Beta kernel
+					dG_factor_2d = (base > 1e-7f) ? -shape_val * G / base * FilterInvSquare : 0.0f;
+				} else if (kernel_type == 2) {
+					// Flex kernel: same as Gaussian, use G_raw
+					dG_factor_2d = -G_raw * FilterInvSquare;
+				} else if (kernel_type == 3) {
+					// General kernel: dG/dd.x = dG/drho2d * drho2d/dd.x
+					// dG/drho = -0.25 * β * G * pow_term / rho
+					// rho2d = FilterInvSquare * (d.x² + d.y²), so drho2d/dd.x = 2 * FilterInvSquare * d.x
+					// dG_factor_2d should satisfy: dG_factor_2d * d.x = dG/dd.x
+					// Therefore: dG_factor_2d = dG/drho * 2 * FilterInvSquare = -0.5 * β * G * pow_term / rho * FilterInvSquare
+					dG_factor_2d = -0.5f * general_beta * G * general_pow_term / general_rho_safe * FilterInvSquare;
+				} else {
+					// Gaussian kernel
+					dG_factor_2d = -G * FilterInvSquare;
+				}
+				const float dG_ddelx = dG_factor_2d * d.x;
+				const float dG_ddely = dG_factor_2d * d.y;
 				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
 				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
 				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz); // propagate depth loss
@@ -2221,7 +2368,10 @@ void BACKWARD::render(
 	const int* level_offsets_diffuse,
 	const float* gridrange_diffuse,
 	float* dL_dfeatures_diffuse,
-	const int render_mode)
+	const int render_mode,
+	const float* shapes,
+	const int kernel_type,
+	float* dL_dshapes)
 {
 	// Determine D_DIFFUSE template parameter for kernel dispatch
 	const uint32_t D_DIFFUSE_TEMPLATE = D_diffuse;
@@ -2232,21 +2382,21 @@ void BACKWARD::render(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode);
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
 			break;
 		case 8:
 			renderCUDAsurfelBackward<8, 0> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode);
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
 			break;
 		case 16:
 			renderCUDAsurfelBackward<16, 0> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode);
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
 			break;
 	case 24:
 		// Always use D_DIFFUSE=0 template and handle dual hashgrids at runtime
@@ -2255,42 +2405,42 @@ void BACKWARD::render(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
 		break;
 	case 32:
 		renderCUDAsurfelBackward<32, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
 		break;
 	case 42:
 		renderCUDAsurfelBackward<42, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
 		break;
 	case 48:
 		renderCUDAsurfelBackward<48, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
 		break;
 	case 72:
 		renderCUDAsurfelBackward<72, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
 		break;
 	case 90:
 		renderCUDAsurfelBackward<90, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
 		break;
 	default:
 		printf("Unsupported channel count: %d\n", C);

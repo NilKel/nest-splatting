@@ -32,7 +32,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& gridrange,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx, 
+	const float tan_fovx,
 	const float tan_fovy,
 	const int image_height,
 	const int image_width,
@@ -43,7 +43,7 @@ RasterizeGaussiansCUDA(
 	const bool debug,
 	const float beta,
 	const bool if_contract,
-	const bool record_transmittance, 
+	const bool record_transmittance,
 	const uint32_t Level,
 	const float LevelScale,
 	const uint32_t Base,
@@ -54,9 +54,11 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& gridrange_diffuse,
 	const int render_mode,
 	const torch::Tensor& shape_dims,
-	const int max_intersections);
+	const int max_intersections,
+	const torch::Tensor& shapes,
+	const int kernel_type);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
 	 const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -98,7 +100,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& offsets_diffuse,
 	const torch::Tensor& gridrange_diffuse,
 	const int render_mode,
-	const torch::Tensor& shape_dims);
+	const torch::Tensor& shape_dims,
+	const torch::Tensor& shapes,
+	const int kernel_type);
 		
 torch::Tensor markVisible(
 		torch::Tensor& means3D,

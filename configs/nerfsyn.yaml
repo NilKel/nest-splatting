@@ -50,7 +50,7 @@ ingp_stage:
 surfel:
   base_beta: 0
   base_opacity: 0
-  tg_beta: 0.0
+  tg_beta: 0
   tg_base_alpha: 0.0
   update_interval: 500
   update_interations: 5_000

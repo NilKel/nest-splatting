@@ -260,7 +260,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* background,
 	const int width, int height,
 	uint32_t c_dim, uint32_t level, uint32_t l_dim, float l_scale, uint32_t Base,
-	bool align_corners, uint32_t interp, 
+	bool align_corners, uint32_t interp,
 	const bool if_contract, const bool record_transmittance,
 	const float* means3D,
 	const float* shs,
@@ -293,7 +293,9 @@ int CudaRasterizer::Rasterizer::forward(
 	const int* level_offsets_diffuse,
 	const float* gridrange_diffuse,
 	const int render_mode,
-	const uint32_t max_intersections)
+	const uint32_t max_intersections,
+	const float* shapes,
+	const int kernel_type)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -430,7 +432,9 @@ int CudaRasterizer::Rasterizer::forward(
 		level_offsets_diffuse,
 		gridrange_diffuse,
 		render_mode,
-		max_intersections), debug)
+		max_intersections,
+		shapes,
+		kernel_type), debug)
 
 	return num_rendered;
 }
@@ -442,7 +446,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* background,
 	const int width, int height,
 	uint32_t c_dim, uint32_t level, uint32_t l_dim, float l_scale, uint32_t Base,
-	bool align_corners, uint32_t interp, 
+	bool align_corners, uint32_t interp,
 	const bool if_contract,
 	const float* means3D,
 	const float* shs,
@@ -487,7 +491,10 @@ void CudaRasterizer::Rasterizer::backward(
 	const int* level_offsets_diffuse,
 	const float* gridrange_diffuse,
 	float* dL_dfeatures_diffuse,
-	const int render_mode)
+	const int render_mode,
+	const float* shapes,
+	const int kernel_type,
+	float* dL_dshapes)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -528,7 +535,7 @@ void CudaRasterizer::Rasterizer::backward(
 		color_ptr,
 		transMat_ptr,
 		homotrans,
-	 	ap_level,
+		ap_level,
 		hash_features,
 		level_offsets,
 		gridrange,
@@ -550,7 +557,10 @@ void CudaRasterizer::Rasterizer::backward(
 		level_offsets_diffuse,
 		gridrange_diffuse,
 		dL_dfeatures_diffuse,
-		render_mode), debug)
+		render_mode,
+		shapes,
+		kernel_type,
+		dL_dshapes), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,

@@ -22,7 +22,7 @@ from utils.general_utils import MEM_PRINT
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
     beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False, decompose_mode = None, max_intersections = 0,
-    skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2):
+    skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2, no_gumbel = False, dropout_lambda = 0.0, is_training = True):
     """
     Render the scene.
 
@@ -33,6 +33,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     max_intersections: Max ray-Gaussian intersections per pixel. 0 means no limit.
     skip_mlp: If True, skip MLP decode and return zeros for RGB (for benchmarking).
     force_no_hash_cuda: If True, disable hash_in_CUDA (use plain 2DGS rasterizer, no hash query).
+    dropout_lambda: Hash dropout rate for cat_dropout mode (0.2 = 20% of Gaussians don't query hash during training).
+    is_training: Whether we're in training mode (affects dropout behavior).
     """
 
     render_start_time = time.time()
@@ -151,7 +153,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Adaptive_gate mode detection (VQ-AD style gating: soft→STE→hard)
     is_adaptive_gate_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_gate_mode') and ingp.is_adaptive_gate_mode
 
-    hybrid_levels = ingp.hybrid_levels if (is_cat_mode or is_adaptive_cat_mode or is_adaptive_zero_mode or is_adaptive_gate_mode) else 0
+    # Cat_dropout mode detection (cat mode with hash dropout during training)
+    is_cat_dropout_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_cat_dropout_mode') and ingp.is_cat_dropout_mode
+
+    hybrid_levels = ingp.hybrid_levels if (is_cat_mode or is_adaptive_cat_mode or is_adaptive_zero_mode or is_adaptive_gate_mode or is_cat_dropout_mode) else 0
     
     # Adaptive mode detection
     is_adaptive_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_mode') and ingp.is_adaptive_mode
@@ -211,29 +216,72 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # When hybrid_levels == 0, behave identically to baseline
         if is_cat_mode and hybrid_levels > 0:
             # Set per-Gaussian features as colors_precomp
-            colors_precomp = pc.get_gaussian_features
+            gaussian_features = pc.get_gaussian_features
             shs = None
-            render_mode = 4
-            
-            # Encode levels for CUDA case 4: (total << 16) | (active_hashgrid << 8) | hybrid
+
+            # Encode levels for CUDA: (total << 16) | (active_hashgrid << 8) | hybrid
             # Uses active_hashgrid_levels for C2F (progressively enables hashgrid levels)
             total_levels = ingp.levels
             active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
             levels = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
-            
+
             # Pad offsets to 17 elements (CUDA code expects up to 16 levels + 1)
             # This is needed because CUDA copies offsets based on max possible levels
             if offsets.shape[0] < 17:
                 padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
                 padded_offsets[:offsets.shape[0]] = offsets
                 offsets = padded_offsets
-            
+
+            colors_precomp = gaussian_features
+            render_mode = 4
+
             # Cat mode: G + H = O
             gaussian_dim = hybrid_levels * ingp.level_dim  # e.g., 5*4 = 20
             hash_dim = active_hashgrid_levels * ingp.level_dim  # e.g., 1*4 = 4
             output_dim = total_levels * ingp.level_dim  # e.g., 6*4 = 24
             shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
-        
+
+        # Cat_dropout mode: cat mode with hash dropout during training
+        # Uses mode 14 (adaptive_zero kernel) with hardcoded weights
+        # Training: weight=1 for (1-dropout_lambda)% of Gaussians, weight=0 for dropout_lambda%
+        # Inference: weight=1 for all (identical to cat mode)
+        elif is_cat_dropout_mode and hybrid_levels > 0:
+            gaussian_features = pc.get_gaussian_features  # (N, hybrid_levels * D)
+            shs = None
+
+            # Encode levels for CUDA: (total << 16) | (active_hashgrid << 8) | hybrid
+            total_levels = ingp.levels
+            active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
+            levels = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+
+            # Pad offsets to 17 elements (CUDA code expects up to 16 levels + 1)
+            if offsets.shape[0] < 17:
+                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
+                padded_offsets[:offsets.shape[0]] = offsets
+                offsets = padded_offsets
+
+            N = gaussian_features.shape[0]
+
+            if is_training and dropout_lambda > 0:
+                # Training with dropout: randomly mask some Gaussians to not use hash
+                # weight=1 means use hash, weight=0 means use zeros for fine levels
+                dropout_mask = (torch.rand(N, 1, device="cuda") >= dropout_lambda).float()
+            else:
+                # Inference or no dropout: all weights = 1 (use hash for all)
+                dropout_mask = torch.ones(N, 1, device="cuda")
+
+            # Concatenate: [coarse_features | weight]
+            colors_precomp = torch.cat([gaussian_features, dropout_mask], dim=1)
+
+            # Use mode 14 (adaptive_zero kernel) - training mode (no inference flag)
+            render_mode = 14
+
+            # Shape dims: GS = coarse, HS = fine hash, OS = total
+            gaussian_dim = hybrid_levels * ingp.level_dim
+            hash_dim = active_hashgrid_levels * ingp.level_dim
+            output_dim = total_levels * ingp.level_dim
+            shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
+
         # Adaptive mode: blend per-Gaussian and hashgrid features in Python, pass 24D to rasterizer
         elif is_adaptive_mode and pc._adaptive_feat_dim > 0:
             # Query hashgrid features for all Gaussians (24D)
@@ -430,16 +478,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 # INFERENCE: Hard threshold on probability (prob > 0.5 → use hash)
                 effective_mask = (torch.sigmoid(gate_logits) > 0.5).float()
             else:
-                # TRAINING: Gumbel-STE + Forced Training
+                # TRAINING: STE with optional Gumbel noise + Forced Training
 
-                # 1. Gumbel noise for stochastic exploration
-                uniform = torch.rand_like(gate_logits).clamp(1e-6, 1 - 1e-6)
-                gumbel_noise = -torch.log(-torch.log(uniform))
-                noisy_logits = (gate_logits + gumbel_noise) / temperature
+                if no_gumbel:
+                    # Deterministic STE: no Gumbel noise, just hard threshold with soft gradients
+                    soft_gate = torch.sigmoid(gate_logits / temperature)
+                    hard_gate = (soft_gate > 0.5).float() - soft_gate.detach() + soft_gate
+                else:
+                    # Gumbel-STE: stochastic exploration
+                    # 1. Gumbel noise for stochastic exploration
+                    uniform = torch.rand_like(gate_logits).clamp(1e-6, 1 - 1e-6)
+                    gumbel_noise = -torch.log(-torch.log(uniform))
+                    noisy_logits = (gate_logits + gumbel_noise) / temperature
 
-                # 2. STE: hard forward, soft backward
-                soft_gate = torch.sigmoid(noisy_logits)
-                hard_gate = (soft_gate > 0.5).float() - soft_gate.detach() + soft_gate
+                    # 2. STE: hard forward, soft backward
+                    soft_gate = torch.sigmoid(noisy_logits)
+                    hard_gate = (soft_gate > 0.5).float() - soft_gate.detach() + soft_gate
 
                 # 3. Forced training: force some Gaussians to use hash (detached, not learnable)
                 force_mask = (torch.rand_like(gate_logits) < force_ratio).float().detach()
@@ -667,7 +721,25 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
-    
+
+    # Get shape parameter for beta/general kernel (if using beta or general kernel)
+    # Get flex_beta parameter for flex kernel (if using flex kernel)
+    shapes = None
+    kernel_type = 0  # 0=gaussian, 1=beta, 2=flex, 3=general
+    if hasattr(pc, 'kernel_type') and pc.kernel_type == "beta" and hasattr(pc, '_shape') and pc._shape.numel() > 0:
+        shapes = pc.get_shape
+        kernel_type = 1
+    elif hasattr(pc, 'kernel_type') and pc.kernel_type == "flex" and hasattr(pc, '_flex_beta') and pc._flex_beta.numel() > 0:
+        # For flex kernel, pass per-Gaussian beta via the shapes parameter
+        # The CUDA kernel will interpret this as beta instead of shape based on kernel_type=2
+        shapes = pc.get_flex_beta
+        kernel_type = 2
+    elif hasattr(pc, 'kernel_type') and pc.kernel_type == "general" and hasattr(pc, '_shape') and pc._shape.numel() > 0:
+        # For general kernel (Isotropic Generalized Gaussian), pass beta via shapes parameter
+        # Beta in range [2.0, 8.0]: 2.0=standard Gaussian, 8.0=super-Gaussian (box)
+        shapes = pc.get_shape
+        kernel_type = 3
+
     rendered_image, radii, allmap, transmittance_avg, num_covered_pixels = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -683,6 +755,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         offsets = offsets,
         gridrange = gridrange,
         render_mode = render_mode,
+        shapes = shapes,
+        kernel_type = kernel_type,
     )
     
     # additional regularizations

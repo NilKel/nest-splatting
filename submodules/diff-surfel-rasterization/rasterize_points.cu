@@ -53,7 +53,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& gridrange,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx, 
+	const float tan_fovx,
 	const float tan_fovy,
 	const int image_height,
 	const int image_width,
@@ -64,7 +64,7 @@ RasterizeGaussiansCUDA(
 	const bool debug,
 	const float beta,
 	const bool if_contract,
-	const bool record_transmittance, 
+	const bool record_transmittance,
 	const uint32_t Level,
 	const float LevelScale,
 	const uint32_t Base,
@@ -75,7 +75,9 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& gridrange_diffuse,
 	const int render_mode,
 	const torch::Tensor& shape_dims,
-	const int max_intersections)
+	const int max_intersections,
+	const torch::Tensor& shapes,
+	const int kernel_type)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 	AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -118,6 +120,11 @@ RasterizeGaussiansCUDA(
   CHECK_INPUT(features_diffuse);
   CHECK_INPUT(offsets_diffuse);
   CHECK_INPUT(gridrange_diffuse);
+
+  // Beta kernel shapes (optional)
+  if (shapes.numel() > 0) {
+    CHECK_INPUT(shapes);
+  }
 
   // Keep D for hashgrid feature dimension (still needed for CUDA kernels)
   uint32_t D = 0;
@@ -184,6 +191,9 @@ RasterizeGaussiansCUDA(
 	  // For baseline hashgrid mode, colors is empty - pass nullptr instead of invalid pointer
 	  const float* colors_ptr = (colors.numel() > 0) ? colors.contiguous().data<float>() : nullptr;
 
+	  // Beta kernel shapes pointer (nullptr if not using beta kernel)
+	  const float* shapes_ptr = (shapes.numel() > 0) ? shapes.contiguous().data<float>() : nullptr;
+
 	  rendered = CudaRasterizer::Rasterizer::forward(
 		geomFunc,
 		binningFunc,
@@ -193,18 +203,18 @@ RasterizeGaussiansCUDA(
 		W, H, C, Level, D, LevelScale, Base, align_corners, interp, if_contract, record_transmittance,
 		means3D.contiguous().data<float>(),
 		sh.contiguous().data_ptr<float>(),
-		colors_ptr, 
-		opacity.contiguous().data<float>(), 
+		colors_ptr,
+		opacity.contiguous().data<float>(),
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
 		rotations.contiguous().data_ptr<float>(),
-		transMat_precomp.contiguous().data<float>(), 
+		transMat_precomp.contiguous().data<float>(),
 		homotrans.contiguous().data<float>(),
 		ap_level.contiguous().data<float>(),
-		features.contiguous().data<float>(), 
-		offsets.contiguous().data<int>(), 
-		gridrange.contiguous().data<float>(), 
-		viewmatrix.contiguous().data<float>(), 
+		features.contiguous().data<float>(),
+		offsets.contiguous().data<int>(),
+		gridrange.contiguous().data<float>(),
+		viewmatrix.contiguous().data<float>(),
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
 		tan_fovx,
@@ -223,13 +233,15 @@ RasterizeGaussiansCUDA(
 		offsets_diffuse.contiguous().data<int>(),
 		gridrange_diffuse.contiguous().data<float>(),
 		render_mode,
-		(uint32_t)max_intersections);
+		(uint32_t)max_intersections,
+		shapes_ptr,
+		kernel_type);
   }
 
   return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
 	 const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -271,7 +283,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& offsets_diffuse,
 	const torch::Tensor& gridrange_diffuse,
 	const int render_mode,
-	const torch::Tensor& shape_dims) 
+	const torch::Tensor& shape_dims,
+	const torch::Tensor& shapes,
+	const int kernel_type) 
 {
 
   CHECK_INPUT(background);
@@ -367,11 +381,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dfeatures_diffuse = torch::zeros({table_size_diffuse, D_diffuse}, means3D.options());
 
   torch::Tensor dL_gradsum = torch::zeros({P, 1}, means3D.options());
-  
+
+  // Beta kernel shape gradients
+  torch::Tensor dL_dshapes = torch::zeros({P, 1}, means3D.options());
+
   if(P != 0)
   {
 	  // For baseline hashgrid mode, colors is empty - pass nullptr instead of invalid pointer
 	  const float* colors_ptr_bw = (colors.numel() > 0) ? colors.contiguous().data<float>() : nullptr;
+
+	  // Beta kernel shapes pointer
+	  const float* shapes_ptr_bw = (shapes.numel() > 0) ? shapes.contiguous().data<float>() : nullptr;
 
 	  CudaRasterizer::Rasterizer::backward(P, degree, M, R,
 	  background.contiguous().data<float>(),
@@ -420,10 +440,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  offsets_diffuse.contiguous().data<int>(),
 	  gridrange_diffuse.contiguous().data<float>(),
 	  dL_dfeatures_diffuse.contiguous().data<float>(),
-	  render_mode);
+	  render_mode,
+	  shapes_ptr_bw,
+	  kernel_type,
+	  dL_dshapes.contiguous().data<float>());
   }
 
-  return std::make_tuple(dL_dfeatures, dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dtransMat, dL_dsh, dL_dscales, dL_drotations, dL_gradsum, dL_dfeatures_diffuse);
+  return std::make_tuple(dL_dfeatures, dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dtransMat, dL_dsh, dL_dscales, dL_drotations, dL_gradsum, dL_dfeatures_diffuse, dL_dshapes);
 }
 
 torch::Tensor markVisible(

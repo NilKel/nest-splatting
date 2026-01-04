@@ -24,7 +24,7 @@ from utils.mesh_utils import GaussianExtractor, to_cam_open3d, post_process_mesh
 from utils.render_utils import generate_path, create_videos
 from hash_encoder.modules import INGP
 from hash_encoder.config import Config
-from utils.render_utils import save_img_u8, convert_gray_to_cmap
+from utils.render_utils import save_img_u8, convert_gray_to_cmap, create_flex_beta_heatmap
 from lpipsPyTorch import lpips
 from train import merge_cfg_to_args
 
@@ -56,6 +56,13 @@ if __name__ == "__main__":
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only, must match training)")
     parser.add_argument("--eval_depth", action="store_true",
                         help="Render and save depth maps (expected and median)")
+    parser.add_argument("--kernel", type=str, default="gaussian",
+                        choices=["gaussian", "beta", "flex"],
+                        help="Kernel type (must match training)")
+    parser.add_argument("--eval_flex_beta", action="store_true",
+                        help="Render flex beta heatmap (only for --kernel flex)")
+    parser.add_argument("--flex_beta_max", type=float, default=10.0,
+                        help="Max beta for flex beta heatmap colormap")
     args = get_combined_args(parser)
 
     exp_path = args.model_path
@@ -84,6 +91,20 @@ if __name__ == "__main__":
     gaussians.base_opacity = cfg_model.surfel.tg_base_alpha
     beta = cfg_model.surfel.tg_beta
     # print(f'base_a {gaussians.base_opacity}, beta {beta}')
+
+    # Set kernel type for flex kernel support
+    if hasattr(args, 'kernel') and args.kernel == "flex":
+        gaussians.kernel_type = "flex"
+        # Initialize flex_beta if not already loaded
+        if not hasattr(gaussians, '_flex_beta') or gaussians._flex_beta.numel() == 0:
+            import torch.nn as nn
+            n_gaussians = len(gaussians.get_xyz)
+            flex_beta_init = torch.full((n_gaussians, 1), 5.0, device="cuda").float()
+            gaussians._flex_beta = nn.Parameter(flex_beta_init.requires_grad_(False))
+            print(f"[FLEX KERNEL] Initialized {n_gaussians} Gaussians with default beta=5.0")
+        else:
+            print(f"[FLEX KERNEL] Loaded flex_beta: mean={gaussians.get_flex_beta.mean().item():.3f}, "
+                  f"min={gaussians.get_flex_beta.min().item():.3f}, max={gaussians.get_flex_beta.max().item():.3f}")
 
     gaussians.XYZ_TYPE = "UV"
     active_levels = ingp_model.set_active_levels(iteration)
@@ -190,6 +211,30 @@ if __name__ == "__main__":
                     
                     save_img_u8(depth_expected_color, os.path.join(test_renders, base_name + '_depth_expected.png'))
                     save_img_u8(depth_median_color, os.path.join(test_renders, base_name + '_depth_median.png'))
+
+                # Save flex beta heatmap if --eval_flex_beta is set and using flex kernel
+                if args.eval_flex_beta and hasattr(args, 'kernel') and args.kernel == "flex":
+                    # Create flex_beta output dir if needed
+                    flex_beta_dir = os.path.join(test_dir, "flex_beta")
+                    os.makedirs(flex_beta_dir, exist_ok=True)
+
+                    # Get per-Gaussian flex beta and expand to RGB
+                    flex_beta_vals = gaussians.get_flex_beta  # (N, 1)
+                    flex_beta_color = flex_beta_vals.expand(-1, 3)  # (N, 3)
+
+                    # Render with flex_beta as override_color
+                    flex_render_pkg = render(cam, gaussians, pipe, background,
+                                            ingp=None, beta=0.0, iteration=iteration, cfg=cfg_model,
+                                            override_color=flex_beta_color)
+                    flex_beta_map = flex_render_pkg["render"][0:1]  # Take first channel
+                    render_alpha = flex_render_pkg["rend_alpha"]  # (1, H, W)
+
+                    # Create heatmap
+                    flex_beta_heatmap, min_beta, max_beta = create_flex_beta_heatmap(
+                        flex_beta_map, render_alpha,
+                        min_display=0.0, max_display=args.flex_beta_max
+                    )
+                    save_img_u8(flex_beta_heatmap, os.path.join(flex_beta_dir, base_name + '_flex_beta.png'))
 
     if not args.skip_mesh:
         gaussExtractor = GaussianExtractor(render, gaussians, pipe, background, ingp = ingp_model, \

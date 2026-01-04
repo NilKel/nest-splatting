@@ -84,6 +84,19 @@ class GaussianModel:
         # Relocation mode for adaptive weights: 'clone' (copy from source) or 'reset' (initialize to 0)
         self._relocation_mode = "clone"
 
+        # Beta/General kernel shape parameter (per-Gaussian, controls kernel falloff)
+        # Beta kernel: sigmoid(_shape) * 4.0 + 0.001 gives range [0.001, 4.001]
+        #   shape≈0 = hard flat disk, shape≈4 = soft Gaussian cloud
+        # General kernel: sigmoid(_shape) * 6.0 + 2.0 gives range [2.0, 8.0]
+        #   beta=2.0 = standard Gaussian, beta=8.0 = super-Gaussian (box)
+        self._shape = torch.empty(0)
+        self.kernel_type = "gaussian"  # "gaussian", "beta", "flex", or "general"
+
+        # Flex kernel: per-Gaussian learnable beta for Gaussian sharpening
+        # softplus(_flex_beta) gives range [0, inf), typically [0, ~50]
+        # beta=0 = standard Gaussian, beta>0 = sharper/more opaque
+        self._flex_beta = torch.empty(0)
+
         # Diffuse mode flag (uses SH degree 0, no hashgrid)
         self._diffuse_mode = False
         # Specular mode flag (full 2DGS with SH, no hashgrid)
@@ -254,8 +267,45 @@ class GaussianModel:
     
     @property
     def get_opacity(self):
-        return self.opacity_activation(self._opacity) * (1.0 - self.base_opacity) + self.base_opacity
-    
+        op = self.opacity_activation(self._opacity) * (1.0 - self.base_opacity) + self.base_opacity
+        # Energy normalization for beta kernel: boost opacity as shape increases (softer kernels)
+        # This preserves brightness as kernels harden (shape → 0)
+        if self.kernel_type == "beta" and self._shape.numel() > 0:
+            return op * (1.0 + self.get_shape)
+        # Energy normalization for general kernel: scale by 2/beta
+        # At beta=2 (standard Gaussian), factor=1.0. At beta=8 (super-Gaussian), factor=0.25
+        if self.kernel_type == "general" and self._shape.numel() > 0:
+            return op * (2.0 / self.get_shape)
+        return op
+
+    @property
+    def get_shape(self):
+        """Returns shape parameter for beta or general kernel.
+
+        Beta kernel: range [0.001, 4.001]
+            shape ≈ 0: hard flat disk
+            shape ≈ 4: soft Gaussian cloud
+
+        General kernel (Isotropic Generalized Gaussian): range [2.0, 8.0]
+            beta = 2.0: standard Gaussian
+            beta = 8.0: super-Gaussian (flat top, steep edges)
+        """
+        if self.kernel_type == "general":
+            # Sigmoid * 6.0 + 2.0 maps (-inf, inf) -> (2.0, 8.0)
+            return torch.sigmoid(self._shape) * 6.0 + 2.0
+        else:
+            # Beta kernel activation
+            return torch.sigmoid(self._shape) * 4.0 + 0.001
+
+    @property
+    def get_flex_beta(self):
+        """Returns per-Gaussian beta for flex kernel.
+        Uses softplus to ensure non-negative values [0, inf).
+        beta = 0: standard Gaussian
+        beta > 0: sharper, more opaque Gaussian
+        """
+        return torch.nn.functional.softplus(self._flex_beta)
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_xyz, self.get_scaling, scaling_modifier, self._rotation)
 
@@ -392,6 +442,20 @@ class GaussianModel:
         # Diffuse mode flag (uses SH degree 0, no hashgrid)
         self._diffuse_mode = hasattr(args, 'method') and args.method == "diffuse"
 
+        # Initialize beta kernel shape parameter if using beta kernel
+        if hasattr(args, 'kernel') and args.kernel == "beta":
+            self.kernel_type = "beta"
+            # Initialize shape to produce soft Gaussians (shape ≈ 3.2)
+            # sigmoid(1.4) ≈ 0.8, and 0.8 * 4.0 + 0.001 = 3.201
+            shape_init = 1.4 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
+            self._shape = nn.Parameter(shape_init.requires_grad_(True))
+        elif hasattr(args, 'kernel') and args.kernel == "flex":
+            self.kernel_type = "flex"
+            self._shape = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+        else:
+            self.kernel_type = "gaussian"
+            self._shape = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -440,6 +504,17 @@ class GaussianModel:
         if hasattr(self, '_gate_logits') and self._gate_logits.numel() > 0:
             l.append({'params': [self._gate_logits], 'lr': training_args.opacity_lr, "name": "gate_logits"})
 
+        # Add beta kernel shape parameter (if present)
+        if hasattr(self, '_shape') and self._shape.numel() > 0:
+            l.append({'params': [self._shape], 'lr': training_args.opacity_lr, "name": "shape"})
+
+        # Add flex kernel per-Gaussian beta parameter (if present)
+        if hasattr(self, '_flex_beta') and self._flex_beta.numel() > 0:
+            l.append({'params': [self._flex_beta], 'lr': training_args.opacity_lr, "name": "flex_beta"})
+            print(f"[DEBUG] Added flex_beta to optimizer: shape={self._flex_beta.shape}, lr={training_args.opacity_lr}")
+        else:
+            print(f"[DEBUG] flex_beta NOT added: hasattr={hasattr(self, '_flex_beta')}, numel={self._flex_beta.numel() if hasattr(self, '_flex_beta') else 'N/A'}")
+
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale*xyz_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale*xyz_lr_scale,
@@ -471,6 +546,9 @@ class GaussianModel:
         if self._gaussian_feat_dim > 0:
             for i in range(self._gaussian_feat_dim):
                 l.append('gf_{}'.format(i))
+        # Add beta kernel shape parameter
+        if hasattr(self, '_shape') and self._shape.numel() > 0:
+            l.append('shape')
         return l
 
     def save_ply(self, path):
@@ -488,12 +566,20 @@ class GaussianModel:
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         
+        # Build list of attributes to save
+        attr_list = [xyz, normals, f_dc, f_rest, opacities, scale, rotation]
+
         # Include gaussian_features if present (cat mode)
         if self._gaussian_feat_dim > 0:
             gaussian_feats = self._gaussian_features.detach().cpu().numpy()
-            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, gaussian_feats), axis=1)
-        else:
-            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+            attr_list.append(gaussian_feats)
+
+        # Include shape parameter if present (beta kernel)
+        if hasattr(self, '_shape') and self._shape.numel() > 0:
+            shapes = self._shape.detach().cpu().numpy()
+            attr_list.append(shapes)
+
+        attributes = np.concatenate(attr_list, axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -579,6 +665,26 @@ class GaussianModel:
         ap_level = init_level * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
         self._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
 
+        # Load beta kernel shape parameter (if present in PLY)
+        if "shape" in [p.name for p in plydata.elements[0].properties]:
+            shapes = np.asarray(plydata.elements[0]["shape"])[..., np.newaxis]
+            self._shape = nn.Parameter(torch.tensor(shapes, dtype=torch.float, device="cuda").requires_grad_(True))
+            self.kernel_type = "beta"
+            print(f"Loaded beta kernel shape parameter")
+        elif args is not None and hasattr(args, 'kernel') and args.kernel == "beta":
+            # Beta kernel requested but no shape in PLY - initialize
+            shape_init = 1.4 * torch.ones((xyz.shape[0], 1), dtype=torch.float, device="cuda")
+            self._shape = nn.Parameter(shape_init.requires_grad_(True))
+            self.kernel_type = "beta"
+            print(f"Warning: No shape in PLY, initialized beta kernel shape to ~3.2")
+        elif args is not None and hasattr(args, 'kernel') and args.kernel == "flex":
+            # Flex kernel requested
+            self._shape = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self.kernel_type = "flex"
+        else:
+            self._shape = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self.kernel_type = "gaussian"
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -636,6 +742,10 @@ class GaussianModel:
             self._adaptive_zero_weight = optimizable_tensors["adaptive_zero_weight"]
         if "gate_logits" in optimizable_tensors:
             self._gate_logits = optimizable_tensors["gate_logits"]
+        if "shape" in optimizable_tensors:
+            self._shape = optimizable_tensors["shape"]
+        if "flex_beta" in optimizable_tensors:
+            self._flex_beta = optimizable_tensors["flex_beta"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.feat_gradient_accum = self.feat_gradient_accum[valid_points_mask]
@@ -672,7 +782,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None, new_adaptive_zero_weight=None, new_gate_logits=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None, new_adaptive_zero_weight=None, new_gate_logits=None, new_shape=None, new_flex_beta=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -703,6 +813,14 @@ class GaussianModel:
         if new_gate_logits is not None and hasattr(self, '_gate_logits') and self._gate_logits.numel() > 0:
             d["gate_logits"] = new_gate_logits
 
+        # Add beta kernel shape parameter
+        if new_shape is not None and hasattr(self, '_shape') and self._shape.numel() > 0:
+            d["shape"] = new_shape
+
+        # Add flex kernel per-Gaussian beta parameter
+        if new_flex_beta is not None and hasattr(self, '_flex_beta') and self._flex_beta.numel() > 0:
+            d["flex_beta"] = new_flex_beta
+
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
@@ -723,6 +841,10 @@ class GaussianModel:
             self._adaptive_zero_weight = optimizable_tensors["adaptive_zero_weight"]
         if "gate_logits" in optimizable_tensors:
             self._gate_logits = optimizable_tensors["gate_logits"]
+        if "shape" in optimizable_tensors:
+            self._shape = optimizable_tensors["shape"]
+        if "flex_beta" in optimizable_tensors:
+            self._flex_beta = optimizable_tensors["flex_beta"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.feat_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -791,7 +913,17 @@ class GaussianModel:
             else:  # clone
                 new_gate_logits = self._gate_logits[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits)
+        # Handle beta kernel shape parameter
+        new_shape = None
+        if hasattr(self, '_shape') and self._shape.numel() > 0:
+            new_shape = self._shape[selected_pts_mask].repeat(N, 1)
+
+        # Handle flex kernel per-Gaussian beta parameter
+        new_flex_beta = None
+        if hasattr(self, '_flex_beta') and self._flex_beta.numel() > 0:
+            new_flex_beta = self._flex_beta[selected_pts_mask].repeat(N, 1)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -850,7 +982,17 @@ class GaussianModel:
             else:  # clone
                 new_gate_logits = self._gate_logits[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits)
+        # Handle beta kernel shape parameter
+        new_shape = None
+        if hasattr(self, '_shape') and self._shape.numel() > 0:
+            new_shape = self._shape[selected_pts_mask]
+
+        # Handle flex kernel per-Gaussian beta parameter
+        new_flex_beta = None
+        if hasattr(self, '_flex_beta') and self._flex_beta.numel() > 0:
+            new_flex_beta = self._flex_beta[selected_pts_mask]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, ap_update, act_level, densify_tag = True, prune_tag = True):
         
@@ -961,6 +1103,11 @@ class GaussianModel:
             else:  # clone
                 gate_logits = self._gate_logits[idxs]
 
+        # Handle beta kernel shape parameter
+        shape = None
+        if hasattr(self, '_shape') and self._shape.numel() > 0:
+            shape = self._shape[idxs]
+
         return (
             self._xyz[idxs],
             self._features_dc[idxs],
@@ -974,7 +1121,8 @@ class GaussianModel:
             adaptive_features,
             adaptive_cat_weight,
             adaptive_zero_weight,
-            gate_logits
+            gate_logits,
+            shape
         )
 
     def _mcmc_sample_alives(self, probs, num, alive_indices=None):
@@ -1041,7 +1189,8 @@ class GaussianModel:
             new_adaptive_features,
             new_adaptive_cat_weight,
             new_adaptive_zero_weight,
-            new_gate_logits
+            new_gate_logits,
+            new_shape
         ) = self._mcmc_update_params(reinit_idx, ratio=ratio)
 
         # Reset optimizer state for sampled indices FIRST (before updating)
@@ -1078,6 +1227,9 @@ class GaussianModel:
 
         if hasattr(self, '_gate_logits') and self._gate_logits.numel() > 0 and new_gate_logits is not None:
             self._gate_logits.data[dead_indices] = new_gate_logits
+
+        if hasattr(self, '_shape') and self._shape.numel() > 0 and new_shape is not None:
+            self._shape.data[dead_indices] = new_shape
 
         # Reset optimizer state for dead indices (they got completely new values)
         self._reset_optimizer_state_for_indices(dead_indices)
@@ -1121,7 +1273,8 @@ class GaussianModel:
             new_adaptive_features,
             new_adaptive_cat_weight,
             new_adaptive_zero_weight,
-            new_gate_logits
+            new_gate_logits,
+            new_shape
         ) = self._mcmc_update_params(add_idx, ratio=ratio)
 
         # Update source Gaussians (they gave away some of their "mass")
@@ -1133,7 +1286,7 @@ class GaussianModel:
             new_xyz, new_features_dc, new_features_rest, new_opacity,
             new_scaling, new_rotation, new_ap_level,
             new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight,
-            new_adaptive_zero_weight, new_gate_logits
+            new_adaptive_zero_weight, new_gate_logits, new_shape
         )
         
         # Reset optimizer state for modified source indices

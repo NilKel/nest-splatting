@@ -436,6 +436,119 @@ def create_intersection_heatmap(gaussian_num, legend_width=80, max_display=200, 
     return result, min_count, max_count
 
 
+def create_flex_beta_heatmap(flex_beta_map, alpha_map, legend_width=80, min_display=0.0, max_display=10.0):
+    """
+    Create a heatmap visualization of per-pixel flex kernel beta values.
+    Uses coolwarm colormap: blue (high beta, hard) -> red (low beta, soft).
+
+    Args:
+        flex_beta_map: Tensor of shape (1, H, W) containing alpha-weighted flex beta values
+        alpha_map: Tensor of shape (1, H, W) containing alpha values for masking background
+        legend_width: Width of the legend bar on the right side (default 80px)
+        min_display: Minimum beta for colormap (default 0.0)
+        max_display: Maximum beta for colormap (default 10.0, values above clipped)
+
+    Returns:
+        heatmap_img: numpy array of shape (H, W + legend_width, 3) in [0, 1] range
+        min_beta: minimum beta value (excluding background)
+        max_beta: maximum beta value
+    """
+    # Convert to numpy
+    if hasattr(flex_beta_map, 'cpu'):
+        beta_vals = flex_beta_map.squeeze().cpu().numpy()
+    else:
+        beta_vals = np.squeeze(flex_beta_map)
+
+    if hasattr(alpha_map, 'cpu'):
+        alpha_vals = alpha_map.squeeze().cpu().numpy()
+    else:
+        alpha_vals = np.squeeze(alpha_map)
+
+    H, W = beta_vals.shape
+
+    # Valid mask: where alpha > threshold (not background)
+    valid_mask = alpha_vals > 0.01
+
+    # Find actual min/max excluding background
+    if valid_mask.any():
+        min_beta = float(beta_vals[valid_mask].min())
+        max_beta = float(beta_vals[valid_mask].max())
+    else:
+        min_beta, max_beta = 0.0, 1.0
+
+    # Normalize to [0, 1] using display range
+    normalized = np.zeros_like(beta_vals, dtype=np.float32)
+    normalized[valid_mask] = (beta_vals[valid_mask] - min_display) / (max_display - min_display)
+    normalized = np.clip(normalized, 0, 1)
+
+    # Apply coolwarm colormap (reversed: high beta = blue, low beta = red)
+    # coolwarm: red (0) -> white (0.5) -> blue (1)
+    # We want: low beta (soft) = red, high beta (hard) = blue
+    cmap = plt.get_cmap('coolwarm')
+    heatmap_rgba = cmap(normalized)  # (H, W, 4)
+    heatmap = heatmap_rgba[..., :3].astype(np.float32)
+
+    # Set background to black
+    heatmap[~valid_mask] = 0.0
+
+    # Create legend bar
+    legend = np.zeros((H, legend_width, 3), dtype=np.float32)
+
+    bar_start = int(H * 0.08)
+    bar_end = int(H * 0.92)
+    bar_height = bar_end - bar_start
+    bar_x_start = 15
+    bar_x_end = legend_width - 15
+
+    # Create vertical gradient (high beta at top = blue, low at bottom = red)
+    for y in range(bar_start, bar_end):
+        t = 1.0 - (y - bar_start) / max(bar_height - 1, 1)  # 1 at top, 0 at bottom
+        color = cmap(t)[:3]
+        legend[y, bar_x_start:bar_x_end, :] = color
+
+    # Combine heatmap and legend
+    heatmap_with_legend = np.concatenate([heatmap, legend], axis=1)
+
+    # Add text labels
+    fig, ax = plt.subplots(figsize=(((W + legend_width) / 100), (H / 100)), dpi=100)
+    ax.imshow(heatmap_with_legend)
+    ax.axis('off')
+
+    text_x = W + legend_width // 2
+
+    # Labels: high beta (hard) at top, low beta (soft) at bottom
+    ax.text(text_x, bar_start - 8, f'{max_display:.1f}', fontsize=9, ha='center', va='bottom',
+            color='white', fontweight='bold')
+    ax.text(text_x, bar_end + 8, f'{min_display:.1f}', fontsize=9, ha='center', va='top',
+            color='white', fontweight='bold')
+
+    # Title
+    ax.text(text_x, H * 0.03, 'Flex β', fontsize=8, ha='center', va='center', color='white')
+
+    # Show actual stats
+    ax.text(text_x, H * 0.96, f'range:{min_beta:.2f}-{max_beta:.2f}', fontsize=6,
+            ha='center', va='center', color='yellow')
+
+    # Render figure to numpy array
+    fig.tight_layout(pad=0)
+    fig.canvas.draw()
+
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+    result = buf[..., :3].astype(np.float32) / 255.0
+
+    plt.close(fig)
+
+    # Resize if needed
+    if result.shape[0] != H or result.shape[1] != W + legend_width:
+        from PIL import Image as PILImage
+        result_pil = PILImage.fromarray((result * 255).astype(np.uint8))
+        result_pil = result_pil.resize((W + legend_width, H), PILImage.LANCZOS)
+        result = np.array(result_pil).astype(np.float32) / 255.0
+
+    return result, min_beta, max_beta
+
+
 def create_intersection_histogram(gaussian_num, max_display=200, num_bins=50):
     """
     Create a histogram visualization showing the distribution of intersection counts.

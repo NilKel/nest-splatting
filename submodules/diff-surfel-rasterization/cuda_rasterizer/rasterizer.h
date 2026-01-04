@@ -70,14 +70,16 @@ namespace CudaRasterizer
 			const int* level_offsets_diffuse = nullptr,
 			const float* gridrange_diffuse = nullptr,
 			const int render_mode = 0,
-			const uint32_t max_intersections = 0);
+			const uint32_t max_intersections = 0,
+			const float* shapes = nullptr,
+			const int kernel_type = 0);
 
 		static void backward(
 			const int P, int D, int M, int R,
 			const float* background,
-			const int width, int height, 
+			const int width, int height,
 			uint32_t c_dim, uint32_t level, uint32_t l_dim, float l_scale, uint32_t Base,
-			bool align_corners, uint32_t interp, 
+			bool align_corners, uint32_t interp,
 			const bool if_contract,
 			const float* means3D,
 			const float* shs,
@@ -122,7 +124,10 @@ namespace CudaRasterizer
 			const int* level_offsets_diffuse = nullptr,
 			const float* gridrange_diffuse = nullptr,
 			float* dL_dfeatures_diffuse = nullptr,
-			const int render_mode = 0);
+			const int render_mode = 0,
+			const float* shapes = nullptr,
+			const int kernel_type = 0,
+			float* dL_dshapes = nullptr);
 	};
 };
 

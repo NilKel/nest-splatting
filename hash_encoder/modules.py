@@ -58,6 +58,8 @@ class INGP(nn.Module):
         # Store args for cat mode configuration
         self.args = args
         self.is_cat_mode = args is not None and hasattr(args, 'method') and args.method == "cat"
+        # Store args for cat_dropout mode configuration (cat with hash dropout during training)
+        self.is_cat_dropout_mode = args is not None and hasattr(args, 'method') and args.method == "cat_dropout"
 
         # Store args for adaptive mode configuration
         self.is_adaptive_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive"
@@ -73,8 +75,8 @@ class INGP(nn.Module):
         self.is_adaptive_gate_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive_gate"
         self.adaptive_gate_inference = args is not None and hasattr(args, 'adaptive_gate_inference') and args.adaptive_gate_inference
 
-        # hybrid_levels is used by cat, adaptive_cat, adaptive_zero, and adaptive_gate modes
-        self.hybrid_levels = args.hybrid_levels if (self.is_cat_mode or self.is_adaptive_cat_mode or self.is_adaptive_zero_mode or self.is_adaptive_gate_mode) and hasattr(args, 'hybrid_levels') else 0
+        # hybrid_levels is used by cat, cat_dropout, adaptive_cat, adaptive_zero, and adaptive_gate modes
+        self.hybrid_levels = args.hybrid_levels if (self.is_cat_mode or self.is_cat_dropout_mode or self.is_adaptive_cat_mode or self.is_adaptive_zero_mode or self.is_adaptive_gate_mode) and hasattr(args, 'hybrid_levels') else 0
 
         # Determine method - baseline uses C2F, all other methods disable it
         self.method = args.method if args is not None and hasattr(args, 'method') else "baseline"

@@ -32,7 +32,7 @@ except ImportError:
 
 from hash_encoder.modules import INGP
 from hash_encoder.config import Config
-from utils.render_utils import save_img_u8, convert_gray_to_cmap, create_intersection_heatmap, create_intersection_histogram
+from utils.render_utils import save_img_u8, convert_gray_to_cmap, create_intersection_heatmap, create_intersection_histogram, create_flex_beta_heatmap
 from utils.render_utils import gsnum_trans_color
 import open3d as o3d
 import datetime
@@ -60,7 +60,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     first_iter = 0
     gaussians = GaussianModel(dataset.sh_degree)
-    
+
+    # Set kernel type for beta kernel support
+    gaussians.kernel_type = args.kernel
+
     # Check for warmup checkpoint in data directory
     warmup_checkpoint_path = os.path.join(dataset.source_path, "warmup_checkpoint.pth")
     loaded_from_warmup = False
@@ -74,10 +77,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("  Training Nest representation from scratch with hash_in_CUDA=True")
         print("="*70 + "\n")
         scene = Scene(dataset, gaussians)
+
+        # Initialize flex kernel per-Gaussian beta parameter (if using flex kernel)
+        if args.kernel == "flex":
+            n_gaussians = len(gaussians.get_xyz)
+            flex_beta_init_val = 5.0  # softplus(5) ≈ 5.007, starts sharp/hard
+            flex_beta_init = torch.full((n_gaussians, 1), flex_beta_init_val, device="cuda").float()
+            gaussians._flex_beta = nn.Parameter(flex_beta_init.requires_grad_(True))
+            init_beta_val = torch.nn.functional.softplus(torch.tensor(flex_beta_init_val)).item()
+            print(f"[FLEX KERNEL] Initialized {n_gaussians} Gaussians with per-Gaussian beta")
+            print(f"[FLEX KERNEL] Initial beta value: {init_beta_val:.4f} (0=standard Gaussian, higher=sharper)")
+        elif args.kernel == "general":
+            n_gaussians = len(gaussians.get_xyz)
+            shape_init_val = -10.0  # sigmoid(-10) ≈ 0 -> beta = 0*6+2 = 2.0 (standard Gaussian)
+            shape_init = torch.full((n_gaussians, 1), shape_init_val, device="cuda").float()
+            gaussians._shape = nn.Parameter(shape_init.requires_grad_(True))
+            init_shape_val = (torch.sigmoid(torch.tensor(shape_init_val)) * 6.0 + 2.0).item()
+            print(f"[GENERAL KERNEL] Initialized {n_gaussians} Gaussians with shape parameter")
+            print(f"[GENERAL KERNEL] Initial beta value: {init_shape_val:.3f} (2=Gaussian, 8=super-Gaussian/box)")
+
         gaussians.training_setup(opt)
     elif checkpoint:
         # User-specified checkpoint takes priority
         scene = Scene(dataset, gaussians)
+
+        # Initialize flex kernel per-Gaussian beta parameter (if using flex kernel)
+        if args.kernel == "flex":
+            n_gaussians = len(gaussians.get_xyz)
+            flex_beta_init_val = 5.0  # softplus(5) ≈ 5.007, starts sharp/hard
+            flex_beta_init = torch.full((n_gaussians, 1), flex_beta_init_val, device="cuda").float()
+            gaussians._flex_beta = nn.Parameter(flex_beta_init.requires_grad_(True))
+            init_beta_val = torch.nn.functional.softplus(torch.tensor(flex_beta_init_val)).item()
+            print(f"[FLEX KERNEL] Initialized {n_gaussians} Gaussians with per-Gaussian beta")
+            print(f"[FLEX KERNEL] Initial beta value: {init_beta_val:.4f} (0=standard Gaussian, higher=sharper)")
+        elif args.kernel == "general":
+            n_gaussians = len(gaussians.get_xyz)
+            shape_init_val = -10.0  # sigmoid(-10) ≈ 0 -> beta = 0*6+2 = 2.0 (standard Gaussian)
+            shape_init = torch.full((n_gaussians, 1), shape_init_val, device="cuda").float()
+            gaussians._shape = nn.Parameter(shape_init.requires_grad_(True))
+            init_shape_val = (torch.sigmoid(torch.tensor(shape_init_val)) * 6.0 + 2.0).item()
+            print(f"[GENERAL KERNEL] Initialized {n_gaussians} Gaussians with shape parameter")
+            print(f"[GENERAL KERNEL] Initial beta value: {init_shape_val:.3f} (2=Gaussian, 8=super-Gaussian/box)")
+
         gaussians.training_setup(opt)
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
@@ -108,8 +149,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians._loaded_from_checkpoint = True
         scene = Scene(dataset, gaussians)
         
-        # Initialize per-Gaussian features for cat mode (trained from scratch after warmup)
-        if args.method == "cat" and args.hybrid_levels > 0:
+        # Initialize per-Gaussian features for cat/cat_dropout mode (trained from scratch after warmup)
+        if args.method in ["cat", "cat_dropout"] and args.hybrid_levels > 0:
             per_level_dim = 4  # From config encoding.hashgrid.dim
             gaussians._gaussian_feat_dim = args.hybrid_levels * per_level_dim
             gaussian_feats = torch.zeros((len(gaussians.get_xyz), gaussians._gaussian_feat_dim), device="cuda").float()
@@ -209,6 +250,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"[ADAPTIVE_GATE] Per-Gaussian features (coarse): {gaussians._gaussian_feat_dim}D")
             print(f"[ADAPTIVE_GATE] Gate init: {args.gate_init} (sigmoid={torch.sigmoid(torch.tensor(args.gate_init)).item():.2f})")
             print(f"[ADAPTIVE_GATE] Force ratio: {args.force_ratio} ({args.force_ratio*100:.0f}% forced hash during training)")
+
+        # Initialize beta kernel shape parameter (if using beta kernel)
+        print(f"[DEBUG] Checking beta kernel init: args.kernel={args.kernel}")
+        if args.kernel == "beta":
+            # Initialize _shape such that sigmoid(_shape) * 4 + 0.001 starts close to 4.0 (soft Gaussian-like)
+            # sigmoid(5.0) ≈ 0.993 -> 0.993 * 4 + 0.001 ≈ 3.97
+            n_gaussians = len(gaussians.get_xyz)
+            shape_init_val = 5.0  # Results in shape ≈ 3.97
+            shape_init = torch.full((n_gaussians, 1), shape_init_val, device="cuda").float()
+            gaussians._shape = nn.Parameter(shape_init.requires_grad_(True))
+            init_shape_val = (torch.sigmoid(torch.tensor(shape_init_val)) * 4.0 + 0.001).item()
+            print(f"[BETA KERNEL] Initialized {n_gaussians} Gaussians with shape parameter")
+            print(f"[BETA KERNEL] Shape tensor: {gaussians._shape.shape}, numel={gaussians._shape.numel()}")
+            print(f"[BETA KERNEL] Initial shape value: {init_shape_val:.3f} (will be pushed toward 0 by regularization)")
+        elif args.kernel == "flex":
+            # Initialize _flex_beta such that softplus(_flex_beta) starts at 0 (standard Gaussian)
+            # softplus(x) = log(1 + exp(x)), so softplus(-5) ≈ 0.007, softplus(0) ≈ 0.693
+            # We want to start at 0 (standard Gaussian), so use large negative value
+            n_gaussians = len(gaussians.get_xyz)
+            flex_beta_init_val = 5.0  # softplus(5) ≈ 5.007, starts sharp/hard
+            flex_beta_init = torch.full((n_gaussians, 1), flex_beta_init_val, device="cuda").float()
+            gaussians._flex_beta = nn.Parameter(flex_beta_init.requires_grad_(True))
+            init_beta_val = torch.nn.functional.softplus(torch.tensor(flex_beta_init_val)).item()
+            print(f"[FLEX KERNEL] Initialized {n_gaussians} Gaussians with per-Gaussian beta")
+            print(f"[FLEX KERNEL] _flex_beta tensor: {gaussians._flex_beta.shape}, numel={gaussians._flex_beta.numel()}")
+            print(f"[FLEX KERNEL] Initial beta value: {init_beta_val:.4f} (0=standard Gaussian, higher=sharper)")
+        elif args.kernel == "general":
+            # Initialize _shape such that sigmoid(_shape) * 6.0 + 2.0 starts at 2.0 (standard Gaussian)
+            # sigmoid(-10) ≈ 0 -> 0 * 6 + 2 = 2.0
+            n_gaussians = len(gaussians.get_xyz)
+            shape_init_val = -10.0  # Results in beta ≈ 2.0 (standard Gaussian)
+            shape_init = torch.full((n_gaussians, 1), shape_init_val, device="cuda").float()
+            gaussians._shape = nn.Parameter(shape_init.requires_grad_(True))
+            init_shape_val = (torch.sigmoid(torch.tensor(shape_init_val)) * 6.0 + 2.0).item()
+            print(f"[GENERAL KERNEL] Initialized {n_gaussians} Gaussians with shape parameter")
+            print(f"[GENERAL KERNEL] _shape tensor: {gaussians._shape.shape}, numel={gaussians._shape.numel()}")
+            print(f"[GENERAL KERNEL] Initial beta value: {init_shape_val:.3f} (2=Gaussian, 8=super-Gaussian/box)")
 
         # Set relocation mode for adaptive weights (clone from source or reset to 0)
         if args.method in ["adaptive_cat", "adaptive_zero", "adaptive_gate"]:
@@ -323,7 +401,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         # Load optimizer state from warmup checkpoint
         # For cat/adaptive/adaptive_cat/adaptive_zero/adaptive_gate/diffuse mode, new params won't be in saved state - they train from scratch
-        if args.method not in ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse"]:
+        # Also skip for beta/flex/general kernels which add new _shape/_flex_beta params not in warmup checkpoint
+        if args.method not in ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse"] and args.kernel == "gaussian":
             gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
         
         # Move optimizer state to GPU
@@ -356,15 +435,40 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     else:
         # Normal initialization - train from scratch
         scene = Scene(dataset, gaussians)
+
+        # Initialize flex kernel per-Gaussian beta parameter (if using flex kernel)
+        if args.kernel == "flex":
+            n_gaussians = len(gaussians.get_xyz)
+            flex_beta_init_val = 5.0  # softplus(5) ≈ 5.007, starts sharp/hard
+            flex_beta_init = torch.full((n_gaussians, 1), flex_beta_init_val, device="cuda").float()
+            gaussians._flex_beta = nn.Parameter(flex_beta_init.requires_grad_(True))
+            init_beta_val = torch.nn.functional.softplus(torch.tensor(flex_beta_init_val)).item()
+            print(f"[FLEX KERNEL] Initialized {n_gaussians} Gaussians with per-Gaussian beta")
+            print(f"[FLEX KERNEL] Initial beta value: {init_beta_val:.4f} (0=standard Gaussian, higher=sharper)")
+        elif args.kernel == "general":
+            n_gaussians = len(gaussians.get_xyz)
+            shape_init_val = -10.0  # sigmoid(-10) ≈ 0 -> beta = 0*6+2 = 2.0 (standard Gaussian)
+            shape_init = torch.full((n_gaussians, 1), shape_init_val, device="cuda").float()
+            gaussians._shape = nn.Parameter(shape_init.requires_grad_(True))
+            init_shape_val = (torch.sigmoid(torch.tensor(shape_init_val)) * 6.0 + 2.0).item()
+            print(f"[GENERAL KERNEL] Initialized {n_gaussians} Gaussians with shape parameter")
+            print(f"[GENERAL KERNEL] Initial beta value: {init_shape_val:.3f} (2=Gaussian, 8=super-Gaussian/box)")
+
         gaussians.training_setup(opt)
         if cfg_model.settings.if_ingp:
             print(f"\n[INFO] No warmup checkpoint found at {warmup_checkpoint_path}")
             print(f"[INFO] Will train 2DGS for {cfg_model.ingp_stage.initialize} iterations, then save checkpoint.\n")
 
     surfel_cfg = cfg_model.surfel
+
+    # Override tg_beta if --beta is specified
+    if args.beta is not None:
+        surfel_cfg.tg_beta = args.beta
+        print(f"[OVERRIDE] tg_beta set to {args.beta} (from --beta argument)")
+
     gaussians.base_opacity = surfel_cfg.base_opacity
     beta = surfel_cfg.base_beta
-    print(f'base opacity {surfel_cfg.base_opacity}, base beta {beta}')
+    print(f'base opacity {surfel_cfg.base_opacity}, base beta {beta}, target beta {surfel_cfg.tg_beta}')
 
     if not os.path.exists(os.path.join(scene.model_path, "training_output")):
         os.mkdir(os.path.join(scene.model_path, "training_output"))
@@ -489,7 +593,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, current_bg, ingp = ingp,
             beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance,
             use_xyz_mode = args.use_xyz_mode, decompose_mode = dataset.decompose_mode,
-            temperature = temperature, force_ratio = args.force_ratio)
+            temperature = temperature, force_ratio = args.force_ratio, no_gumbel = args.no_gumbel,
+            dropout_lambda = args.dropout_lambda, is_training = True)
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
     
@@ -600,11 +705,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Regularize ACTIVATED values (after sigmoid/exp) - following 3dgrut MCMC implementation
         mcmc_opacity_reg = torch.tensor(0.0, device="cuda")
         mcmc_scale_reg = torch.tensor(0.0, device="cuda")
+        bce_phase_active = args.bce and iteration > (opt.iterations - args.bce_iter)
         if args.mcmc:
-            # Regularize activated opacity (after sigmoid) to encourage low opacity -> sparsity
-            mcmc_opacity_reg = args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
-            # Regularize activated scale (after exp) to encourage small scales -> compact Gaussians
-            mcmc_scale_reg = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
+            # If --bce_solo, skip MCMC regularization during BCE phase to let BCE work alone
+            if not (args.bce_solo and bce_phase_active):
+                # Regularize activated opacity (after sigmoid) to encourage low opacity -> sparsity
+                mcmc_opacity_reg = args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
+                # Regularize activated scale (after exp) to encourage small scales -> compact Gaussians
+                mcmc_scale_reg = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
 
         # Adaptive_cat entropy regularization - encourage binary blend weights (0 or 1)
         adaptive_cat_reg_loss = torch.tensor(0.0, device="cuda")
@@ -678,8 +786,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             bce = -(opacity * torch.log(opacity + eps) + (1 - opacity) * torch.log(1 - opacity + eps))
             bce_opacity_loss = args.bce_lambda * bce.mean()
 
+        # Beta kernel shape regularization - encourage shapes toward 0 (hard flat disks)
+        # Shape in range [0.001, 4.001]: low = hard disk, high = soft Gaussian cloud
+        shape_reg_loss = torch.tensor(0.0, device="cuda")
+        if args.kernel == "beta" and args.lambda_shape > 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+            # L1 penalty on shape values - pushes toward 0 (hard disks)
+            shape_reg_loss = args.lambda_shape * gaussians.get_shape.mean()
+
+        # Flex kernel beta regularization - prevent runaway sharpening
+        # Beta in range [0, inf): 0 = standard Gaussian, higher = sharper
+        # Positive lambda pushes toward 0 (softer), negative pushes toward infinity (harder)
+        flex_beta_reg_loss = torch.tensor(0.0, device="cuda")
+        if args.kernel == "flex" and args.lambda_flex_beta != 0 and hasattr(gaussians, '_flex_beta') and gaussians._flex_beta.numel() > 0:
+            # L1 penalty on beta values - sign determines direction
+            flex_beta_reg_loss = args.lambda_flex_beta * gaussians.get_flex_beta.mean()
+
+        # General kernel beta regularization - push toward high beta (super-Gaussian/box)
+        # Beta in range [2.0, 8.0]: 2.0 = standard Gaussian, 8.0 = super-Gaussian (box)
+        # Positive lambda pushes toward 8 (hard), negative lambda pushes toward 2 (soft)
+        # Modes: basic (constant), decay (linear decay), scaled (by RGB loss), scaled_decay (both)
+        general_beta_reg_loss = torch.tensor(0.0, device="cuda")
+        if args.kernel == "general" and args.lambda_shape != 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+            effective_lambda = args.lambda_shape
+
+            # Apply decay if requested
+            if args.genreg in ["decay", "scaled_decay"]:
+                decay_factor = max(0.0, 1.0 - iteration / opt.iterations)
+                effective_lambda = effective_lambda * decay_factor
+
+            # Apply RGB loss scaling if requested
+            if args.genreg in ["scaled", "scaled_decay"]:
+                loss_scale = loss.detach().clamp(min=1e-4)
+                effective_lambda = effective_lambda * loss_scale
+
+            # L1 penalty on (8 - β) - positive lambda pushes toward 8 (hard)
+            general_beta_reg_loss = effective_lambda * (8.0 - gaussians.get_shape).mean()
+
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss
 
         total_loss.backward()
 
@@ -711,10 +855,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "Points": points_str,
                 }
-                # Add MCMC loss to progress bar if enabled
-                if args.mcmc:
+                # Add MCMC loss to progress bar if enabled (hide during BCE solo phase)
+                if args.mcmc and not (args.bce_solo and bce_phase_active):
                     loss_dict["OpR"] = f"{mcmc_opacity_reg.item():.{5}f}"
                     loss_dict["ScR"] = f"{mcmc_scale_reg.item():.{5}f}"
+                # Add BCE phase indicator to progress bar
+                if bce_phase_active:
+                    loss_dict["BCE"] = "ON"
                 # Add adaptive_cat metrics to progress bar
                 if args.method == "adaptive_cat" and hasattr(gaussians, '_adaptive_cat_weight') and gaussians._adaptive_cat_weight.numel() > 0:
                     weights = torch.sigmoid(gaussians._adaptive_cat_weight)
@@ -745,6 +892,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # Add BCE opacity loss to progress bar if active
                 if args.bce and bce_opacity_loss.item() > 0:
                     loss_dict["BCE"] = f"{bce_opacity_loss.item():.{5}f}"
+                # Add beta kernel shape stats to progress bar (always show when using beta kernel)
+                if args.kernel == "beta":
+                    loss_dict["ShR"] = f"{shape_reg_loss.item():.5f}"
+                    if hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+                        shape_vals = gaussians.get_shape
+                        loss_dict["Shp"] = f"{shape_vals.mean().item():.2f}"
+                # Add flex kernel beta stats to progress bar
+                if args.kernel == "flex":
+                    loss_dict["FxR"] = f"{flex_beta_reg_loss.item():.5f}"
+                    if hasattr(gaussians, '_flex_beta') and gaussians._flex_beta.numel() > 0:
+                        beta_vals = gaussians.get_flex_beta
+                        loss_dict["Fxβ"] = f"{beta_vals.mean().item():.2f}"
+                # Add general kernel beta stats to progress bar
+                if args.kernel == "general":
+                    loss_dict["GnR"] = f"{general_beta_reg_loss.item():.5f}"
+                    if hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+                        beta_vals = gaussians.get_shape
+                        loss_dict["Gnβ"] = f"{beta_vals.mean().item():.2f}"
                 progress_bar.set_postfix(loss_dict)
 
                 progress_bar.update(10)
@@ -772,9 +937,78 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tb_writer.add_scalar('adaptive_cat/reg_loss', adaptive_cat_reg_loss.item(), iteration)
                 if args.bce:
                     tb_writer.add_scalar('train_loss_patches/bce_opacity_loss', bce_opacity_loss.item(), iteration)
+                # Log beta kernel shape stats
+                if args.kernel == "beta" and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+                    shape_vals = gaussians.get_shape
+                    tb_writer.add_scalar('beta_kernel/shape_mean', shape_vals.mean().item(), iteration)
+                    tb_writer.add_scalar('beta_kernel/shape_min', shape_vals.min().item(), iteration)
+                    tb_writer.add_scalar('beta_kernel/shape_max', shape_vals.max().item(), iteration)
+                    tb_writer.add_scalar('beta_kernel/shape_reg_loss', shape_reg_loss.item(), iteration)
+                    # Track shape distribution: percent of Gaussians with hard disk shape (< 0.5)
+                    pct_hard = (shape_vals < 0.5).float().mean().item() * 100
+                    tb_writer.add_scalar('beta_kernel/pct_hard_disk', pct_hard, iteration)
+                # Log flex kernel beta stats
+                if args.kernel == "flex" and hasattr(gaussians, '_flex_beta') and gaussians._flex_beta.numel() > 0:
+                    beta_vals = gaussians.get_flex_beta
+                    tb_writer.add_scalar('flex_kernel/beta_mean', beta_vals.mean().item(), iteration)
+                    tb_writer.add_scalar('flex_kernel/beta_min', beta_vals.min().item(), iteration)
+                    tb_writer.add_scalar('flex_kernel/beta_max', beta_vals.max().item(), iteration)
+                    tb_writer.add_scalar('flex_kernel/beta_reg_loss', flex_beta_reg_loss.item(), iteration)
+                    # Track beta distribution: percent with high sharpening (beta > 1)
+                    pct_sharp = (beta_vals > 1.0).float().mean().item() * 100
+                    tb_writer.add_scalar('flex_kernel/pct_sharp_beta_gt_1', pct_sharp, iteration)
+                # Log general kernel beta stats
+                if args.kernel == "general" and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+                    beta_vals = gaussians.get_shape  # beta in [2.0, 8.0]
+                    tb_writer.add_scalar('general_kernel/beta_mean', beta_vals.mean().item(), iteration)
+                    tb_writer.add_scalar('general_kernel/beta_min', beta_vals.min().item(), iteration)
+                    tb_writer.add_scalar('general_kernel/beta_max', beta_vals.max().item(), iteration)
+                    tb_writer.add_scalar('general_kernel/beta_reg_loss', general_beta_reg_loss.item(), iteration)
+                    # Track beta distribution: percent with high beta (super-Gaussian, > 5.0)
+                    pct_super = (beta_vals > 5.0).float().mean().item() * 100
+                    pct_gaussian = (beta_vals < 3.0).float().mean().item() * 100
+                    tb_writer.add_scalar('general_kernel/pct_super_gaussian_gt_5', pct_super, iteration)
+                    tb_writer.add_scalar('general_kernel/pct_gaussian_lt_3', pct_gaussian, iteration)
 
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), \
                 ingp_model=ingp, beta = beta, args = args, cfg_model = cfg_model, test_psnr = test_psnr, train_psnr = train_psnr, iter_list = iter_list)
+
+            # Print beta kernel stats every 1000 iterations
+            if args.kernel == "beta" and iteration % 1000 == 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+                shape_vals = gaussians.get_shape
+                shape_mean = shape_vals.mean().item()
+                shape_std = shape_vals.std().item()
+                shape_min = shape_vals.min().item()
+                shape_max = shape_vals.max().item()
+                pct_hard = (shape_vals < 0.5).float().mean().item() * 100
+                pct_soft = (shape_vals > 2.0).float().mean().item() * 100
+                print(f"\n[ITER {iteration}] Beta Kernel Stats: shape={shape_mean:.3f}±{shape_std:.3f} (min={shape_min:.3f}, max={shape_max:.3f})")
+                print(f"  Hard disks (<0.5): {pct_hard:.1f}% | Soft clouds (>2.0): {pct_soft:.1f}% | Reg loss: {shape_reg_loss.item():.6f}")
+
+            # Print flex kernel stats every 1000 iterations
+            if args.kernel == "flex" and iteration % 1000 == 0 and hasattr(gaussians, '_flex_beta') and gaussians._flex_beta.numel() > 0:
+                beta_vals = gaussians.get_flex_beta
+                beta_mean = beta_vals.mean().item()
+                beta_std = beta_vals.std().item()
+                beta_min = beta_vals.min().item()
+                beta_max = beta_vals.max().item()
+                pct_standard = (beta_vals < 0.1).float().mean().item() * 100  # Nearly standard Gaussian
+                pct_sharp = (beta_vals > 1.0).float().mean().item() * 100     # Significantly sharpened
+                print(f"\n[ITER {iteration}] Flex Kernel Stats: beta={beta_mean:.3f}±{beta_std:.3f} (min={beta_min:.3f}, max={beta_max:.3f})")
+                print(f"  Standard (<0.1): {pct_standard:.1f}% | Sharp (>1.0): {pct_sharp:.1f}% | Reg loss: {flex_beta_reg_loss.item():.2e}")
+
+            # Print general kernel stats every 1000 iterations
+            if args.kernel == "general" and iteration % 1000 == 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+                beta_vals = gaussians.get_shape  # beta in [2.0, 8.0]
+                beta_mean = beta_vals.mean().item()
+                beta_std = beta_vals.std().item()
+                beta_min = beta_vals.min().item()
+                beta_max = beta_vals.max().item()
+                pct_gaussian = (beta_vals < 3.0).float().mean().item() * 100  # Near standard Gaussian (β≈2)
+                pct_super = (beta_vals > 5.0).float().mean().item() * 100     # Super-Gaussian (β>5)
+                print(f"\n[ITER {iteration}] General Kernel Stats: β={beta_mean:.3f}±{beta_std:.3f} (min={beta_min:.3f}, max={beta_max:.3f})")
+                print(f"  Gaussian (<3): {pct_gaussian:.1f}% | Super-Gaussian (>5): {pct_super:.1f}% | Reg loss: {general_beta_reg_loss.item():.2e}")
+
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -1021,7 +1255,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
     # Compute weight distribution for adaptive_zero mode
     weight_below_01 = None
     weight_above_09 = None
-    if args.method in ["adaptive_zero", "adaptive_gate"] and hasattr(gaussians, '_adaptive_zero_weight'):
+    if args.method == "adaptive_zero" and hasattr(gaussians, '_adaptive_zero_weight'):
         with torch.no_grad():
             weights = torch.sigmoid(gaussians._adaptive_zero_weight).squeeze()
             weight_below_01 = (weights < 0.1).sum().item()
@@ -1032,6 +1266,20 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
             print(f"[LOG]   Below 0.1 (Gaussian-only): {weight_below_01:,} ({pct_below_01:.1f}%)")
             print(f"[LOG]   Above 0.9 (Hash-enhanced): {weight_above_09:,} ({pct_above_09:.1f}%)")
             print(f"[LOG]   Middle (0.1-0.9):          {num_gaussians - weight_below_01 - weight_above_09:,} ({100 - pct_below_01 - pct_above_09:.1f}%)")
+
+    # Compute gate distribution for adaptive_gate mode (hard threshold at 0.5)
+    gate_below_05 = None
+    gate_above_05 = None
+    if args.method == "adaptive_gate" and hasattr(gaussians, '_gate_logits'):
+        with torch.no_grad():
+            gate_prob = torch.sigmoid(gaussians._gate_logits).squeeze()
+            gate_below_05 = (gate_prob <= 0.5).sum().item()
+            gate_above_05 = (gate_prob > 0.5).sum().item()
+            pct_below_05 = 100.0 * gate_below_05 / num_gaussians
+            pct_above_05 = 100.0 * gate_above_05 / num_gaussians
+            print(f"[LOG] Gate distribution (threshold=0.5):")
+            print(f"[LOG]   Gate closed (<=0.5, Gaussian-only): {gate_below_05:,} ({pct_below_05:.1f}%)")
+            print(f"[LOG]   Gate open (>0.5, uses hash):        {gate_above_05:,} ({pct_above_05:.1f}%)")
     
     # Estimate framerate by timing a few renders
     print("\n[LOG] Measuring render framerate...")
@@ -1076,8 +1324,10 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
         f.write("=" * 50 + "\n\n")
 
         f.write(f"Method: {args.method}\n")
-        if args.method == "cat":
+        if args.method in ["cat", "cat_dropout"]:
             f.write(f"Hybrid Levels: {args.hybrid_levels}\n")
+            if args.method == "cat_dropout":
+                f.write(f"Dropout Lambda: {args.dropout_lambda}\n")
         if args.mcmc:
             f.write(f"MCMC Mode: Enabled\n")
             f.write(f"  - Opacity Reg: {args.opacity_reg}\n")
@@ -1099,7 +1349,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
             f.write(f"  (MCMC: only alive Gaussians counted)\n")
         f.write("\n")
 
-        # Weight distribution for adaptive modes
+        # Weight distribution for adaptive_zero mode
         if weight_below_01 is not None:
             pct_below = 100.0 * weight_below_01 / num_gaussians
             pct_above = 100.0 * weight_above_09 / num_gaussians
@@ -1109,6 +1359,16 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
             f.write(f"Below 0.1 (Gaussian-only): {weight_below_01:,} ({pct_below:.1f}%)\n")
             f.write(f"Above 0.9 (Hash-enhanced): {weight_above_09:,} ({pct_above:.1f}%)\n")
             f.write(f"Middle (0.1-0.9):          {num_gaussians - weight_below_01 - weight_above_09:,} ({pct_middle:.1f}%)\n")
+            f.write("\n")
+
+        # Gate distribution for adaptive_gate mode
+        if gate_below_05 is not None:
+            pct_closed = 100.0 * gate_below_05 / num_gaussians
+            pct_open = 100.0 * gate_above_05 / num_gaussians
+            f.write("Gate Distribution (threshold=0.5)\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"Gate closed (<=0.5, Gaussian-only): {gate_below_05:,} ({pct_closed:.1f}%)\n")
+            f.write(f"Gate open (>0.5, uses hash):        {gate_above_05:,} ({pct_open:.1f}%)\n")
             f.write("\n")
 
         f.write("Performance\n")
@@ -1135,10 +1395,17 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     # Create intersection heatmap output directory
     intersection_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'intersection'))
     os.makedirs(intersection_output_dir, exist_ok=True)
-    
-    # Check if cat mode decomposition should be done
-    is_cat_mode = (ingp is not None and hasattr(ingp, 'is_cat_mode') and ingp.is_cat_mode 
-                   and hasattr(args, 'hybrid_levels') and args.hybrid_levels > 0)
+
+    # Create flex beta heatmap output directory (if using flex kernel)
+    is_flex_kernel = hasattr(gaussians, 'kernel_type') and gaussians.kernel_type == "flex" and hasattr(gaussians, '_flex_beta') and gaussians._flex_beta.numel() > 0
+    if is_flex_kernel:
+        flex_beta_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'flex_beta'))
+        os.makedirs(flex_beta_output_dir, exist_ok=True)
+
+    # Check if cat mode decomposition should be done (also for cat_dropout mode)
+    is_cat_mode = ((ingp is not None and hasattr(ingp, 'is_cat_mode') and ingp.is_cat_mode) or
+                   (ingp is not None and hasattr(ingp, 'is_cat_dropout_mode') and ingp.is_cat_dropout_mode)) \
+                   and hasattr(args, 'hybrid_levels') and args.hybrid_levels > 0
     total_levels = ingp.levels if ingp is not None else 0
     
     # Check if hybrid_SH, hybrid_SH_raw, or hybrid_SH_post mode decomposition should be done
@@ -1336,6 +1603,25 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
             histogram_img, stats = create_intersection_histogram(gaussian_num, max_display=200)
             save_img_u8(intersection_heatmap, os.path.join(intersection_output_dir, f"{idx:03d}_intersection.png"))
             save_img_u8(histogram_img, os.path.join(intersection_output_dir, f"{idx:03d}_histogram.png"))
+
+            # Flex kernel beta heatmap: render flex_beta as color, then apply coolwarm colormap
+            if is_flex_kernel:
+                # Get per-Gaussian flex beta and expand to RGB (same value in all 3 channels)
+                flex_beta_vals = gaussians.get_flex_beta  # (N, 1)
+                flex_beta_color = flex_beta_vals.expand(-1, 3)  # (N, 3)
+
+                # Render with flex_beta as override_color (uses alpha blending from rasterizer)
+                flex_beta_render_pkg = render(viewpoint, gaussians, pipe, background,
+                                             ingp=None, beta=0.0, iteration=iteration, cfg=cfg_model,
+                                             override_color=flex_beta_color)
+                flex_beta_map = flex_beta_render_pkg["render"][0:1]  # Take first channel (R=G=B)
+                render_alpha = flex_beta_render_pkg["rend_alpha"]  # (1, H, W)
+
+                # Create heatmap visualization
+                flex_beta_heatmap, min_beta, max_beta = create_flex_beta_heatmap(
+                    flex_beta_map, render_alpha, min_display=0.0, max_display=10.0
+                )
+                save_img_u8(flex_beta_heatmap, os.path.join(flex_beta_output_dir, f"{idx:03d}_flex_beta.png"))
 
             # Cat mode decomposition: render with masked features
             if do_cat_decomposition:
@@ -1723,10 +2009,10 @@ if __name__ == "__main__":
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
     
-    # Method argument - baseline, cat, adaptive, adaptive_add, adaptive_cat, adaptive_zero, adaptive_gate, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
+    # Method argument - baseline, cat, cat_dropout, adaptive, adaptive_add, adaptive_cat, adaptive_zero, adaptive_gate, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "cat", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid"],
-                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'adaptive_zero' (cat with weighted hash vs zeros - w=0 skips hash query), 'adaptive_gate' (VQ-AD style gating: soft→STE→hard, L1 regularization toward zeros), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), or 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual)")
+                        choices=["baseline", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid"],
+                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'cat_dropout' (cat with hash dropout during training - use --dropout_lambda), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'adaptive_zero' (cat with weighted hash vs zeros - w=0 skips hash query), 'adaptive_gate' (VQ-AD style gating: soft→STE→hard, L1 regularization toward zeros), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), or 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual)")
     parser.add_argument("--hybrid_levels", type=int, default=3,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
     parser.add_argument("--decompose_mode", type=str, default=None,
@@ -1734,6 +2020,8 @@ if __name__ == "__main__":
                         help="Decomposition mode for hybrid_SH visualization: 'gaussian_only' (only per-Gaussian SH), 'ngp_only' (only hashgrid DC residual), or None (normal combined rendering)")
     parser.add_argument("--disable_c2f", action="store_true",
                         help="Disable coarse-to-fine for cat mode (all levels active from start)")
+    parser.add_argument("--dropout_lambda", type=float, default=0.0,
+                        help="Hash dropout rate for cat_dropout mode: fraction of Gaussians that don't query hash during training (0.2 = 20%% dropout)")
     parser.add_argument("--lambda_adaptive", type=float, default=0.001,
                         help="Regularization weight for adaptive mode to encourage per-Gaussian features")
     parser.add_argument("--eval_depth", action="store_true",
@@ -1770,12 +2058,18 @@ if __name__ == "__main__":
                         help="How to handle adaptive weights for new/relocated Gaussians: 'clone' copies from source, 'reset' initializes to 0 (sigmoid=0.5)")
 
     # Adaptive_gate arguments (Gumbel-STE with forced training)
+    parser.add_argument("--no_gumbel", action="store_true",
+                        help="Disable Gumbel noise in adaptive_gate mode (use deterministic STE instead)")
+    parser.add_argument("--hard_switch", action="store_true",
+                        help="Use hard switching (no weight multiplication) during training - replicates cat mode behavior")
     parser.add_argument("--lambda_sparsity", type=float, default=0.005,
                         help="Sparsity penalty on gate probability (encourages gates to stay closed)")
     parser.add_argument("--force_ratio", type=float, default=0.2,
                         help="Fraction of Gaussians forced to use hash during training (0.2 = 20%%)")
     parser.add_argument("--gate_init", type=float, default=2.0,
                         help="Initial gate logit value (positive = favor hash, sigmoid(2)≈0.88)")
+    parser.add_argument("--gate_bce_lambda", type=float, default=0.0,
+                        help="BCE loss weight for gate probabilities (encourages binary 0/1 decisions)")
     parser.add_argument("--adaptive_gate_inference", action="store_true",
                         help="Use hard gating at inference (probability>0.5 uses hash, otherwise zeros)")
 
@@ -1813,15 +2107,42 @@ if __name__ == "__main__":
                         help="Apply BCE regularization for the last N iterations (default: 5000)")
     parser.add_argument("--bce_lambda", type=float, default=0.01,
                         help="BCE regularization weight (default: 0.01)")
+    parser.add_argument("--bce_solo", action="store_true",
+                        help="Disable MCMC opacity regularization during BCE phase (avoids conflicting gradients)")
+
+    # Beta (Gaussian sharpening) override
+    parser.add_argument("--beta", type=float, default=None,
+                        help="Override tg_beta from config (higher = sharper Gaussians, more opaque throughout)")
+
+    # Beta kernel arguments
+    parser.add_argument("--kernel", type=str, default="gaussian",
+                        choices=["gaussian", "beta", "flex", "general"],
+                        help="Kernel type: 'gaussian' (default exp(-0.5*r²)), 'beta' (learnable pow(1-r², shape) per Gaussian), 'flex' (Gaussian with learnable per-Gaussian beta), or 'general' (Isotropic Generalized Gaussian)")
+    parser.add_argument("--lambda_shape", type=float, default=0.001,
+                        help="L1 regularization weight on beta kernel shape parameter (pushes toward 0 = hard disks)")
+    parser.add_argument("--lambda_flex_beta", type=float, default=0.0001,
+                        help="L1 regularization weight on flex kernel beta parameter (prevents runaway sharpening)")
+    parser.add_argument("--genreg", type=str, default="basic",
+                        choices=["basic", "decay", "scaled", "scaled_decay"],
+                        help="General kernel regularization mode: 'basic' (constant), 'decay' (linear decay over training), 'scaled' (scaled by RGB loss), 'scaled_decay' (both)")
 
     args = parser.parse_args(sys.argv[1:])
-    
+
+    # --bce_solo implies --bce
+    if args.bce_solo:
+        args.bce = True
+
     print("Optimizing " + args.model_path)
     print(f"Method: {args.method.upper()}")
     if args.method == "cat":
         print(f"Hybrid levels: {args.hybrid_levels} (per-Gaussian features for coarse levels)")
         if args.disable_c2f:
             print(f"C2F disabled: all levels active from start")
+    elif args.method == "cat_dropout":
+        print(f"Cat Dropout mode: cat mode with hash dropout during training")
+        print(f"  - Hybrid levels: {args.hybrid_levels} (per-Gaussian features for coarse levels)")
+        print(f"  - Dropout lambda: {args.dropout_lambda} ({args.dropout_lambda*100:.0f}% of Gaussians don't query hash)")
+        print(f"  - Inference: identical to cat mode (no dropout)")
     elif args.method == "adaptive_cat":
         print(f"Adaptive Cat mode: learnable binary blend weights (smooth training, binary inference)")
         print(f"  - Entropy regularization: {args.lambda_adaptive_cat} (anneals from iter {args.adaptive_cat_anneal_start})")
@@ -1840,6 +2161,35 @@ if __name__ == "__main__":
 
     if args.bce:
         print(f"BCE opacity regularization: enabled for last {args.bce_iter} iterations (lambda={args.bce_lambda})")
+
+    # Always print kernel info
+    print(f"Kernel type: {args.kernel.upper()}")
+    if args.kernel == "beta":
+        print(f"  Beta kernel: learnable per-Gaussian shape parameter")
+        print(f"  - Formula: alpha = opacity * pow(1 - r², shape)")
+        print(f"  - Shape range: [0.001, 4.001] (0=hard disk, 4=soft cloud)")
+        print(f"  - Shape regularization: lambda={args.lambda_shape} (L1 penalty pushes toward hard disks)")
+    elif args.kernel == "flex":
+        print(f"  Flex kernel: Gaussian with learnable per-Gaussian beta (sharpening)")
+        print(f"  - Formula: G = exp(power); alpha = (1+beta)*G / (1+beta*G)")
+        print(f"  - Beta range: [0, inf) via softplus (0=standard Gaussian, higher=sharper)")
+        print(f"  - Beta regularization: lambda={args.lambda_flex_beta} (L1 penalty prevents runaway)")
+    elif args.kernel == "general":
+        print(f"  General kernel: Isotropic Generalized Gaussian")
+        print(f"  - Formula: alpha = opacity * exp(-0.5 * (r²)^(β/2))")
+        print(f"  - Beta range: [2.0, 8.0] via sigmoid*6+2 (2=Gaussian, 8=super-Gaussian/box)")
+        print(f"  - Beta regularization: lambda={args.lambda_shape}, mode={args.genreg}")
+        if args.genreg == "basic":
+            print(f"    (constant regularization throughout training)")
+        elif args.genreg == "decay":
+            print(f"    (linear decay from lambda to 0 over training)")
+        elif args.genreg == "scaled":
+            print(f"    (scaled by RGB loss to stay proportional)")
+        elif args.genreg == "scaled_decay":
+            print(f"    (scaled by RGB loss + linear decay)")
+    else:
+        print(f"  Gaussian kernel: alpha = opacity * exp(-0.5 * r²)")
+        print(f"  (Use --kernel beta for learnable beta kernel, --kernel flex for Gaussian with learnable sharpening)")
 
     cfg_model = Config(args.yaml)
     merge_cfg_to_args(args, cfg_model)
