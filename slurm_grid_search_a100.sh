@@ -20,7 +20,7 @@ ACCOUNT="rctcd82061"
 TIME_LIMIT="12:00:00"  # 12 hours per experiment
 
 # Data paths for cluster
-BASE_DATA_DIR="/data/rg_data/aig/users/z0051beu/Projects/data/nest_synthetic"
+BASE_DATA_DIR="/data/rg_data/aig/users/z0051beu/Projects/data/nerf_synthetic"
 SCENE_PATH="${BASE_DATA_DIR}/nerf_synthetic/chair"
 YAML_CONFIG="./configs/nerfsyn.yaml"
 
@@ -113,7 +113,7 @@ for op_reg in "${OPACITY_REGS[@]}"; do
                     
                     # Format: exp_name kernel kernel_param op_reg sc_reg noise_lr bce_lambda
                     echo "$exp_name general $lambda_shape $op_reg $sc_reg $noise_lr $bce_lambda" >> "$EXPERIMENT_CONFIG"
-                    ((EXPERIMENT_COUNT++))
+                    EXPERIMENT_COUNT=$((EXPERIMENT_COUNT + 1))
                 done
                 
                 # Flex kernel experiments  
@@ -123,7 +123,7 @@ for op_reg in "${OPACITY_REGS[@]}"; do
                     
                     # Format: exp_name kernel kernel_param op_reg sc_reg noise_lr bce_lambda
                     echo "$exp_name flex $lambda_flex_beta $op_reg $sc_reg $noise_lr $bce_lambda" >> "$EXPERIMENT_CONFIG"
-                    ((EXPERIMENT_COUNT++))
+                    EXPERIMENT_COUNT=$((EXPERIMENT_COUNT + 1))
                 done
             done
         done
