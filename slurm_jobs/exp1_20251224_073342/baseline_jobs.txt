@@ -1,7 +1,0 @@
-bicycle baseline exp1_baseline
-bonsai baseline exp1_baseline
-counter baseline exp1_baseline
-garden baseline exp1_baseline
-kitchen baseline exp1_baseline
-room baseline exp1_baseline
-stump baseline exp1_baseline
