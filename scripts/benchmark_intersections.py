@@ -129,6 +129,8 @@ def main():
     parser.add_argument("--method", type=str, default="cat")
     parser.add_argument("--hybrid_levels", type=int, default=5)
     parser.add_argument("--num_iters", type=int, default=100, help="Number of iterations for timing")
+    parser.add_argument("--kernel", type=str, default="gaussian", choices=["gaussian", "beta", "flex", "general"],
+                        help="Kernel type: gaussian (default 2DGS), beta, flex, or general")
 
     args = get_combined_args(parser)
 
@@ -151,6 +153,11 @@ def main():
     gaussians.base_opacity = cfg_model.surfel.tg_base_alpha
     gaussians.XYZ_TYPE = "UV"
     ingp_model.set_active_levels(iteration)
+
+    # Override kernel type if specified (PLY loading defaults to "beta" if shape column exists)
+    if args.kernel != "gaussian":
+        gaussians.kernel_type = args.kernel
+        print(f"[BENCHMARK] Kernel type set to: {args.kernel}")
 
     num_gaussians_total = len(gaussians.get_xyz)
     print(f"[BENCHMARK] Total Gaussians in PLY: {num_gaussians_total:,}")

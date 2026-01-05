@@ -39,7 +39,8 @@ def rasterize_gaussians(
     hashgrid_settings,
     render_mode,
     shapes,
-    kernel_type
+    kernel_type,
+    aabb_mode=0
 ):
     return _RasterizeGaussians.apply(
         means3D,
@@ -62,7 +63,8 @@ def rasterize_gaussians(
         hashgrid_settings,
         render_mode,
         shapes,
-        kernel_type
+        kernel_type,
+        aabb_mode
     )
 
 class _RasterizeGaussians(torch.autograd.Function):
@@ -89,7 +91,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         hashgrid_settings,
         render_mode,
         shapes,
-        kernel_type
+        kernel_type,
+        aabb_mode=0
     ):
 
         start_event = torch.cuda.Event(enable_timing=True)
@@ -142,7 +145,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             hashgrid_settings.shape_dims,
             raster_settings.max_intersections,
             shapes,
-            kernel_type
+            kernel_type,
+            aabb_mode
         )
 
         # Invoke C++/CUDA rasterizer
@@ -270,6 +274,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             None,  # render_mode
             grad_shapes,  # shapes
             None,  # kernel_type
+            None,  # aabb_mode
         )
 
         return grads
@@ -323,7 +328,7 @@ class GaussianRasterizer(nn.Module):
         homotrans = None, ap_level = None, \
         features = None, offsets = None, gridrange = None, \
         features_diffuse = None, offsets_diffuse = None, gridrange_diffuse = None, \
-        render_mode = 0, shapes = None, kernel_type = 0):
+        render_mode = 0, shapes = None, kernel_type = 0, aabb_mode = 0):
 
         raster_settings = self.raster_settings
         hashgrid_settings = self.hashgrid_settings
@@ -392,7 +397,8 @@ class GaussianRasterizer(nn.Module):
             hashgrid_settings,
             render_mode,
             shapes,
-            kernel_type
+            kernel_type,
+            aabb_mode
         )
 
 def compute_relocation(opacity_old, scale_old, N, binoms, n_max):

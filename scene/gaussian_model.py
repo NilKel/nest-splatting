@@ -270,12 +270,8 @@ class GaussianModel:
         op = self.opacity_activation(self._opacity) * (1.0 - self.base_opacity) + self.base_opacity
         # Energy normalization for beta kernel: boost opacity as shape increases (softer kernels)
         # This preserves brightness as kernels harden (shape → 0)
-        if self.kernel_type == "beta" and self._shape.numel() > 0:
-            return op * (1.0 + self.get_shape)
-        # Energy normalization for general kernel: scale by 2/beta
-        # At beta=2 (standard Gaussian), factor=1.0. At beta=8 (super-Gaussian), factor=0.25
-        if self.kernel_type == "general" and self._shape.numel() > 0:
-            return op * (2.0 / self.get_shape)
+        # if self.kernel_type == "beta" and self._shape.numel() > 0:
+        #     return op * (1.0 + self.get_shape)
         return op
 
     @property

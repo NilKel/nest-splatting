@@ -295,7 +295,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const int render_mode,
 	const uint32_t max_intersections,
 	const float* shapes,
-	const int kernel_type)
+	const int kernel_type,
+	const int aabb_mode)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -347,7 +348,10 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.normal_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		prefiltered
+		prefiltered,
+		shapes,
+		kernel_type,
+		aabb_mode
 	), debug)
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians

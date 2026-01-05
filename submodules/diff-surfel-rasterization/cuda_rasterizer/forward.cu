@@ -345,7 +345,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	const float* shapes,
+	const int kernel_type,
+	const int aabb_mode)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -388,13 +391,42 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	normal = multiplier * normal;
 #endif
 
+	// Compute cutoff for bounding box
+	float cutoff;
+	if (aabb_mode == 1 && kernel_type == 3 && shapes != nullptr) {
+		// AdR: Adaptive bounding box based on opacity and beta
+		// For general kernel (kernel_type=3), the kernel is exp(-0.5 * (r²)^(β/2))
+		// We want: opacity * exp(-0.5 * k^β) = 1/255
+		// Solving: k = (2 * ln(opacity * 255))^(1/β)
+		float opacity_val = opacities[idx];
+		float beta = shapes[idx];  // Beta parameter for this Gaussian, range [2.0, 8.0]
+
+		// Early cull: if opacity < 1/255, Gaussian is invisible everywhere
+		if (opacity_val < (1.0f / 255.0f)) {
+			radii[idx] = 0;
+			tiles_touched[idx] = 0;
+			return;
+		}
+
+		// k = (2 * ln(opacity * 255))^(1/beta)
+		float log_term = 2.0f * logf(opacity_val * 255.0f);
+		if (log_term > 0.0f) {
+			float k = powf(log_term, 1.0f / beta);
+			// Safety clamp: don't let soft Gaussians (low beta) grow beyond 4σ
+			cutoff = fminf(k, 4.0f);
+		} else {
+			// log_term <= 0 means opacity <= 1/255, shouldn't happen after early cull
+			cutoff = 0.1f;  // Minimal bounding box
+		}
+	} else {
 #if TIGHTBBOX // no use in the paper, but it indeed help speeds.
-	// the effective extent is now depended on the opacity of gaussian.
-	float cutoff = sqrtf(max(9.f + 2.f * logf(opacities[idx]), 0.000001));
+		// the effective extent is now depended on the opacity of gaussian.
+		cutoff = sqrtf(max(9.f + 2.f * logf(opacities[idx]), 0.000001));
 #else
-	// float cutoff = 3.0f;
-	float cutoff = 4.0f;
+		// 2DGS default: fixed 4σ cutoff
+		cutoff = 4.0f;
 #endif
+	}
 
 	// Compute center and radius
 	float2 point_image;
@@ -2181,7 +2213,10 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	const float* shapes,
+	const int kernel_type,
+	const int aabb_mode)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -2194,7 +2229,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		clamped,
 		transMat_precomp,
 		colors_precomp,
-		viewmatrix, 
+		viewmatrix,
 		projmatrix,
 		cam_pos,
 		W, H,
@@ -2208,6 +2243,9 @@ void FORWARD::preprocess(int P, int D, int M,
 		normal_opacity,
 		grid,
 		tiles_touched,
-		prefiltered
+		prefiltered,
+		shapes,
+		kernel_type,
+		aabb_mode
 		);
 }

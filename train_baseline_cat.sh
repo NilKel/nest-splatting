@@ -221,7 +221,7 @@ for scene in "${SCENES[@]}"; do
     run_training "$scene" "baseline" "${BASE_NAME}_baseline" ""
     
     # 2. CAT MODE - hybrid_levels 0 to 6
-    for hl in {0..6}; do
+    for hl in {5..6}; do
         run_training "$scene" "cat" "${BASE_NAME}_cat${hl}" "--hybrid_levels $hl"
     done
     

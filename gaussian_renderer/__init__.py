@@ -22,7 +22,8 @@ from utils.general_utils import MEM_PRINT
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
     beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False, decompose_mode = None, max_intersections = 0,
-    skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2, no_gumbel = False, dropout_lambda = 0.0, is_training = True):
+    skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2, no_gumbel = False, dropout_lambda = 0.0, is_training = True,
+    aabb_mode = "2dgs"):
     """
     Render the scene.
 
@@ -740,6 +741,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         shapes = pc.get_shape
         kernel_type = 3
 
+    # Convert aabb_mode string to int: 0=2dgs (fixed 4σ), 1=adr (adaptive)
+    aabb_mode_int = 1 if aabb_mode == "adr" else 0
+
     rendered_image, radii, allmap, transmittance_avg, num_covered_pixels = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -757,6 +761,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         render_mode = render_mode,
         shapes = shapes,
         kernel_type = kernel_type,
+        aabb_mode = aabb_mode_int,
     )
     
     # additional regularizations

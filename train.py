@@ -594,7 +594,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance,
             use_xyz_mode = args.use_xyz_mode, decompose_mode = dataset.decompose_mode,
             temperature = temperature, force_ratio = args.force_ratio, no_gumbel = args.no_gumbel,
-            dropout_lambda = args.dropout_lambda, is_training = True)
+            dropout_lambda = args.dropout_lambda, is_training = True, aabb_mode = args.aabb)
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
     
@@ -2125,6 +2125,9 @@ if __name__ == "__main__":
     parser.add_argument("--genreg", type=str, default="basic",
                         choices=["basic", "decay", "scaled", "scaled_decay"],
                         help="General kernel regularization mode: 'basic' (constant), 'decay' (linear decay over training), 'scaled' (scaled by RGB loss), 'scaled_decay' (both)")
+    parser.add_argument("--aabb", type=str, default="2dgs",
+                        choices=["2dgs", "adr"],
+                        help="AABB mode: '2dgs' (fixed 4σ cutoff), 'adr' (adaptive opacity+beta-aware for general kernel)")
 
     args = parser.parse_args(sys.argv[1:])
 
