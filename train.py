@@ -17,6 +17,7 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
+import traceback
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, build_scaling_rotation
 import uuid
@@ -25,6 +26,44 @@ from utils.image_utils import psnr, render_net_image
 from lpipsPyTorch import lpips
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+
+
+def write_gpu_failure(model_path, error_msg):
+    """Write GPU failure to marker file for SLURM retry.
+
+    This file is checked by the SLURM worker script after training completes.
+    If it contains content, the worker will submit a retry job on a different node.
+    """
+    failure_file = os.path.join(model_path, ".gpu_failure")
+    try:
+        with open(failure_file, "w") as f:
+            f.write(f"Time: {datetime.datetime.now()}\n")
+            f.write(f"Error: {error_msg}\n")
+            f.write(f"Traceback:\n{traceback.format_exc()}\n")
+        print(f"\n[GPU FAILURE] Written to {failure_file}")
+    except Exception as e:
+        print(f"\n[GPU FAILURE] Could not write failure file: {e}")
+        print(f"Original error: {error_msg}")
+
+
+def is_gpu_error(error):
+    """Check if an exception is a GPU-related error that warrants retry."""
+    error_str = str(error).lower()
+    gpu_error_patterns = [
+        "cuda",
+        "out of memory",
+        "illegal memory access",
+        "device-side assert",
+        "nccl",
+        "cublas",
+        "cudnn",
+        "gpu",
+        "tinycudann",
+        "compute capability",
+    ]
+    return any(pattern in error_str for pattern in gpu_error_patterns)
+
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -2372,7 +2411,15 @@ if __name__ == "__main__":
 
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, \
-        args)
 
-    print("\nTraining complete.")
+    # Wrap training in try/except to catch GPU errors for SLURM retry
+    try:
+        training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, \
+            args)
+        print("\nTraining complete.")
+    except Exception as e:
+        if is_gpu_error(e):
+            # Write to failure file so SLURM worker knows to retry
+            write_gpu_failure(args.model_path, str(e))
+        # Re-raise to exit with non-zero code
+        raise

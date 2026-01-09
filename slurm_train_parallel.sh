@@ -178,73 +178,6 @@ set -e
 MIP360_OUTDOOR_SCENES="bicycle flowers garden stump treehill"
 MIP360_INDOOR_SCENES="room counter kitchen bonsai"
 
-#=============================================================================
-# GPU Validation Function
-#=============================================================================
-validate_gpu() {
-    echo "[GPU Check] Validating CUDA availability..."
-    python -c "
-import torch
-import sys
-
-if not torch.cuda.is_available():
-    print('[GPU Check] FATAL: No CUDA device available')
-    sys.exit(1)
-
-try:
-    # Test basic CUDA operations
-    device = torch.device('cuda')
-    x = torch.randn(100, 100, device=device)
-    y = x @ x.T
-    torch.cuda.synchronize()
-
-    # Try importing tinycudann (common failure point)
-    import tinycudann as tcnn
-
-    print(f'[GPU Check] OK - {torch.cuda.get_device_name(0)}')
-    print(f'[GPU Check] CUDA {torch.version.cuda}, Compute Capability {torch.cuda.get_device_capability(0)}')
-except Exception as e:
-    print(f'[GPU Check] FATAL: GPU test failed - {e}')
-    sys.exit(1)
-"
-    return $?
-}
-
-#=============================================================================
-# Request requeue on bad GPU - exits with special code to trigger SLURM requeue
-#=============================================================================
-MAX_REQUEUES=5  # Maximum times a job can be requeued
-
-request_requeue() {
-    local reason=$1
-
-    # Track requeue count using SLURM's restart count
-    REQUEUE_COUNT=${SLURM_RESTART_COUNT:-0}
-
-    echo ""
-    echo "════════════════════════════════════════════════════════════════════"
-    echo "  REQUESTING REQUEUE - Bad GPU/Node detected"
-    echo "════════════════════════════════════════════════════════════════════"
-    echo "Reason: $reason"
-    echo "Host: $(hostname)"
-    echo "GPU: $CUDA_VISIBLE_DEVICES"
-    echo "Requeue attempt: $((REQUEUE_COUNT + 1))/$MAX_REQUEUES"
-    echo ""
-
-    if [ $REQUEUE_COUNT -ge $MAX_REQUEUES ]; then
-        echo "ERROR: Max requeue attempts ($MAX_REQUEUES) reached!"
-        echo "This job has failed on $MAX_REQUEUES different GPUs."
-        echo "Manual intervention required."
-        echo "════════════════════════════════════════════════════════════════════"
-        exit 1
-    fi
-
-    echo "Exiting with code 99 to trigger SLURM requeue..."
-    echo "Job will be rescheduled on a different node."
-    echo "════════════════════════════════════════════════════════════════════"
-    exit 99
-}
-
 # Read the job specification from the config file
 JOB_LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$JOB_CONFIG_FILE")
 if [ -z "$JOB_LINE" ]; then
@@ -271,12 +204,8 @@ if [ "$DATASET_PATH" = "mip_360" ]; then
     fi
 fi
 
-REQUEUE_COUNT=${SLURM_RESTART_COUNT:-0}
 echo "════════════════════════════════════════════════════════════════════"
 echo "  SLURM Job: Task $SLURM_ARRAY_TASK_ID"
-if [ $REQUEUE_COUNT -gt 0 ]; then
-    echo "  (Requeue attempt $REQUEUE_COUNT/$MAX_REQUEUES)"
-fi
 echo "════════════════════════════════════════════════════════════════════"
 echo "Scene:       $SCENE"
 echo "Method:      $METHOD"
@@ -320,10 +249,14 @@ fi
 # Assign unique port per task to avoid conflicts when multiple jobs run on same node
 PORT=$((6009 + SLURM_ARRAY_TASK_ID))
 
-# Validate GPU BEFORE running - request requeue if bad
-if ! validate_gpu; then
-    request_requeue "GPU validation failed (tinycudann import or CUDA test)"
-fi
+# Create output directory and empty failure file
+# train.py will write to this file if it detects a GPU error
+mkdir -p "$OUTPUT_PATH"
+FAILURE_FILE="${OUTPUT_PATH}/.gpu_failure"
+> "$FAILURE_FILE"  # Create/clear failure file
+
+# Save job parameters for potential retry
+echo "$SCENE $METHOD $EXPERIMENT_NAME $METHOD_ARGS" > "${OUTPUT_PATH}/.job_params"
 
 # Run training
 CMD="python train.py -s $SCENE_PATH -m $EXPERIMENT_NAME --yaml $SCENE_YAML_CONFIG --eval --iterations $ITERATIONS $SCENE_RESOLUTION_ARG --method $METHOD --port $PORT $METHOD_ARGS $EXTRA_ARGS"
@@ -339,24 +272,56 @@ set -e
 
 echo ""
 echo "════════════════════════════════════════════════════════════════════"
-if [ $EXIT_CODE -eq 0 ]; then
+
+# Check if train.py wrote to the failure file (indicating GPU error)
+if [ -s "\$FAILURE_FILE" ]; then
+    echo "  ✗ GPU FAILURE DETECTED"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "train.py reported a GPU error:"
+    cat "\$FAILURE_FILE"
+    echo ""
+    echo "Submitting retry job on different node..."
+
+    # Create retry sbatch script
+    RETRY_SCRIPT="\${OUTPUT_PATH}/.retry_\${SLURM_JOB_ID}.sbatch"
+    cat > "\$RETRY_SCRIPT" << RETRY_EOF
+#!/bin/bash
+#SBATCH --partition=$PARTITION
+#SBATCH --account=$ACCOUNT
+#SBATCH --gres=gpu:1
+#SBATCH --job-name=retry_\${SCENE}_\${METHOD}
+#SBATCH --output=\${OUTPUT_PATH}/retry_%j.out
+#SBATCH --error=\${OUTPUT_PATH}/retry_%j.err
+#SBATCH --time=$TIME_LIMIT
+#SBATCH --exclude=\$(hostname)
+
+# Setup environment
+source ~/userdir/miniconda3/etc/profile.d/conda.sh
+conda activate nest_splatting
+
+cd /data/rg_data/aig/users/z0051beu/Projects/nest-splatting
+
+# Re-run the same training command
+\$CMD
+RETRY_EOF
+
+    sbatch --begin=now+1min "\$RETRY_SCRIPT"
+    echo "Retry job submitted. This job exiting."
+    rm -f "\$FAILURE_FILE"
+    exit 1
+elif [ \$EXIT_CODE -eq 0 ]; then
     echo "  ✓ SUCCESS"
     echo "════════════════════════════════════════════════════════════════════"
-    echo "Finished: $(date)"
+    echo "Finished: \$(date)"
+    rm -f "\$FAILURE_FILE"
     exit 0
-fi
-
-# Check if this looks like a GPU error (common CUDA errors)
-# If so, request requeue to try on a different GPU
-if [ $EXIT_CODE -ne 0 ]; then
-    echo "  ✗ FAILED (exit code: $EXIT_CODE)"
+else
+    echo "  ✗ FAILED (exit code: \$EXIT_CODE)"
     echo "════════════════════════════════════════════════════════════════════"
-    echo ""
-    echo "Checking if this is a GPU-related failure..."
-
-    # Request requeue for GPU-related failures
-    # The job will be rescheduled on a different node
-    request_requeue "Training failed with exit code $EXIT_CODE (likely GPU issue)"
+    echo "Non-GPU failure - no automatic retry."
+    echo "Finished: \$(date)"
+    rm -f "\$FAILURE_FILE"
+    exit \$EXIT_CODE
 fi
 WORKER_EOF
 
@@ -378,11 +343,7 @@ cat > "$BASELINE_SBATCH" << EOF
 #SBATCH --error=$JOB_DIR/logs/baseline_%a.err
 #SBATCH --time=$TIME_LIMIT
 #SBATCH --array=1-${NUM_BASELINE_JOBS}%${NUM_BASELINE_JOBS}
-#SBATCH --requeue
 #SBATCH --open-mode=append
-
-# Handle requeue signal - SLURM sends SIGUSR1 before requeueing
-trap 'echo "Received requeue signal, job will be rescheduled..."' SIGUSR1
 
 # Setup environment
 source ~/userdir/miniconda3/etc/profile.d/conda.sh
@@ -400,18 +361,9 @@ export EXTRA_ARGS="$EXTRA_ARGS"
 # Change to project directory
 cd /data/rg_data/aig/users/z0051beu/Projects/nest-splatting
 
-# Run worker - exit code 99 triggers requeue via scontrol
+# Run worker
 $WORKER_SCRIPT
-EXIT_CODE=\$?
-
-# If worker requested requeue (exit 99), tell SLURM to requeue this job
-if [ \$EXIT_CODE -eq 99 ]; then
-    echo "Worker requested requeue, notifying SLURM..."
-    scontrol requeue \$SLURM_JOB_ID
-    exit 0
-fi
-
-exit \$EXIT_CODE
+exit \$?
 EOF
 
 # Phase 2: Cat jobs
@@ -426,11 +378,7 @@ cat > "$CAT_SBATCH" << EOF
 #SBATCH --error=$JOB_DIR/logs/cat_%a.err
 #SBATCH --time=$TIME_LIMIT
 #SBATCH --array=1-${NUM_CAT_JOBS}%${NUM_CAT_JOBS}
-#SBATCH --requeue
 #SBATCH --open-mode=append
-
-# Handle requeue signal - SLURM sends SIGUSR1 before requeueing
-trap 'echo "Received requeue signal, job will be rescheduled..."' SIGUSR1
 
 # Setup environment
 source ~/userdir/miniconda3/etc/profile.d/conda.sh
@@ -448,18 +396,9 @@ export EXTRA_ARGS="$EXTRA_ARGS"
 # Change to project directory
 cd /data/rg_data/aig/users/z0051beu/Projects/nest-splatting
 
-# Run worker - exit code 99 triggers requeue via scontrol
+# Run worker
 $WORKER_SCRIPT
-EXIT_CODE=\$?
-
-# If worker requested requeue (exit 99), tell SLURM to requeue this job
-if [ \$EXIT_CODE -eq 99 ]; then
-    echo "Worker requested requeue, notifying SLURM..."
-    scontrol requeue \$SLURM_JOB_ID
-    exit 0
-fi
-
-exit \$EXIT_CODE
+exit \$?
 EOF
 
 # Create logs directory
