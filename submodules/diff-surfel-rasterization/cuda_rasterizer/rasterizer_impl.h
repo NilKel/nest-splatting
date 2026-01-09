@@ -33,6 +33,8 @@ namespace CudaRasterizer
 		char* scanning_space;
 		bool* clamped;
 		int* internal_radii;
+		int* radii_x;  // Separate X radius for rectangular AABB
+		int* radii_y;  // Separate Y radius for rectangular AABB
 		float2* means2D;
 		float* transMat;
 		float4* normal_opacity;

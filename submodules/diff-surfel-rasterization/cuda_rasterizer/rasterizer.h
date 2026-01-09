@@ -73,7 +73,9 @@ namespace CudaRasterizer
 			const uint32_t max_intersections = 0,
 			const float* shapes = nullptr,
 			const int kernel_type = 0,
-			const int aabb_mode = 0);
+			const int aabb_mode = 0,
+			const float aa = 0.0f,
+			const float aa_threshold = 0.01f);
 
 		static void backward(
 			const int P, int D, int M, int R,

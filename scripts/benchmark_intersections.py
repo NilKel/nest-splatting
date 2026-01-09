@@ -30,7 +30,7 @@ def merge_cfg_to_args(args, cfg_model):
             pass  # Keep XYZ_TYPE in cfg
 
 
-def benchmark_fps(gaussians, scene, pipe, ingp, cfg_model, iteration, num_iters=100, opacity_override=None, max_intersections=0):
+def benchmark_fps(gaussians, scene, pipe, ingp, cfg_model, iteration, num_iters=100, opacity_override=None, max_intersections=0, aabb_mode=0):
     """Benchmark render FPS, optionally overriding opacity or capping intersections."""
     test_cameras = scene.getTestCameras()
     if len(test_cameras) == 0:
@@ -56,14 +56,14 @@ def benchmark_fps(gaussians, scene, pipe, ingp, cfg_model, iteration, num_iters=
     with torch.no_grad():
         # Warm-up render
         _ = render(viewpoint, gaussians, pipe, bg, ingp=ingp, beta=beta,
-                  iteration=iteration, cfg=cfg_model, max_intersections=max_intersections)
+                  iteration=iteration, cfg=cfg_model, max_intersections=max_intersections, aabb_mode=aabb_mode)
         torch.cuda.synchronize()
 
         # Time multiple renders
         start_time = time.time()
         for _ in range(num_iters):
             _ = render(viewpoint, gaussians, pipe, bg, ingp=ingp, beta=beta,
-                      iteration=iteration, cfg=cfg_model, max_intersections=max_intersections)
+                      iteration=iteration, cfg=cfg_model, max_intersections=max_intersections, aabb_mode=aabb_mode)
         torch.cuda.synchronize()
         elapsed = time.time() - start_time
 
@@ -131,6 +131,10 @@ def main():
     parser.add_argument("--num_iters", type=int, default=100, help="Number of iterations for timing")
     parser.add_argument("--kernel", type=str, default="gaussian", choices=["gaussian", "beta", "flex", "general"],
                         help="Kernel type: gaussian (default 2DGS), beta, flex, or general")
+    parser.add_argument("--aabb_mode", type=int, default=None,
+                        help="AABB mode: 0=square (2DGS), 1=AdR cutoff, 2=rectangular, 3=AdR+rect. If not specified, tests all modes.")
+    parser.add_argument("--compare_aabb", action="store_true",
+                        help="Compare all AABB modes (overrides --aabb_mode)")
 
     args = get_combined_args(parser)
 
@@ -197,61 +201,109 @@ def main():
         H, W = test_cameras[0].image_height, test_cameras[0].image_width
         print(f"[BENCHMARK] Resolution: {W}x{H}")
 
-    # Get intersection stats with normal opacity
-    print("\n[BENCHMARK] Getting intersection statistics (normal opacity)...")
-    stats = get_intersection_stats(gaussians, scene, pipe, ingp_model, cfg_model, iteration)
-    if stats:
-        print(f"  Mean intersections: {stats['mean']:.2f}")
-        print(f"  Median intersections: {stats['median']:.2f}")
-        print(f"  Max intersections: {stats['max']:.0f}")
-        print(f"  Std intersections: {stats['std']:.2f}")
+    # Determine which aabb_mode(s) to test
+    aabb_mode_names = {0: "square", 1: "AdR", 2: "rect", 3: "AdR+rect"}
 
-    # Benchmark with different max_intersections caps
-    caps_to_test = [0, 1, 20, 50, 100]  # 0 means no limit
-    results = {}
+    if args.compare_aabb:
+        # Compare all AABB modes
+        aabb_modes_to_test = [0, 2, 1, 3]  # Test: baseline, rect only, AdR only, both
+        print("\n" + "="*60)
+        print("AABB MODE COMPARISON")
+        print("="*60)
+        print(f"  0 = Square AABB, fixed 4σ cutoff (2DGS default)")
+        print(f"  1 = Square AABB, AdR cutoff (adaptive)")
+        print(f"  2 = Rectangular AABB, fixed 4σ cutoff")
+        print(f"  3 = Rectangular AABB, AdR cutoff (full optimization)")
 
-    for cap in caps_to_test:
-        cap_label = "unlimited" if cap == 0 else str(cap)
-        print(f"\n[BENCHMARK] Testing max_intersections={cap_label}...")
+        aabb_results = {}
+        for mode in aabb_modes_to_test:
+            mode_name = aabb_mode_names[mode]
+            print(f"\n[BENCHMARK] Testing aabb_mode={mode} ({mode_name})...")
 
-        # Get intersection stats with this cap
-        stats_cap = get_intersection_stats(gaussians, scene, pipe, ingp_model, cfg_model, iteration, max_intersections=cap)
-        if stats_cap:
-            print(f"  Actual mean intersections: {stats_cap['mean']:.2f}")
-            print(f"  Actual max intersections: {stats_cap['max']:.0f}")
+            fps, ms = benchmark_fps(gaussians, scene, pipe, ingp_model, cfg_model, iteration,
+                                   num_iters=args.num_iters, aabb_mode=mode)
+            print(f"  FPS: {fps:.2f} ({ms:.2f} ms/frame)")
+            aabb_results[mode] = {'fps': fps, 'ms': ms, 'name': mode_name}
 
-        # Benchmark FPS
-        fps, ms = benchmark_fps(gaussians, scene, pipe, ingp_model, cfg_model, iteration,
-                               num_iters=args.num_iters, max_intersections=cap)
-        print(f"  FPS: {fps:.2f} ({ms:.2f} ms/frame)")
-        results[cap] = {'fps': fps, 'ms': ms, 'stats': stats_cap}
+        # Summary table
+        print("\n" + "="*60)
+        print("AABB MODE BENCHMARK RESULTS")
+        print("="*60)
+        print(f"Model: {args.model_path}")
+        print(f"Gaussians: {num_gaussians:,}")
+        print(f"Kernel: {args.kernel}")
 
-    # Summary
-    print("\n" + "="*60)
-    print("BENCHMARK SUMMARY")
-    print("="*60)
-    print(f"Model: {args.model_path}")
-    print(f"Gaussians: {num_gaussians:,}")
-    if stats:
-        print(f"Mean intersections (unlimited): {stats['mean']:.2f}")
-        print(f"Max intersections (unlimited): {stats['max']:.0f}")
+        print(f"\n{'Mode':<12} {'Name':<12} {'FPS':>10} {'ms/frame':>12} {'Speedup':>10}")
+        print("-" * 60)
+        baseline_fps = aabb_results[0]['fps']
+        for mode in aabb_modes_to_test:
+            r = aabb_results[mode]
+            speedup = r['fps'] / baseline_fps if baseline_fps > 0 else 0
+            speedup_str = f"{speedup:.2f}x" if mode != 0 else "baseline"
+            print(f"{mode:<12} {r['name']:<12} {r['fps']:>10.2f} {r['ms']:>12.2f} {speedup_str:>10}")
 
-    print(f"\n{'Cap':<12} {'FPS':>10} {'ms/frame':>12} {'Mean Ints':>12} {'Max Ints':>10}")
-    print("-" * 60)
-    for cap in caps_to_test:
-        cap_label = "unlimited" if cap == 0 else str(cap)
-        r = results[cap]
-        mean_ints = r['stats']['mean'] if r['stats'] else 0
-        max_ints = r['stats']['max'] if r['stats'] else 0
-        print(f"{cap_label:<12} {r['fps']:>10.2f} {r['ms']:>12.2f} {mean_ints:>12.2f} {max_ints:>10.0f}")
+        print("="*60)
 
-    # Speedup relative to unlimited
-    if results[0]['fps'] > 0:
-        print(f"\nSpeedups relative to unlimited:")
-        for cap in caps_to_test[1:]:
-            speedup = results[cap]['fps'] / results[0]['fps']
-            print(f"  max_intersections={cap}: {speedup:.2f}x")
-    print("="*60)
+    else:
+        # Original behavior: test max_intersections caps with specified aabb_mode
+        aabb_mode = args.aabb_mode if args.aabb_mode is not None else 0
+
+        # Get intersection stats with normal opacity
+        print(f"\n[BENCHMARK] Getting intersection statistics (aabb_mode={aabb_mode})...")
+        stats = get_intersection_stats(gaussians, scene, pipe, ingp_model, cfg_model, iteration)
+        if stats:
+            print(f"  Mean intersections: {stats['mean']:.2f}")
+            print(f"  Median intersections: {stats['median']:.2f}")
+            print(f"  Max intersections: {stats['max']:.0f}")
+            print(f"  Std intersections: {stats['std']:.2f}")
+
+        # Benchmark with different max_intersections caps
+        caps_to_test = [0, 1, 20, 50, 100]  # 0 means no limit
+        results = {}
+
+        for cap in caps_to_test:
+            cap_label = "unlimited" if cap == 0 else str(cap)
+            print(f"\n[BENCHMARK] Testing max_intersections={cap_label}...")
+
+            # Get intersection stats with this cap
+            stats_cap = get_intersection_stats(gaussians, scene, pipe, ingp_model, cfg_model, iteration, max_intersections=cap)
+            if stats_cap:
+                print(f"  Actual mean intersections: {stats_cap['mean']:.2f}")
+                print(f"  Actual max intersections: {stats_cap['max']:.0f}")
+
+            # Benchmark FPS
+            fps, ms = benchmark_fps(gaussians, scene, pipe, ingp_model, cfg_model, iteration,
+                                   num_iters=args.num_iters, max_intersections=cap, aabb_mode=aabb_mode)
+            print(f"  FPS: {fps:.2f} ({ms:.2f} ms/frame)")
+            results[cap] = {'fps': fps, 'ms': ms, 'stats': stats_cap}
+
+        # Summary
+        print("\n" + "="*60)
+        print("BENCHMARK SUMMARY")
+        print("="*60)
+        print(f"Model: {args.model_path}")
+        print(f"Gaussians: {num_gaussians:,}")
+        print(f"AABB Mode: {aabb_mode} ({aabb_mode_names.get(aabb_mode, 'unknown')})")
+        if stats:
+            print(f"Mean intersections (unlimited): {stats['mean']:.2f}")
+            print(f"Max intersections (unlimited): {stats['max']:.0f}")
+
+        print(f"\n{'Cap':<12} {'FPS':>10} {'ms/frame':>12} {'Mean Ints':>12} {'Max Ints':>10}")
+        print("-" * 60)
+        for cap in caps_to_test:
+            cap_label = "unlimited" if cap == 0 else str(cap)
+            r = results[cap]
+            mean_ints = r['stats']['mean'] if r['stats'] else 0
+            max_ints = r['stats']['max'] if r['stats'] else 0
+            print(f"{cap_label:<12} {r['fps']:>10.2f} {r['ms']:>12.2f} {mean_ints:>12.2f} {max_ints:>10.0f}")
+
+        # Speedup relative to unlimited
+        if results[0]['fps'] > 0:
+            print(f"\nSpeedups relative to unlimited:")
+            for cap in caps_to_test[1:]:
+                speedup = results[cap]['fps'] / results[0]['fps']
+                print(f"  max_intersections={cap}: {speedup:.2f}x")
+        print("="*60)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@
 #
 
 import os
+import json
 import torch
 import torch.nn as nn
 from random import randint
@@ -32,6 +33,7 @@ except ImportError:
 
 from hash_encoder.modules import INGP
 from hash_encoder.config import Config
+from scene.background import LearnableSkybox
 from utils.render_utils import save_img_u8, convert_gray_to_cmap, create_intersection_heatmap, create_intersection_histogram, create_flex_beta_heatmap
 from utils.render_utils import gsnum_trans_color
 import open3d as o3d
@@ -505,6 +507,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if cfg_model.settings.if_ingp:
         ingp_model = INGP(cfg_model, args=args).to('cuda')
 
+    # Initialize learnable skybox for background modeling
+    skybox = None
+    background_mode = args.background  # "none", "skybox_dense", or "skybox_sparse"
+    if background_mode in ["skybox_dense", "skybox_sparse"]:
+        skybox = LearnableSkybox(
+            resolution_h=args.skybox_res,
+            resolution_w=args.skybox_res * 2
+        ).cuda()
+        skybox.training_setup(lr=args.skybox_lr)
+        sparse_str = " (sparse MLP)" if background_mode == "skybox_sparse" else " (dense MLP)"
+        print(f"[SKYBOX] Initialized {args.skybox_res}x{args.skybox_res * 2} learnable skybox{sparse_str} (lr={args.skybox_lr})")
+        print(f"[SKYBOX] texture.requires_grad={skybox.texture.requires_grad}, device={skybox.texture.device}, shape={skybox.texture.shape}")
+        print(f"[SKYBOX] optimizer param groups: {len(skybox.optimizer.param_groups)}, params: {sum(p.numel() for g in skybox.optimizer.param_groups for p in g['params'])}")
+
     opacity_reset_protect = cfg_model.training_cfg.opacity_reset_protect
     if_pixel_densify_enhance = cfg_model.settings.pixel_densify_enhance
     
@@ -590,18 +606,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             temperature = 1.0
 
+        # Only use skybox after switch_iter (when hash grid activates)
+        active_skybox = skybox if (skybox is not None and iteration >= cfg_model.ingp_stage.switch_iter) else None
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, current_bg, ingp = ingp,
             beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance,
             use_xyz_mode = args.use_xyz_mode, decompose_mode = dataset.decompose_mode,
             temperature = temperature, force_ratio = args.force_ratio, no_gumbel = args.no_gumbel,
-            dropout_lambda = args.dropout_lambda, is_training = True, aabb_mode = args.aabb)
+            dropout_lambda = args.dropout_lambda, is_training = True, aabb_mode = args.aabb,
+            aa = args.aa, aa_threshold = args.aa_threshold, skybox = active_skybox,
+            background_mode = background_mode)
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
     
         gt_image = viewpoint_cam.original_image.cuda()
         
         # Apply random background for unbiased opacity training
-        if use_random_bg and iteration >= random_bg_start_iter:
+        # Skip if skybox is active - skybox already provides the background
+        if use_random_bg and iteration >= random_bg_start_iter and active_skybox is None:
             H, W = image.shape[1], image.shape[2]
             # Generate a single random RGB value for the entire background
             # Changes every 100 iterations
@@ -609,10 +631,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             random_bg_color = torch.rand(3, 1, 1, device="cuda")
             random_bg = random_bg_color.expand(3, H, W)
             rend_alpha = render_pkg["rend_alpha"]
-            
+
             # Apply random background to rendered image
             image = image + (1.0 - rend_alpha) * random_bg
-            
+
             # Apply same random background to GT image
             gt_alpha_for_bg = viewpoint_cam.gt_alpha_mask.cuda().float() if cfg_model.settings.gt_alpha else (gt_image != 0).any(dim=0, keepdim=True).float()
             gt_image = gt_image + (1.0 - gt_alpha_for_bg) * random_bg
@@ -706,7 +728,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         mcmc_opacity_reg = torch.tensor(0.0, device="cuda")
         mcmc_scale_reg = torch.tensor(0.0, device="cuda")
         bce_phase_active = args.bce and iteration > (opt.iterations - args.bce_iter)
-        if args.mcmc:
+        if args.mcmc or args.mcmc_deficit:
             # If --bce_solo, skip MCMC regularization during BCE phase to let BCE work alone
             if not (args.bce_solo and bce_phase_active):
                 # Regularize activated opacity (after sigmoid) to encourage low opacity -> sparsity
@@ -839,24 +861,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_mask_for_log = 0.4 * mask_loss.item() + 0.6 * ema_mask_for_log
             
             # Track MCMC regularization losses
-            if args.mcmc:
+            if args.mcmc or args.mcmc_deficit:
                 mcmc_total = mcmc_opacity_reg.item() + mcmc_scale_reg.item()
                 ema_mcmc_loss_for_log = 0.4 * mcmc_total + 0.6 * ema_mcmc_loss_for_log
-            
+
             if iteration % 10 == 0:
                 # For MCMC, show alive Gaussians (opacity > 0.005) instead of total
-                if args.mcmc:
+                if args.mcmc or args.mcmc_deficit:
                     n_alive = (gaussians.get_opacity > 0.005).sum().item()
                     points_str = f"{int(n_alive)}/{len(gaussians.get_xyz)}"
                 else:
                     points_str = f"{len(gaussians.get_xyz)}"
-                
+
                 loss_dict = {
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "Points": points_str,
                 }
                 # Add MCMC loss to progress bar if enabled (hide during BCE solo phase)
-                if args.mcmc and not (args.bce_solo and bce_phase_active):
+                if (args.mcmc or args.mcmc_deficit) and not (args.bce_solo and bce_phase_active):
                     loss_dict["OpR"] = f"{mcmc_opacity_reg.item():.{5}f}"
                     loss_dict["ScR"] = f"{mcmc_scale_reg.item():.{5}f}"
                 # Add BCE phase indicator to progress bar
@@ -922,7 +944,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/mask_loss', ema_mask_for_log, iteration)
-                if args.mcmc:
+                if args.mcmc or args.mcmc_deficit:
                     tb_writer.add_scalar('train_loss_patches/mcmc_reg_loss', ema_mcmc_loss_for_log, iteration)
                     tb_writer.add_scalar('train_loss_patches/mcmc_opacity_reg', mcmc_opacity_reg.item(), iteration)
                     tb_writer.add_scalar('train_loss_patches/mcmc_scale_reg', mcmc_scale_reg.item(), iteration)
@@ -971,7 +993,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tb_writer.add_scalar('general_kernel/pct_gaussian_lt_3', pct_gaussian, iteration)
 
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), \
-                ingp_model=ingp, beta = beta, args = args, cfg_model = cfg_model, test_psnr = test_psnr, train_psnr = train_psnr, iter_list = iter_list)
+                ingp_model=ingp, beta = beta, args = args, cfg_model = cfg_model, test_psnr = test_psnr, train_psnr = train_psnr, iter_list = iter_list, skybox_model = skybox,
+                background_mode = background_mode)
 
             # Print beta kernel stats every 1000 iterations
             if args.kernel == "beta" and iteration % 1000 == 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
@@ -1014,19 +1037,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
                 if ingp is not None:
                     ingp.save_model(scene.model_path, iteration)
+                if skybox is not None:
+                    skybox.save_model(scene.model_path, iteration)
 
             # Densification / MCMC Relocation
             if iteration < opt.densify_until_iter and optim_gaussian:
-                if args.mcmc:
+                if args.mcmc or args.mcmc_deficit:
                     # MCMC mode: relocate dead Gaussians and add new ones
                     if args.cap_max <= 0:
-                        raise ValueError("--cap_max must be specified and positive when using --mcmc mode")
-                    
+                        raise ValueError("--cap_max must be specified and positive when using --mcmc or --mcmc_deficit mode")
+
                     if iteration > opt.densify_from_iter and iteration % densification_interval == 0:
                         # Find dead Gaussians (very low opacity)
                         dead_mask = (gaussians.get_opacity <= 0.005).squeeze(-1)
-                        gaussians.relocate_gs(dead_mask=dead_mask)
-                        gaussians.add_new_gs(cap_max=args.cap_max)
+                        current_count = len(gaussians.get_xyz)
+
+                        if args.mcmc_deficit and current_count > args.cap_max:
+                            # DEFICIT MODE: Delete dead Gaussians until we reach cap_max
+                            n_dead = dead_mask.sum().item()
+                            if n_dead > 0:
+                                gaussians.prune_points(dead_mask)
+                            # No add_new_gs while in deficit - just delete
+                        else:
+                            # Normal MCMC: relocate dead Gaussians + add new ones
+                            gaussians.relocate_gs(dead_mask=dead_mask)
+                            gaussians.add_new_gs(cap_max=args.cap_max)
                 else:
                     # Traditional densification
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
@@ -1055,9 +1090,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if optim_ngp:
                     ingp.current_optimizer.step()
                     ingp.current_optimizer.zero_grad(set_to_none = True)
-                
+
+                # Skybox optimizer step (only after switch_iter when skybox is active)
+                if skybox is not None and iteration >= cfg_model.ingp_stage.switch_iter:
+                    # Debug: check if gradients exist
+                    if iteration % 1000 == 0:
+                        grad = skybox.texture.grad
+                        if grad is not None:
+                            print(f"[SKYBOX] iter {iteration}: grad norm = {grad.norm().item():.6f}, texture range = [{skybox.texture.min().item():.4f}, {skybox.texture.max().item():.4f}]")
+                        else:
+                            print(f"[SKYBOX] iter {iteration}: NO GRADIENT!")
+                    skybox.optimizer.step()
+                    skybox.optimizer.zero_grad(set_to_none=True)
+
                 # MCMC: SGLD noise injection after optimizer step
-                if args.mcmc:
+                if args.mcmc or args.mcmc_deficit:
                     # Get current xyz learning rate
                     xyz_lr = gaussians.optimizer.param_groups[0]['lr']
                     
@@ -1100,12 +1147,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 normal_name = os.path.join(output_path,  str(iteration) + '_normal.png')
                 save_img_u8(rend_normal.permute(1,2,0).cpu().numpy() * 0.5 + 0.5, normal_name)
-                
+
                 ### error image from superGS
                 error_img = error_img.mean(axis=0)
                 color_map = convert_gray_to_cmap(error_img.detach().cpu(), map_mode = 'jet', revert = False, vmax = 1)
                 error_name = os.path.join(output_path,  str(iteration) + '_diff.png')
                 save_img_u8(color_map, error_name)
+
+                # Save FG/BG separation if skybox is active
+                if "render_fg" in render_pkg:
+                    fg_image = torch.clamp(render_pkg["render_fg"], 0.0, 1.0)
+                    bg_image = torch.clamp(render_pkg["render_bg"], 0.0, 1.0)
+                    alpha = render_pkg["rend_alpha"]
+
+                    fg_name = os.path.join(output_path, str(iteration) + '_fg.png')
+                    save_img_u8(fg_image.permute(1,2,0).detach().cpu().numpy(), fg_name)
+
+                    bg_name = os.path.join(output_path, str(iteration) + '_bg.png')
+                    save_img_u8(bg_image.permute(1,2,0).detach().cpu().numpy(), bg_name)
+
+                    alpha_name = os.path.join(output_path, str(iteration) + '_alpha.png')
+                    save_img_u8(alpha.repeat(3,1,1).permute(1,2,0).detach().cpu().numpy(), alpha_name)
 
             if network_gui.conn == None:
                 network_gui.try_connect(dataset.render_items)
@@ -1200,7 +1262,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         torch.cuda.empty_cache()
 
     # Prune dead Gaussians in MCMC mode before final rendering
-    if args.mcmc:
+    if args.mcmc or args.mcmc_deficit:
         print("\n" + "="*70)
         print("  PRUNING DEAD GAUSSIANS (MCMC MODE)")
         print("="*70)
@@ -1229,15 +1291,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     print("\n" + "="*70)
     print(" "*20 + "FINAL TEST RENDERING")
     print("="*70)
-    render_final_images(scene, gaussians, pipe, eval_background, final_ingp, beta, iteration, cfg_model, args, 
-                        cameras=scene.getTestCameras(), output_subdir='final_test_renders', metrics_file='test_metrics.txt')
-    
+    render_final_images(scene, gaussians, pipe, eval_background, final_ingp, beta, iteration, cfg_model, args,
+                        cameras=scene.getTestCameras(), output_subdir='final_test_renders', metrics_file='test_metrics.txt',
+                        skybox=skybox, background_mode=background_mode)
+
     print("\n" + "="*70)
     print(" "*20 + "FINAL TRAIN RENDERING")
     print("="*70)
     render_final_images(scene, gaussians, pipe, eval_background, final_ingp, beta, iteration, cfg_model, args,
                         cameras=scene.getTrainCameras(), output_subdir='final_train_renders', metrics_file='train_metrics.txt',
-                        skip_decomposition=True)
+                        skip_decomposition=True, skybox=skybox, background_mode=background_mode)
     
     # Save training log with point count and framerate
     save_training_log(scene, gaussians, final_ingp, pipe, args, cfg_model, iteration)
@@ -1292,16 +1355,16 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
         
         with torch.no_grad():
             # Warm-up render
-            _ = render(viewpoint, gaussians, pipe, bg, ingp=ingp, beta=beta, 
-                      iteration=iteration, cfg=cfg_model)
+            _ = render(viewpoint, gaussians, pipe, bg, ingp=ingp, beta=beta,
+                      iteration=iteration, cfg=cfg_model, aabb_mode=args.aabb)
             torch.cuda.synchronize()
-            
+
             # Time multiple renders
             num_timing_iters = 100
             start_time = time.time()
             for _ in range(num_timing_iters):
                 _ = render(viewpoint, gaussians, pipe, bg, ingp=ingp, beta=beta,
-                          iteration=iteration, cfg=cfg_model)
+                          iteration=iteration, cfg=cfg_model, aabb_mode=args.aabb)
             torch.cuda.synchronize()
             elapsed = time.time() - start_time
             
@@ -1328,12 +1391,15 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
             f.write(f"Hybrid Levels: {args.hybrid_levels}\n")
             if args.method == "cat_dropout":
                 f.write(f"Dropout Lambda: {args.dropout_lambda}\n")
-        if args.mcmc:
-            f.write(f"MCMC Mode: Enabled\n")
+        if args.mcmc or args.mcmc_deficit:
+            mode_name = "MCMC Deficit" if args.mcmc_deficit else "MCMC"
+            f.write(f"{mode_name} Mode: Enabled\n")
             f.write(f"  - Opacity Reg: {args.opacity_reg}\n")
             f.write(f"  - Scale Reg: {args.scale_reg}\n")
             f.write(f"  - Noise LR: {args.noise_lr}\n")
             f.write(f"  - Cap Max: {args.cap_max}\n")
+            if args.mcmc_deficit:
+                f.write(f"  - Deficit mode: deletes dead Gaussians until reaching cap_max\n")
             f.write(f"  - Note: Dead Gaussians (opacity ≤ 0.005) pruned before final rendering\n")
         if args.bce:
             f.write(f"BCE Opacity Regularization: Enabled\n")
@@ -1345,7 +1411,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
         f.write("Model Statistics\n")
         f.write("-" * 30 + "\n")
         f.write(f"Number of Gaussians: {num_gaussians:,}\n")
-        if args.mcmc:
+        if args.mcmc or args.mcmc_deficit:
             f.write(f"  (MCMC: only alive Gaussians counted)\n")
         f.write("\n")
 
@@ -1382,9 +1448,27 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
 
 
 def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args,
-                        cameras, output_subdir, metrics_file, stride=1, skip_decomposition=False):
-    """Render images and compute metrics."""
-    
+                        cameras, output_subdir, metrics_file, stride=1, skip_decomposition=False,
+                        skybox=None, background_mode="none"):
+    """Render images and compute metrics.
+
+    Cameras are sorted by image_name (e.g., r_0, r_1, ..., r_99) for consistent ordering
+    regardless of how they were shuffled during training.
+    """
+    # Sort cameras by image_name for consistent ordering
+    # Extract numeric part from names like "r_23" for proper numeric sorting
+    def get_sort_key(cam):
+        name = cam.image_name if hasattr(cam, 'image_name') else ""
+        # Try to extract number from name like "r_23"
+        import re
+        match = re.search(r'(\d+)', name)
+        if match:
+            return int(match.group(1))
+        return name  # Fall back to string sorting
+
+    cameras = sorted(cameras, key=get_sort_key)
+    print(f"[FINAL] Sorted {len(cameras)} cameras by image_name")
+
     final_output_dir = os.path.join(scene.model_path, output_subdir)
     os.makedirs(final_output_dir, exist_ok=True)
     
@@ -1528,7 +1612,8 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                 continue
 
             render_pkg = render(viewpoint, gaussians, pipe, background,
-                              ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
+                              ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                              skybox=skybox, background_mode=background_mode)
 
             rendered = torch.clamp(render_pkg["render"], 0.0, 1.0)
             gt = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -1542,14 +1627,17 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
             ssim_values.append(ssim_val)
             lpips_values.append(lpips_val)
             l1_values.append(l1_val)
-            rendered_indices.append(idx)
+            # Store both sorted index and camera name for proper identification
+            cam_name_for_index = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
+            rendered_indices.append(f"{idx:03d}_{cam_name_for_index}")
 
             # For adaptive modes, also compute training mode (soft) metrics
             if is_adaptive_zero_mode and ingp is not None:
                 # Temporarily switch to training mode
                 ingp.adaptive_zero_inference = False
                 training_pkg = render(viewpoint, gaussians, pipe, background,
-                                      ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
+                                      ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                      skybox=skybox, background_mode=background_mode)
                 ingp.adaptive_zero_inference = True  # Restore inference mode
 
                 training_rendered = torch.clamp(training_pkg["render"], 0.0, 1.0)
@@ -1562,7 +1650,8 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                 # Temporarily switch to training mode
                 ingp.adaptive_cat_inference = False
                 training_pkg = render(viewpoint, gaussians, pipe, background,
-                                      ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model)
+                                      ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                      skybox=skybox, background_mode=background_mode)
                 ingp.adaptive_cat_inference = True  # Restore inference mode
 
                 training_rendered = torch.clamp(training_pkg["render"], 0.0, 1.0)
@@ -1571,21 +1660,23 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                 training_mode_lpips.append(lpips(training_rendered.unsqueeze(0), gt.unsqueeze(0), net_type='vgg').item())
                 training_mode_l1.append(l1_loss(training_rendered, gt).mean().item())
             
-            # Save images with consistent index naming
+            # Save images with camera name for proper ordering
+            # After sorting, idx corresponds to sorted order (0=r_0, 1=r_1, etc.)
+            cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
             rendered_np = rendered.permute(1, 2, 0).cpu().numpy()
             gt_np = gt.permute(1, 2, 0).cpu().numpy()
-            
-            save_img_u8(gt_np, os.path.join(final_output_dir, f"{idx:03d}_gt.png"))
-            save_img_u8(rendered_np, os.path.join(final_output_dir, f"{idx:03d}_render.png"))
-            
+
+            save_img_u8(gt_np, os.path.join(final_output_dir, f"{idx:03d}_{cam_name}_gt.png"))
+            save_img_u8(rendered_np, os.path.join(final_output_dir, f"{idx:03d}_{cam_name}_render.png"))
+
             # Always save depth maps to separate folder
             depth_expected = render_pkg['depth_expected']  # (1, H, W)
             depth_median = render_pkg['depth_median']  # (1, H, W)
-            
+
             # Convert to numpy for colormap
             depth_expected_np = depth_expected.squeeze(0).cpu().numpy()
             depth_median_np = depth_median.squeeze(0).cpu().numpy()
-            
+
             # Save as colormapped images
             depth_expected_color = convert_gray_to_cmap(
                 depth_expected_np, map_mode='turbo', revert=False
@@ -1593,16 +1684,16 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
             depth_median_color = convert_gray_to_cmap(
                 depth_median_np, map_mode='turbo', revert=False
             )
-            
-            save_img_u8(depth_expected_color, os.path.join(depth_output_dir, f"{idx:03d}_depth_expected.png"))
-            save_img_u8(depth_median_color, os.path.join(depth_output_dir, f"{idx:03d}_depth_median.png"))
+
+            save_img_u8(depth_expected_color, os.path.join(depth_output_dir, f"{idx:03d}_{cam_name}_depth_expected.png"))
+            save_img_u8(depth_median_color, os.path.join(depth_output_dir, f"{idx:03d}_{cam_name}_depth_median.png"))
 
             # Save intersection count heatmap (turbo colormap, max_display=200 for consistency)
             gaussian_num = render_pkg['gaussian_num']  # (1, H, W)
             intersection_heatmap, min_count, max_count = create_intersection_heatmap(gaussian_num, max_display=200)
             histogram_img, stats = create_intersection_histogram(gaussian_num, max_display=200)
-            save_img_u8(intersection_heatmap, os.path.join(intersection_output_dir, f"{idx:03d}_intersection.png"))
-            save_img_u8(histogram_img, os.path.join(intersection_output_dir, f"{idx:03d}_histogram.png"))
+            save_img_u8(intersection_heatmap, os.path.join(intersection_output_dir, f"{idx:03d}_{cam_name}_intersection.png"))
+            save_img_u8(histogram_img, os.path.join(intersection_output_dir, f"{idx:03d}_{cam_name}_histogram.png"))
 
             # Flex kernel beta heatmap: render flex_beta as color, then apply coolwarm colormap
             if is_flex_kernel:
@@ -1770,7 +1861,7 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                 ngp_only_np = ngp_only_rendered.permute(1, 2, 0).cpu().numpy()
                 save_img_u8(ngp_only_np, os.path.join(gate_ngp_only_dir, f"{idx:03d}_ngp_only.png"))
 
-            cam_name = viewpoint.image_name if hasattr(viewpoint, 'image_name') else f"view_{idx:03d}"
+            # cam_name already defined above for image saving
             print(f"[FINAL] Idx {idx:3d} ({cam_name}): PSNR={psnr_val:.2f} SSIM={ssim_val:.4f} LPIPS={lpips_val:.4f}")
 
     # Summary
@@ -1916,6 +2007,34 @@ def prepare_output_and_logger(dataset, scene_name, yaml_file="", args=None):
     with open(os.path.join(dataset.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(dataset))))
 
+    # Save full training configuration for reproducibility
+    if args is not None:
+        import shutil
+        import pickle
+
+        # 1. Save exact command line
+        with open(os.path.join(dataset.model_path, "command_line.txt"), 'w') as f:
+            f.write(" ".join(sys.argv))
+
+        # 2. Save full args as JSON (human-readable)
+        args_dict = vars(args).copy()
+        # Convert non-serializable types
+        for k, v in args_dict.items():
+            if hasattr(v, '__dict__'):
+                args_dict[k] = str(v)
+        with open(os.path.join(dataset.model_path, "args.json"), 'w') as f:
+            json.dump(args_dict, f, indent=2, default=str)
+
+        # 3. Save args as pickle (exact reproduction)
+        with open(os.path.join(dataset.model_path, "args.pkl"), 'wb') as f:
+            pickle.dump(args, f)
+
+        # 4. Copy the YAML config file
+        if hasattr(args, 'yaml') and os.path.exists(args.yaml):
+            shutil.copy(args.yaml, os.path.join(dataset.model_path, "config.yaml"))
+
+        print(f"[CONFIG] Saved training configuration to {dataset.model_path}")
+
     tb_writer = None
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(dataset.model_path)
@@ -1925,7 +2044,7 @@ def prepare_output_and_logger(dataset, scene_name, yaml_file="", args=None):
 
 @torch.no_grad()
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, \
-ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_list = None):
+ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_list = None, skybox_model = None, background_mode = "none"):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/reg_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -1934,22 +2053,41 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
 
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
                               {'name': 'train', 'cameras' : scene.getTrainCameras()})
+
+        # Determine if skybox should be active at this iteration
+        active_skybox = skybox_model if (skybox_model is not None and iteration >= cfg_model.ingp_stage.switch_iter) else None
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    
+
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs, ingp = ingp_model, \
-                         beta = beta, iteration = iteration, cfg = cfg_model)
+                         beta = beta, iteration = iteration, cfg = cfg_model, skybox = active_skybox,
+                         background_mode = background_mode)
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    
+
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+
+                    # Log images for first camera only
+                    if tb_writer and idx == 0:
+                        tb_writer.add_image(f'{config["name"]}/render', image, iteration)
+                        tb_writer.add_image(f'{config["name"]}/gt', gt_image, iteration)
+
+                        # Log FG/BG separation if skybox is active
+                        if "render_fg" in render_pkg:
+                            fg_image = torch.clamp(render_pkg["render_fg"], 0.0, 1.0)
+                            bg_image = torch.clamp(render_pkg["render_bg"], 0.0, 1.0)
+                            alpha = render_pkg["rend_alpha"]
+
+                            tb_writer.add_image(f'{config["name"]}/foreground', fg_image, iteration)
+                            tb_writer.add_image(f'{config["name"]}/background', bg_image, iteration)
+                            tb_writer.add_image(f'{config["name"]}/alpha', alpha.repeat(3, 1, 1), iteration)
 
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
@@ -1959,11 +2097,11 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
                     test_psnr.append(psnr_test.item())
                 elif config['name'] == 'train':
                     train_psnr.append(psnr_test.item())
-                
+
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-        
+
         torch.cuda.empty_cache()
 
 def merge_cfg_to_args(args, cfg):
@@ -2034,7 +2172,13 @@ if __name__ == "__main__":
                         help="Use random per-pixel background during training for unbiased opacity learning. Eval uses black background.")
     parser.add_argument("--cold", action="store_true",
                         help="Cold start: skip 2DGS warmup phase and optimize Nest representation from scratch (no checkpoint loading, hash_in_CUDA always on)")
-    
+
+    # Anti-aliasing arguments (Zip-NeRF style distance-based hash attenuation)
+    parser.add_argument("--aa", type=float, default=0.0,
+                        help="Anti-aliasing scale factor. 0=disabled (default), >0=enabled (recommended: 1.0). Attenuates high-frequency hash levels for distant Gaussians.")
+    parser.add_argument("--aa_threshold", type=float, default=0.01,
+                        help="Skip hash query when average level weight < threshold (inference optimization)")
+
     # Adaptive_cat arguments
     parser.add_argument("--lambda_adaptive_cat", type=float, default=0.01,
                         help="Entropy regularization weight for adaptive_cat binarization (pushes weights toward 0 or 1)")
@@ -2091,6 +2235,8 @@ if __name__ == "__main__":
     # MCMC arguments - based on "3D Gaussian Splatting as Markov Chain Monte Carlo"
     parser.add_argument("--mcmc", action="store_true",
                         help="Enable MCMC-based Gaussian management (replaces traditional densification)")
+    parser.add_argument("--mcmc_deficit", action="store_true",
+                        help="MCMC deficit mode: delete dead Gaussians until reaching cap_max, then normal MCMC. Use when init points > cap_max.")
     parser.add_argument("--cap_max", type=int, default=-1,
                         help="Maximum number of Gaussians (required for MCMC mode)")
     parser.add_argument("--opacity_reg", type=float, default=0.01,
@@ -2099,6 +2245,15 @@ if __name__ == "__main__":
                         help="L1 regularization weight on scale (MCMC mode)")
     parser.add_argument("--noise_lr", type=float, default=5e5,
                         help="SGLD noise learning rate multiplier (MCMC mode)")
+
+    # Learnable skybox background for outdoor scenes
+    parser.add_argument("--background", type=str, default="none",
+                        choices=["none", "skybox_dense", "skybox_sparse"],
+                        help="Background mode: 'none' (solid color), 'skybox_dense' (learnable skybox, full MLP on all pixels), 'skybox_sparse' (learnable skybox, MLP only on covered pixels)")
+    parser.add_argument("--skybox_lr", type=float, default=1e-3,
+                        help="Learning rate for skybox texture")
+    parser.add_argument("--skybox_res", type=int, default=512,
+                        help="Skybox texture resolution (height; width=2*height)")
 
     # BCE opacity regularization - reduce semi-transparent foggy Gaussians
     parser.add_argument("--bce", action="store_true",
@@ -2126,8 +2281,8 @@ if __name__ == "__main__":
                         choices=["basic", "decay", "scaled", "scaled_decay"],
                         help="General kernel regularization mode: 'basic' (constant), 'decay' (linear decay over training), 'scaled' (scaled by RGB loss), 'scaled_decay' (both)")
     parser.add_argument("--aabb", type=str, default="2dgs",
-                        choices=["2dgs", "adr"],
-                        help="AABB mode: '2dgs' (fixed 4σ cutoff), 'adr' (adaptive opacity+beta-aware for general kernel)")
+                        choices=["2dgs", "adr_only", "rect", "adr"],
+                        help="AABB mode: '2dgs' (square, fixed 4σ - default), 'adr_only' (square, AdR cutoff), 'rect' (rectangular, fixed 4σ), 'adr' (rectangular + AdR cutoff - full optimization)")
 
     args = parser.parse_args(sys.argv[1:])
 

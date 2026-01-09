@@ -65,7 +65,7 @@ __global__ void checkFrustum(int P,
 	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
 }
 
-// Generates one key/value pair for all Gaussian / tile overlaps. 
+// Generates one key/value pair for all Gaussian / tile overlaps.
 // Run once per Gaussian (1:N mapping).
 __global__ void duplicateWithKeys(
 	int P,
@@ -75,6 +75,8 @@ __global__ void duplicateWithKeys(
 	uint64_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
 	int* radii,
+	int* radii_x,  // Separate X radius for rectangular AABB
+	int* radii_y,  // Separate Y radius for rectangular AABB
 	dim3 grid)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -88,13 +90,14 @@ __global__ void duplicateWithKeys(
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
 		uint2 rect_min, rect_max;
 
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+		// Use separate X/Y radii for rectangular AABB bounds
+		getRectXY(points_xy[idx], radii_x[idx], radii_y[idx], rect_min, rect_max, grid);
 
-		// For each tile that the bounding rect overlaps, emit a 
+		// For each tile that the bounding rect overlaps, emit a
 		// key/value pair. The key is |  tile ID  |      depth      |,
-		// and the value is the ID of the Gaussian. Sorting the values 
+		// and the value is the ID of the Gaussian. Sorting the values
 		// with this key yields Gaussian IDs in a list, such that they
-		// are first sorted by tile and then by depth. 
+		// are first sorted by tile and then by depth.
 		for (int y = rect_min.y; y < rect_max.y; y++)
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
@@ -119,6 +122,8 @@ __global__ void duplicateKeysWithTileDepth(
 	uint64_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
 	int* radii,
+	int* radii_x,  // Separate X radius for rectangular AABB
+	int* radii_y,  // Separate Y radius for rectangular AABB
 	dim3 grid)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -130,7 +135,8 @@ __global__ void duplicateKeysWithTileDepth(
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
 		uint2 rect_min, rect_max;
 
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+		// Use separate X/Y radii for rectangular AABB bounds
+		getRectXY(points_xy[idx], radii_x[idx], radii_y[idx], rect_min, rect_max, grid);
 
 		// Tile based depth sort
 		// code from renderCUDA part.
@@ -215,6 +221,8 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.depths, P, 128);
 	obtain(chunk, geom.clamped, P * 3, 128);
 	obtain(chunk, geom.internal_radii, P, 128);
+	obtain(chunk, geom.radii_x, P, 128);  // Separate X radius for rectangular AABB
+	obtain(chunk, geom.radii_y, P, 128);  // Separate Y radius for rectangular AABB
 	obtain(chunk, geom.means2D, P, 128);
 	obtain(chunk, geom.transMat, P * 9, 128);
 	obtain(chunk, geom.normal_opacity, P, 128);
@@ -296,7 +304,9 @@ int CudaRasterizer::Rasterizer::forward(
 	const uint32_t max_intersections,
 	const float* shapes,
 	const int kernel_type,
-	const int aabb_mode)
+	const int aabb_mode,
+	const float aa,
+	const float aa_threshold)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -341,6 +351,8 @@ int CudaRasterizer::Rasterizer::forward(
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
 		radii,
+		geomState.radii_x,
+		geomState.radii_y,
 		geomState.means2D,
 		geomState.depths,
 		geomState.transMat,
@@ -366,7 +378,7 @@ int CudaRasterizer::Rasterizer::forward(
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
-	// For each instance to be rendered, produce adequate [ tile | depth ] key 
+	// For each instance to be rendered, produce adequate [ tile | depth ] key
 	// and corresponding dublicated Gaussian indices to be sorted
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
@@ -376,6 +388,8 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
 		radii,
+		geomState.radii_x,
+		geomState.radii_y,
 		tile_grid)
 	CHECK_CUDA(, debug)
 
@@ -438,7 +452,9 @@ int CudaRasterizer::Rasterizer::forward(
 		render_mode,
 		max_intersections,
 		shapes,
-		kernel_type), debug)
+		kernel_type,
+		aa,
+		aa_threshold), debug)
 
 	return num_rendered;
 }

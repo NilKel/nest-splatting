@@ -263,11 +263,11 @@ if [ "$DATASET_PATH" = "mip_360" ]; then
     # Check if scene is indoor or outdoor
     if echo "$MIP360_INDOOR_SCENES" | grep -qw "$SCENE"; then
         SCENE_YAML_CONFIG="./configs/360_indoor.yaml"
-        SCENE_RESOLUTION_ARG="-i images_2"
+        SCENE_RESOLUTION_ARG="-r 2"
     else
         # Default to outdoor for any scene in outdoor list or unknown
         SCENE_YAML_CONFIG="./configs/360_outdoor.yaml"
-        SCENE_RESOLUTION_ARG="-i images_4"
+        SCENE_RESOLUTION_ARG="-r 4"
     fi
 fi
 

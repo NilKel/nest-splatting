@@ -31,6 +31,26 @@ from collections import defaultdict
 from datetime import datetime
 
 
+# Scene groupings for mip-nerf 360 dataset
+MIPNERF360_GROUPS = {
+    'indoor': ['bonsai', 'counter', 'kitchen', 'room'],
+    'outdoor': ['bicycle', 'flowers', 'garden', 'stump', 'treehill'],
+}
+
+
+def calculate_column_widths(all_experiments):
+    """Calculate column widths based on actual data."""
+    max_method = len("Method")
+    max_name = len("Name")
+
+    for scene_exps in all_experiments.values():
+        for method, name, _, _, _, _, _ in scene_exps:
+            max_method = max(max_method, len(method))
+            max_name = max(max_name, len(name))
+
+    return max_method + 2, max_name + 2
+
+
 def parse_metrics_file(filepath):
     """Parse a metrics file and extract summary + per-image data."""
     if not os.path.exists(filepath):
@@ -184,12 +204,24 @@ def scan_completed_experiments(output_dir):
     return experiments
 
 
-def format_summary_table(all_experiments, metric_key, metric_name, scenes):
+def format_summary_table(all_experiments, metric_key, metric_name, scenes, dataset_name=None):
     """Create a summary table for a specific metric across all scenes."""
+    # Calculate dynamic column widths
+    method_width, name_width = calculate_column_widths(all_experiments)
+    scene_width = 10  # Width for scene columns
+
+    # Determine if we should show mipnerf360 groupings
+    is_mipnerf360 = dataset_name and 'mipnerf360' in dataset_name.lower()
+
+    # Build scene to group mapping for mipnerf360
+    scene_to_group = {}
+    if is_mipnerf360:
+        for group_name, group_scenes in MIPNERF360_GROUPS.items():
+            for s in group_scenes:
+                scene_to_group[s] = group_name
+
     lines = []
-    lines.append(f"{'='*120}")
     lines.append(f"  TEST {metric_name.upper()} BY SCENE")
-    lines.append(f"{'='*120}")
 
     # Collect all methods
     all_methods = set()
@@ -198,17 +230,24 @@ def format_summary_table(all_experiments, metric_key, metric_name, scenes):
             all_methods.add((method, name))
 
     # Header
-    header = f"{'Method':<12} {'Name':<30}"
+    header = f"{'Method':<{method_width}} {'Name':<{name_width}}"
     for scene in scenes:
-        header += f" {scene[:8]:>8}"
-    header += f" {'Avg':>8}"
+        header += f" {scene[:scene_width]:>{scene_width}}"
+    # Add group average columns at the end for mipnerf360
+    if is_mipnerf360:
+        header += f" {'indoor':>{scene_width}} {'outdoor':>{scene_width}}"
+    header += f" {'All':>{scene_width}}"
+
+    lines.append("=" * len(header))
+    lines.insert(0, "=" * len(header))
     lines.append(header)
     lines.append("-" * len(header))
 
     # Data rows
     for method, name in sorted(all_methods):
-        row = f"{method:<12} {name:<30}"
+        row = f"{method:<{method_width}} {name:<{name_width}}"
         values = []
+        group_values = {'indoor': [], 'outdoor': []} if is_mipnerf360 else {}
 
         for scene in scenes:
             found = False
@@ -216,35 +255,60 @@ def format_summary_table(all_experiments, metric_key, metric_name, scenes):
                 if m == method and n == name:
                     val = test.get(metric_key)
                     if val is not None:
-                        row += f" {val:>8.4f}" if metric_key in ['ssim', 'lpips'] else f" {val:>8.2f}"
+                        row += f" {val:>{scene_width}.4f}" if metric_key in ['ssim', 'lpips'] else f" {val:>{scene_width}.2f}"
                         values.append(val)
+                        # Track by group for mipnerf360
+                        if is_mipnerf360 and scene in scene_to_group:
+                            group_values[scene_to_group[scene]].append(val)
                     else:
-                        row += f" {'-':>8}"
+                        row += f" {'-':>{scene_width}}"
                     found = True
                     break
             if not found:
-                row += f" {'-':>8}"
+                row += f" {'-':>{scene_width}}"
 
-        # Average
+        # Add group averages for mipnerf360
+        if is_mipnerf360:
+            for group_name in ['indoor', 'outdoor']:
+                gv = group_values[group_name]
+                if gv:
+                    gavg = sum(gv) / len(gv)
+                    row += f" {gavg:>{scene_width}.4f}" if metric_key in ['ssim', 'lpips'] else f" {gavg:>{scene_width}.2f}"
+                else:
+                    row += f" {'-':>{scene_width}}"
+
+        # Overall average
         if values:
             avg = sum(values) / len(values)
-            row += f" {avg:>8.4f}" if metric_key in ['ssim', 'lpips'] else f" {avg:>8.2f}"
+            row += f" {avg:>{scene_width}.4f}" if metric_key in ['ssim', 'lpips'] else f" {avg:>{scene_width}.2f}"
         else:
-            row += f" {'-':>8}"
+            row += f" {'-':>{scene_width}}"
 
         lines.append(row)
 
-    lines.append(f"{'='*120}")
+    lines.append("=" * len(header))
     lines.append("")
     return "\n".join(lines)
 
 
-def format_fps_table(all_experiments, scenes):
+def format_fps_table(all_experiments, scenes, dataset_name=None):
     """Create a FPS summary table across all scenes."""
+    # Calculate dynamic column widths
+    method_width, name_width = calculate_column_widths(all_experiments)
+    scene_width = 10  # Width for scene columns
+
+    # Determine if we should show mipnerf360 groupings
+    is_mipnerf360 = dataset_name and 'mipnerf360' in dataset_name.lower()
+
+    # Build scene to group mapping for mipnerf360
+    scene_to_group = {}
+    if is_mipnerf360:
+        for group_name, group_scenes in MIPNERF360_GROUPS.items():
+            for s in group_scenes:
+                scene_to_group[s] = group_name
+
     lines = []
-    lines.append(f"{'='*120}")
     lines.append(f"  RENDER FPS BY SCENE")
-    lines.append(f"{'='*120}")
 
     # Collect all methods
     all_methods = set()
@@ -253,17 +317,24 @@ def format_fps_table(all_experiments, scenes):
             all_methods.add((method, name))
 
     # Header
-    header = f"{'Method':<12} {'Name':<30}"
+    header = f"{'Method':<{method_width}} {'Name':<{name_width}}"
     for scene in scenes:
-        header += f" {scene[:8]:>8}"
-    header += f" {'Avg':>8}"
+        header += f" {scene[:scene_width]:>{scene_width}}"
+    # Add group average columns at the end for mipnerf360
+    if is_mipnerf360:
+        header += f" {'indoor':>{scene_width}} {'outdoor':>{scene_width}}"
+    header += f" {'All':>{scene_width}}"
+
+    lines.append("=" * len(header))
+    lines.insert(0, "=" * len(header))
     lines.append(header)
     lines.append("-" * len(header))
 
     # Data rows
     for method, name in sorted(all_methods):
-        row = f"{method:<12} {name:<30}"
+        row = f"{method:<{method_width}} {name:<{name_width}}"
         fps_values = []
+        group_values = {'indoor': [], 'outdoor': []} if is_mipnerf360 else {}
 
         for scene in scenes:
             found = False
@@ -271,35 +342,60 @@ def format_fps_table(all_experiments, scenes):
                 if m == method and n == name:
                     if training_log and 'fps' in training_log:
                         fps = training_log['fps']
-                        row += f" {fps:>8.1f}"
+                        row += f" {fps:>{scene_width}.1f}"
                         fps_values.append(fps)
+                        # Track by group for mipnerf360
+                        if is_mipnerf360 and scene in scene_to_group:
+                            group_values[scene_to_group[scene]].append(fps)
                     else:
-                        row += f" {'-':>8}"
+                        row += f" {'-':>{scene_width}}"
                     found = True
                     break
             if not found:
-                row += f" {'-':>8}"
+                row += f" {'-':>{scene_width}}"
 
-        # Average
+        # Add group averages for mipnerf360
+        if is_mipnerf360:
+            for group_name in ['indoor', 'outdoor']:
+                gv = group_values[group_name]
+                if gv:
+                    gavg = sum(gv) / len(gv)
+                    row += f" {gavg:>{scene_width}.1f}"
+                else:
+                    row += f" {'-':>{scene_width}}"
+
+        # Overall average
         if fps_values:
             avg = sum(fps_values) / len(fps_values)
-            row += f" {avg:>8.1f}"
+            row += f" {avg:>{scene_width}.1f}"
         else:
-            row += f" {'-':>8}"
+            row += f" {'-':>{scene_width}}"
 
         lines.append(row)
 
-    lines.append(f"{'='*120}")
+    lines.append("=" * len(header))
     lines.append("")
     return "\n".join(lines)
 
 
-def format_point_count_table(all_experiments, scenes):
+def format_point_count_table(all_experiments, scenes, dataset_name=None):
     """Create a point count summary table across all scenes."""
+    # Calculate dynamic column widths
+    method_width, name_width = calculate_column_widths(all_experiments)
+    scene_width = 10  # Width for scene columns
+
+    # Determine if we should show mipnerf360 groupings
+    is_mipnerf360 = dataset_name and 'mipnerf360' in dataset_name.lower()
+
+    # Build scene to group mapping for mipnerf360
+    scene_to_group = {}
+    if is_mipnerf360:
+        for group_name, group_scenes in MIPNERF360_GROUPS.items():
+            for s in group_scenes:
+                scene_to_group[s] = group_name
+
     lines = []
-    lines.append(f"{'='*140}")
     lines.append(f"  POINT COUNT BY SCENE (in thousands)")
-    lines.append(f"{'='*140}")
 
     # Collect all methods
     all_methods = set()
@@ -308,17 +404,24 @@ def format_point_count_table(all_experiments, scenes):
             all_methods.add((method, name))
 
     # Header
-    header = f"{'Method':<12} {'Name':<30}"
+    header = f"{'Method':<{method_width}} {'Name':<{name_width}}"
     for scene in scenes:
-        header += f" {scene[:8]:>8}"
-    header += f" {'Avg':>8}"
+        header += f" {scene[:scene_width]:>{scene_width}}"
+    # Add group average columns at the end for mipnerf360
+    if is_mipnerf360:
+        header += f" {'indoor':>{scene_width}} {'outdoor':>{scene_width}}"
+    header += f" {'All':>{scene_width}}"
+
+    lines.append("=" * len(header))
+    lines.insert(0, "=" * len(header))
     lines.append(header)
     lines.append("-" * len(header))
 
     # Data rows
     for method, name in sorted(all_methods):
-        row = f"{method:<12} {name:<30}"
+        row = f"{method:<{method_width}} {name:<{name_width}}"
         point_values = []
+        group_values = {'indoor': [], 'outdoor': []} if is_mipnerf360 else {}
 
         for scene in scenes:
             found = False
@@ -326,35 +429,60 @@ def format_point_count_table(all_experiments, scenes):
                 if m == method and n == name:
                     if point_count is not None:
                         # Display in thousands
-                        row += f" {point_count/1000:>8.1f}"
+                        row += f" {point_count/1000:>{scene_width}.1f}"
                         point_values.append(point_count)
+                        # Track by group for mipnerf360
+                        if is_mipnerf360 and scene in scene_to_group:
+                            group_values[scene_to_group[scene]].append(point_count)
                     else:
-                        row += f" {'-':>8}"
+                        row += f" {'-':>{scene_width}}"
                     found = True
                     break
             if not found:
-                row += f" {'-':>8}"
+                row += f" {'-':>{scene_width}}"
 
-        # Average
+        # Add group averages for mipnerf360
+        if is_mipnerf360:
+            for group_name in ['indoor', 'outdoor']:
+                gv = group_values[group_name]
+                if gv:
+                    gavg = sum(gv) / len(gv)
+                    row += f" {gavg/1000:>{scene_width}.1f}"
+                else:
+                    row += f" {'-':>{scene_width}}"
+
+        # Overall average
         if point_values:
             avg = sum(point_values) / len(point_values)
-            row += f" {avg/1000:>8.1f}"
+            row += f" {avg/1000:>{scene_width}.1f}"
         else:
-            row += f" {'-':>8}"
+            row += f" {'-':>{scene_width}}"
 
         lines.append(row)
 
-    lines.append(f"{'='*140}")
+    lines.append("=" * len(header))
     lines.append("")
     return "\n".join(lines)
 
 
-def format_combined_quality_table(all_experiments, scenes):
+def format_combined_quality_table(all_experiments, scenes, dataset_name=None):
     """Create a combined quality table with PSNR, SSIM, LPIPS and avg point count."""
+    # Calculate dynamic column widths
+    method_width, name_width = calculate_column_widths(all_experiments)
+    val_width = 8  # Width for value columns
+
+    # Determine if we should show mipnerf360 groupings
+    is_mipnerf360 = dataset_name and 'mipnerf360' in dataset_name.lower()
+
+    # Build scene to group mapping for mipnerf360
+    scene_to_group = {}
+    if is_mipnerf360:
+        for group_name, group_scenes in MIPNERF360_GROUPS.items():
+            for s in group_scenes:
+                scene_to_group[s] = group_name
+
     lines = []
-    lines.append(f"{'='*100}")
     lines.append(f"  COMBINED TEST METRICS (Averages across scenes)")
-    lines.append(f"{'='*100}")
 
     # Collect all methods
     all_methods = set()
@@ -362,14 +490,21 @@ def format_combined_quality_table(all_experiments, scenes):
         for method, name, _, _, _, _, _ in scene_exps:
             all_methods.add((method, name))
 
-    # Header
-    header = f"{'Method':<12} {'Name':<35} {'PSNR':>8} {'SSIM':>8} {'LPIPS':>8} {'FPS':>8} {'#Pts(K)':>8}"
+    # Header - add indoor/outdoor columns for mipnerf360
+    if is_mipnerf360:
+        header = f"{'Method':<{method_width}} {'Name':<{name_width}} {'PSNR':>{val_width}} {'SSIM':>{val_width}} {'LPIPS':>{val_width}} {'FPS':>{val_width}} {'#Pts(K)':>{val_width}} {'in_PSNR':>{val_width}} {'out_PSNR':>{val_width}}"
+    else:
+        header = f"{'Method':<{method_width}} {'Name':<{name_width}} {'PSNR':>{val_width}} {'SSIM':>{val_width}} {'LPIPS':>{val_width}} {'FPS':>{val_width}} {'#Pts(K)':>{val_width}}"
+
+    lines.append("=" * len(header))
+    lines.insert(0, "=" * len(header))
     lines.append(header)
     lines.append("-" * len(header))
 
     # Data rows
     for method, name in sorted(all_methods):
         psnr_vals, ssim_vals, lpips_vals, fps_vals, point_vals = [], [], [], [], []
+        group_psnr = {'indoor': [], 'outdoor': []} if is_mipnerf360 else {}
 
         for scene in scenes:
             for m, n, test, _, training_log, point_count, _ in all_experiments.get(scene, []):
@@ -382,43 +517,55 @@ def format_combined_quality_table(all_experiments, scenes):
                         fps_vals.append(training_log['fps'])
                     if point_count is not None:
                         point_vals.append(point_count)
+                    # Track PSNR by group for mipnerf360
+                    if is_mipnerf360 and scene in scene_to_group:
+                        group_psnr[scene_to_group[scene]].append(test['psnr'])
                     break
 
-        row = f"{method:<12} {name:<35}"
+        row = f"{method:<{method_width}} {name:<{name_width}}"
 
         # PSNR
         if psnr_vals:
-            row += f" {sum(psnr_vals)/len(psnr_vals):>8.2f}"
+            row += f" {sum(psnr_vals)/len(psnr_vals):>{val_width}.2f}"
         else:
-            row += f" {'-':>8}"
+            row += f" {'-':>{val_width}}"
 
         # SSIM
         if ssim_vals:
-            row += f" {sum(ssim_vals)/len(ssim_vals):>8.4f}"
+            row += f" {sum(ssim_vals)/len(ssim_vals):>{val_width}.4f}"
         else:
-            row += f" {'-':>8}"
+            row += f" {'-':>{val_width}}"
 
         # LPIPS
         if lpips_vals:
-            row += f" {sum(lpips_vals)/len(lpips_vals):>8.4f}"
+            row += f" {sum(lpips_vals)/len(lpips_vals):>{val_width}.4f}"
         else:
-            row += f" {'-':>8}"
+            row += f" {'-':>{val_width}}"
 
         # FPS
         if fps_vals:
-            row += f" {sum(fps_vals)/len(fps_vals):>8.1f}"
+            row += f" {sum(fps_vals)/len(fps_vals):>{val_width}.1f}"
         else:
-            row += f" {'-':>8}"
+            row += f" {'-':>{val_width}}"
 
         # Point count (in thousands)
         if point_vals:
-            row += f" {sum(point_vals)/len(point_vals)/1000:>8.1f}"
+            row += f" {sum(point_vals)/len(point_vals)/1000:>{val_width}.1f}"
         else:
-            row += f" {'-':>8}"
+            row += f" {'-':>{val_width}}"
+
+        # Add group PSNR averages for mipnerf360
+        if is_mipnerf360:
+            for group_name in ['indoor', 'outdoor']:
+                gv = group_psnr[group_name]
+                if gv:
+                    row += f" {sum(gv)/len(gv):>{val_width}.2f}"
+                else:
+                    row += f" {'-':>{val_width}}"
 
         lines.append(row)
 
-    lines.append(f"{'='*100}")
+    lines.append("=" * len(header))
     lines.append("")
     return "\n".join(lines)
 
@@ -504,7 +651,7 @@ def create_scene_report(scene, experiments, save_dir):
     return filepath
 
 
-def create_combined_report(all_experiments, save_dir):
+def create_combined_report(all_experiments, save_dir, dataset_name=None):
     """Create a combined report with all scenes."""
     scenes = sorted(all_experiments.keys())
 
@@ -512,6 +659,7 @@ def create_combined_report(all_experiments, save_dir):
     lines.append(f"{'#'*80}")
     lines.append(f"#  COMBINED METRICS REPORT")
     lines.append(f"#  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"#  Dataset: {dataset_name or 'unknown'}")
     lines.append(f"#  Scenes: {len(all_experiments)}")
     total_exp = sum(len(v) for v in all_experiments.values())
     lines.append(f"#  Total completed experiments: {total_exp}")
@@ -519,13 +667,13 @@ def create_combined_report(all_experiments, save_dir):
     lines.append("")
 
     # Combined quality table (averages)
-    lines.append(format_combined_quality_table(all_experiments, scenes))
+    lines.append(format_combined_quality_table(all_experiments, scenes, dataset_name))
 
     # PSNR table
-    lines.append(format_summary_table(all_experiments, 'psnr', 'PSNR', scenes))
+    lines.append(format_summary_table(all_experiments, 'psnr', 'PSNR', scenes, dataset_name))
 
     # SSIM table
-    lines.append(format_summary_table(all_experiments, 'ssim', 'SSIM', scenes))
+    lines.append(format_summary_table(all_experiments, 'ssim', 'SSIM', scenes, dataset_name))
 
     # LPIPS table (if available)
     has_lpips = False
@@ -538,13 +686,13 @@ def create_combined_report(all_experiments, save_dir):
             break
 
     if has_lpips:
-        lines.append(format_summary_table(all_experiments, 'lpips', 'LPIPS', scenes))
+        lines.append(format_summary_table(all_experiments, 'lpips', 'LPIPS', scenes, dataset_name))
 
     # FPS table
-    lines.append(format_fps_table(all_experiments, scenes))
+    lines.append(format_fps_table(all_experiments, scenes, dataset_name))
 
     # Point count table
-    lines.append(format_point_count_table(all_experiments, scenes))
+    lines.append(format_point_count_table(all_experiments, scenes, dataset_name))
 
     # Per-scene details
     for scene in scenes:
@@ -717,7 +865,7 @@ def process_dataset(dataset_name, dataset_path, base_save_dir):
 
     # Create combined report
     print("\nCreating combined report...")
-    combined_path = create_combined_report(experiments, save_dir)
+    combined_path = create_combined_report(experiments, save_dir, dataset_name)
     print(f"  {combined_path}")
 
     # Create CSV files

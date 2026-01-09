@@ -78,7 +78,9 @@ RasterizeGaussiansCUDA(
 	const int max_intersections,
 	const torch::Tensor& shapes,
 	const int kernel_type,
-	const int aabb_mode)
+	const int aabb_mode,
+	const float aa,
+	const float aa_threshold)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 	AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -237,7 +239,9 @@ RasterizeGaussiansCUDA(
 		(uint32_t)max_intersections,
 		shapes_ptr,
 		kernel_type,
-		aabb_mode);
+		aabb_mode,
+		aa,
+		aa_threshold);
   }
 
   return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg);

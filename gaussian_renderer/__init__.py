@@ -23,7 +23,7 @@ from utils.general_utils import MEM_PRINT
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
     beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False, decompose_mode = None, max_intersections = 0,
     skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2, no_gumbel = False, dropout_lambda = 0.0, is_training = True,
-    aabb_mode = "2dgs"):
+    aabb_mode = "2dgs", aa = 0.0, aa_threshold = 0.01, skybox = None, background_mode = "none"):
     """
     Render the scene.
 
@@ -718,7 +718,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         H = base_resolution,
         align_corners = align_corners,
         interpolation = interpolation,
-        shape_dims = shape_dims
+        shape_dims = shape_dims,
+        aa = aa,
+        aa_threshold = aa_threshold
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
@@ -741,8 +743,23 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         shapes = pc.get_shape
         kernel_type = 3
 
-    # Convert aabb_mode string to int: 0=2dgs (fixed 4σ), 1=adr (adaptive)
-    aabb_mode_int = 1 if aabb_mode == "adr" else 0
+    # Convert aabb_mode string to int:
+    # 0 = square AABB, fixed 4σ cutoff (2DGS default)
+    # 1 = square AABB, AdR cutoff (adaptive) - use "adr_only" for this
+    # 2 = rectangular AABB, fixed 4σ cutoff
+    # 3 = rectangular AABB, AdR cutoff (full optimization) - use "adr" for this
+    if isinstance(aabb_mode, int):
+        aabb_mode_int = aabb_mode
+    elif aabb_mode == "adr":
+        aabb_mode_int = 3  # Full optimization: AdR + rectangular AABB
+    elif aabb_mode == "adr_only":
+        aabb_mode_int = 1  # AdR cutoff only (square AABB)
+    elif aabb_mode == "rect":
+        aabb_mode_int = 2
+    elif aabb_mode == "adr_rect":
+        aabb_mode_int = 3  # Same as "adr"
+    else:
+        aabb_mode_int = 0  # "2dgs" or default
 
     rendered_image, radii, allmap, transmittance_avg, num_covered_pixels = rasterizer(
         means3D = means3D,
@@ -1014,17 +1031,60 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             if skip_mlp:
                 # Skip MLP decode, just return zeros (for benchmarking rasterizer only)
                 rendered_image = torch.zeros(3, H, W, device="cuda")
+            elif background_mode == "skybox_sparse":
+                # SPARSE MLP: Only decode pixels with Gaussian coverage
+                # This avoids running MLP on sky/background pixels that will be replaced by skybox
+                valid_mask = render_mask.squeeze()  # (H, W) bool
+                n_valid = valid_mask.sum().item()
+
+                if n_valid > 0:
+                    # Gather valid features and directions
+                    features_flat = rendered_image.view(feat_dim, -1).permute(1, 0)  # (H*W, F)
+                    valid_indices = valid_mask.view(-1).nonzero(as_tuple=True)[0]  # (D,) indices
+                    valid_features = features_flat[valid_indices]  # (D, F)
+                    valid_dirs = rays_dir[valid_indices]  # (D, 3)
+
+                    # MLP decode only valid pixels
+                    valid_rgb = ingp.rgb_decode(valid_features, valid_dirs)  # (D, 3)
+
+                    # Scatter back to full image
+                    rendered_image = torch.zeros(H * W, 3, device="cuda")
+                    rendered_image[valid_indices] = valid_rgb
+                    rendered_image = rendered_image.view(H, W, 3).permute(2, 0, 1)  # (3, H, W)
+                else:
+                    # No valid pixels, return zeros
+                    rendered_image = torch.zeros(3, H, W, device="cuda")
             else:
+                # DENSE MLP: Decode all pixels (standard path)
                 rendered_image = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), rays_dir)
                 rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
                 rendered_image = rendered_image * render_mask
 
         vis_appearance_level = allmap[11:14]
 
+    # Background compositing: skybox or solid color
+    # Initialize FG/BG outputs for visualization
+    rendered_image_fg = None
+    skybox_rgb = None
 
-    if bg_color.sum() > 0:
+    if skybox is not None:
+        # Compute ray directions if not already available
+        H, W = viewpoint_camera.image_height, viewpoint_camera.image_width
+        rays_d, rays_o = cam2rays(viewpoint_camera)
+        ray_unit_skybox = torch_F.normalize(rays_d, dim=-1).float()
+
+        # Query skybox for background colors
+        skybox_rgb = skybox(ray_unit_skybox)  # (H*W, 3)
+        skybox_rgb = skybox_rgb.view(H, W, 3).permute(2, 0, 1)  # (3, H, W)
+
+        # Save foreground before compositing (for visualization)
+        rendered_image_fg = rendered_image.clone()
+
+        # Composite: foreground + (1-alpha) * skybox
+        rendered_image = rendered_image + (1.0 - render_alpha) * skybox_rgb
+    elif bg_color.sum() > 0:
         rendered_image = rendered_image + (1.0 - render_alpha) * bg_color.unsqueeze(-1).unsqueeze(-1)
-    
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     rets =  {"render": rendered_image,
@@ -1063,5 +1123,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Add adaptive mask for regularization loss (if in adaptive mode)
     if is_adaptive_mode and pc._adaptive_feat_dim > 0:
         rets['adaptive_mask'] = mask  # (N, feat_dim)
-    
+
+    # Add skybox FG/BG outputs for visualization
+    if rendered_image_fg is not None:
+        rets['render_fg'] = rendered_image_fg
+    if skybox_rgb is not None:
+        rets['render_bg'] = skybox_rgb
+
     return rets

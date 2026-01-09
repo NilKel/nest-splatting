@@ -57,7 +57,9 @@ RasterizeGaussiansCUDA(
 	const int max_intersections,
 	const torch::Tensor& shapes,
 	const int kernel_type,
-	const int aabb_mode);
+	const int aabb_mode,
+	const float aa,
+	const float aa_threshold);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(

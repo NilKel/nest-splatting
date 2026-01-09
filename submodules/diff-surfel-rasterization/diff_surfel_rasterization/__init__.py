@@ -146,7 +146,9 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.max_intersections,
             shapes,
             kernel_type,
-            aabb_mode
+            aabb_mode,
+            hashgrid_settings.aa,
+            hashgrid_settings.aa_threshold
         )
 
         # Invoke C++/CUDA rasterizer
@@ -299,12 +301,13 @@ class GaussianRasterizationSettings(NamedTuple):
 
 class HashGridSettings(NamedTuple):
     L: int
-    S: float 
+    S: float
     H : int
     align_corners : bool
     interpolation : int
     shape_dims: torch.Tensor  # [GS, HS, OS] or empty for backward compat
-    shape_dims: torch.Tensor  # [GS, HS, OS] or empty for backward compat
+    aa: float = 0.0  # Anti-aliasing scale factor (0=disabled, >0=enabled)
+    aa_threshold: float = 0.01  # Skip hash query when avg level weight < threshold
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings, hashgrid_settings):
