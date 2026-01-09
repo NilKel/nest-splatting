@@ -211,7 +211,7 @@ def format_summary_table(all_experiments, metric_key, metric_name, scenes, datas
     scene_width = 10  # Width for scene columns
 
     # Determine if we should show mipnerf360 groupings
-    is_mipnerf360 = dataset_name and 'mipnerf360' in dataset_name.lower()
+    is_mipnerf360 = dataset_name and 'mip' in dataset_name.lower() and '360' in dataset_name.lower()
 
     # Build scene to group mapping for mipnerf360
     scene_to_group = {}
@@ -298,7 +298,7 @@ def format_fps_table(all_experiments, scenes, dataset_name=None):
     scene_width = 10  # Width for scene columns
 
     # Determine if we should show mipnerf360 groupings
-    is_mipnerf360 = dataset_name and 'mipnerf360' in dataset_name.lower()
+    is_mipnerf360 = dataset_name and 'mip' in dataset_name.lower() and '360' in dataset_name.lower()
 
     # Build scene to group mapping for mipnerf360
     scene_to_group = {}
@@ -385,7 +385,7 @@ def format_point_count_table(all_experiments, scenes, dataset_name=None):
     scene_width = 10  # Width for scene columns
 
     # Determine if we should show mipnerf360 groupings
-    is_mipnerf360 = dataset_name and 'mipnerf360' in dataset_name.lower()
+    is_mipnerf360 = dataset_name and 'mip' in dataset_name.lower() and '360' in dataset_name.lower()
 
     # Build scene to group mapping for mipnerf360
     scene_to_group = {}
@@ -472,7 +472,7 @@ def format_combined_quality_table(all_experiments, scenes, dataset_name=None):
     val_width = 8  # Width for value columns
 
     # Determine if we should show mipnerf360 groupings
-    is_mipnerf360 = dataset_name and 'mipnerf360' in dataset_name.lower()
+    is_mipnerf360 = dataset_name and 'mip' in dataset_name.lower() and '360' in dataset_name.lower()
 
     # Build scene to group mapping for mipnerf360
     scene_to_group = {}
