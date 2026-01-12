@@ -433,6 +433,36 @@ __global__ void preprocessCUDA(int P, int D, int M,
 			// log_term <= 0 means opacity <= 1/255, shouldn't happen after early cull
 			cutoff = 0.1f;  // Minimal bounding box
 		}
+	} else if (use_adr_cutoff && kernel_type == 1 && shapes != nullptr) {
+		// AdR for beta kernel (kernel_type=1): alpha = opacity * (1 - r²)^shape
+		// Beta kernel has compact support: exactly 0 outside unit disk (r² > 1)
+		// We want: opacity * (1 - r²)^shape >= 1/255
+		// Solving: (1 - r²)^shape >= 1/(255 * opacity)
+		//          1 - r² >= (1/(255 * opacity))^(1/shape)
+		//          r² <= 1 - (1/(255 * opacity))^(1/shape)
+		//          r <= sqrt(1 - (1/(255 * opacity))^(1/shape))
+		float opacity_val = opacities[idx];
+		float shape = shapes[idx];  // Shape parameter, range [0.001, 4.001]
+
+		// Early cull: if opacity < 1/255, Gaussian is invisible everywhere
+		if (opacity_val < (1.0f / 255.0f)) {
+			radii[idx] = 0;
+			tiles_touched[idx] = 0;
+			return;
+		}
+
+		// Compute threshold: (1/(255 * opacity))^(1/shape)
+		float threshold = powf(1.0f / (255.0f * opacity_val), 1.0f / shape);
+
+		if (threshold < 1.0f) {
+			// r = sqrt(1 - threshold)
+			cutoff = sqrtf(1.0f - threshold);
+		} else {
+			// threshold >= 1 means the Gaussian is too dim to see anywhere
+			// This happens when opacity is very low or shape is very high
+			cutoff = 0.1f;  // Minimal bounding box
+		}
+		// Beta kernel always has hard cutoff at r=1, so no need to clamp above
 	} else {
 #if TIGHTBBOX // no use in the paper, but it indeed help speeds.
 		// the effective extent is now depended on the opacity of gaussian.

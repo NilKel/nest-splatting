@@ -36,6 +36,7 @@ docker-compose.override.yml
 # -----------------------------
 output/
 outputs/
+outputs
 metrics_reports/
 checkpoints/
 logs/
@@ -48,6 +49,7 @@ cache/
 *.safetensors
 *.npy
 data/
+data
 
 # -----------------------------
 # System files

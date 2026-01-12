@@ -278,9 +278,9 @@ class GaussianModel:
     def get_shape(self):
         """Returns shape parameter for beta or general kernel.
 
-        Beta kernel: range [0.001, 4.001]
-            shape ≈ 0: hard flat disk
-            shape ≈ 4: soft Gaussian cloud
+        Beta kernel: range [0.5, 4.0]
+            shape = 0.5: hard flat disk (minimum to prevent gradient collapse)
+            shape = 4.0: soft Gaussian cloud
 
         General kernel (Isotropic Generalized Gaussian): range [2.0, 8.0]
             beta = 2.0: standard Gaussian
@@ -291,7 +291,8 @@ class GaussianModel:
             return torch.sigmoid(self._shape) * 6.0 + 2.0
         else:
             # Beta kernel activation
-            return torch.sigmoid(self._shape) * 4.0 + 0.001
+            # Range [0.5, 4.0] - minimum 0.5 prevents gradient collapse at low shape
+            return torch.sigmoid(self._shape) * 3.5 + 0.5
 
     @property
     def get_flex_beta(self):
@@ -441,9 +442,9 @@ class GaussianModel:
         # Initialize beta kernel shape parameter if using beta kernel
         if hasattr(args, 'kernel') and args.kernel == "beta":
             self.kernel_type = "beta"
-            # Initialize shape to produce soft Gaussians (shape ≈ 3.2)
-            # sigmoid(1.4) ≈ 0.8, and 0.8 * 4.0 + 0.001 = 3.201
-            shape_init = 1.4 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
+            # Initialize shape to produce medium-hard kernels (shape ≈ 1.54)
+            # sigmoid(-1.0) ≈ 0.27, and 0.27 * 3.5 + 0.5 = 1.44
+            shape_init = -1.0 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
             self._shape = nn.Parameter(shape_init.requires_grad_(True))
         elif hasattr(args, 'kernel') and args.kernel == "flex":
             self.kernel_type = "flex"
@@ -668,11 +669,11 @@ class GaussianModel:
             self.kernel_type = "beta"
             print(f"Loaded beta kernel shape parameter")
         elif args is not None and hasattr(args, 'kernel') and args.kernel == "beta":
-            # Beta kernel requested but no shape in PLY - initialize
-            shape_init = 1.4 * torch.ones((xyz.shape[0], 1), dtype=torch.float, device="cuda")
+            # Beta kernel requested but no shape in PLY - initialize to medium-hard
+            shape_init = -1.0 * torch.ones((xyz.shape[0], 1), dtype=torch.float, device="cuda")
             self._shape = nn.Parameter(shape_init.requires_grad_(True))
             self.kernel_type = "beta"
-            print(f"Warning: No shape in PLY, initialized beta kernel shape to ~3.2")
+            print(f"Warning: No shape in PLY, initialized beta kernel shape to ~1.44 (medium-hard)")
         elif args is not None and hasattr(args, 'kernel') and args.kernel == "flex":
             # Flex kernel requested
             self._shape = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))

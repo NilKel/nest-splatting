@@ -274,11 +274,11 @@ echo ""
 echo "════════════════════════════════════════════════════════════════════"
 
 # Check if train.py wrote to the failure file (indicating GPU error)
-if [ -s "\$FAILURE_FILE" ]; then
+if [ -s "$FAILURE_FILE" ]; then
     echo "  ✗ GPU FAILURE DETECTED"
     echo "════════════════════════════════════════════════════════════════════"
     echo "train.py reported a GPU error:"
-    cat "\$FAILURE_FILE"
+    cat "$FAILURE_FILE"
     echo ""
     echo "Submitting retry job on different node..."
 
