@@ -246,14 +246,24 @@ if [ -f "$TEST_METRICS" ]; then
     exit 0
 fi
 
+# Check if there was a previous GPU failure - if so, we're retrying
+FAILURE_FILE="${OUTPUT_PATH}/.gpu_failure"
+if [ -s "$FAILURE_FILE" ]; then
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  RETRYING - Previous GPU failure detected"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "Previous failure:"
+    cat "$FAILURE_FILE"
+    echo ""
+fi
+
 # Assign unique port per task to avoid conflicts when multiple jobs run on same node
 PORT=$((6009 + SLURM_ARRAY_TASK_ID))
 
-# Create output directory and empty failure file
-# train.py will write to this file if it detects a GPU error
+# Create output directory and clear failure file for this run
 mkdir -p "$OUTPUT_PATH"
-FAILURE_FILE="${OUTPUT_PATH}/.gpu_failure"
-> "$FAILURE_FILE"  # Create/clear failure file
+> "$FAILURE_FILE"  # Clear failure file for fresh run
 
 # Save job parameters for potential retry
 echo "$SCENE $METHOD $EXPERIMENT_NAME $METHOD_ARGS" > "${OUTPUT_PATH}/.job_params"
