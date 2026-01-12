@@ -193,10 +193,13 @@ def scan_completed_experiments(output_dir):
                     train_metrics = parse_metrics_file(train_path)
                     training_log = parse_training_log(training_log_path)
 
-                    # Get point count from PLY file, fallback to training_log
-                    point_count = find_point_cloud(exp_dir)
-                    if point_count is None and training_log and 'gaussians' in training_log:
+                    # Get point count from training_log (accurate for MCMC which only counts alive Gaussians)
+                    # Fallback to PLY file if training_log doesn't have it
+                    point_count = None
+                    if training_log and 'gaussians' in training_log:
                         point_count = training_log['gaussians']
+                    if point_count is None:
+                        point_count = find_point_cloud(exp_dir)
 
                     if test_metrics and train_metrics:
                         experiments[scene].append((method, name, test_metrics, train_metrics, training_log, point_count, str(exp_dir)))

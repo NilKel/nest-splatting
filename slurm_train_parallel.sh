@@ -305,7 +305,7 @@ cd /data/rg_data/aig/users/z0051beu/Projects/nest-splatting
 \$CMD
 RETRY_EOF
 
-    sbatch --begin=now+1min "\$RETRY_SCRIPT"
+    sbatch "\$RETRY_SCRIPT"
     echo "Retry job submitted. This job exiting."
     rm -f "\$FAILURE_FILE"
     exit 1

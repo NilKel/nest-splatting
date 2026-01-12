@@ -1072,8 +1072,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print(f"  Gaussian (<3): {pct_gaussian:.1f}% | Super-Gaussian (>5): {pct_super:.1f}% | Reg loss: {general_beta_reg_loss.item():.2e}")
 
             if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
+                # For MCMC, skip saving at final iteration - will save after pruning dead Gaussians
+                is_final_iter = (iteration == opt.iterations)
+                is_mcmc = (args.mcmc or args.mcmc_deficit)
+                if is_mcmc and is_final_iter:
+                    print("\n[ITER {}] Skipping save (MCMC: will save after pruning dead Gaussians)".format(iteration))
+                else:
+                    print("\n[ITER {}] Saving Gaussians".format(iteration))
+                    scene.save(iteration)
                 if ingp is not None:
                     ingp.save_model(scene.model_path, iteration)
                 if skybox is not None:
@@ -1319,6 +1325,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"  Remaining: {len(gaussians.get_xyz)}")
         else:
             print(f"  No dead Gaussians to prune")
+
+        # Save final PLY (always, since we skipped the in-loop save for MCMC)
+        print(f"  Saving final point cloud...")
+        scene.save(iteration)
         print("="*70 + "\n")
 
     # Final test and train rendering with stride 1
