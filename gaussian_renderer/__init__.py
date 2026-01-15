@@ -23,7 +23,7 @@ from utils.general_utils import MEM_PRINT
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
     beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False, decompose_mode = None, max_intersections = 0,
     skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2, no_gumbel = False, dropout_lambda = 0.0, is_training = True,
-    aabb_mode = "2dgs", aa = 0.0, aa_threshold = 0.01, skybox = None, background_mode = "none"):
+    aabb_mode = "2dgs", aa = 0.0, aa_threshold = 0.01, skybox = None, background_mode = "none", bg_hashgrid = None):
     """
     Render the scene.
 
@@ -1056,13 +1056,49 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     rendered_image = torch.zeros(3, H, W, device="cuda")
             else:
                 # DENSE MLP: Decode all pixels (standard path)
-                rendered_image = ingp.rgb_decode(rendered_image.view(feat_dim, -1).permute(1, 0), rays_dir)
-                rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
-                rendered_image = rendered_image * render_mask
+                fg_features = rendered_image.view(feat_dim, -1).permute(1, 0)  # (H*W, F)
+
+                # Background hashgrid compositing
+                if bg_hashgrid is not None:
+                    # Query background hashgrid at ray directions with camera position
+                    ray_unit_bg = torch_F.normalize(rays_dir, dim=-1).float()  # (H*W, 3)
+                    # rays_o is (3,) camera position, expand to (H*W, 3)
+                    ray_origins_bg = rays_o.unsqueeze(0).expand(ray_unit_bg.shape[0], -1)
+                    bg_features = bg_hashgrid(ray_unit_bg, ray_origins_bg)  # (H*W, F)
+
+                    # Get alpha for compositing (H*W, 1)
+                    alpha_flat = render_alpha.view(-1, 1)  # (H*W, 1)
+
+                    if background_mode == "hashgrid_sep":
+                        # SEPARATE DECODE: Decode FG and BG separately, composite in RGB space
+                        # This prevents BG from learning subtractive features
+                        fg_rgb = ingp.rgb_decode(fg_features, rays_dir)  # (H*W, 3)
+                        bg_rgb = ingp.rgb_decode(bg_features, rays_dir)  # (H*W, 3)
+                        # Composite in RGB space: FG is already alpha-premultiplied from rasterizer
+                        # Use alpha for compositing, NOT render_mask (BG fills empty regions)
+                        rendered_image = fg_rgb + (1.0 - alpha_flat) * bg_rgb
+                    elif background_mode == "hashgrid_relu":
+                        # RELU: Apply ReLU to BG features to prevent subtractive features
+                        bg_features = torch_F.relu(bg_features)
+                        composite_features = fg_features + (1.0 - alpha_flat) * bg_features
+                        rendered_image = ingp.rgb_decode(composite_features, rays_dir)
+                    else:
+                        # STANDARD: Composite features before MLP decode (original behavior)
+                        composite_features = fg_features + (1.0 - alpha_flat) * bg_features
+                        rendered_image = ingp.rgb_decode(composite_features, rays_dir)
+
+                    # BG hashgrid handles empty regions via (1-alpha) compositing
+                    # Do NOT apply render_mask here - it would zero out BG contribution
+                    rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
+                else:
+                    # Standard path without background hashgrid
+                    rendered_image = ingp.rgb_decode(fg_features, rays_dir)
+                    rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
+                    rendered_image = rendered_image * render_mask
 
         vis_appearance_level = allmap[11:14]
 
-    # Background compositing: skybox or solid color
+    # Background compositing: skybox or solid color (legacy path for skybox texture)
     # Initialize FG/BG outputs for visualization
     rendered_image_fg = None
     skybox_rgb = None

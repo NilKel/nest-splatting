@@ -22,7 +22,7 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], mcmc_fps=False, cap_max=-1):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -47,6 +47,22 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
         else:
             assert False, "Could not recognize scene type!"
+
+        # FPS subsampling for mcmc_fps mode
+        if mcmc_fps and cap_max > 0:
+            from utils.point_cloud_utils import load_or_create_fps_pointcloud
+
+            num_init_points = len(scene_info.point_cloud.points)
+            print(f"[FPS] Initial point cloud: {num_init_points} points, cap_max: {cap_max}")
+
+            if num_init_points > cap_max:
+                subsampled_pcd = load_or_create_fps_pointcloud(
+                    args.source_path, scene_info.point_cloud, cap_max
+                )
+                scene_info = scene_info._replace(point_cloud=subsampled_pcd)
+                print(f"[FPS] Subsampled to {len(scene_info.point_cloud.points)} points")
+            else:
+                print(f"[FPS] Skipping - init points ({num_init_points}) <= cap_max ({cap_max})")
 
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:

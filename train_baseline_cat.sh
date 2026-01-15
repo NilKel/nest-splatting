@@ -14,7 +14,7 @@ set -e  # Exit on error
 DEFAULT_ITERATIONS=30000
 BASE_DATA_DIR="/home/nilkel/Projects/data/nest_synthetic"
 DTU_DATA_DIR="/home/nilkel/Projects/nest-splatting/data/dtu/2DGS_data/DTU"
-MIP360_DATA_DIR="/home/nilkel/Projects/data/mip360"
+MIP360_DATA_DIR="/home/nilkel/Projects/data/mip_360"
 
 # Parse arguments
 if [ $# -lt 2 ]; then
@@ -35,13 +35,12 @@ if [ $# -lt 2 ]; then
     echo "  $0 DTU exp1 scan24 30000 \"--mcmc --cap_max 300000\"  # With MCMC mode"
     echo ""
     echo "Methods trained per scene:"
-    echo "  - baseline"
-    echo "  - cat0 through cat6 (hybrid_levels 0-6)"
+    echo "  - cat with hybrid_levels 5"
     echo ""
     echo "Datasets:"
     echo "  nerf_synthetic: chair, drums, ficus, hotdog, lego, materials, mic, ship"
     echo "  DTU: scan24, scan37, scan40, scan55, scan63, scan65, scan69, scan83, scan97, scan105, scan106, scan110, scan114, scan118, scan122"
-    echo "  mip_360: bicycle, bonsai, counter, garden, kitchen, room, stump"
+    echo "  mip_360: bicycle, bonsai, counter, garden, kitchen, room, stump, flowers, treehill"
     exit 1
 fi
 
@@ -69,10 +68,14 @@ case "$DATASET" in
         ;;
     mip_360)
         DATA_DIR="$MIP360_DATA_DIR"
-        YAML_CONFIG="./configs/360_outdoor.yaml"  # Default to outdoor, can be overridden
-        ALL_SCENES="bicycle,bonsai,counter,garden,kitchen,room,stump"
+        # YAML_CONFIG and RESOLUTION_ARG set per-scene (indoor vs outdoor)
+        YAML_CONFIG="PER_SCENE"
+        ALL_SCENES="bicycle,bonsai,counter,garden,kitchen,room,stump,flowers,treehill"
         DATASET_PATH="mip_360"
-        RESOLUTION_ARG="-r 2"  # mip_360 uses resolution 2
+        RESOLUTION_ARG="PER_SCENE"
+        # Scene classification
+        MIP360_OUTDOOR_SCENES="bicycle flowers garden stump treehill"
+        MIP360_INDOOR_SCENES="room counter kitchen bonsai"
         ;;
     *)
         echo "ERROR: Unknown dataset '$DATASET'"
@@ -89,8 +92,8 @@ fi
 # Convert comma-separated list to array
 IFS=',' read -ra SCENES <<< "$SCENE_NAMES"
 
-# Verify YAML config exists
-if [ ! -f "$YAML_CONFIG" ]; then
+# Verify YAML config exists (skip for PER_SCENE which is resolved at runtime)
+if [ "$YAML_CONFIG" != "PER_SCENE" ] && [ ! -f "$YAML_CONFIG" ]; then
     echo "ERROR: YAML config not found: $YAML_CONFIG"
     exit 1
 fi
@@ -109,9 +112,14 @@ echo "Base name:   $BASE_NAME"
 echo "Scenes:      ${SCENES[@]}"
 echo "Iterations:  $ITERATIONS"
 echo "Data dir:    $DATA_DIR"
+if [ "$YAML_CONFIG" = "PER_SCENE" ]; then
+echo "Config:      PER_SCENE (indoor: 360_indoor.yaml, outdoor: 360_outdoor.yaml)"
+echo "Resolution:  PER_SCENE (indoor: images_2, outdoor: images_4)"
+else
 echo "Config:      $YAML_CONFIG"
 if [ -n "$RESOLUTION_ARG" ]; then
 echo "Resolution:  ${RESOLUTION_ARG#-r }"
+fi
 fi
 if [ -n "$EXTRA_ARGS" ]; then
 echo "Extra args:  $EXTRA_ARGS"
@@ -134,17 +142,30 @@ run_training() {
     local method=$2
     local experiment_name=$3
     local extra_args=$4
-    
+
     CURRENT_RUN=$((CURRENT_RUN + 1))
-    
+
     local scene_path="${DATA_DIR}/${scene_name}"
-    
+
     if [ ! -d "$scene_path" ]; then
         echo "WARNING: Scene path does not exist: $scene_path - SKIPPING"
         SKIPPED=$((SKIPPED + 1))
         return 0
     fi
-    
+
+    # Handle per-scene config for mip_360 (indoor vs outdoor)
+    local scene_yaml="$YAML_CONFIG"
+    local scene_resolution="$RESOLUTION_ARG"
+    if [ "$YAML_CONFIG" = "PER_SCENE" ]; then
+        if echo "$MIP360_INDOOR_SCENES" | grep -qw "$scene_name"; then
+            scene_yaml="./configs/360_indoor.yaml"
+            scene_resolution="-i images_2"
+        else
+            scene_yaml="./configs/360_outdoor.yaml"
+            scene_resolution="-i images_4"
+        fi
+    fi
+
     # Path structure: outputs/{dataset}/{scene}/{method}/{name}
     # For cat mode, train.py appends _{hybrid_levels}_levels to the name
     if [ "$method" = "cat" ]; then
@@ -154,7 +175,7 @@ run_training() {
         OUTPUT_PATH="outputs/${DATASET_PATH}/${scene_name}/${method}/${experiment_name}"
     fi
     TEST_METRICS="${OUTPUT_PATH}/test_metrics.txt"
-    
+
     # Check if already completed
     if [ -f "$TEST_METRICS" ]; then
         echo "════════════════════════════════════════════════════════════════════"
@@ -165,12 +186,12 @@ run_training() {
         SKIPPED=$((SKIPPED + 1))
         return 0
     fi
-    
+
     echo "════════════════════════════════════════════════════════════════════"
     echo "  [$CURRENT_RUN/$TOTAL_RUNS] Training: ${scene_name} - ${experiment_name}"
     echo "════════════════════════════════════════════════════════════════════"
-    
-    CMD="python train.py -s $scene_path -m $experiment_name --yaml $YAML_CONFIG --eval --iterations $ITERATIONS $RESOLUTION_ARG --method $method $extra_args $EXTRA_ARGS"
+
+    CMD="python train.py -s $scene_path -m $experiment_name --yaml $scene_yaml --eval --iterations $ITERATIONS $scene_resolution --method $method $extra_args $EXTRA_ARGS"
     
     echo "Command: $CMD"
     echo "Started: $(date)"
@@ -195,9 +216,9 @@ run_training() {
     fi
 }
 
-# Calculate total runs: baseline + cat0-6 = 8 methods per scene
+# Calculate total runs: cat with hybrid_levels 5 only = 1 method per scene
 NUM_SCENES=${#SCENES[@]}
-METHODS_PER_SCENE=8  # baseline + cat0-6
+METHODS_PER_SCENE=1  # cat with hybrid_levels 5 only
 TOTAL_RUNS=$((NUM_SCENES * METHODS_PER_SCENE))
 CURRENT_RUN=0
 COMPLETED=0
@@ -216,17 +237,12 @@ for scene in "${SCENES[@]}"; do
     echo "  SCENE: ${scene}"
     echo "════════════════════════════════════════════════════════════════════"
     echo ""
-    
-    # 1. BASELINE MODE
-    run_training "$scene" "baseline" "${BASE_NAME}_baseline" ""
-    
-    # 2. CAT MODE - hybrid_levels 0 to 6
-    for hl in {5..6}; do
-        run_training "$scene" "cat" "${BASE_NAME}_cat${hl}" "--hybrid_levels $hl"
-    done
-    
+
+    # CAT MODE - hybrid_levels 5 only
+    run_training "$scene" "cat" "${BASE_NAME}" "--hybrid_levels 5"
+
     echo ""
-    echo "  Completed all methods for scene: ${scene}"
+    echo "  Completed scene: ${scene}"
     echo ""
 done
 

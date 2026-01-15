@@ -588,7 +588,7 @@ class INGP(nn.Module):
         if self.encoder_dir :
             enc_dir = self._encode_view(ray_unit)
             feat = torch.cat([feat, enc_dir], dim=-1)
-        
+
         h = self.mlp_rgb(feat).float()
         rgb = torch.sigmoid(h)[:, :3]
         return rgb

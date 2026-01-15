@@ -72,8 +72,9 @@ except ImportError:
 
 from hash_encoder.modules import INGP
 from hash_encoder.config import Config
-from scene.background import LearnableSkybox
+from scene.background import LearnableSkybox, SphereHashGridBackground
 from utils.render_utils import save_img_u8, convert_gray_to_cmap, create_intersection_heatmap, create_intersection_histogram, create_flex_beta_heatmap
+from utils.point_utils import cam2rays
 from utils.render_utils import gsnum_trans_color
 import open3d as o3d
 import datetime
@@ -117,7 +118,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("  Skipping 2DGS warmup phase and all checkpoint loading")
         print("  Training Nest representation from scratch with hash_in_CUDA=True")
         print("="*70 + "\n")
-        scene = Scene(dataset, gaussians)
+        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max)
 
         # Initialize flex kernel per-Gaussian beta parameter (if using flex kernel)
         if args.kernel == "flex":
@@ -140,7 +141,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.training_setup(opt)
     elif checkpoint:
         # User-specified checkpoint takes priority
-        scene = Scene(dataset, gaussians)
+        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max)
 
         # Initialize flex kernel per-Gaussian beta parameter (if using flex kernel)
         if args.kernel == "flex":
@@ -188,7 +189,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         # Create scene (won't reinitialize Gaussians)
         gaussians._loaded_from_checkpoint = True
-        scene = Scene(dataset, gaussians)
+        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max)
         
         # Initialize per-Gaussian features for cat/cat_dropout mode (trained from scratch after warmup)
         if args.method in ["cat", "cat_dropout"] and args.hybrid_levels > 0:
@@ -475,7 +476,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("="*70 + "\n")
     else:
         # Normal initialization - train from scratch
-        scene = Scene(dataset, gaussians)
+        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max)
 
         # Initialize flex kernel per-Gaussian beta parameter (if using flex kernel)
         if args.kernel == "flex":
@@ -548,7 +549,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     # Initialize learnable skybox for background modeling
     skybox = None
-    background_mode = args.background  # "none", "skybox_dense", or "skybox_sparse"
+    bg_hashgrid = None
+    background_mode = args.background  # "none", "skybox_dense", "skybox_sparse", "hashgrid", "hashgrid_relu", "hashgrid_sep"
     if background_mode in ["skybox_dense", "skybox_sparse"]:
         skybox = LearnableSkybox(
             resolution_h=args.skybox_res,
@@ -559,6 +561,40 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f"[SKYBOX] Initialized {args.skybox_res}x{args.skybox_res * 2} learnable skybox{sparse_str} (lr={args.skybox_lr})")
         print(f"[SKYBOX] texture.requires_grad={skybox.texture.requires_grad}, device={skybox.texture.device}, shape={skybox.texture.shape}")
         print(f"[SKYBOX] optimizer param groups: {len(skybox.optimizer.param_groups)}, params: {sum(p.numel() for g in skybox.optimizer.param_groups for p in g['params'])}")
+    elif background_mode in ["hashgrid", "hashgrid_relu", "hashgrid_sep"]:
+        # Get num_levels and level_dim from main method's config to match feature dimensions
+        total_levels = cfg_model.encoding.levels
+        level_dim = cfg_model.encoding.hashgrid.dim
+
+        # Use CLI args or defaults matching main method
+        bg_levels = args.bg_hashgrid_levels if args.bg_hashgrid_levels is not None else total_levels
+        bg_dim = args.bg_hashgrid_dim if args.bg_hashgrid_dim is not None else level_dim
+
+        # Validate that output dimensions match
+        main_feat_dim = total_levels * level_dim
+        bg_feat_dim = bg_levels * bg_dim
+        if bg_feat_dim != main_feat_dim:
+            print(f"[BG_HASHGRID] WARNING: Feature dimension mismatch!")
+            print(f"[BG_HASHGRID]   Main method: {total_levels} levels × {level_dim} dim = {main_feat_dim}D")
+            print(f"[BG_HASHGRID]   BG hashgrid: {bg_levels} levels × {bg_dim} dim = {bg_feat_dim}D")
+            print(f"[BG_HASHGRID]   Adjusting BG levels to match main method...")
+            bg_levels = total_levels
+            bg_dim = level_dim
+
+        bg_hashgrid = SphereHashGridBackground(
+            num_levels=bg_levels,
+            level_dim=bg_dim,
+            log2_hashmap_size=args.bg_hashgrid_size,
+            base_resolution=16,
+            desired_resolution=args.bg_hashgrid_res,
+            sphere_radius=args.bg_hashgrid_radius,
+        ).cuda()
+        bg_hashgrid.training_setup(lr=args.bg_hashgrid_lr)
+        bg_start_iter = max(args.bg_hashgrid_start_iter, cfg_model.ingp_stage.switch_iter) if args.bg_hashgrid_start_iter > 0 else cfg_model.ingp_stage.switch_iter
+        mode_str = {"hashgrid": "feature composite", "hashgrid_relu": "ReLU features", "hashgrid_sep": "separate RGB decode"}[background_mode]
+        print(f"[BG_HASHGRID] Mode: {background_mode} ({mode_str})")
+        print(f"[BG_HASHGRID] Feature dim: {bg_hashgrid.output_dim}D (matches main method's {main_feat_dim}D)")
+        print(f"[BG_HASHGRID] Will activate at iteration {bg_start_iter} (switch_iter={cfg_model.ingp_stage.switch_iter})")
 
     opacity_reset_protect = cfg_model.training_cfg.opacity_reset_protect
     if_pixel_densify_enhance = cfg_model.settings.pixel_densify_enhance
@@ -645,8 +681,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             temperature = 1.0
 
-        # Only use skybox after switch_iter (when hash grid activates)
+        # Only use skybox/bg_hashgrid after their respective start iterations
         active_skybox = skybox if (skybox is not None and iteration >= cfg_model.ingp_stage.switch_iter) else None
+        # BG hashgrid can start later than main hashgrid to let FG train first
+        # bg_start_iter is at least switch_iter (need hashgrid features to decode)
+        bg_start_iter = max(args.bg_hashgrid_start_iter, cfg_model.ingp_stage.switch_iter)
+        active_bg_hashgrid = bg_hashgrid if (bg_hashgrid is not None and iteration >= bg_start_iter) else None
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, current_bg, ingp = ingp,
             beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance,
@@ -654,7 +694,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             temperature = temperature, force_ratio = args.force_ratio, no_gumbel = args.no_gumbel,
             dropout_lambda = args.dropout_lambda, is_training = True, aabb_mode = args.aabb,
             aa = args.aa, aa_threshold = args.aa_threshold, skybox = active_skybox,
-            background_mode = background_mode)
+            background_mode = background_mode, bg_hashgrid = active_bg_hashgrid)
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
     
@@ -767,7 +807,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         mcmc_opacity_reg = torch.tensor(0.0, device="cuda")
         mcmc_scale_reg = torch.tensor(0.0, device="cuda")
         bce_phase_active = args.bce and iteration > (opt.iterations - args.bce_iter)
-        if args.mcmc or args.mcmc_deficit:
+        if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
             # If --bce_solo, skip MCMC regularization during BCE phase to let BCE work alone
             if not (args.bce_solo and bce_phase_active):
                 # Regularize activated opacity (after sigmoid) to encourage low opacity -> sparsity
@@ -883,10 +923,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # L1 penalty on (8 - β) - positive lambda pushes toward 8 (hard)
             general_beta_reg_loss = effective_lambda * (8.0 - gaussians.get_shape).mean()
 
+        # L1 regularization on hashgrid embeddings - encourage sparsity to remove grey haze
+        l1_hash_loss = torch.tensor(0.0, device="cuda")
+        if args.l1_hash > 0 and ingp is not None and hasattr(ingp, 'hash_encoding') and ingp.hash_encoding is not None:
+            l1_hash_loss = args.l1_hash * torch.abs(ingp.hash_encoding.embeddings).mean()
+
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss
 
         total_loss.backward()
+
+        # Total variation regularization on hashgrid - penalizes uniform regions while preserving edges
+        # Must be called after backward() and before optimizer.step() as it directly modifies gradients
+        if args.tv_hash > 0 and ingp is not None and hasattr(ingp, 'hash_encoding') and ingp.hash_encoding is not None:
+            ingp.hash_encoding.grad_total_variation(weight=args.tv_hash)
 
         iter_end.record()
         
@@ -900,13 +950,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_mask_for_log = 0.4 * mask_loss.item() + 0.6 * ema_mask_for_log
             
             # Track MCMC regularization losses
-            if args.mcmc or args.mcmc_deficit:
+            if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
                 mcmc_total = mcmc_opacity_reg.item() + mcmc_scale_reg.item()
                 ema_mcmc_loss_for_log = 0.4 * mcmc_total + 0.6 * ema_mcmc_loss_for_log
 
             if iteration % 10 == 0:
                 # For MCMC, show alive Gaussians (opacity > 0.005) instead of total
-                if args.mcmc or args.mcmc_deficit:
+                if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
                     n_alive = (gaussians.get_opacity > 0.005).sum().item()
                     points_str = f"{int(n_alive)}/{len(gaussians.get_xyz)}"
                 else:
@@ -917,7 +967,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Points": points_str,
                 }
                 # Add MCMC loss to progress bar if enabled (hide during BCE solo phase)
-                if (args.mcmc or args.mcmc_deficit) and not (args.bce_solo and bce_phase_active):
+                if (args.mcmc or args.mcmc_deficit or args.mcmc_fps) and not (args.bce_solo and bce_phase_active):
                     loss_dict["OpR"] = f"{mcmc_opacity_reg.item():.{5}f}"
                     loss_dict["ScR"] = f"{mcmc_scale_reg.item():.{5}f}"
                 # Add BCE phase indicator to progress bar
@@ -983,7 +1033,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/mask_loss', ema_mask_for_log, iteration)
-                if args.mcmc or args.mcmc_deficit:
+                if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
                     tb_writer.add_scalar('train_loss_patches/mcmc_reg_loss', ema_mcmc_loss_for_log, iteration)
                     tb_writer.add_scalar('train_loss_patches/mcmc_opacity_reg', mcmc_opacity_reg.item(), iteration)
                     tb_writer.add_scalar('train_loss_patches/mcmc_scale_reg', mcmc_scale_reg.item(), iteration)
@@ -1033,7 +1083,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), \
                 ingp_model=ingp, beta = beta, args = args, cfg_model = cfg_model, test_psnr = test_psnr, train_psnr = train_psnr, iter_list = iter_list, skybox_model = skybox,
-                background_mode = background_mode)
+                background_mode = background_mode, bg_hashgrid_model = bg_hashgrid)
 
             # Print beta kernel stats every 1000 iterations
             if args.kernel == "beta" and iteration % 1000 == 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
@@ -1074,7 +1124,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 # For MCMC, skip saving at final iteration - will save after pruning dead Gaussians
                 is_final_iter = (iteration == opt.iterations)
-                is_mcmc = (args.mcmc or args.mcmc_deficit)
+                is_mcmc = (args.mcmc or args.mcmc_deficit or args.mcmc_fps)
                 if is_mcmc and is_final_iter:
                     print("\n[ITER {}] Skipping save (MCMC: will save after pruning dead Gaussians)".format(iteration))
                 else:
@@ -1084,13 +1134,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     ingp.save_model(scene.model_path, iteration)
                 if skybox is not None:
                     skybox.save_model(scene.model_path, iteration)
+                if bg_hashgrid is not None:
+                    bg_hashgrid.save_model(scene.model_path, iteration)
 
             # Densification / MCMC Relocation
             if iteration < opt.densify_until_iter and optim_gaussian:
-                if args.mcmc or args.mcmc_deficit:
+                if args.mcmc or args.mcmc_deficit or args.mcmc_fps or args.mcmc_fps:
                     # MCMC mode: relocate dead Gaussians and add new ones
                     if args.cap_max <= 0:
-                        raise ValueError("--cap_max must be specified and positive when using --mcmc or --mcmc_deficit mode")
+                        raise ValueError("--cap_max must be specified and positive when using --mcmc, --mcmc_deficit, or --mcmc_fps mode")
 
                     if iteration > opt.densify_from_iter and iteration % densification_interval == 0:
                         # Find dead Gaussians (very low opacity)
@@ -1104,7 +1156,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 gaussians.prune_points(dead_mask)
                             # No add_new_gs while in deficit - just delete
                         else:
-                            # Normal MCMC: relocate dead Gaussians + add new ones
+                            # Normal MCMC (also used by mcmc_fps): relocate dead Gaussians + add new ones
                             gaussians.relocate_gs(dead_mask=dead_mask)
                             gaussians.add_new_gs(cap_max=args.cap_max)
                 else:
@@ -1148,8 +1200,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     skybox.optimizer.step()
                     skybox.optimizer.zero_grad(set_to_none=True)
 
+                # Background hashgrid optimizer step (only after bg_start_iter)
+                bg_start_iter = max(args.bg_hashgrid_start_iter, cfg_model.ingp_stage.switch_iter)
+                if bg_hashgrid is not None and iteration >= bg_start_iter:
+                    # Debug: check if gradients exist
+                    if iteration % 1000 == 0 or iteration == bg_start_iter:
+                        grad = bg_hashgrid.hash_encoding.embeddings.grad
+                        if grad is not None:
+                            print(f"[BG_HASHGRID] iter {iteration}: grad norm = {grad.norm().item():.6f}")
+                        else:
+                            print(f"[BG_HASHGRID] iter {iteration}: NO GRADIENT!")
+                        if iteration == bg_start_iter:
+                            print(f"[BG_HASHGRID] Starting BG hashgrid training at iteration {bg_start_iter}")
+                    bg_hashgrid.optimizer.step()
+                    bg_hashgrid.optimizer.zero_grad(set_to_none=True)
+
                 # MCMC: SGLD noise injection after optimizer step
-                if args.mcmc or args.mcmc_deficit:
+                if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
                     # Get current xyz learning rate
                     xyz_lr = gaussians.optimizer.param_groups[0]['lr']
                     
@@ -1307,7 +1374,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         torch.cuda.empty_cache()
 
     # Prune dead Gaussians in MCMC mode before final rendering
-    if args.mcmc or args.mcmc_deficit:
+    if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
         print("\n" + "="*70)
         print("  PRUNING DEAD GAUSSIANS (MCMC MODE)")
         print("="*70)
@@ -1342,14 +1409,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     print("="*70)
     render_final_images(scene, gaussians, pipe, eval_background, final_ingp, beta, iteration, cfg_model, args,
                         cameras=scene.getTestCameras(), output_subdir='final_test_renders', metrics_file='test_metrics.txt',
-                        skybox=skybox, background_mode=background_mode)
+                        skybox=skybox, background_mode=background_mode, bg_hashgrid=bg_hashgrid)
 
     print("\n" + "="*70)
     print(" "*20 + "FINAL TRAIN RENDERING")
     print("="*70)
     render_final_images(scene, gaussians, pipe, eval_background, final_ingp, beta, iteration, cfg_model, args,
                         cameras=scene.getTrainCameras(), output_subdir='final_train_renders', metrics_file='train_metrics.txt',
-                        skip_decomposition=True, skybox=skybox, background_mode=background_mode)
+                        skip_decomposition=True, skybox=skybox, background_mode=background_mode, bg_hashgrid=bg_hashgrid)
     
     # Save training log with point count and framerate
     save_training_log(scene, gaussians, final_ingp, pipe, args, cfg_model, iteration)
@@ -1440,7 +1507,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
             f.write(f"Hybrid Levels: {args.hybrid_levels}\n")
             if args.method == "cat_dropout":
                 f.write(f"Dropout Lambda: {args.dropout_lambda}\n")
-        if args.mcmc or args.mcmc_deficit:
+        if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
             mode_name = "MCMC Deficit" if args.mcmc_deficit else "MCMC"
             f.write(f"{mode_name} Mode: Enabled\n")
             f.write(f"  - Opacity Reg: {args.opacity_reg}\n")
@@ -1460,7 +1527,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
         f.write("Model Statistics\n")
         f.write("-" * 30 + "\n")
         f.write(f"Number of Gaussians: {num_gaussians:,}\n")
-        if args.mcmc or args.mcmc_deficit:
+        if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
             f.write(f"  (MCMC: only alive Gaussians counted)\n")
         f.write("\n")
 
@@ -1498,7 +1565,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
 
 def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args,
                         cameras, output_subdir, metrics_file, stride=1, skip_decomposition=False,
-                        skybox=None, background_mode="none"):
+                        skybox=None, background_mode="none", bg_hashgrid=None):
     """Render images and compute metrics.
 
     Cameras are sorted by image_name (e.g., r_0, r_1, ..., r_99) for consistent ordering
@@ -1561,6 +1628,14 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     # Adaptive_gate decomposition: visualize gate-closed vs gate-open Gaussians
     is_adaptive_gate_mode = (ingp is not None and hasattr(ingp, 'is_adaptive_gate_mode') and ingp.is_adaptive_gate_mode)
     do_adaptive_gate_decomposition = is_adaptive_gate_mode and not skip_decomposition
+
+    # BG hashgrid visualization: render BG-only for first few frames
+    do_bg_visualization = bg_hashgrid is not None and background_mode in ["hashgrid", "hashgrid_relu", "hashgrid_sep"]
+    bg_vis_frames = 10  # Number of frames to visualize
+    if do_bg_visualization:
+        bg_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'bg_only'))
+        os.makedirs(bg_output_dir, exist_ok=True)
+        print(f"[FINAL] BG hashgrid visualization enabled: saving BG-only renders for first {bg_vis_frames} frames")
 
     if do_cat_decomposition:
         # Create directories for decomposed renders
@@ -1662,7 +1737,7 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
 
             render_pkg = render(viewpoint, gaussians, pipe, background,
                               ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
-                              skybox=skybox, background_mode=background_mode)
+                              skybox=skybox, background_mode=background_mode, bg_hashgrid=bg_hashgrid)
 
             rendered = torch.clamp(render_pkg["render"], 0.0, 1.0)
             gt = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -1686,7 +1761,7 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                 ingp.adaptive_zero_inference = False
                 training_pkg = render(viewpoint, gaussians, pipe, background,
                                       ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
-                                      skybox=skybox, background_mode=background_mode)
+                                      skybox=skybox, background_mode=background_mode, bg_hashgrid=bg_hashgrid)
                 ingp.adaptive_zero_inference = True  # Restore inference mode
 
                 training_rendered = torch.clamp(training_pkg["render"], 0.0, 1.0)
@@ -1700,7 +1775,7 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                 ingp.adaptive_cat_inference = False
                 training_pkg = render(viewpoint, gaussians, pipe, background,
                                       ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
-                                      skybox=skybox, background_mode=background_mode)
+                                      skybox=skybox, background_mode=background_mode, bg_hashgrid=bg_hashgrid)
                 ingp.adaptive_cat_inference = True  # Restore inference mode
 
                 training_rendered = torch.clamp(training_pkg["render"], 0.0, 1.0)
@@ -1743,6 +1818,25 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
             histogram_img, stats = create_intersection_histogram(gaussian_num, max_display=200)
             save_img_u8(intersection_heatmap, os.path.join(intersection_output_dir, f"{idx:03d}_{cam_name}_intersection.png"))
             save_img_u8(histogram_img, os.path.join(intersection_output_dir, f"{idx:03d}_{cam_name}_histogram.png"))
+
+            # BG-only visualization for first few frames
+            if do_bg_visualization and idx < bg_vis_frames:
+                # Render BG hashgrid only (no Gaussians)
+                H, W = viewpoint.image_height, viewpoint.image_width
+                rays_d, rays_o = cam2rays(viewpoint)
+                ray_unit = torch.nn.functional.normalize(rays_d, dim=-1).float()
+
+                # Query BG hashgrid with camera position for position-aware sphere intersection
+                ray_origins_bg = rays_o.unsqueeze(0).expand(ray_unit.shape[0], -1)
+                bg_features = bg_hashgrid(ray_unit, ray_origins_bg)  # (H*W, F)
+
+                # Decode through MLP
+                bg_rgb = ingp.rgb_decode(bg_features, ray_unit)  # (H*W, 3)
+                bg_rgb = bg_rgb.view(H, W, 3).permute(2, 0, 1)  # (3, H, W)
+                bg_rgb = torch.clamp(bg_rgb, 0.0, 1.0)
+
+                bg_rgb_np = bg_rgb.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(bg_rgb_np, os.path.join(bg_output_dir, f"{idx:03d}_{cam_name}_bg.png"))
 
             # Flex kernel beta heatmap: render flex_beta as color, then apply coolwarm colormap
             if is_flex_kernel:
@@ -2093,7 +2187,7 @@ def prepare_output_and_logger(dataset, scene_name, yaml_file="", args=None):
 
 @torch.no_grad()
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, \
-ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_list = None, skybox_model = None, background_mode = "none"):
+ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_list = None, skybox_model = None, background_mode = "none", bg_hashgrid_model = None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/reg_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -2105,26 +2199,34 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
                               {'name': 'train', 'cameras' : scene.getTrainCameras()})
 
-        # Determine if skybox should be active at this iteration
+        # Determine if skybox/bg_hashgrid should be active at this iteration
         active_skybox = skybox_model if (skybox_model is not None and iteration >= cfg_model.ingp_stage.switch_iter) else None
+        bg_start_iter = max(args.bg_hashgrid_start_iter, cfg_model.ingp_stage.switch_iter) if hasattr(args, 'bg_hashgrid_start_iter') else cfg_model.ingp_stage.switch_iter
+        active_bg_hashgrid = bg_hashgrid_model if (bg_hashgrid_model is not None and iteration >= bg_start_iter) else None
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                # Use stride 25 for train cameras to speed up eval, stride 1 for test
+                eval_stride = 25 if config['name'] == 'train' else 1
+                cameras_evaluated = 0
                 for idx, viewpoint in enumerate(config['cameras']):
+                    if idx % eval_stride != 0:
+                        continue
 
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs, ingp = ingp_model, \
                          beta = beta, iteration = iteration, cfg = cfg_model, skybox = active_skybox,
-                         background_mode = background_mode)
+                         background_mode = background_mode, bg_hashgrid = active_bg_hashgrid)
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
 
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    cameras_evaluated += 1
 
                     # Log images for first camera only
-                    if tb_writer and idx == 0:
+                    if tb_writer and cameras_evaluated == 1:
                         tb_writer.add_image(f'{config["name"]}/render', image, iteration)
                         tb_writer.add_image(f'{config["name"]}/gt', gt_image, iteration)
 
@@ -2138,8 +2240,8 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
                             tb_writer.add_image(f'{config["name"]}/background', bg_image, iteration)
                             tb_writer.add_image(f'{config["name"]}/alpha', alpha.repeat(3, 1, 1), iteration)
 
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])
+                psnr_test /= cameras_evaluated
+                l1_test /= cameras_evaluated
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
 
                 if config['name'] == 'test':
@@ -2286,6 +2388,8 @@ if __name__ == "__main__":
                         help="Enable MCMC-based Gaussian management (replaces traditional densification)")
     parser.add_argument("--mcmc_deficit", action="store_true",
                         help="MCMC deficit mode: delete dead Gaussians until reaching cap_max, then normal MCMC. Use when init points > cap_max.")
+    parser.add_argument("--mcmc_fps", action="store_true",
+                        help="MCMC mode with farthest point subsampling: subsample init points to cap_max before training using FPS algorithm. Cached for standard cap_max values (40k, 100k, 400k, 1M).")
     parser.add_argument("--cap_max", type=int, default=-1,
                         help="Maximum number of Gaussians (required for MCMC mode)")
     parser.add_argument("--opacity_reg", type=float, default=0.01,
@@ -2297,12 +2401,28 @@ if __name__ == "__main__":
 
     # Learnable skybox background for outdoor scenes
     parser.add_argument("--background", type=str, default="none",
-                        choices=["none", "skybox_dense", "skybox_sparse"],
-                        help="Background mode: 'none' (solid color), 'skybox_dense' (learnable skybox, full MLP on all pixels), 'skybox_sparse' (learnable skybox, MLP only on covered pixels)")
+                        choices=["none", "skybox_dense", "skybox_sparse", "hashgrid", "hashgrid_relu", "hashgrid_sep"],
+                        help="Background mode: 'none' (solid color), 'skybox_*' (learnable texture), 'hashgrid' (composite features before MLP), 'hashgrid_relu' (ReLU on BG features), 'hashgrid_sep' (separate MLP decode, composite RGB)")
     parser.add_argument("--skybox_lr", type=float, default=1e-3,
                         help="Learning rate for skybox texture")
     parser.add_argument("--skybox_res", type=int, default=512,
                         help="Skybox texture resolution (height; width=2*height)")
+
+    # Background hashgrid settings (for --background hashgrid)
+    parser.add_argument("--bg_hashgrid_levels", type=int, default=None,
+                        help="Number of levels for background hashgrid (default: same as main method's total levels)")
+    parser.add_argument("--bg_hashgrid_dim", type=int, default=None,
+                        help="Feature dimension per level for background hashgrid (default: same as main method)")
+    parser.add_argument("--bg_hashgrid_size", type=int, default=19,
+                        help="log2 of hash table size for background hashgrid (default: 19 = 512K entries)")
+    parser.add_argument("--bg_hashgrid_res", type=int, default=512,
+                        help="Finest resolution for background hashgrid (default: 512)")
+    parser.add_argument("--bg_hashgrid_lr", type=float, default=1e-2,
+                        help="Learning rate for background hashgrid (default: 1e-2)")
+    parser.add_argument("--bg_hashgrid_start_iter", type=int, default=0,
+                        help="Iteration to start BG hashgrid training (default: 0, starts with switch_iter). Set higher to let FG train first.")
+    parser.add_argument("--bg_hashgrid_radius", type=float, default=500.0,
+                        help="Radius of the background sphere for ray intersection (default: 500.0, should be > scene extent)")
 
     # BCE opacity regularization - reduce semi-transparent foggy Gaussians
     parser.add_argument("--bce", action="store_true",
@@ -2326,6 +2446,10 @@ if __name__ == "__main__":
                         help="L1 regularization weight on beta kernel shape parameter (pushes toward 0 = hard disks)")
     parser.add_argument("--lambda_flex_beta", type=float, default=0.0001,
                         help="L1 regularization weight on flex kernel beta parameter (prevents runaway sharpening)")
+    parser.add_argument("--l1_hash", type=float, default=0.0,
+                        help="L1 regularization on hashgrid embeddings to encourage sparsity (0.0 = disabled)")
+    parser.add_argument("--tv_hash", type=float, default=0.0,
+                        help="Total variation regularization on hashgrid to penalize uniform grey while preserving edges/detail (0.0 = disabled)")
     parser.add_argument("--genreg", type=str, default="basic",
                         choices=["basic", "decay", "scaled", "scaled_decay"],
                         help="General kernel regularization mode: 'basic' (constant), 'decay' (linear decay over training), 'scaled' (scaled by RGB loss), 'scaled_decay' (both)")
