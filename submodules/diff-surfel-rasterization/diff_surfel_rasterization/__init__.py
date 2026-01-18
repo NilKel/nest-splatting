@@ -238,7 +238,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 render_mode,
                 hashgrid_settings.shape_dims,
                 shapes,
-                kernel_type)
+                kernel_type,
+                raster_settings.detach_hash_grad)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
@@ -298,6 +299,7 @@ class GaussianRasterizationSettings(NamedTuple):
     if_contract : bool
     record_transmittance : bool
     max_intersections : int = 0  # 0 means no limit
+    detach_hash_grad : bool = False  # Detach positional gradients from hashgrid (for CAT mode frequency separation)
 
 class HashGridSettings(NamedTuple):
     L: int

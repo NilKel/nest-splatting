@@ -291,7 +291,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int render_mode,
 	const torch::Tensor& shape_dims,
 	const torch::Tensor& shapes,
-	const int kernel_type) 
+	const int kernel_type,
+	const bool detach_hash_grad) 
 {
 
   CHECK_INPUT(background);
@@ -449,7 +450,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  render_mode,
 	  shapes_ptr_bw,
 	  kernel_type,
-	  dL_dshapes.contiguous().data<float>());
+	  dL_dshapes.contiguous().data<float>(),
+	  detach_hash_grad);
   }
 
   return std::make_tuple(dL_dfeatures, dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dtransMat, dL_dsh, dL_dscales, dL_drotations, dL_gradsum, dL_dfeatures_diffuse, dL_dshapes);

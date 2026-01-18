@@ -105,7 +105,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int render_mode,
 	const torch::Tensor& shape_dims,
 	const torch::Tensor& shapes,
-	const int kernel_type);
+	const int kernel_type,
+	const bool detach_hash_grad);
 		
 torch::Tensor markVisible(
 		torch::Tensor& means3D,

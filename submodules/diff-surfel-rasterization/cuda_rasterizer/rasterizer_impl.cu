@@ -514,7 +514,8 @@ void CudaRasterizer::Rasterizer::backward(
 	const int render_mode,
 	const float* shapes,
 	const int kernel_type,
-	float* dL_dshapes)
+	float* dL_dshapes,
+	const bool detach_hash_grad)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -580,7 +581,8 @@ void CudaRasterizer::Rasterizer::backward(
 		render_mode,
 		shapes,
 		kernel_type,
-		dL_dshapes), debug)
+		dL_dshapes,
+		detach_hash_grad), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,

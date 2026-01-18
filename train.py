@@ -119,7 +119,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("  Skipping 2DGS warmup phase and all checkpoint loading")
         print("  Training Nest representation from scratch with hash_in_CUDA=True")
         print("="*70 + "\n")
-        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max)
+        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max, full_args=args)
 
         # Initialize flex kernel per-Gaussian beta parameter (if using flex kernel)
         if args.kernel == "flex":
@@ -142,7 +142,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.training_setup(opt)
     elif checkpoint:
         # User-specified checkpoint takes priority
-        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max)
+        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max, full_args=args)
 
         # Initialize flex kernel per-Gaussian beta parameter (if using flex kernel)
         if args.kernel == "flex":
@@ -187,11 +187,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians._appearance_level = nn.Parameter(ckpt['appearance_level'].cuda().requires_grad_(True))
         gaussians.max_radii2D = ckpt['max_radii2D'].cuda()
         gaussians.spatial_lr_scale = ckpt['spatial_lr_scale']
-        
+
         # Create scene (won't reinitialize Gaussians)
         gaussians._loaded_from_checkpoint = True
-        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max)
-        
+        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max, full_args=args)
+
         # Initialize per-Gaussian features for cat/cat_dropout mode (trained from scratch after warmup)
         if args.method in ["cat", "cat_dropout"] and args.hybrid_levels > 0:
             per_level_dim = 4  # From config encoding.hashgrid.dim
@@ -477,7 +477,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("="*70 + "\n")
     else:
         # Normal initialization - train from scratch
-        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max)
+        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max, full_args=args)
 
         # Initialize flex kernel per-Gaussian beta parameter (if using flex kernel)
         if args.kernel == "flex":
@@ -715,7 +715,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             temperature = temperature, force_ratio = args.force_ratio, no_gumbel = args.no_gumbel,
             dropout_lambda = args.dropout_lambda, is_training = True, aabb_mode = args.aabb,
             aa = args.aa, aa_threshold = args.aa_threshold, skybox = active_skybox,
-            background_mode = background_mode, bg_hashgrid = active_bg_hashgrid)
+            background_mode = background_mode, bg_hashgrid = active_bg_hashgrid,
+            detach_hash_grad = args.detach_hash_grad)
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
     
@@ -756,9 +757,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         error_img = torch.abs(gt_image - image)
 
         if cfg_model.settings.gt_alpha :
-            gt_alpha = viewpoint_cam.gt_alpha_mask.cuda().float()
+            if viewpoint_cam.gt_alpha_mask is None:
+                print(f"[ERROR] gt_alpha=True but gt_alpha_mask is None for {viewpoint_cam.image_name}!")
+                gt_alpha = (gt_image != 0).any(dim=0, keepdim=True).float()
+            else:
+                gt_alpha = viewpoint_cam.gt_alpha_mask.cuda().float()
+                # Debug: print mask info on first iteration
+                if iteration == first_iter + 1:
+                    print(f"[DEBUG gt_alpha] Using gt_alpha_mask for {viewpoint_cam.image_name}")
+                    print(f"[DEBUG gt_alpha] Shape: {gt_alpha.shape}, min: {gt_alpha.min():.3f}, max: {gt_alpha.max():.3f}, mean: {gt_alpha.mean():.3f}")
         else:
             gt_alpha = (gt_image != 0).any(dim=0, keepdim=True).float()
+            if iteration == first_iter + 1:
+                print(f"[DEBUG gt_alpha] Using fallback (non-black pixels) for {viewpoint_cam.image_name}")
         
         try:
             if cfg_model.settings.gs_alpha and ingp is not None:
@@ -2468,6 +2479,8 @@ if __name__ == "__main__":
                         help="Kernel type: 'gaussian' (default exp(-0.5*r²)), 'beta' (pow(1-r², shape) with r∈[0,1]), 'beta_scaled' (same but r∈[0,3] to match 3σ Gaussian extent), 'flex' (Gaussian with learnable per-Gaussian beta), or 'general' (Isotropic Generalized Gaussian)")
     parser.add_argument("--freeze_beta", type=float, default=None,
                         help="Freeze beta kernel shape to a fixed value (e.g., 3.0 for semisoft). Disables shape optimization.")
+    parser.add_argument("--detach_hash_grad", action="store_true",
+                        help="Detach positional gradients from hashgrid in CAT mode (geometry follows per-Gaussian features only)")
     parser.add_argument("--lambda_shape", type=float, default=0.001,
                         help="L1 regularization weight on beta kernel shape parameter (pushes toward 0 = hard disks)")
     parser.add_argument("--lambda_flex_beta", type=float, default=0.0001,

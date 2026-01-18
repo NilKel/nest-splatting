@@ -64,7 +64,8 @@ namespace BACKWARD
 		const int render_mode = 0,
 		const float* shapes = nullptr,
 		const int kernel_type = 0,
-		float* dL_dshapes = nullptr);
+		float* dL_dshapes = nullptr,
+		const bool detach_hash_grad = false);
 
 	void preprocess(
 		int P, int D, int M,

@@ -22,13 +22,15 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], mcmc_fps=False, cap_max=-1):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], mcmc_fps=False, cap_max=-1, full_args=None):
         """b
         :param path: Path to colmap scene main folder.
+        :param full_args: Full training args (for kernel type, method, etc.)
         """
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        self._full_args = full_args  # Store full args for create_from_pcd
 
         if load_iteration:
             if load_iteration == -1:
@@ -100,7 +102,9 @@ class Scene:
             # Gaussians already loaded from warmup checkpoint, skip create_from_pcd
             print(f"[Scene] Using pre-loaded Gaussians ({len(self.gaussians.get_xyz)} points)")
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, args = args)
+            # Use full_args if available (has kernel type, method, etc.), otherwise use ModelParams args
+            pcd_args = self._full_args if self._full_args is not None else args
+            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, args = pcd_args)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))

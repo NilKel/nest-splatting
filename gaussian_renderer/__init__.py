@@ -23,7 +23,7 @@ from utils.general_utils import MEM_PRINT
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
     beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False, decompose_mode = None, max_intersections = 0,
     skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2, no_gumbel = False, dropout_lambda = 0.0, is_training = True,
-    aabb_mode = "2dgs", aa = 0.0, aa_threshold = 0.01, skybox = None, background_mode = "none", bg_hashgrid = None):
+    aabb_mode = "2dgs", aa = 0.0, aa_threshold = 0.01, skybox = None, background_mode = "none", bg_hashgrid = None, detach_hash_grad = False):
     """
     Render the scene.
 
@@ -709,6 +709,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         if_contract = contract,
         record_transmittance = record_transmittance,
         max_intersections = max_intersections,
+        detach_hash_grad = detach_hash_grad,
         # pipe.debug
     )
 

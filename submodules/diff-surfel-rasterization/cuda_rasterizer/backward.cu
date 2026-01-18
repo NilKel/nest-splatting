@@ -486,7 +486,8 @@ renderCUDAsurfelBackward(
 	const int render_mode = 0,
 	const float* __restrict__ shapes = nullptr,
 	const int kernel_type = 0,
-	float* __restrict__ dL_dshapes = nullptr)
+	float* __restrict__ dL_dshapes = nullptr,
+	const bool detach_hash_grad = false)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -1516,6 +1517,14 @@ renderCUDAsurfelBackward(
 					                              hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
 					                              grad_hash, dL_dfeatures, dL_dxyz);
 				}
+
+				// Detach hashgrid positional gradients if requested (for CAT mode frequency separation)
+				// This prevents high-frequency hashgrid features from moving Gaussian positions
+				if(detach_hash_grad) {
+					dL_dxyz[0] = 0.0f;
+					dL_dxyz[1] = 0.0f;
+					dL_dxyz[2] = 0.0f;
+				}
 			}
 
 			// Write weight gradient
@@ -1604,6 +1613,14 @@ renderCUDAsurfelBackward(
 					                              collec_offsets, appearance_level, hash_features,
 					                              hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
 					                              grad_hash, dL_dfeatures, dL_dxyz);
+				}
+
+				// Detach hashgrid positional gradients if requested (for frequency separation)
+				// This prevents high-frequency hashgrid features from moving Gaussian positions
+				if(detach_hash_grad) {
+					dL_dxyz[0] = 0.0f;
+					dL_dxyz[1] = 0.0f;
+					dL_dxyz[2] = 0.0f;
 				}
 			}
 
@@ -2378,7 +2395,8 @@ void BACKWARD::render(
 	const int render_mode,
 	const float* shapes,
 	const int kernel_type,
-	float* dL_dshapes)
+	float* dL_dshapes,
+	const bool detach_hash_grad)
 {
 	// Determine D_DIFFUSE template parameter for kernel dispatch
 	const uint32_t D_DIFFUSE_TEMPLATE = D_diffuse;
@@ -2389,21 +2407,21 @@ void BACKWARD::render(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 			break;
 		case 8:
 			renderCUDAsurfelBackward<8, 0> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 			break;
 		case 16:
 			renderCUDAsurfelBackward<16, 0> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 			break;
 	case 24:
 		// Always use D_DIFFUSE=0 template and handle dual hashgrids at runtime
@@ -2412,42 +2430,42 @@ void BACKWARD::render(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	case 32:
 		renderCUDAsurfelBackward<32, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	case 42:
 		renderCUDAsurfelBackward<42, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	case 48:
 		renderCUDAsurfelBackward<48, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	case 72:
 		renderCUDAsurfelBackward<72, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	case 90:
 		renderCUDAsurfelBackward<90, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	default:
 		printf("Unsupported channel count: %d\n", C);
