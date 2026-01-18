@@ -84,6 +84,9 @@ class GaussianModel:
         # Relocation mode for adaptive weights: 'clone' (copy from source) or 'reset' (initialize to 0)
         self._relocation_mode = "clone"
 
+        # Frozen beta shape value (raw _shape value) - if not None, shape is frozen and this value is used for new Gaussians
+        self._frozen_beta_raw = None
+
         # Beta/General kernel shape parameter (per-Gaussian, controls kernel falloff)
         # Beta kernel: sigmoid(_shape) * 4.0 + 0.001 gives range [0.001, 4.001]
         #   shape≈0 = hard flat disk, shape≈4 = soft Gaussian cloud
@@ -291,10 +294,9 @@ class GaussianModel:
             return torch.sigmoid(self._shape) * 6.0 + 2.0
         else:
             # Beta kernel activation
-            # Range [0.001, 4.0] - full range from hard disk to soft Gaussian
-            # shape → 0.001: hard flat disk
-            # shape → 4.0: soft Gaussian-like falloff
-            return torch.sigmoid(self._shape) * 4.0 + 0.001
+            # β = sigmoid(_shape) * 5.0, range [0, 5]
+            # β=0: flat disk, β~4: Gaussian-like, β=5: sharper
+            return torch.sigmoid(self._shape) * 5.0
 
     @property
     def get_flex_beta(self):
@@ -442,12 +444,13 @@ class GaussianModel:
         self._diffuse_mode = hasattr(args, 'method') and args.method == "diffuse"
 
         # Initialize beta kernel shape parameter if using beta kernel
-        if hasattr(args, 'kernel') and args.kernel == "beta":
-            self.kernel_type = "beta"
-            # Initialize shape to produce soft kernels (shape ≈ 3.8)
-            # sigmoid(3.0) ≈ 0.95, and 0.95 * 4.0 + 0.001 ≈ 3.8
-            shape_init = 3.0 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
+        if hasattr(args, 'kernel') and args.kernel in ["beta", "beta_scaled"]:
+            self.kernel_type = args.kernel  # "beta" or "beta_scaled"
+            # β = sigmoid(_shape) * 5.0, init to β≈3 (semisoft)
+            # sigmoid(0.405) ≈ 0.6, so β ≈ 3
+            shape_init = 0.405 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
             self._shape = nn.Parameter(shape_init.requires_grad_(True))
+            print(f"[DEBUG] {args.kernel} kernel shape initialized: requires_grad={self._shape.requires_grad}")
         elif hasattr(args, 'kernel') and args.kernel == "flex":
             self.kernel_type = "flex"
             self._shape = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
@@ -503,9 +506,11 @@ class GaussianModel:
         if hasattr(self, '_gate_logits') and self._gate_logits.numel() > 0:
             l.append({'params': [self._gate_logits], 'lr': training_args.opacity_lr, "name": "gate_logits"})
 
-        # Add beta kernel shape parameter (if present)
+        # Add beta kernel shape parameter (if present and requires grad)
         if hasattr(self, '_shape') and self._shape.numel() > 0:
-            l.append({'params': [self._shape], 'lr': training_args.opacity_lr, "name": "shape"})
+            print(f"[DEBUG] training_setup: _shape.requires_grad={self._shape.requires_grad}")
+            if self._shape.requires_grad:
+                l.append({'params': [self._shape], 'lr': 0.001, "name": "shape"})
 
         # Add flex kernel per-Gaussian beta parameter (if present)
         if hasattr(self, '_flex_beta') and self._flex_beta.numel() > 0:
@@ -668,14 +673,19 @@ class GaussianModel:
         if "shape" in [p.name for p in plydata.elements[0].properties]:
             shapes = np.asarray(plydata.elements[0]["shape"])[..., np.newaxis]
             self._shape = nn.Parameter(torch.tensor(shapes, dtype=torch.float, device="cuda").requires_grad_(True))
-            self.kernel_type = "beta"
-            print(f"Loaded beta kernel shape parameter")
-        elif args is not None and hasattr(args, 'kernel') and args.kernel == "beta":
-            # Beta kernel requested but no shape in PLY - initialize to soft
-            shape_init = 3.0 * torch.ones((xyz.shape[0], 1), dtype=torch.float, device="cuda")
+            # Determine kernel type from args if available, otherwise default to "beta"
+            if args is not None and hasattr(args, 'kernel') and args.kernel == "beta_scaled":
+                self.kernel_type = "beta_scaled"
+            else:
+                self.kernel_type = "beta"
+            print(f"Loaded {self.kernel_type} kernel shape parameter")
+        elif args is not None and hasattr(args, 'kernel') and args.kernel in ["beta", "beta_scaled"]:
+            # Beta kernel requested but no shape in PLY - init to β≈3 (semisoft)
+            # sigmoid(0.405) ≈ 0.6, so β ≈ 3
+            shape_init = 0.405 * torch.ones((xyz.shape[0], 1), dtype=torch.float, device="cuda")
             self._shape = nn.Parameter(shape_init.requires_grad_(True))
-            self.kernel_type = "beta"
-            print(f"Warning: No shape in PLY, initialized beta kernel shape to ~3.8 (soft)")
+            self.kernel_type = args.kernel
+            print(f"Warning: No shape in PLY, initialized {args.kernel} kernel to β≈3 (semisoft)")
         elif args is not None and hasattr(args, 'kernel') and args.kernel == "flex":
             # Flex kernel requested
             self._shape = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
@@ -743,6 +753,9 @@ class GaussianModel:
             self._gate_logits = optimizable_tensors["gate_logits"]
         if "shape" in optimizable_tensors:
             self._shape = optimizable_tensors["shape"]
+        elif hasattr(self, '_shape') and self._shape.numel() > 0:
+            # Handle frozen shape parameter (not in optimizer) - prune manually
+            self._shape = nn.Parameter(self._shape.data[valid_points_mask].clone(), requires_grad=False)
         if "flex_beta" in optimizable_tensors:
             self._flex_beta = optimizable_tensors["flex_beta"]
 
@@ -751,6 +764,14 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+
+        # Debug: verify shape tensor size matches xyz after pruning
+        if hasattr(self, '_shape') and self._shape.numel() > 0:
+            xyz_size = self.get_xyz.shape[0]
+            shape_size = self._shape.shape[0]
+            if xyz_size != shape_size:
+                print(f"[ERROR] Size mismatch after prune_points: xyz={xyz_size}, shape={shape_size}")
+                raise RuntimeError(f"Shape tensor size mismatch after prune: xyz={xyz_size}, shape={shape_size}")
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -842,6 +863,9 @@ class GaussianModel:
             self._gate_logits = optimizable_tensors["gate_logits"]
         if "shape" in optimizable_tensors:
             self._shape = optimizable_tensors["shape"]
+        elif new_shape is not None and hasattr(self, '_shape') and self._shape.numel() > 0:
+            # Handle frozen shape parameter (not in optimizer) - manually concatenate
+            self._shape = nn.Parameter(torch.cat([self._shape.data, new_shape], dim=0), requires_grad=False)
         if "flex_beta" in optimizable_tensors:
             self._flex_beta = optimizable_tensors["flex_beta"]
 
@@ -849,6 +873,14 @@ class GaussianModel:
         self.feat_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        # Debug: verify shape tensor size matches xyz
+        if hasattr(self, '_shape') and self._shape.numel() > 0:
+            xyz_size = self.get_xyz.shape[0]
+            shape_size = self._shape.shape[0]
+            if xyz_size != shape_size:
+                print(f"[ERROR] Size mismatch after densification_postfix: xyz={xyz_size}, shape={shape_size}")
+                raise RuntimeError(f"Shape tensor size mismatch: xyz={xyz_size}, shape={shape_size}")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -915,7 +947,11 @@ class GaussianModel:
         # Handle beta kernel shape parameter
         new_shape = None
         if hasattr(self, '_shape') and self._shape.numel() > 0:
-            new_shape = self._shape[selected_pts_mask].repeat(N, 1)
+            if self._frozen_beta_raw is not None:
+                num_new = selected_pts_mask.sum().item() * N
+                new_shape = torch.full((num_new, 1), self._frozen_beta_raw, device="cuda")
+            else:
+                new_shape = self._shape[selected_pts_mask].repeat(N, 1)
 
         # Handle flex kernel per-Gaussian beta parameter
         new_flex_beta = None
@@ -984,7 +1020,11 @@ class GaussianModel:
         # Handle beta kernel shape parameter
         new_shape = None
         if hasattr(self, '_shape') and self._shape.numel() > 0:
-            new_shape = self._shape[selected_pts_mask]
+            if self._frozen_beta_raw is not None:
+                num_new = selected_pts_mask.sum().item()
+                new_shape = torch.full((num_new, 1), self._frozen_beta_raw, device="cuda")
+            else:
+                new_shape = self._shape[selected_pts_mask]
 
         # Handle flex kernel per-Gaussian beta parameter
         new_flex_beta = None
@@ -1103,11 +1143,14 @@ class GaussianModel:
                 gate_logits = self._gate_logits[idxs]
 
         # Handle beta kernel shape parameter
-        # Reset to soft value (3.0) instead of cloning - allows easier positional gradients
-        # sigmoid(3.0) ≈ 0.95, giving shape ≈ 3.8 (soft Gaussian-like)
         shape = None
         if hasattr(self, '_shape') and self._shape.numel() > 0:
-            shape = torch.full((len(idxs), 1), 3.0, device="cuda")
+            if self._frozen_beta_raw is not None:
+                # Use frozen value for new Gaussians
+                shape = torch.full((len(idxs), 1), self._frozen_beta_raw, device="cuda")
+            else:
+                # Clone from source
+                shape = self._shape[idxs]
 
         return (
             self._xyz[idxs],

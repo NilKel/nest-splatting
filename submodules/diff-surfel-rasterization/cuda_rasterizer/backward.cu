@@ -762,12 +762,17 @@ renderCUDAsurfelBackward(
 		float general_pow_term = 0.0f;  // For general kernel gradient: (r²)^(β/2)
 		float general_rho_safe = 0.0f;  // For general kernel gradient: max(rho, 1e-8)
 
-		if (kernel_type == 1) {
-			// Beta kernel: alpha = opacity * pow(1 - r², shape)
-			if (rho >= 1.0f)
-				continue;  // Strict cutoff at unit circle
+		// For beta_scaled kernel (type 4), we need k_sq for gradient computation
+		float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
 
-			base = 1.0f - rho;
+		if (kernel_type == 1 || kernel_type == 4) {
+			// Beta kernel: alpha = opacity * pow(1 - r²/k², shape)
+			// kernel_type 1: k²=1 (unit circle cutoff)
+			// kernel_type 4: k²=9 (3σ scaled, matches Gaussian extent)
+			if (rho >= k_sq)
+				continue;  // Strict cutoff at scaled radius
+
+			base = 1.0f - rho / k_sq;
 			shape_val = collected_shapes[j];
 			G = powf(base, shape_val);
 			alpha = min(0.99f, opa * G);
@@ -1960,9 +1965,10 @@ renderCUDAsurfelBackward(
 				// For Flex kernel: same as Gaussian but use G_raw (already accounted for in dL_dG)
 				// For General kernel: dG/drho = -0.25 * β * G * pow_term / rho
 				float dG_factor;
-				if (kernel_type == 1) {
-					// Beta kernel: dG/drho = -shape * G / base, drho/ds.x = 2*s.x
-					dG_factor = (base > 1e-7f) ? -shape_val * G / base : 0.0f;
+				if (kernel_type == 1 || kernel_type == 4) {
+					// Beta kernel: dG/drho = -shape * G / (base * k_sq), drho/ds.x = 2*s.x
+					// For kernel_type 1: k_sq=1, for kernel_type 4: k_sq=9
+					dG_factor = (base > 1e-7f) ? -shape_val * G / (base * k_sq) : 0.0f;
 				} else if (kernel_type == 2) {
 					// Flex kernel: same as Gaussian, use G_raw for position gradient
 					// dL_dG has already been adjusted in the gradient section above
@@ -2020,9 +2026,10 @@ renderCUDAsurfelBackward(
 				// For Flex kernel: same as Gaussian but use G_raw
 				// For General kernel: dG/dd.x = dG/drho * FilterInvSquare * d.x
 				float dG_factor_2d;
-				if (kernel_type == 1) {
-					// Beta kernel
-					dG_factor_2d = (base > 1e-7f) ? -shape_val * G / base * FilterInvSquare : 0.0f;
+				if (kernel_type == 1 || kernel_type == 4) {
+					// Beta kernel: dG/drho = -shape * G / (base * k_sq)
+					// For kernel_type 1: k_sq=1, for kernel_type 4: k_sq=9
+					dG_factor_2d = (base > 1e-7f) ? -shape_val * G / (base * k_sq) * FilterInvSquare : 0.0f;
 				} else if (kernel_type == 2) {
 					// Flex kernel: same as Gaussian, use G_raw
 					dG_factor_2d = -G_raw * FilterInvSquare;

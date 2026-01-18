@@ -405,9 +405,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 #endif
 
 	// Compute cutoff for bounding box
-	// aabb_mode: 0 = square (default), 1 = AdR cutoff, 2 = rectangular, 3 = AdR + rectangular
+	// aabb_mode: 0 = square (default), 1 = AdR cutoff, 2 = rectangular, 3 = AdR + rectangular, 4 = beta (fixed r=1)
 	float cutoff;
 	bool use_adr_cutoff = (aabb_mode == 1 || aabb_mode == 3);  // modes 1 and 3 use AdR
+	bool use_beta_cutoff = (aabb_mode == 4);  // mode 4: fixed r=1 for beta kernels
 	if (use_adr_cutoff && kernel_type == 3 && shapes != nullptr) {
 		// AdR: Adaptive bounding box based on opacity and beta
 		// For general kernel (kernel_type=3), the kernel is exp(-0.5 * (r²)^(β/2))
@@ -433,16 +434,19 @@ __global__ void preprocessCUDA(int P, int D, int M,
 			// log_term <= 0 means opacity <= 1/255, shouldn't happen after early cull
 			cutoff = 0.1f;  // Minimal bounding box
 		}
-	} else if (use_adr_cutoff && kernel_type == 1 && shapes != nullptr) {
-		// AdR for beta kernel (kernel_type=1): alpha = opacity * (1 - r²)^shape
-		// Beta kernel has compact support: exactly 0 outside unit disk (r² > 1)
-		// We want: opacity * (1 - r²)^shape >= 1/255
-		// Solving: (1 - r²)^shape >= 1/(255 * opacity)
-		//          1 - r² >= (1/(255 * opacity))^(1/shape)
-		//          r² <= 1 - (1/(255 * opacity))^(1/shape)
-		//          r <= sqrt(1 - (1/(255 * opacity))^(1/shape))
+	} else if (use_adr_cutoff && (kernel_type == 1 || kernel_type == 4) && shapes != nullptr) {
+		// AdR for beta kernel: alpha = opacity * (1 - r²/k²)^shape
+		// kernel_type 1: k²=1 (unit disk), kernel_type 4: k²=9 (3σ scaled)
+		// We want: opacity * (1 - r²/k²)^shape >= 1/255
+		// Solving: (1 - r²/k²)^shape >= 1/(255 * opacity)
+		//          1 - r²/k² >= (1/(255 * opacity))^(1/shape)
+		//          r²/k² <= 1 - (1/(255 * opacity))^(1/shape)
+		//          r <= k * sqrt(1 - (1/(255 * opacity))^(1/shape))
+		float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
+		float k = (kernel_type == 4) ? 3.0f : 1.0f;
+
 		float opacity_val = opacities[idx];
-		float shape = shapes[idx];  // Shape parameter, range [0.001, 4.001]
+		float shape = shapes[idx];  // Shape parameter
 
 		// Early cull: if opacity < 1/255, Gaussian is invisible everywhere
 		if (opacity_val < (1.0f / 255.0f)) {
@@ -455,14 +459,17 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		float threshold = powf(1.0f / (255.0f * opacity_val), 1.0f / shape);
 
 		if (threshold < 1.0f) {
-			// r = sqrt(1 - threshold)
-			cutoff = sqrtf(1.0f - threshold);
+			// r = k * sqrt(1 - threshold)
+			cutoff = k * sqrtf(1.0f - threshold);
 		} else {
 			// threshold >= 1 means the Gaussian is too dim to see anywhere
-			// This happens when opacity is very low or shape is very high
 			cutoff = 0.1f;  // Minimal bounding box
 		}
-		// Beta kernel always has hard cutoff at r=1, so no need to clamp above
+		// Beta kernel has hard cutoff at r=k, so no need to clamp above
+	} else if (use_beta_cutoff) {
+		// Beta kernel: fixed r=1 cutoff (compact support) - only for kernel_type 1
+		// For beta_scaled (kernel_type 4), use standard 3σ cutoff instead
+		cutoff = 1.0f;
 	} else {
 #if TIGHTBBOX // no use in the paper, but it indeed help speeds.
 		// the effective extent is now depended on the opacity of gaussian.
@@ -992,13 +999,16 @@ renderCUDAsurfelForward(
 		float opa = nor_o.w;
 
 		float alpha;
-		if (kernel_type == 1) {
-			// Beta kernel: alpha = opacity * pow(1 - r², shape)
-			// Use rho (min of rho3d, rho2d) for anti-aliasing
-			if (rho >= 1.0f)
-				continue;  // Strict cutoff at unit circle
+		if (kernel_type == 1 || kernel_type == 4) {
+			// Beta kernel: alpha = opacity * pow(1 - r²/k², shape)
+			// kernel_type 1: k²=1 (unit circle cutoff)
+			// kernel_type 4: k²=9 (3σ scaled, matches Gaussian extent)
+			float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
 
-			float base = 1.0f - rho;
+			if (rho >= k_sq)
+				continue;  // Strict cutoff at scaled radius
+
+			float base = 1.0f - rho / k_sq;
 			float shape = collected_shapes[j];
 			alpha = min(0.99f, opa * powf(base, shape));
 		} else if (kernel_type == 2) {

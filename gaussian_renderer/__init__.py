@@ -728,10 +728,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Get shape parameter for beta/general kernel (if using beta or general kernel)
     # Get flex_beta parameter for flex kernel (if using flex kernel)
     shapes = None
-    kernel_type = 0  # 0=gaussian, 1=beta, 2=flex, 3=general
+    kernel_type = 0  # 0=gaussian, 1=beta, 2=flex, 3=general, 4=beta_scaled
     if hasattr(pc, 'kernel_type') and pc.kernel_type == "beta" and hasattr(pc, '_shape') and pc._shape.numel() > 0:
         shapes = pc.get_shape
         kernel_type = 1
+    elif hasattr(pc, 'kernel_type') and pc.kernel_type == "beta_scaled" and hasattr(pc, '_shape') and pc._shape.numel() > 0:
+        # Beta kernel scaled to match 3σ Gaussian extent (r ∈ [0,3] instead of [0,1])
+        shapes = pc.get_shape
+        kernel_type = 4
     elif hasattr(pc, 'kernel_type') and pc.kernel_type == "flex" and hasattr(pc, '_flex_beta') and pc._flex_beta.numel() > 0:
         # For flex kernel, pass per-Gaussian beta via the shapes parameter
         # The CUDA kernel will interpret this as beta instead of shape based on kernel_type=2
@@ -748,6 +752,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # 1 = square AABB, AdR cutoff (adaptive) - use "adr_only" for this
     # 2 = rectangular AABB, fixed 4σ cutoff
     # 3 = rectangular AABB, AdR cutoff (full optimization) - use "adr" for this
+    # 4 = beta kernel: fixed r=1 cutoff (compact support)
     if isinstance(aabb_mode, int):
         aabb_mode_int = aabb_mode
     elif aabb_mode == "adr":
@@ -758,6 +763,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         aabb_mode_int = 2
     elif aabb_mode == "adr_rect":
         aabb_mode_int = 3  # Same as "adr"
+    elif aabb_mode == "beta":
+        aabb_mode_int = 4  # Beta kernel: fixed r=1 cutoff
     else:
         aabb_mode_int = 0  # "2dgs" or default
 

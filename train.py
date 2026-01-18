@@ -11,6 +11,7 @@
 
 import os
 import json
+import math
 import torch
 import torch.nn as nn
 from random import randint
@@ -164,7 +165,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.training_setup(opt)
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
-    elif cfg_model.settings.if_ingp and os.path.exists(warmup_checkpoint_path):
+    elif cfg_model.settings.if_ingp and os.path.exists(warmup_checkpoint_path) and not args.scratch:
         # Load warmup checkpoint - skip 2DGS phase
         print("\n" + "="*70)
         print("  LOADING 2DGS WARMUP CHECKPOINT")
@@ -497,7 +498,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"[GENERAL KERNEL] Initial beta value: {init_shape_val:.3f} (2=Gaussian, 8=super-Gaussian/box)")
 
         gaussians.training_setup(opt)
-        if cfg_model.settings.if_ingp:
+        if args.scratch:
+            print(f"\n[INFO] --scratch flag: ignoring warmup checkpoint, training from scratch")
+            print(f"[INFO] Will train 2DGS for {cfg_model.ingp_stage.initialize} iterations, then save checkpoint.\n")
+        elif cfg_model.settings.if_ingp:
             print(f"\n[INFO] No warmup checkpoint found at {warmup_checkpoint_path}")
             print(f"[INFO] Will train 2DGS for {cfg_model.ingp_stage.initialize} iterations, then save checkpoint.\n")
 
@@ -598,7 +602,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     opacity_reset_protect = cfg_model.training_cfg.opacity_reset_protect
     if_pixel_densify_enhance = cfg_model.settings.pixel_densify_enhance
-    
+
+    # Freeze beta kernel shape parameter if --freeze_beta is specified
+    if args.freeze_beta is not None and args.kernel in ["beta", "beta_scaled"] and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+        # Convert target beta to raw _shape value: beta = sigmoid(_shape) * 5.0
+        # So _shape = logit(beta / 5.0) = log(beta / (5.0 - beta))
+        target_beta = args.freeze_beta
+        if target_beta <= 0 or target_beta >= 5.0:
+            raise ValueError(f"--freeze_beta must be in range (0, 5), got {target_beta}")
+        raw_shape = math.log(target_beta / (5.0 - target_beta))
+        gaussians._shape.data.fill_(raw_shape)
+        gaussians._shape.requires_grad_(False)
+        # Store frozen value for densification/MCMC to use
+        gaussians._frozen_beta_raw = raw_shape
+        # Remove from optimizer to prevent cat_tensors_to_optimizer from re-enabling grad
+        gaussians.optimizer.param_groups = [g for g in gaussians.optimizer.param_groups if g.get("name") != "shape"]
+        actual_beta = torch.sigmoid(torch.tensor(raw_shape)).item() * 5.0
+        print(f"[BETA KERNEL] Shape frozen at β={actual_beta:.3f} (raw={raw_shape:.3f}, requires_grad=False)")
+
     for iteration in range(first_iter, opt.iterations + 1):        
 
         torch.cuda.synchronize()
@@ -1094,7 +1115,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 shape_max = shape_vals.max().item()
                 pct_hard = (shape_vals < 0.5).float().mean().item() * 100
                 pct_soft = (shape_vals > 2.0).float().mean().item() * 100
-                print(f"\n[ITER {iteration}] Beta Kernel Stats: shape={shape_mean:.3f}±{shape_std:.3f} (min={shape_min:.3f}, max={shape_max:.3f})")
+                has_grad = gaussians._shape.requires_grad
+                print(f"\n[ITER {iteration}] Beta Kernel Stats: shape={shape_mean:.3f}±{shape_std:.3f} (min={shape_min:.3f}, max={shape_max:.3f}) [requires_grad={has_grad}]")
                 print(f"  Hard disks (<0.5): {pct_hard:.1f}% | Soft clouds (>2.0): {pct_soft:.1f}% | Reg loss: {shape_reg_loss.item():.6f}")
 
             # Print flex kernel stats every 1000 iterations
@@ -2323,6 +2345,8 @@ if __name__ == "__main__":
                         help="Use random per-pixel background during training for unbiased opacity learning. Eval uses black background.")
     parser.add_argument("--cold", action="store_true",
                         help="Cold start: skip 2DGS warmup phase and optimize Nest representation from scratch (no checkpoint loading, hash_in_CUDA always on)")
+    parser.add_argument("--scratch", action="store_true",
+                        help="Train from scratch: ignore existing warmup checkpoint and train with full warmup phase")
 
     # Anti-aliasing arguments (Zip-NeRF style distance-based hash attenuation)
     parser.add_argument("--aa", type=float, default=0.0,
@@ -2440,8 +2464,10 @@ if __name__ == "__main__":
 
     # Beta kernel arguments
     parser.add_argument("--kernel", type=str, default="gaussian",
-                        choices=["gaussian", "beta", "flex", "general"],
-                        help="Kernel type: 'gaussian' (default exp(-0.5*r²)), 'beta' (learnable pow(1-r², shape) per Gaussian), 'flex' (Gaussian with learnable per-Gaussian beta), or 'general' (Isotropic Generalized Gaussian)")
+                        choices=["gaussian", "beta", "beta_scaled", "flex", "general"],
+                        help="Kernel type: 'gaussian' (default exp(-0.5*r²)), 'beta' (pow(1-r², shape) with r∈[0,1]), 'beta_scaled' (same but r∈[0,3] to match 3σ Gaussian extent), 'flex' (Gaussian with learnable per-Gaussian beta), or 'general' (Isotropic Generalized Gaussian)")
+    parser.add_argument("--freeze_beta", type=float, default=None,
+                        help="Freeze beta kernel shape to a fixed value (e.g., 3.0 for semisoft). Disables shape optimization.")
     parser.add_argument("--lambda_shape", type=float, default=0.001,
                         help="L1 regularization weight on beta kernel shape parameter (pushes toward 0 = hard disks)")
     parser.add_argument("--lambda_flex_beta", type=float, default=0.0001,
@@ -2454,8 +2480,8 @@ if __name__ == "__main__":
                         choices=["basic", "decay", "scaled", "scaled_decay"],
                         help="General kernel regularization mode: 'basic' (constant), 'decay' (linear decay over training), 'scaled' (scaled by RGB loss), 'scaled_decay' (both)")
     parser.add_argument("--aabb", type=str, default="2dgs",
-                        choices=["2dgs", "adr_only", "rect", "adr"],
-                        help="AABB mode: '2dgs' (square, fixed 4σ - default), 'adr_only' (square, AdR cutoff), 'rect' (rectangular, fixed 4σ), 'adr' (rectangular + AdR cutoff - full optimization)")
+                        choices=["2dgs", "adr_only", "rect", "adr", "beta"],
+                        help="AABB mode: '2dgs' (square, fixed 4σ - default), 'adr_only' (square, AdR cutoff), 'rect' (rectangular, fixed 4σ), 'adr' (rectangular + AdR cutoff), 'beta' (fixed r=1 for beta kernels)")
 
     args = parser.parse_args(sys.argv[1:])
 

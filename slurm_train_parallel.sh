@@ -367,6 +367,9 @@ export DATASET_PATH="$DATASET_PATH"
 export RESOLUTION_ARG="$RESOLUTION_ARG"
 export ITERATIONS="$ITERATIONS"
 export EXTRA_ARGS="$EXTRA_ARGS"
+export PARTITION="$PARTITION"
+export ACCOUNT="$ACCOUNT"
+export TIME_LIMIT="$TIME_LIMIT"
 
 # Change to project directory
 cd /data/rg_data/aig/users/z0051beu/Projects/nest-splatting
@@ -402,6 +405,9 @@ export DATASET_PATH="$DATASET_PATH"
 export RESOLUTION_ARG="$RESOLUTION_ARG"
 export ITERATIONS="$ITERATIONS"
 export EXTRA_ARGS="$EXTRA_ARGS"
+export PARTITION="$PARTITION"
+export ACCOUNT="$ACCOUNT"
+export TIME_LIMIT="$TIME_LIMIT"
 
 # Change to project directory
 cd /data/rg_data/aig/users/z0051beu/Projects/nest-splatting
