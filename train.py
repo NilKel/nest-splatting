@@ -108,7 +108,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.kernel_type = args.kernel
 
     # Check for warmup checkpoint in data directory
-    warmup_checkpoint_path = os.path.join(dataset.source_path, "warmup_checkpoint.pth")
+    # If --warmup tag is specified, use warmup_checkpoint_{tag}.pth
+    if args.warmup:
+        warmup_checkpoint_path = os.path.join(dataset.source_path, f"warmup_checkpoint_{args.warmup}.pth")
+    else:
+        warmup_checkpoint_path = os.path.join(dataset.source_path, "warmup_checkpoint.pth")
     loaded_from_warmup = False
     
     # Cold start mode: skip all checkpoint loading
@@ -294,9 +298,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"[ADAPTIVE_GATE] Gate init: {args.gate_init} (sigmoid={torch.sigmoid(torch.tensor(args.gate_init)).item():.2f})")
             print(f"[ADAPTIVE_GATE] Force ratio: {args.force_ratio} ({args.force_ratio*100:.0f}% forced hash during training)")
 
-        # Initialize beta kernel shape parameter (if using beta kernel)
+        # Initialize beta kernel shape parameter (if using beta or beta_scaled kernel)
         print(f"[DEBUG] Checking beta kernel init: args.kernel={args.kernel}")
-        if args.kernel == "beta":
+        if args.kernel in ["beta", "beta_scaled"]:
             # Initialize _shape such that sigmoid(_shape) * 4 + 0.001 starts close to 4.0 (soft Gaussian-like)
             # sigmoid(5.0) ≈ 0.993 -> 0.993 * 4 + 0.001 ≈ 3.97
             n_gaussians = len(gaussians.get_xyz)
@@ -304,9 +308,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             shape_init = torch.full((n_gaussians, 1), shape_init_val, device="cuda").float()
             gaussians._shape = nn.Parameter(shape_init.requires_grad_(True))
             init_shape_val = (torch.sigmoid(torch.tensor(shape_init_val)) * 4.0 + 0.001).item()
-            print(f"[BETA KERNEL] Initialized {n_gaussians} Gaussians with shape parameter")
-            print(f"[BETA KERNEL] Shape tensor: {gaussians._shape.shape}, numel={gaussians._shape.numel()}")
-            print(f"[BETA KERNEL] Initial shape value: {init_shape_val:.3f} (will be pushed toward 0 by regularization)")
+            kernel_name = "BETA" if args.kernel == "beta" else "BETA_SCALED"
+            print(f"[{kernel_name} KERNEL] Initialized {n_gaussians} Gaussians with shape parameter")
+            print(f"[{kernel_name} KERNEL] Shape tensor: {gaussians._shape.shape}, numel={gaussians._shape.numel()}")
+            print(f"[{kernel_name} KERNEL] Initial shape value: {init_shape_val:.3f} (will be pushed toward 0 by regularization)")
         elif args.kernel == "flex":
             # Initialize _flex_beta such that softplus(_flex_beta) starts at 0 (standard Gaussian)
             # softplus(x) = log(1 + exp(x)), so softplus(-5) ≈ 0.007, softplus(0) ≈ 0.693
@@ -922,7 +927,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Beta kernel shape regularization - encourage shapes toward 0 (hard flat disks)
         # Shape in range [0.001, 4.001]: low = hard disk, high = soft Gaussian cloud
         shape_reg_loss = torch.tensor(0.0, device="cuda")
-        if args.kernel == "beta" and args.lambda_shape > 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+        if args.kernel in ["beta", "beta_scaled"] and args.lambda_shape > 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
             # L1 penalty on shape values - pushes toward 0 (hard disks)
             shape_reg_loss = args.lambda_shape * gaussians.get_shape.mean()
 
@@ -1035,8 +1040,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # Add BCE opacity loss to progress bar if active
                 if args.bce and bce_opacity_loss.item() > 0:
                     loss_dict["BCE"] = f"{bce_opacity_loss.item():.{5}f}"
-                # Add beta kernel shape stats to progress bar (always show when using beta kernel)
-                if args.kernel == "beta":
+                # Add beta kernel shape stats to progress bar (always show when using beta/beta_scaled kernel)
+                if args.kernel in ["beta", "beta_scaled"]:
                     loss_dict["ShR"] = f"{shape_reg_loss.item():.5f}"
                     if hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
                         shape_vals = gaussians.get_shape
@@ -1081,7 +1086,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if args.bce:
                     tb_writer.add_scalar('train_loss_patches/bce_opacity_loss', bce_opacity_loss.item(), iteration)
                 # Log beta kernel shape stats
-                if args.kernel == "beta" and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+                if args.kernel in ["beta", "beta_scaled"] and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
                     shape_vals = gaussians.get_shape
                     tb_writer.add_scalar('beta_kernel/shape_mean', shape_vals.mean().item(), iteration)
                     tb_writer.add_scalar('beta_kernel/shape_min', shape_vals.min().item(), iteration)
@@ -1118,7 +1123,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 background_mode = background_mode, bg_hashgrid_model = bg_hashgrid)
 
             # Print beta kernel stats every 1000 iterations
-            if args.kernel == "beta" and iteration % 1000 == 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+            if args.kernel in ["beta", "beta_scaled"] and iteration % 1000 == 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
                 shape_vals = gaussians.get_shape
                 shape_mean = shape_vals.mean().item()
                 shape_std = shape_vals.std().item()
@@ -1127,7 +1132,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 pct_hard = (shape_vals < 0.5).float().mean().item() * 100
                 pct_soft = (shape_vals > 2.0).float().mean().item() * 100
                 has_grad = gaussians._shape.requires_grad
-                print(f"\n[ITER {iteration}] Beta Kernel Stats: shape={shape_mean:.3f}±{shape_std:.3f} (min={shape_min:.3f}, max={shape_max:.3f}) [requires_grad={has_grad}]")
+                kernel_name = "Beta" if args.kernel == "beta" else "Beta Scaled"
+                print(f"\n[ITER {iteration}] {kernel_name} Kernel Stats: shape={shape_mean:.3f}±{shape_std:.3f} (min={shape_min:.3f}, max={shape_max:.3f}) [requires_grad={has_grad}]")
                 print(f"  Hard disks (<0.5): {pct_hard:.1f}% | Soft clouds (>2.0): {pct_soft:.1f}% | Reg loss: {shape_reg_loss.item():.6f}")
 
             # Print flex kernel stats every 1000 iterations
@@ -2495,6 +2501,9 @@ if __name__ == "__main__":
     parser.add_argument("--aabb", type=str, default="2dgs",
                         choices=["2dgs", "adr_only", "rect", "adr", "beta"],
                         help="AABB mode: '2dgs' (square, fixed 4σ - default), 'adr_only' (square, AdR cutoff), 'rect' (rectangular, fixed 4σ), 'adr' (rectangular + AdR cutoff), 'beta' (fixed r=1 for beta kernels)")
+    parser.add_argument("--warmup", type=str, default=None,
+                        help="Warmup checkpoint tag. Creates/loads warmup_checkpoint_{tag}.pth instead of warmup_checkpoint.pth. "
+                             "Useful for maintaining separate warmup checkpoints for different configurations (e.g., --warmup beta).")
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -2536,7 +2545,13 @@ if __name__ == "__main__":
     print(f"Kernel type: {args.kernel.upper()}")
     if args.kernel == "beta":
         print(f"  Beta kernel: learnable per-Gaussian shape parameter")
-        print(f"  - Formula: alpha = opacity * pow(1 - r², shape)")
+        print(f"  - Formula: alpha = opacity * pow(1 - r², shape), r ∈ [0, 1]")
+        print(f"  - Shape range: [0.001, 4.001] (0=hard disk, 4=soft cloud)")
+        print(f"  - Shape regularization: lambda={args.lambda_shape} (L1 penalty pushes toward hard disks)")
+    elif args.kernel == "beta_scaled":
+        print(f"  Beta Scaled kernel: learnable per-Gaussian shape parameter (scaled radius)")
+        print(f"  - Formula: alpha = opacity * pow(1 - (r/3)², shape), r ∈ [0, 3]")
+        print(f"  - Radius scaled by 3 to match 3σ Gaussian extent")
         print(f"  - Shape range: [0.001, 4.001] (0=hard disk, 4=soft cloud)")
         print(f"  - Shape regularization: lambda={args.lambda_shape} (L1 penalty pushes toward hard disks)")
     elif args.kernel == "flex":

@@ -15,14 +15,16 @@ from gaussian_renderer import render, GaussianModel
 from hash_encoder.modules import INGP
 from hash_encoder.config import Config
 from arguments import ModelParams, PipelineParams, get_combined_args
+from utils.loss_utils import ssim
+from lpipsPyTorch import lpips
 
 
 def merge_cfg_to_args(args, cfg_model):
     args.cfg = cfg_model
 
 
-def benchmark_full_testset(gaussians, scene, pipe, ingp, cfg_model, iteration, aabb_mode=0, num_warmup=5):
-    """Benchmark FPS over all test images."""
+def benchmark_full_testset(gaussians, scene, pipe, ingp, cfg_model, iteration, aabb_mode=0, num_warmup=5, compute_metrics=True):
+    """Benchmark FPS and optionally PSNR/SSIM/LPIPS over all test images."""
     test_cameras = scene.getTestCameras()
     if len(test_cameras) == 0:
         return None
@@ -40,17 +42,45 @@ def benchmark_full_testset(gaussians, scene, pipe, ingp, cfg_model, iteration, a
 
         # Benchmark over all test images
         times = []
+        psnrs = []
+        ssims = []
+        lpips_vals = []
+
         for viewpoint in test_cameras:
             torch.cuda.synchronize()
             t0 = time.time()
-            _ = render(viewpoint, gaussians, pipe, bg, ingp=ingp, beta=beta,
+            render_pkg = render(viewpoint, gaussians, pipe, bg, ingp=ingp, beta=beta,
                       iteration=iteration, cfg=cfg_model, aabb_mode=aabb_mode)
             torch.cuda.synchronize()
             times.append(time.time() - t0)
 
+            if compute_metrics:
+                image = render_pkg["render"].clamp(0, 1)
+                gt = viewpoint.original_image.cuda()
+
+                # PSNR
+                mse = torch.mean((image - gt) ** 2)
+                psnr = 10 * torch.log10(1.0 / mse)
+                psnrs.append(psnr.item())
+
+                # SSIM
+                ssims.append(ssim(image.unsqueeze(0), gt.unsqueeze(0)).item())
+
+                # LPIPS
+                lpips_vals.append(lpips(image, gt, net_type='vgg').item())
+
     mean_time = sum(times) / len(times)
     fps = 1.0 / mean_time
-    return fps, mean_time * 1000, len(test_cameras)
+
+    metrics = None
+    if compute_metrics and psnrs:
+        metrics = {
+            'psnr': sum(psnrs) / len(psnrs),
+            'ssim': sum(ssims) / len(ssims),
+            'lpips': sum(lpips_vals) / len(lpips_vals),
+        }
+
+    return fps, mean_time * 1000, len(test_cameras), metrics
 
 
 def main():
@@ -119,6 +149,7 @@ def main():
         1: "adr_only (square, AdR)",
         2: "rect (rectangular, 4σ)",
         3: "adr (rectangular, AdR)",
+        4: "beta (compact r=1)",
     }
 
     results = {}
@@ -127,31 +158,37 @@ def main():
         print(f"\n[BENCHMARK] Testing mode {mode}: {name}...")
         result = benchmark_full_testset(gaussians, scene, pipe, ingp_model, cfg_model, iteration, aabb_mode=mode)
         if result:
-            fps, ms, num_images = result
-            results[mode] = (fps, ms, name)
-            print(f"  FPS: {fps:.2f}, ms/frame: {ms:.2f}")
+            fps, ms, num_images, metrics = result
+            results[mode] = (fps, ms, name, metrics)
+            if metrics:
+                print(f"  FPS: {fps:.2f}, PSNR: {metrics['psnr']:.2f}, SSIM: {metrics['ssim']:.4f}, LPIPS: {metrics['lpips']:.4f}")
+            else:
+                print(f"  FPS: {fps:.2f}, ms/frame: {ms:.2f}")
 
     # Summary table
-    print("\n" + "="*70)
+    print("\n" + "="*95)
     print("AABB MODE BENCHMARK (Full Test Set)")
-    print("="*70)
+    print("="*95)
     print(f"Model: {args.model_path}")
     print(f"Gaussians: {num_gaussians:,}")
     print(f"Kernel: {args.kernel}")
     print(f"Test images: {len(test_cameras)}")
 
-    print(f"\n{'Mode':<5} {'Name':<25} {'FPS':>10} {'ms/frame':>12} {'Speedup':>10}")
-    print("-"*70)
-    
+    print(f"\n{'Mode':<5} {'Name':<25} {'FPS':>8} {'PSNR':>8} {'SSIM':>8} {'LPIPS':>8} {'Speedup':>10}")
+    print("-"*95)
+
     baseline_fps = results[0][0] if 0 in results else 1.0
-    
+
     for mode in sorted(results.keys()):
-        fps, ms, name = results[mode]
+        fps, ms, name, metrics = results[mode]
         speedup = (fps - baseline_fps) / baseline_fps * 100
         speedup_str = f"{speedup:+.1f}%" if mode != 0 else "baseline"
-        print(f"{mode:<5} {name:<25} {fps:>10.2f} {ms:>12.2f} {speedup_str:>10}")
+        if metrics:
+            print(f"{mode:<5} {name:<25} {fps:>8.2f} {metrics['psnr']:>8.2f} {metrics['ssim']:>8.4f} {metrics['lpips']:>8.4f} {speedup_str:>10}")
+        else:
+            print(f"{mode:<5} {name:<25} {fps:>8.2f} {'N/A':>8} {'N/A':>8} {'N/A':>8} {speedup_str:>10}")
 
-    print("="*70)
+    print("="*95)
 
 
 if __name__ == "__main__":

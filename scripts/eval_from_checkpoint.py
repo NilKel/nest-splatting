@@ -26,6 +26,7 @@ from hash_encoder.config import Config
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
+from utils.render_utils import save_img_u8, convert_gray_to_cmap
 from lpipsPyTorch import lpips
 
 
@@ -85,17 +86,35 @@ def benchmark_fps(gaussians, cameras, pipe, ingp, cfg_model, iteration, backgrou
 
 
 def compute_metrics(gaussians, cameras, pipe, ingp, cfg_model, iteration, background,
-                   sort_by_name=True, skybox=None, background_mode="none"):
+                   sort_by_name=True, skybox=None, background_mode="none",
+                   save_renders=False, save_depths=False, output_dir=None, camera_type="test"):
     """Compute PSNR, SSIM, LPIPS metrics over cameras.
 
     Args:
         sort_by_name: If True, sort cameras by image_name for consistent ordering
+        save_renders: If True, save rendered images and GT to output_dir
+        save_depths: If True, save depth maps to output_dir
+        output_dir: Directory to save outputs (model_path if None)
+        camera_type: "test" or "train" for output subdirectory naming
     """
     beta = cfg_model.surfel.tg_beta
 
     # Sort cameras by image_name if requested
     if sort_by_name:
         cameras = sorted(cameras, key=lambda c: c.image_name)
+
+    # Create output directories if saving
+    if save_renders or save_depths:
+        if output_dir is None:
+            raise ValueError("output_dir must be specified when saving renders/depths")
+
+        render_dir = os.path.join(output_dir, f"final_{camera_type}_renders")
+        depth_dir = os.path.join(output_dir, f"final_{camera_type}_depths")
+
+        if save_renders:
+            os.makedirs(render_dir, exist_ok=True)
+        if save_depths:
+            os.makedirs(depth_dir, exist_ok=True)
 
     psnr_values = []
     ssim_values = []
@@ -104,7 +123,7 @@ def compute_metrics(gaussians, cameras, pipe, ingp, cfg_model, iteration, backgr
     cam_names = []
 
     with torch.no_grad():
-        for cam in cameras:
+        for idx, cam in enumerate(cameras):
             render_pkg = render(cam, gaussians, pipe, background, ingp=ingp, beta=beta,
                                iteration=iteration, cfg=cfg_model, skybox=skybox,
                                background_mode=background_mode)
@@ -124,6 +143,29 @@ def compute_metrics(gaussians, cameras, pipe, ingp, cfg_model, iteration, backgr
             cam_names.append(cam.image_name)
 
             print(f"[EVAL] {cam.image_name}: PSNR={psnr_val:.2f} SSIM={ssim_val:.4f} LPIPS={lpips_val:.4f}")
+
+            # Save renders
+            if save_renders:
+                cam_name = cam.image_name
+                rendered_np = rendered.permute(1, 2, 0).cpu().numpy()
+                gt_np = gt.permute(1, 2, 0).cpu().numpy()
+                save_img_u8(gt_np, os.path.join(render_dir, f"{idx:03d}_{cam_name}_gt.png"))
+                save_img_u8(rendered_np, os.path.join(render_dir, f"{idx:03d}_{cam_name}_render.png"))
+
+            # Save depth maps
+            if save_depths:
+                cam_name = cam.image_name
+                depth_expected = render_pkg['depth_expected']  # (1, H, W)
+                depth_median = render_pkg['depth_median']  # (1, H, W)
+
+                depth_expected_np = depth_expected.squeeze(0).cpu().numpy()
+                depth_median_np = depth_median.squeeze(0).cpu().numpy()
+
+                depth_expected_color = convert_gray_to_cmap(depth_expected_np, map_mode='turbo', revert=False)
+                depth_median_color = convert_gray_to_cmap(depth_median_np, map_mode='turbo', revert=False)
+
+                save_img_u8(depth_expected_color, os.path.join(depth_dir, f"{idx:03d}_{cam_name}_depth_expected.png"))
+                save_img_u8(depth_median_color, os.path.join(depth_dir, f"{idx:03d}_{cam_name}_depth_median.png"))
 
     return {
         'psnr': psnr_values,
@@ -156,6 +198,10 @@ def main():
                        help="Evaluate on train cameras")
     parser.add_argument("--sort_by_name", action="store_true", default=True,
                        help="Sort cameras by image_name for consistent ordering")
+    parser.add_argument("--save_renders", action="store_true",
+                       help="Save rendered images and GT to final_{test/train}_renders/")
+    parser.add_argument("--save_depths", action="store_true",
+                       help="Save depth maps to final_{test/train}_depths/")
 
     eval_args = parser.parse_args()
 
@@ -200,6 +246,9 @@ def main():
     temp_parser = ArgumentParser()
     model_params = ModelParams(temp_parser, sentinel=True)
     pipeline_params = PipelineParams(temp_parser)
+
+    # Force eval=True to load test cameras even if model was trained without --eval
+    args.eval = True
 
     dataset = model_params.extract(args)
     pipe = pipeline_params.extract(args)
@@ -291,10 +340,17 @@ def main():
 
     # Metrics
     if not eval_args.fps_only:
-        print(f"\n[METRICS] Computing PSNR/SSIM/LPIPS on {camera_type} set...")
+        save_info = ""
+        if eval_args.save_renders:
+            save_info += " (saving renders)"
+        if eval_args.save_depths:
+            save_info += " (saving depths)"
+        print(f"\n[METRICS] Computing PSNR/SSIM/LPIPS on {camera_type} set{save_info}...")
         metrics = compute_metrics(
             gaussians, cameras, pipe, ingp_model, cfg_model, iteration, background,
-            sort_by_name=eval_args.sort_by_name, skybox=skybox, background_mode=background_mode
+            sort_by_name=eval_args.sort_by_name, skybox=skybox, background_mode=background_mode,
+            save_renders=eval_args.save_renders, save_depths=eval_args.save_depths,
+            output_dir=eval_args.model_path, camera_type=camera_type
         )
 
         print(f"\n[SUMMARY]")

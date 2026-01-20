@@ -139,6 +139,7 @@ def main():
         1: "adr_only (square, AdR)",
         2: "rect (rectangular, 4σ)",
         3: "adr (rectangular, AdR)",
+        4: "beta (fixed r=1 cutoff)",
     }
 
     results = {}

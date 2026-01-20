@@ -435,41 +435,52 @@ __global__ void preprocessCUDA(int P, int D, int M,
 			cutoff = 0.1f;  // Minimal bounding box
 		}
 	} else if (use_adr_cutoff && (kernel_type == 1 || kernel_type == 4) && shapes != nullptr) {
-		// AdR for beta kernel: alpha = opacity * (1 - r²/k²)^shape
+		// AdR for beta kernel with max-pool: need to consider both Beta and Gaussian radii
 		// kernel_type 1: k²=1 (unit disk), kernel_type 4: k²=9 (3σ scaled)
-		// We want: opacity * (1 - r²/k²)^shape >= 1/255
-		// Solving: (1 - r²/k²)^shape >= 1/(255 * opacity)
-		//          1 - r²/k² >= (1/(255 * opacity))^(1/shape)
-		//          r²/k² <= 1 - (1/(255 * opacity))^(1/shape)
-		//          r <= k * sqrt(1 - (1/(255 * opacity))^(1/shape))
 		float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
 		float k = (kernel_type == 4) ? 3.0f : 1.0f;
 
 		float opacity_val = opacities[idx];
 		float shape = shapes[idx];  // Shape parameter
 
-		// Early cull: if opacity < 1/255, Gaussian is invisible everywhere
+		// Early cull: if opacity < 1/255, splat is invisible everywhere
 		if (opacity_val < (1.0f / 255.0f)) {
 			radii[idx] = 0;
 			tiles_touched[idx] = 0;
 			return;
 		}
 
-		// Compute threshold: (1/(255 * opacity))^(1/shape)
-		float threshold = powf(1.0f / (255.0f * opacity_val), 1.0f / shape);
+		// Visibility threshold (alpha_min = 1/255)
+		float ratio = 1.0f / (255.0f * opacity_val);
 
+		// Beta kernel radius: solve opacity * (1 - r²/k²)^shape >= 1/255
+		// => r <= k * sqrt(1 - ratio^(1/shape))
+		float r_beta = 0.0f;
+		float threshold = powf(ratio, 1.0f / shape);
 		if (threshold < 1.0f) {
-			// r = k * sqrt(1 - threshold)
-			cutoff = k * sqrtf(1.0f - threshold);
-		} else {
-			// threshold >= 1 means the Gaussian is too dim to see anywhere
-			cutoff = 0.1f;  // Minimal bounding box
+			r_beta = k * sqrtf(1.0f - threshold);
 		}
-		// Beta kernel has hard cutoff at r=k, so no need to clamp above
+
+		// Gaussian low-pass radius: solve opacity * exp(-r²/2) >= 1/255
+		// => r² <= -2 * ln(ratio) = 2 * ln(255 * opacity)
+		// => r <= sqrt(2 * ln(255 * opacity))
+		float r_lp = 0.0f;
+		float log_term = logf(255.0f * opacity_val);
+		if (log_term > 0.0f) {
+			r_lp = sqrtf(2.0f * log_term);
+		}
+
+		// Combined cutoff: max of Beta and Gaussian radii (lossless)
+		cutoff = fmaxf(r_beta, r_lp);
+
+		// Safety clamp to prevent excessively large bounding boxes
+		cutoff = fminf(cutoff, k + 2.0f);
 	} else if (use_beta_cutoff) {
-		// Beta kernel: fixed r=1 cutoff (compact support) - only for kernel_type 1
-		// For beta_scaled (kernel_type 4), use standard 3σ cutoff instead
-		cutoff = 1.0f;
+		// Beta kernel: fixed cutoff for compact support with low-pass consideration
+		float k = (kernel_type == 4) ? 3.0f : 1.0f;
+		// Low-pass radius for typical opacity (~0.5): sqrt(2 * ln(127.5)) ≈ 3.1
+		float r_lp_typical = sqrtf(2.0f * logf(127.5f));
+		cutoff = fmaxf(k * 1.1f, r_lp_typical);
 	} else {
 #if TIGHTBBOX // no use in the paper, but it indeed help speeds.
 		// the effective extent is now depended on the opacity of gaussian.
@@ -1000,17 +1011,29 @@ renderCUDAsurfelForward(
 
 		float alpha;
 		if (kernel_type == 1 || kernel_type == 4) {
-			// Beta kernel: alpha = opacity * pow(1 - r²/k², shape)
+			// Beta kernel with separate G_obj (Beta) and G_screen (Gaussian low-pass)
 			// kernel_type 1: k²=1 (unit circle cutoff)
 			// kernel_type 4: k²=9 (3σ scaled, matches Gaussian extent)
 			float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
-
-			if (rho >= k_sq)
-				continue;  // Strict cutoff at scaled radius
-
-			float base = 1.0f - rho / k_sq;
 			float shape = collected_shapes[j];
-			alpha = min(0.99f, opa * powf(base, shape));
+
+			// 1. Hard support check on object-space distance (with epsilon for numerical safety)
+			if (rho3d >= k_sq + 1e-6f)
+				continue;  // Outside compact support - skip entirely
+
+			// 2. Object-space Beta kernel (geometry)
+			float base = fmaxf(0.0f, 1.0f - rho3d / k_sq);
+			float alpha_beta = powf(base, shape);
+
+			// 3. Screen-space Gaussian low-pass (anti-aliasing)
+			// Gaussian: exp(-rho2d / 2) where rho2d = FilterInvSquare * d^2
+			float alpha_lp = expf(-rho2d / 2.0f);
+
+			// 4. Max-pool handoff: smooth transition between Beta (close) and Gaussian (far)
+			float kernel_val = fmaxf(alpha_beta, alpha_lp);
+
+			// 5. Final alpha with opacity
+			alpha = fminf(0.99f, opa * kernel_val);
 		} else if (kernel_type == 2) {
 			// Flex kernel: Standard Gaussian with per-Gaussian learnable beta
 			// Same formula as Gaussian but beta comes from shapes array instead of global config

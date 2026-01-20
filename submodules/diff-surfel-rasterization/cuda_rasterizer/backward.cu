@@ -763,20 +763,38 @@ renderCUDAsurfelBackward(
 		float general_pow_term = 0.0f;  // For general kernel gradient: (r²)^(β/2)
 		float general_rho_safe = 0.0f;  // For general kernel gradient: max(rho, 1e-8)
 
+		// For beta kernel max-pool gradient routing
+		bool beta_wins = false;
+		float alpha_beta = 0.0f;
+		float alpha_lp = 0.0f;
+
 		// For beta_scaled kernel (type 4), we need k_sq for gradient computation
 		float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
 
 		if (kernel_type == 1 || kernel_type == 4) {
-			// Beta kernel: alpha = opacity * pow(1 - r²/k², shape)
+			// Beta kernel with separate G_obj (Beta) and G_screen (Gaussian low-pass)
 			// kernel_type 1: k²=1 (unit circle cutoff)
 			// kernel_type 4: k²=9 (3σ scaled, matches Gaussian extent)
-			if (rho >= k_sq)
-				continue;  // Strict cutoff at scaled radius
 
-			base = 1.0f - rho / k_sq;
+			// 1. Hard support check on object-space distance
+			if (rho3d >= k_sq + 1e-6f)
+				continue;  // Outside compact support - skip entirely
+
 			shape_val = collected_shapes[j];
-			G = powf(base, shape_val);
-			alpha = min(0.99f, opa * G);
+
+			// 2. Object-space Beta kernel
+			base = fmaxf(0.0f, 1.0f - rho3d / k_sq);
+			alpha_beta = powf(base, shape_val);
+
+			// 3. Screen-space Gaussian low-pass
+			alpha_lp = expf(-rho2d / 2.0f);
+
+			// 4. Max-pool handoff: track which branch won for gradient routing
+			beta_wins = (alpha_beta >= alpha_lp);
+			G = beta_wins ? alpha_beta : alpha_lp;
+
+			// 5. Final alpha
+			alpha = fminf(0.99f, opa * G);
 		} else if (kernel_type == 2) {
 			// Flex kernel: Standard Gaussian with per-Gaussian learnable beta
 			float power = -0.5f * rho;
@@ -1883,14 +1901,13 @@ renderCUDAsurfelBackward(
 			// Helpful reusable temporary variables
 			float dL_dG = nor_o.w * dL_dalpha;
 
-			if (kernel_type == 1) {
-				// Beta kernel: G = pow(base, shape), dG/dbase = shape * pow(base, shape-1)
-				// dL_dG is dL/dG, need to propagate to dL/drho
-				// For shape gradient: dG/dshape = G * ln(base)
-				if (dL_dshapes != nullptr && base > 1e-7f) {
+			if (kernel_type == 1 || kernel_type == 4) {
+				// Beta kernel with max-pool: gradient only flows through winning branch
+				// Shape gradient only applies when beta branch won
+				if (beta_wins && dL_dshapes != nullptr && base > 1e-7f) {
 					// dL/dshape = dL/dalpha * dalpha/dG * dG/dshape
-					//           = dL/dalpha * opacity * G * ln(base)
-					float dL_dshape = dL_dalpha * opa * G * logf(base);
+					//           = dL/dalpha * opacity * alpha_beta * ln(base)
+					float dL_dshape = dL_dalpha * opa * alpha_beta * logf(base);
 					atomicAdd(&dL_dshapes[global_id], dL_dshape);
 				}
 				// dL_dG stays as nor_o.w * dL_dalpha for position gradient propagation
@@ -1983,9 +2000,15 @@ renderCUDAsurfelBackward(
 				// For General kernel: dG/drho = -0.25 * β * G * pow_term / rho
 				float dG_factor;
 				if (kernel_type == 1 || kernel_type == 4) {
-					// Beta kernel: dG/drho = -shape * G / (base * k_sq), drho/ds.x = 2*s.x
-					// For kernel_type 1: k_sq=1, for kernel_type 4: k_sq=9
-					dG_factor = (base > 1e-7f) ? -shape_val * G / (base * k_sq) : 0.0f;
+					// Beta kernel with max-pool: gradient depends on which branch won
+					if (beta_wins && base > 1e-7f) {
+						// Beta branch: dG/drho3d = -shape * alpha_beta / (base * k_sq)
+						dG_factor = -shape_val * alpha_beta / (base * k_sq);
+					} else {
+						// Gaussian low-pass won, but we're in rho3d branch
+						// alpha_lp depends on rho2d, not rho3d, so gradient is 0
+						dG_factor = 0.0f;
+					}
 				} else if (kernel_type == 2) {
 					// Flex kernel: same as Gaussian, use G_raw for position gradient
 					// dL_dG has already been adjusted in the gradient section above
@@ -2044,9 +2067,15 @@ renderCUDAsurfelBackward(
 				// For General kernel: dG/dd.x = dG/drho * FilterInvSquare * d.x
 				float dG_factor_2d;
 				if (kernel_type == 1 || kernel_type == 4) {
-					// Beta kernel: dG/drho = -shape * G / (base * k_sq)
-					// For kernel_type 1: k_sq=1, for kernel_type 4: k_sq=9
-					dG_factor_2d = (base > 1e-7f) ? -shape_val * G / (base * k_sq) * FilterInvSquare : 0.0f;
+					// Beta kernel with max-pool: gradient depends on which branch won
+					if (!beta_wins) {
+						// Gaussian low-pass won: dG/drho2d = -0.5 * alpha_lp
+						dG_factor_2d = -0.5f * alpha_lp * FilterInvSquare;
+					} else {
+						// Beta branch won, but we're in rho2d branch
+						// alpha_beta depends on rho3d, not rho2d, so gradient is 0
+						dG_factor_2d = 0.0f;
+					}
 				} else if (kernel_type == 2) {
 					// Flex kernel: same as Gaussian, use G_raw
 					dG_factor_2d = -G_raw * FilterInvSquare;
