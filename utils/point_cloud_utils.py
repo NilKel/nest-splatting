@@ -4,6 +4,7 @@
 
 import os
 import numpy as np
+import torch
 from plyfile import PlyData, PlyElement
 
 from utils.graphics_utils import BasicPointCloud
@@ -12,10 +13,59 @@ from utils.sh_utils import SH2RGB
 # Standard cap_max values that get cached
 STANDARD_CAP_VALUES = [40000, 100000, 400000, 1000000]
 
+# Check if fpsample is available for fast FPS (bucket-based QuickFPS algorithm)
+try:
+    import fpsample
+    FPSAMPLE_AVAILABLE = True
+except ImportError:
+    FPSAMPLE_AVAILABLE = False
+
+
+def farthest_point_subsample_cuda(points: torch.Tensor, num_samples: int) -> torch.Tensor:
+    """
+    CUDA-accelerated farthest point sampling (manual implementation).
+    Note: fpsample's QuickFPS is preferred and used by default in farthest_point_subsample().
+
+    Args:
+        points: (N, 3) torch tensor on GPU
+        num_samples: Target number of points to select
+
+    Returns:
+        indices: (num_samples,) tensor of selected point indices
+    """
+    N = points.shape[0]
+    device = points.device
+
+    if num_samples >= N:
+        return torch.arange(N, device=device)
+
+    # Manual CUDA implementation (vectorized distance computation on GPU)
+    selected = torch.zeros(num_samples, dtype=torch.long, device=device)
+    distances = torch.full((N,), float('inf'), device=device)
+
+    # Start with random point
+    selected[0] = torch.randint(N, (1,), device=device)
+
+    for i in range(1, num_samples):
+        # Update distances to nearest selected point (vectorized on GPU)
+        last_selected = points[selected[i-1]]  # (3,)
+        dist_to_last = torch.norm(points - last_selected, dim=1)  # (N,)
+        distances = torch.minimum(distances, dist_to_last)
+
+        # Select farthest point
+        selected[i] = torch.argmax(distances)
+
+        # Progress logging
+        if (i + 1) % 50000 == 0:
+            print(f"  [FPS-CUDA] Progress: {i+1}/{num_samples}")
+
+    return selected
+
 
 def farthest_point_subsample(points: np.ndarray, num_samples: int) -> np.ndarray:
     """
-    Iteratively select farthest points from point cloud using FPS algorithm.
+    Farthest point sampling - uses fpsample's QuickFPS if available (very fast),
+    falls back to CUDA or CPU implementation.
 
     Args:
         points: (N, 3) numpy array of xyz coordinates
@@ -29,6 +79,29 @@ def farthest_point_subsample(points: np.ndarray, num_samples: int) -> np.ndarray
     if num_samples >= N:
         return np.arange(N)
 
+    # Use fpsample's QuickFPS (bucket-based, very fast)
+    if FPSAMPLE_AVAILABLE:
+        # Determine h parameter based on workload
+        # h=3 for small, h=5-7 for medium, h=9 for large
+        if N > 500000:
+            h = 9
+        elif N > 100000:
+            h = 7
+        else:
+            h = 5
+        print(f"  [FPS] Using fpsample QuickFPS (h={h}) ({N:,} -> {num_samples:,} points)")
+        indices = fpsample.bucket_fps_kdline_sampling(points.astype(np.float64), num_samples, h=h)
+        return indices.astype(np.int64)
+
+    # CUDA fallback
+    if torch.cuda.is_available():
+        print(f"  [FPS] Using manual CUDA ({N:,} -> {num_samples:,} points)")
+        points_cuda = torch.from_numpy(points).float().cuda()
+        indices_cuda = farthest_point_subsample_cuda(points_cuda, num_samples)
+        return indices_cuda.cpu().numpy()
+
+    # CPU fallback
+    print(f"  [FPS] Using CPU (CUDA not available)")
     selected = np.zeros(num_samples, dtype=np.int64)
     distances = np.full(N, np.inf)
 

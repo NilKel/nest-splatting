@@ -192,6 +192,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.max_radii2D = ckpt['max_radii2D'].cuda()
         gaussians.spatial_lr_scale = ckpt['spatial_lr_scale']
 
+        # Apply FPS subsampling to loaded Gaussians if mcmc_fps is enabled
+        if args.mcmc_fps and args.cap_max > 0:
+            n_loaded = len(gaussians._xyz)
+            if n_loaded > args.cap_max:
+                print(f"  [FPS] Loaded Gaussians: {n_loaded}, cap_max: {args.cap_max}")
+                print(f"  [FPS] Subsampling loaded Gaussians using FPS...")
+
+                # Use FPS to select indices
+                from utils.point_cloud_utils import farthest_point_subsample
+                xyz_np = gaussians._xyz.detach().cpu().numpy()
+                selected_indices = farthest_point_subsample(xyz_np, args.cap_max)
+                selected_indices = torch.tensor(selected_indices, device="cuda")
+
+                # Subsample all Gaussian parameters
+                gaussians._xyz = nn.Parameter(gaussians._xyz[selected_indices].requires_grad_(True))
+                gaussians._features_dc = nn.Parameter(gaussians._features_dc[selected_indices].requires_grad_(True))
+                gaussians._features_rest = nn.Parameter(gaussians._features_rest[selected_indices].requires_grad_(True))
+                gaussians._scaling = nn.Parameter(gaussians._scaling[selected_indices].requires_grad_(True))
+                gaussians._rotation = nn.Parameter(gaussians._rotation[selected_indices].requires_grad_(True))
+                gaussians._opacity = nn.Parameter(gaussians._opacity[selected_indices].requires_grad_(True))
+                gaussians._appearance_level = nn.Parameter(gaussians._appearance_level[selected_indices].requires_grad_(True))
+                gaussians.max_radii2D = gaussians.max_radii2D[selected_indices]
+
+                # Reset gradient accumulators for new size (will be properly initialized in training_setup)
+                n_new = len(gaussians._xyz)
+                gaussians.xyz_gradient_accum = torch.zeros((n_new, 1), device="cuda")
+                gaussians.feat_gradient_accum = torch.zeros((n_new, 1), device="cuda")
+                gaussians.denom = torch.zeros((n_new, 1), device="cuda")
+
+                print(f"  [FPS] Subsampled to {n_new} Gaussians")
+            else:
+                print(f"  [FPS] Skipping - loaded Gaussians ({n_loaded}) <= cap_max ({args.cap_max})")
+
         # Create scene (won't reinitialize Gaussians)
         gaussians._loaded_from_checkpoint = True
         scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max, full_args=args)
@@ -460,7 +493,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     state[k] = v.cuda()
         
         # Restore densification state (critical for identical behavior)
-        if 'xyz_gradient_accum' in ckpt:
+        # Skip if FPS subsampling was applied - the sizes won't match
+        fps_was_applied = args.mcmc_fps and args.cap_max > 0 and len(gaussians._xyz) < ckpt['xyz'].shape[0]
+        if 'xyz_gradient_accum' in ckpt and not fps_was_applied:
             gaussians.xyz_gradient_accum = ckpt['xyz_gradient_accum'].cuda()
             gaussians.denom = ckpt['denom'].cuda()
             if 'feat_gradient_accum' in ckpt:
@@ -1455,7 +1490,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     print("="*70)
     render_final_images(scene, gaussians, pipe, eval_background, final_ingp, beta, iteration, cfg_model, args,
                         cameras=scene.getTrainCameras(), output_subdir='final_train_renders', metrics_file='train_metrics.txt',
-                        skip_decomposition=True, skybox=skybox, background_mode=background_mode, bg_hashgrid=bg_hashgrid)
+                        stride=25, skip_decomposition=True, skybox=skybox, background_mode=background_mode, bg_hashgrid=bg_hashgrid)
     
     # Save training log with point count and framerate
     save_training_log(scene, gaussians, final_ingp, pipe, args, cfg_model, iteration)
