@@ -229,8 +229,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians._loaded_from_checkpoint = True
         scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max, full_args=args)
 
-        # Initialize per-Gaussian features for cat/cat_dropout mode (trained from scratch after warmup)
-        if args.method in ["cat", "cat_dropout"] and args.hybrid_levels > 0:
+        # Initialize per-Gaussian features for cat/cat_dropout/3D_direct/3D_direct_fused mode (trained from scratch after warmup)
+        if args.method in ["cat", "cat_dropout", "3D_direct", "3D_direct_fused", "3D_direct_lean"] and args.hybrid_levels > 0:
             per_level_dim = 4  # From config encoding.hashgrid.dim
             gaussians._gaussian_feat_dim = args.hybrid_levels * per_level_dim
             gaussian_feats = torch.zeros((len(gaussians.get_xyz), gaussians._gaussian_feat_dim), device="cuda").float()
@@ -330,6 +330,69 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"[ADAPTIVE_GATE] Per-Gaussian features (coarse): {gaussians._gaussian_feat_dim}D")
             print(f"[ADAPTIVE_GATE] Gate init: {args.gate_init} (sigmoid={torch.sigmoid(torch.tensor(args.gate_init)).item():.2f})")
             print(f"[ADAPTIVE_GATE] Force ratio: {args.force_ratio} ({args.force_ratio*100:.0f}% forced hash during training)")
+        elif args.method == "3D":
+            # 3D mode: per-Gaussian features for intersection-based SH rendering
+            # Uses cat-style split: hybrid_levels for per-Gaussian (coarse), rest for hashgrid (fine)
+            # Combined with hash features → MLP → SH coefficients
+            num_levels = cfg_model.encoding.levels
+            per_level_dim = cfg_model.encoding.hashgrid.dim
+            gauss_feat_dim = args.hybrid_levels * per_level_dim  # Coarse levels as per-Gaussian features
+            gaussians._gaussian_feat_dim = gauss_feat_dim
+
+            # Initialize per-Gaussian features to zeros (matching CAT mode and 3D_direct)
+            n_gaussians = len(gaussians.get_xyz)
+            gaussian_feats = torch.zeros((n_gaussians, gauss_feat_dim), device="cuda").float()
+            gaussians._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+
+            # Store config for renderer
+            gaussians._3D_mode = True
+
+            print(f"[3D MODE] Initialized {n_gaussians} Gaussians (cat-style)")
+            print(f"[3D MODE] Total levels: {num_levels}, Hybrid levels: {args.hybrid_levels}")
+            print(f"[3D MODE] Per-Gaussian features (coarse): {args.hybrid_levels} × {per_level_dim} = {gauss_feat_dim}D")
+            print(f"[3D MODE] Hashgrid features (fine): {num_levels - args.hybrid_levels} × {per_level_dim} = {(num_levels - args.hybrid_levels) * per_level_dim}D")
+            print(f"[3D MODE] Max intersections per pixel: {args.max_intersections_per_pixel}")
+
+        elif args.method == "3D_direct":
+            # 3D_direct mode: per-Gaussian features for intersection-based direct RGB rendering
+            # Uses cat-style split: hybrid_levels for per-Gaussian (coarse), rest for hashgrid (fine)
+            # Combined with hash features + view encoding → MLP → RGB (no SH step)
+            num_levels = cfg_model.encoding.levels
+            per_level_dim = cfg_model.encoding.hashgrid.dim
+            gauss_feat_dim = args.hybrid_levels * per_level_dim  # Coarse levels as per-Gaussian features
+            gaussians._gaussian_feat_dim = gauss_feat_dim
+
+            # Initialize per-Gaussian features to zeros (matching CAT mode)
+            n_gaussians = len(gaussians.get_xyz)
+            gaussian_feats = torch.zeros((n_gaussians, gauss_feat_dim), device="cuda").float()
+            gaussians._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+
+            # Store config for renderer
+            gaussians._3D_direct_mode = True
+
+            print(f"[3D_DIRECT MODE] Initialized {n_gaussians} Gaussians (cat-style)")
+            print(f"[3D_DIRECT MODE] Total levels: {num_levels}, Hybrid levels: {args.hybrid_levels}")
+            print(f"[3D_DIRECT MODE] Per-Gaussian features (coarse): {args.hybrid_levels} × {per_level_dim} = {gauss_feat_dim}D")
+            print(f"[3D_DIRECT MODE] Hashgrid features (fine): {num_levels - args.hybrid_levels} × {per_level_dim} = {(num_levels - args.hybrid_levels) * per_level_dim}D")
+            print(f"[3D_DIRECT MODE] Max intersections per pixel: {args.max_intersections_per_pixel}")
+
+        elif args.method in ["3D_direct_fused", "3D_direct_lean"]:
+            # 3D_direct_fused/lean mode: fused in-kernel MLP rendering
+            # Like cat mode but MLP runs inside CUDA kernel, outputs RGB directly
+            num_levels = cfg_model.encoding.levels
+            per_level_dim = cfg_model.encoding.hashgrid.dim
+            gauss_feat_dim = args.hybrid_levels * per_level_dim  # Coarse levels as per-Gaussian features
+            gaussians._gaussian_feat_dim = gauss_feat_dim
+
+            # Initialize per-Gaussian features to zeros (matching CAT mode)
+            n_gaussians = len(gaussians.get_xyz)
+            gaussian_feats = torch.zeros((n_gaussians, gauss_feat_dim), device="cuda").float()
+            gaussians._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
+
+            print(f"[3D_DIRECT_FUSED MODE] Initialized {n_gaussians} Gaussians (cat-style)")
+            print(f"[3D_DIRECT_FUSED MODE] Total levels: {num_levels}, Hybrid levels: {args.hybrid_levels}")
+            print(f"[3D_DIRECT_FUSED MODE] Per-Gaussian features (coarse): {args.hybrid_levels} × {per_level_dim} = {gauss_feat_dim}D")
+            print(f"[3D_DIRECT_FUSED MODE] Hashgrid features (fine): {num_levels - args.hybrid_levels} × {per_level_dim} = {(num_levels - args.hybrid_levels) * per_level_dim}D")
 
         # Initialize beta kernel shape parameter (if using beta or beta_scaled kernel)
         print(f"[DEBUG] Checking beta kernel init: args.kernel={args.kernel}")
@@ -481,9 +544,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.training_setup(opt)
         
         # Load optimizer state from warmup checkpoint
-        # For cat/adaptive/adaptive_cat/adaptive_zero/adaptive_gate/diffuse mode, new params won't be in saved state - they train from scratch
+        # For cat/adaptive/adaptive_cat/adaptive_zero/adaptive_gate/diffuse/3D/3D_direct/3D_direct_fused mode, new params won't be in saved state - they train from scratch
         # Also skip for beta/flex/general kernels which add new _shape/_flex_beta params not in warmup checkpoint
-        if args.method not in ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse"] and args.kernel == "gaussian":
+        if args.method not in ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean"] and args.kernel == "gaussian":
             gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
         
         # Move optimizer state to GPU
@@ -756,10 +819,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             dropout_lambda = args.dropout_lambda, is_training = True, aabb_mode = args.aabb,
             aa = args.aa, aa_threshold = args.aa_threshold, skybox = active_skybox,
             background_mode = background_mode, bg_hashgrid = active_bg_hashgrid,
-            detach_hash_grad = args.detach_hash_grad)
+            detach_hash_grad = args.detach_hash_grad, max_intersections_per_pixel = args.max_intersections_per_pixel)
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-    
+        
         gt_image = viewpoint_cam.original_image.cuda()
         
         # Apply random background for unbiased opacity training
@@ -772,6 +835,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             random_bg_color = torch.rand(3, 1, 1, device="cuda")
             random_bg = random_bg_color.expand(3, H, W)
             rend_alpha = render_pkg["rend_alpha"]
+
+            # In 3D/3D_direct mode, detach rend_alpha to prevent double counting of geometry gradients.
+            # Geometry grads flow through IntersectionOpacityGrad; using (1-rend_alpha) would create
+            # a second gradient path through native backward, causing gradients to be ~3x too large.
+            if args.method in ["3D", "3D_direct"]:
+                rend_alpha = rend_alpha.detach()
 
             # Apply random background to rendered image
             image = image + (1.0 - rend_alpha) * random_bg
@@ -961,8 +1030,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Beta kernel shape regularization - encourage shapes toward 0 (hard flat disks)
         # Shape in range [0.001, 4.001]: low = hard disk, high = soft Gaussian cloud
+        # Applied only in the last shape_iter iterations (or always if shape_iter == 0)
         shape_reg_loss = torch.tensor(0.0, device="cuda")
-        if args.kernel in ["beta", "beta_scaled"] and args.lambda_shape > 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+        shape_phase_active = args.shape_iter == 0 or iteration > (opt.iterations - args.shape_iter)
+        if args.kernel in ["beta", "beta_scaled"] and args.lambda_shape > 0 and shape_phase_active and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
             # L1 penalty on shape values - pushes toward 0 (hard disks)
             shape_reg_loss = args.lambda_shape * gaussians.get_shape.mean()
 
@@ -978,8 +1049,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Beta in range [2.0, 8.0]: 2.0 = standard Gaussian, 8.0 = super-Gaussian (box)
         # Positive lambda pushes toward 8 (hard), negative lambda pushes toward 2 (soft)
         # Modes: basic (constant), decay (linear decay), scaled (by RGB loss), scaled_decay (both)
+        # Applied only in the last shape_iter iterations (or always if shape_iter == 0)
         general_beta_reg_loss = torch.tensor(0.0, device="cuda")
-        if args.kernel == "general" and args.lambda_shape != 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+        if args.kernel == "general" and args.lambda_shape != 0 and shape_phase_active and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
             effective_lambda = args.lambda_shape
 
             # Apply decay if requested
@@ -1005,10 +1077,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         total_loss.backward()
 
+        # Apply MLP gradients for 3D_direct_fused mode
+        # MLP weights are in CUDA constant memory, gradients computed in CUDA backward
+        if ingp is not None and hasattr(ingp, 'is_3D_direct_fused_mode') and ingp.is_3D_direct_fused_mode:
+            # Import from lean library if using lean mode
+            if hasattr(ingp, 'is_3D_direct_lean_mode') and ingp.is_3D_direct_lean_mode:
+                from diff_surfel_3D import get_mlp_grads
+            else:
+                from diff_surfel_rasterization import get_mlp_grads
+            mlp_grads = get_mlp_grads()
+            if mlp_grads is not None:
+                grad_W1, grad_W2, grad_W3 = mlp_grads
+                mlp = ingp.mlp_fused
+                # Accumulate gradients (in case there are multiple backward passes)
+                # MLP layout: Linear(41, 32, bias=False), Linear(32, 32, bias=False), Linear(32, 3, bias=False)
+                if mlp[0].weight.grad is None:
+                    mlp[0].weight.grad = grad_W1.clone()
+                else:
+                    mlp[0].weight.grad += grad_W1
+                if mlp[2].weight.grad is None:
+                    mlp[2].weight.grad = grad_W2.clone()
+                else:
+                    mlp[2].weight.grad += grad_W2
+                if mlp[4].weight.grad is None:
+                    mlp[4].weight.grad = grad_W3.clone()
+                else:
+                    mlp[4].weight.grad += grad_W3
+
         # Total variation regularization on hashgrid - penalizes uniform regions while preserving edges
         # Must be called after backward() and before optimizer.step() as it directly modifies gradients
         if args.tv_hash > 0 and ingp is not None and hasattr(ingp, 'hash_encoding') and ingp.hash_encoding is not None:
             ingp.hash_encoding.grad_total_variation(weight=args.tv_hash)
+
 
         iter_end.record()
         
@@ -1340,6 +1440,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 error_name = os.path.join(output_path,  str(iteration) + '_diff.png')
                 save_img_u8(color_map, error_name)
 
+                # Save decomposed renders for 3D_direct and cat modes (gaussian-only and hash-only)
+                if args.method in ["3D_direct", "cat"] and ingp is not None:
+                    # Gaussian-only render (hash features zeroed)
+                    render_pkg_gauss = render(viewpoint_cam, gaussians, pipe, current_bg, ingp=ingp,
+                        beta=beta, iteration=iteration, cfg=cfg_model, decompose_mode='gaussian_only',
+                        is_training=False, max_intersections_per_pixel=args.max_intersections_per_pixel)
+                    gauss_image = torch.clamp(render_pkg_gauss["render"], 0.0, 1.0)
+                    gauss_name = os.path.join(output_path, str(iteration) + '_gaussian.png')
+                    save_img_u8(gauss_image.permute(1,2,0).detach().cpu().numpy(), gauss_name)
+
+                    # Hash-only render (gaussian features zeroed)
+                    render_pkg_hash = render(viewpoint_cam, gaussians, pipe, current_bg, ingp=ingp,
+                        beta=beta, iteration=iteration, cfg=cfg_model, decompose_mode='ngp_only',
+                        is_training=False, max_intersections_per_pixel=args.max_intersections_per_pixel)
+                    hash_image = torch.clamp(render_pkg_hash["render"], 0.0, 1.0)
+                    hash_name = os.path.join(output_path, str(iteration) + '_hash.png')
+                    save_img_u8(hash_image.permute(1,2,0).detach().cpu().numpy(), hash_name)
+
                 # Save FG/BG separation if skybox is active
                 if "render_fg" in render_pkg:
                     fg_image = torch.clamp(render_pkg["render_fg"], 0.0, 1.0)
@@ -1577,7 +1695,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
         f.write("=" * 50 + "\n\n")
 
         f.write(f"Method: {args.method}\n")
-        if args.method in ["cat", "cat_dropout"]:
+        if args.method in ["cat", "cat_dropout", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean"]:
             f.write(f"Hybrid Levels: {args.hybrid_levels}\n")
             if args.method == "cat_dropout":
                 f.write(f"Dropout Lambda: {args.dropout_lambda}\n")
@@ -2374,8 +2492,8 @@ if __name__ == "__main__":
     
     # Method argument - baseline, cat, cat_dropout, adaptive, adaptive_add, adaptive_cat, adaptive_zero, adaptive_gate, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid"],
-                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'cat_dropout' (cat with hash dropout during training - use --dropout_lambda), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'adaptive_zero' (cat with weighted hash vs zeros - w=0 skips hash query), 'adaptive_gate' (VQ-AD style gating: soft→STE→hard, L1 regularization toward zeros), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), or 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual)")
+                        choices=["baseline", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean"],
+                        help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'cat_dropout' (cat with hash dropout during training - use --dropout_lambda), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'adaptive_zero' (cat with weighted hash vs zeros - w=0 skips hash query), 'adaptive_gate' (VQ-AD style gating: soft→STE→hard, L1 regularization toward zeros), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual), '3D' (intersection-based SH rendering), '3D_direct' (intersection-based RGB MLP), or '3D_direct_fused' (fused in-kernel MLP, no intersection buffer)")
     parser.add_argument("--hybrid_levels", type=int, default=3,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
     parser.add_argument("--decompose_mode", type=str, default=None,
@@ -2454,6 +2572,13 @@ if __name__ == "__main__":
     parser.add_argument("--temp_anneal_end", type=int, default=25000,
                         help="Iteration to reach final temperature")
 
+    # 3D mode arguments (intersection-based SH rendering, uses --hybrid_levels like cat mode)
+    parser.add_argument("--max_intersections_per_pixel", type=int, default=32,
+                        help="Maximum intersections per pixel for 3D mode (memory cap, default 32)")
+    parser.add_argument("--mlp_3D_hidden", type=int, default=16,
+                        help="Hidden dimension for 3D mode MLP (default 32, ≤128 for FullyFusedMLP)")
+    parser.add_argument("--mlp_3D_layers", type=int, default=2,
+                        help="Number of hidden layers for 3D mode MLP (default 2)")
 
     # Parabola regularization (additive with BCE)
     parser.add_argument("--lambda_parabola", type=float, default=0.0,
@@ -2524,6 +2649,8 @@ if __name__ == "__main__":
                         help="Detach positional gradients from hashgrid in CAT mode (geometry follows per-Gaussian features only)")
     parser.add_argument("--lambda_shape", type=float, default=0.001,
                         help="L1 regularization weight on beta kernel shape parameter (pushes toward 0 = hard disks)")
+    parser.add_argument("--shape_iter", type=int, default=0,
+                        help="Apply shape regularization for the last N iterations only (0 = always active, default: 0)")
     parser.add_argument("--lambda_flex_beta", type=float, default=0.0001,
                         help="L1 regularization weight on flex kernel beta parameter (prevents runaway sharpening)")
     parser.add_argument("--l1_hash", type=float, default=0.0,
@@ -2582,13 +2709,15 @@ if __name__ == "__main__":
         print(f"  Beta kernel: learnable per-Gaussian shape parameter")
         print(f"  - Formula: alpha = opacity * pow(1 - r², shape), r ∈ [0, 1]")
         print(f"  - Shape range: [0.001, 4.001] (0=hard disk, 4=soft cloud)")
-        print(f"  - Shape regularization: lambda={args.lambda_shape} (L1 penalty pushes toward hard disks)")
+        shape_iter_str = f"last {args.shape_iter} iterations" if args.shape_iter > 0 else "always active"
+        print(f"  - Shape regularization: lambda={args.lambda_shape} ({shape_iter_str})")
     elif args.kernel == "beta_scaled":
         print(f"  Beta Scaled kernel: learnable per-Gaussian shape parameter (scaled radius)")
         print(f"  - Formula: alpha = opacity * pow(1 - (r/3)², shape), r ∈ [0, 3]")
         print(f"  - Radius scaled by 3 to match 3σ Gaussian extent")
         print(f"  - Shape range: [0.001, 4.001] (0=hard disk, 4=soft cloud)")
-        print(f"  - Shape regularization: lambda={args.lambda_shape} (L1 penalty pushes toward hard disks)")
+        shape_iter_str = f"last {args.shape_iter} iterations" if args.shape_iter > 0 else "always active"
+        print(f"  - Shape regularization: lambda={args.lambda_shape} ({shape_iter_str})")
     elif args.kernel == "flex":
         print(f"  Flex kernel: Gaussian with learnable per-Gaussian beta (sharpening)")
         print(f"  - Formula: G = exp(power); alpha = (1+beta)*G / (1+beta*G)")
@@ -2598,7 +2727,8 @@ if __name__ == "__main__":
         print(f"  General kernel: Isotropic Generalized Gaussian")
         print(f"  - Formula: alpha = opacity * exp(-0.5 * (r²)^(β/2))")
         print(f"  - Beta range: [2.0, 8.0] via sigmoid*6+2 (2=Gaussian, 8=super-Gaussian/box)")
-        print(f"  - Beta regularization: lambda={args.lambda_shape}, mode={args.genreg}")
+        shape_iter_str = f"last {args.shape_iter} iterations" if args.shape_iter > 0 else "always"
+        print(f"  - Beta regularization: lambda={args.lambda_shape}, mode={args.genreg}, active={shape_iter_str}")
         if args.genreg == "basic":
             print(f"    (constant regularization throughout training)")
         elif args.genreg == "decay":

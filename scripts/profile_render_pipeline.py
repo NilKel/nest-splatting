@@ -185,7 +185,7 @@ def profile_render_detailed(viewpoint_camera, pc, pipe, bg_color, ingp, cfg, ite
                 features=features_table,
                 offsets=offsets,
                 gridrange=gridrange,
-                render_mode=6 if is_cat_mode else 0,  # 6 = cat mode
+                render_mode=1 if is_cat_mode else 0,  # 1 = cat mode
                 shapes=shapes,
                 kernel_type=kernel_type,
                 aabb_mode=0,

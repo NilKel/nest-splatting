@@ -376,16 +376,16 @@ class GaussianModel:
         ap_level = init_level * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
         self._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
         
-        # Initialize per-Gaussian features for cat mode
+        # Initialize per-Gaussian features for cat mode, 3D mode, and 3D_direct mode
         # Dimension = hybrid_levels * per_level_dim (default: 3 * 4 = 12)
-        if hasattr(args, 'method') and args.method == "cat" and hasattr(args, 'hybrid_levels'):
+        if hasattr(args, 'method') and args.method in ["cat", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean"] and hasattr(args, 'hybrid_levels'):
             per_level_dim = 4  # From config encoding.hashgrid.dim
             self._gaussian_feat_dim = args.hybrid_levels * per_level_dim
         else:
             self._gaussian_feat_dim = 0
         
         if self._gaussian_feat_dim > 0:
-            gaussian_feats = torch.zeros((self.get_xyz.shape[0], self._gaussian_feat_dim), device="cuda").float()
+            gaussian_feats = torch.randn((self.get_xyz.shape[0], self._gaussian_feat_dim), device="cuda").float() * 0.01
             self._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
         else:
             self._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
@@ -654,13 +654,13 @@ class GaussianModel:
             self._gaussian_feat_dim = len(gf_names)
             self._gaussian_features = nn.Parameter(torch.tensor(gaussian_feats, dtype=torch.float, device="cuda").requires_grad_(True))
             print(f"Loaded {self._gaussian_feat_dim}D per-Gaussian features for cat mode")
-        elif args is not None and hasattr(args, 'method') and args.method == "cat" and hasattr(args, 'hybrid_levels'):
-            # Cat mode but no features in PLY - initialize them (for old checkpoints)
+        elif args is not None and hasattr(args, 'method') and args.method in ["cat", "3D", "3D_direct"] and hasattr(args, 'hybrid_levels'):
+            # Cat/3D mode but no features in PLY - initialize them (for old checkpoints)
             per_level_dim = 4
             self._gaussian_feat_dim = args.hybrid_levels * per_level_dim
-            gaussian_feats = torch.zeros((xyz.shape[0], self._gaussian_feat_dim), device="cuda").float()
+            gaussian_feats = torch.randn((xyz.shape[0], self._gaussian_feat_dim), device="cuda").float() * 0.01
             self._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
-            print(f"Warning: No per-Gaussian features in PLY, initialized {self._gaussian_feat_dim}D zeros for cat mode")
+            print(f"Warning: No per-Gaussian features in PLY, initialized {self._gaussian_feat_dim}D randn*0.01 for {args.method} mode")
         else:
             self._gaussian_feat_dim = 0
             self._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))

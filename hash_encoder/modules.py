@@ -74,9 +74,20 @@ class INGP(nn.Module):
         # Store args for adaptive_gate mode configuration (VQ-AD style gating: soft -> STE -> hard)
         self.is_adaptive_gate_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive_gate"
         self.adaptive_gate_inference = args is not None and hasattr(args, 'adaptive_gate_inference') and args.adaptive_gate_inference
+        # Store args for 3D mode (intersection buffer + SH blending in PyTorch) - defined early for hybrid_levels check
+        self.is_3D_mode = args is not None and hasattr(args, 'method') and args.method == "3D"
+        # Store args for 3D_direct mode (intersection buffer + direct RGB like cat mode's 2D MLP)
+        self.is_3D_direct_mode = args is not None and hasattr(args, 'method') and args.method == "3D_direct"
+        # Store args for 3D_direct_fused mode (fused in-kernel MLP, no intersection buffer)
+        self.is_3D_direct_fused_mode = args is not None and hasattr(args, 'method') and args.method == "3D_direct_fused"
+        # Store args for 3D_direct_lean mode (same as fused but uses lean rasterizer library for faster builds)
+        self.is_3D_direct_lean_mode = args is not None and hasattr(args, 'method') and args.method == "3D_direct_lean"
+        # Treat lean mode same as fused mode for MLP/rendering logic
+        if self.is_3D_direct_lean_mode:
+            self.is_3D_direct_fused_mode = True
 
-        # hybrid_levels is used by cat, cat_dropout, adaptive_cat, adaptive_zero, and adaptive_gate modes
-        self.hybrid_levels = args.hybrid_levels if (self.is_cat_mode or self.is_cat_dropout_mode or self.is_adaptive_cat_mode or self.is_adaptive_zero_mode or self.is_adaptive_gate_mode) and hasattr(args, 'hybrid_levels') else 0
+        # hybrid_levels is used by cat, cat_dropout, adaptive_cat, adaptive_zero, adaptive_gate, 3D, 3D_direct, and 3D_direct_fused modes
+        self.hybrid_levels = args.hybrid_levels if (self.is_cat_mode or self.is_cat_dropout_mode or self.is_adaptive_cat_mode or self.is_adaptive_zero_mode or self.is_adaptive_gate_mode or self.is_3D_mode or self.is_3D_direct_mode or self.is_3D_direct_fused_mode) and hasattr(args, 'hybrid_levels') else 0
 
         # Determine method - baseline uses C2F, all other methods disable it
         self.method = args.method if args is not None and hasattr(args, 'method') else "baseline"
@@ -129,7 +140,116 @@ class INGP(nn.Module):
             # MLP input is always total_levels * dim (buffer size is constant)
             self.feat_dim = cfg_model.encoding.levels * cfg_model.encoding.hashgrid.dim # + 3
             self.mlp_rgb = self.build_mlp(cfg_model.rgb, input_dim=self.feat_dim + view_enc_dir, output_dim = 3)
-        
+
+        # 3D mode: Additional MLP for intersection-based SH rendering
+        # Takes hash_features + per-Gaussian features, outputs SH coefficients
+        # Uses cat-style split: hybrid_levels for per-Gaussian (coarse), rest for hashgrid (fine)
+        self.mlp_3D = None
+        if self.is_3D_mode:
+            # Cat-style dimensions: coarse (per-Gaussian) + fine (hashgrid) = total
+            total_levels = cfg_model.encoding.levels
+            level_dim = cfg_model.encoding.hashgrid.dim
+            hash_dim = (total_levels - self.hybrid_levels) * level_dim  # Fine levels from hashgrid
+            gauss_feat_dim = self.hybrid_levels * level_dim  # Coarse levels as per-Gaussian features
+            mlp_3D_input = total_levels * level_dim  # Total: hash + Gaussian = all levels
+            mlp_3D_output = 48  # 16 SH coefficients × 3 RGB channels
+            mlp_3D_hidden = getattr(args, 'mlp_3D_hidden', 32)  # Default 32 (same as 3D_direct)
+            mlp_3D_layers = getattr(args, 'mlp_3D_layers', 2)  # Default 2 hidden layers
+
+            # Store dimensions for use in forward pass
+            self.mlp_3D_hash_dim = hash_dim
+            self.mlp_3D_gauss_dim = gauss_feat_dim
+
+            print(f'[3D MODE] Building mlp_3D (cat-style):')
+            print(f'  Coarse (per-Gaussian): {self.hybrid_levels} levels × {level_dim}D = {gauss_feat_dim}D')
+            print(f'  Fine (hashgrid): {total_levels - self.hybrid_levels} levels × {level_dim}D = {hash_dim}D')
+            print(f'  Total input: {mlp_3D_input}D')
+            print(f'  Hidden: {mlp_3D_hidden} neurons × {mlp_3D_layers} layers')
+            print(f'  Output: {mlp_3D_output}D (16 SH coeffs × 3 RGB)')
+
+            # Use FullyFusedMLP for speed (requires hidden_dim ≤ 128)
+            self.mlp_3D = tcnn.Network(
+                n_input_dims=mlp_3D_input,
+                n_output_dims=mlp_3D_output,
+                network_config={
+                    "otype": "FullyFusedMLP" if mlp_3D_hidden <= 128 else "CutlassMLP",
+                    "activation": "ReLU",
+                    "output_activation": "None",
+                    "n_neurons": mlp_3D_hidden,
+                    "n_hidden_layers": mlp_3D_layers,
+                },
+            )
+
+        # 3D_direct mode: Like 3D mode but outputs RGB directly (like cat mode's 2D MLP)
+        # Takes (hash_features + per-Gaussian features + view_encoding) → RGB
+        # Uses PyTorch MLP (float32) for simple gradient comparison with 3D_lean CUDA MLP
+        self.mlp_3D_direct = None
+        if self.is_3D_direct_mode:
+            total_levels = cfg_model.encoding.levels
+            level_dim = cfg_model.encoding.hashgrid.dim
+            hash_dim = (total_levels - self.hybrid_levels) * level_dim
+            gauss_feat_dim = self.hybrid_levels * level_dim
+            mlp_input = total_levels * level_dim + view_enc_dir  # features + view encoding
+            mlp_output = 3  # RGB directly
+            mlp_hidden = 32  # Match CUDA MLP hidden dim
+
+            self.mlp_3D_direct_hash_dim = hash_dim
+            self.mlp_3D_direct_gauss_dim = gauss_feat_dim
+
+            print(f'[3D_DIRECT MODE] Building mlp_3D_direct (PyTorch MLP, float32):')
+            print(f'  Coarse (per-Gaussian): {self.hybrid_levels} levels × {level_dim}D = {gauss_feat_dim}D')
+            print(f'  Fine (hashgrid): {total_levels - self.hybrid_levels} levels × {level_dim}D = {hash_dim}D')
+            print(f'  View encoding: {view_enc_dir}D')
+            print(f'  Total input: {mlp_input}D')
+            print(f'  Hidden: {mlp_hidden} neurons × 2 layers')
+            print(f'  Output: {mlp_output}D (RGB)')
+
+            # Use PyTorch MLP (float32) instead of tcnn for simpler gradient comparison
+            # Architecture matches 3D_lean CUDA MLP: 40D → 32D (ReLU) → 32D (ReLU) → 3D
+            self.mlp_3D_direct = nn.Sequential(
+                nn.Linear(mlp_input, mlp_hidden),  # W1: [40, 32], b1: [32]
+                nn.ReLU(),
+                nn.Linear(mlp_hidden, mlp_hidden),  # W2: [32, 32], b2: [32]
+                nn.ReLU(),
+                nn.Linear(mlp_hidden, mlp_output),  # W3: [32, 3], b3: [3]
+                # Note: sigmoid applied after in forward pass
+            ).cuda()
+
+        # 3D_direct_fused mode: PyTorch MLP for in-kernel evaluation
+        # Uses explicit weight matrices (not tcnn) so we can upload to CUDA constant memory
+        # Architecture: 40D input → 32D hidden (ReLU) × 2 → 3D RGB (sigmoid in CUDA)
+        self.mlp_fused = None
+        if self.is_3D_direct_fused_mode:
+            total_levels = cfg_model.encoding.levels
+            level_dim = cfg_model.encoding.hashgrid.dim
+            feat_dim = total_levels * level_dim  # 24D (6 levels × 4D)
+            view_enc_dim = 16  # Positional encoding for view direction
+            mlp_input_dim = feat_dim + view_enc_dim  # 40D
+
+            print(f'[3D_DIRECT_FUSED MODE] Building bias-free PyTorch MLP for CUDA global memory:')
+            print(f'  Features: {feat_dim}D (Gaussian: {self.hybrid_levels * level_dim}D + Hash: {(total_levels - self.hybrid_levels) * level_dim}D)')
+            print(f'  View encoding: {view_enc_dim}D')
+            print(f'  Total input: {mlp_input_dim}D (+ 1D padding = {mlp_input_dim + 1}D)')
+            print(f'  Architecture: {mlp_input_dim + 1}D → 32D (ReLU) → 32D (ReLU) → 3D (sigmoid)')
+            print(f'  Bias-free: L1 uses input padding (col 41 acts as bias), L2/L3 no bias')
+
+            # Create explicit PyTorch layers for weight extraction (bias-free)
+            # Layer 1: 41D input (40D features + 1D padding) for implicit bias via W1[:, 40]
+            # Layers 2, 3: no bias
+            self.mlp_fused = nn.Sequential(
+                nn.Linear(mlp_input_dim + 1, 32, bias=False),  # W1: [32, 41] (col 41 = implicit bias)
+                nn.ReLU(),
+                nn.Linear(32, 32, bias=False),                  # W2: [32, 32]
+                nn.ReLU(),
+                nn.Linear(32, 3, bias=False),                   # W3: [3, 32]
+                # Note: sigmoid is applied in CUDA kernel, not here
+            ).cuda()
+
+            # Store dimensions for weight extraction
+            self.mlp_fused_input_dim = mlp_input_dim
+            self.mlp_fused_hash_dim = (total_levels - self.hybrid_levels) * level_dim
+            self.mlp_fused_gauss_dim = self.hybrid_levels * level_dim
+
         self.training_setup(cfg_model.optim)
 
         self.pre_level = None
@@ -155,6 +275,16 @@ class INGP(nn.Module):
         # Only add MLP if it exists (not diffuse mode)
         if self.mlp_rgb is not None:
             l.append({'params': self.mlp_rgb.parameters(), 'lr': lr_mlp_rgb, "name": "rgb_mlp"})
+        # Add mlp_3D for 3D mode
+        if hasattr(self, 'mlp_3D') and self.mlp_3D is not None:
+            l.append({'params': self.mlp_3D.parameters(), 'lr': lr_mlp_rgb, "name": "mlp_3D"})
+        # Add mlp_3D_direct for 3D_direct mode
+        # Use same LR as CAT mode's mlp_rgb - gradients are now correct after rend_alpha detach fix
+        if hasattr(self, 'mlp_3D_direct') and self.mlp_3D_direct is not None:
+            l.append({'params': self.mlp_3D_direct.parameters(), 'lr': lr_mlp_rgb, "name": "mlp_3D_direct"})
+        # Add mlp_fused for 3D_direct_fused mode (PyTorch MLP for CUDA constant memory)
+        if hasattr(self, 'mlp_fused') and self.mlp_fused is not None:
+            l.append({'params': self.mlp_fused.parameters(), 'lr': lr_mlp_rgb, "name": "mlp_fused"})
 
         # For diffuse mode, create a dummy optimizer (no INGP params to optimize)
         if len(l) == 0:
@@ -488,6 +618,65 @@ class INGP(nn.Module):
             # Set active levels (no C2F)
             self.active_hashgrid_levels = self.hashgrid_levels
 
+        # 3D/3D_direct/3D_direct_fused mode: cat-style split with hybrid_levels for per-Gaussian, rest for hashgrid
+        # Hash features → PyTorch pipeline → SH coefficients (3D) or direct RGB (3D_direct/3D_direct_fused)
+        elif (self.is_3D_mode or self.is_3D_direct_mode or self.is_3D_direct_fused_mode) and self.hybrid_levels > 0:
+            # Use finest (total - hybrid) levels for hashgrid, just like cat mode
+            self.hashgrid_levels = num_levels_total - self.hybrid_levels
+            self.hashgrid_disabled = False
+
+            if self.hashgrid_levels <= 0:
+                # Edge case: all levels are per-Gaussian features, no hashgrid
+                mode_name = "3D_DIRECT_FUSED" if self.is_3D_direct_fused_mode else ("3D_DIRECT" if self.is_3D_direct_mode else "3D")
+                print(f'[{mode_name} MODE] hybrid_levels={self.hybrid_levels} >= total_levels={num_levels_total}')
+                print(f'[{mode_name} MODE] Using only per-Gaussian features (no hashgrid)')
+                self.hash_encoding = None
+                self.hashgrid_disabled = True
+                self.resolutions = []
+                self.active_hashgrid_levels = 0
+            else:
+                # Normal 3D mode: use finest levels for hashgrid
+                hashgrid_resolutions = all_resolutions[-self.hashgrid_levels:]
+                base_resolution = hashgrid_resolutions[0]
+                finest_resolution = hashgrid_resolutions[-1]
+
+                # Calculate growth rate for the hashgrid
+                if self.hashgrid_levels > 1:
+                    hash_growth_rate = np.exp((np.log(finest_resolution) - np.log(base_resolution)) / (self.hashgrid_levels - 1))
+                else:
+                    hash_growth_rate = 1.0
+
+                config = SimpleNamespace(
+                    device="cuda",
+                    otype="HashGrid",
+                    n_levels=self.hashgrid_levels,
+                    n_features_per_level=cfg_encoding.hashgrid.dim,
+                    log2_hashmap_size=cfg_encoding.hashgrid.dict_size,
+                    base_resolution=base_resolution,
+                    finest_resolution=finest_resolution,
+                    init_mode='uniform',
+                    per_level_scale=hash_growth_rate,
+                    range=self.voxel_range,
+                )
+
+                mode_name = "3D_DIRECT_FUSED" if self.is_3D_direct_fused_mode else ("3D_DIRECT" if self.is_3D_direct_mode else "3D")
+                print(f'[{mode_name} MODE] Cat-style hashgrid configuration:')
+                print(f'  Total levels: {num_levels_total}')
+                print(f'  Hybrid (per-Gaussian) levels: {self.hybrid_levels}')
+                print(f'  Hashgrid levels: {self.hashgrid_levels}')
+                print(f'  Resolutions: {base_resolution} -> {finest_resolution}')
+                print(f'  Features per level: {cfg_encoding.hashgrid.dim}D')
+                print(f'  Hashgrid size: 2^{cfg_encoding.hashgrid.dict_size}')
+                print(f'  Per-Gaussian features: {self.hybrid_levels}×{cfg_encoding.hashgrid.dim} = {self.hybrid_levels * cfg_encoding.hashgrid.dim}D')
+                print(f'  Hash features: {self.hashgrid_levels}×{cfg_encoding.hashgrid.dim} = {self.hashgrid_levels * cfg_encoding.hashgrid.dim}D')
+                print(f'  MLP input: {num_levels_total * cfg_encoding.hashgrid.dim}D (cat-style concat)')
+
+                self.hash_encoding = register_GridEncoder(config)
+                self.resolutions = hashgrid_resolutions
+
+                # Set active levels (all hashgrid levels active, no C2F for 3D)
+                self.active_hashgrid_levels = self.hashgrid_levels
+
         else:
             # Baseline mode: use all levels
             self.hashgrid_levels = num_levels_total
@@ -612,6 +801,13 @@ class INGP(nn.Module):
             self.active_hashgrid_levels = 0
             self.optim_gaussian = True
             return 0
+
+        # 3D/3D_direct mode: all levels active (no C2F), hash encoding is for intersection positions
+        if self.is_3D_mode or self.is_3D_direct_mode:
+            self.active_levels = self.levels
+            self.active_hashgrid_levels = self.levels
+            self.optim_gaussian = True
+            return self.active_levels
         
         # Diffuse_ngp/diffuse_offset mode: disable C2F, use all levels immediately
         if self.is_diffuse_ngp_mode or self.is_diffuse_offset_mode:
@@ -630,6 +826,12 @@ class INGP(nn.Module):
             self.optim_gaussian = True  # Train Gaussians throughout
         elif self.is_adaptive_gate_mode:
             # Adaptive_gate mode: VQ-AD gating, all hashgrid levels active (no C2F)
+            self.active_levels = self.levels  # Total levels (for MLP input size)
+            self.active_hashgrid_levels = self.hashgrid_levels  # All hashgrid levels active
+            self.optim_gaussian = True  # Train Gaussians throughout
+        elif self.is_3D_direct_fused_mode:
+            # 3D_direct_fused mode: Fused in-kernel MLP, all hashgrid levels active (no C2F)
+            # MLP is built expecting fixed input dimensions, can't use C2F
             self.active_levels = self.levels  # Total levels (for MLP input size)
             self.active_hashgrid_levels = self.hashgrid_levels  # All hashgrid levels active
             self.optim_gaussian = True  # Train Gaussians throughout
@@ -725,10 +927,226 @@ class INGP(nn.Module):
         return points_enc
 
     def _encode_view(self, d):
-        d = (d+1) / 2 
+        d = (d+1) / 2
         d = self.encoder_dir(d)
         return d
-    
+
+    def get_fused_mlp_weights(self):
+        """
+        Extract MLP weights for CUDA global memory upload (bias-free).
+        Returns (W1, W2, W3) in the format expected by set_mlp_weights.
+
+        The CUDA kernel uses: mlp_W1[h * 41 + i]
+        - h = hidden neuron index (row), i = input index (column)
+        - This is row-major access of a [HIDDEN_DIM, IN_DIM] = [32, 41] matrix
+        - PyTorch Linear(41, 32, bias=False) stores weight as [32, 41]
+        - So NO transpose needed - PyTorch format matches CUDA row-major layout
+        - Layer 1 column 41 acts as implicit bias (input padded with 1.0 in CUDA)
+        """
+        if self.mlp_fused is None:
+            return None
+
+        # mlp_fused is nn.Sequential with layers: Linear, ReLU, Linear, ReLU, Linear
+        # Indices: [0]=Linear1, [1]=ReLU, [2]=Linear2, [3]=ReLU, [4]=Linear3
+        W1 = self.mlp_fused[0].weight.data  # [32, 41] - col 41 = implicit bias
+        W2 = self.mlp_fused[2].weight.data  # [32, 32]
+        W3 = self.mlp_fused[4].weight.data  # [3, 32]
+
+        # NO transpose - PyTorch [out, in] is already row-major [out][in]
+        # which matches CUDA's W[h * in_dim + i] access pattern
+        return W1.contiguous(), W2.contiguous(), W3.contiguous()
+
+    def _copy_tcnn_to_pytorch_mlp(self, checkpoint_state_dict=None):
+        """
+        Copy weights from tcnn MLP (mlp_rgb or mlp_3D_direct) to PyTorch MLP (mlp_fused).
+
+        tcnn stores weights with padding (dimensions padded to multiples of 16):
+        - Input: 40 → 48 (padded with 1s)
+        - Hidden: 32 (no padding needed)
+        - Output: 3 → 16 (padded)
+
+        tcnn layout (NO BIASES, weights only):
+        - W1: [32, 48] = 1536 floats
+        - W2: [32, 32] = 1024 floats
+        - W3: [16, 32] = 512 floats (we use [3, 32] portion)
+        Total: 3072 floats
+
+        Our bias-free architecture:
+        - W1: [32, 41] — columns 0-39 from tcnn W1[:, 0:40], column 40 = sum(tcnn W1[:, 40:48])
+        - W2: [32, 32] — direct copy
+        - W3: [3, 32] — slice from tcnn's [16, 32]
+
+        Args:
+            checkpoint_state_dict: Optional state_dict from checkpoint. If provided and
+                contains mlp_3D_direct.params, extract weights from there directly.
+        """
+        if self.mlp_fused is None:
+            print("[WARN] mlp_fused is None, cannot copy weights")
+            return
+
+        # First priority: extract directly from checkpoint if mlp_3D_direct is there
+        params = None
+        source_name = None
+
+        if checkpoint_state_dict is not None:
+            # Check for mlp_3D_direct.params in checkpoint
+            for key, value in checkpoint_state_dict.items():
+                if 'mlp_3D_direct.params' in key:
+                    params = value.cpu()
+                    source_name = f"checkpoint[{key}]"
+                    break
+
+        # Fallback to existing tcnn MLPs in model
+        if params is None:
+            if hasattr(self, 'mlp_3D_direct') and self.mlp_3D_direct is not None:
+                params = self.mlp_3D_direct.params.data.cpu()
+                source_name = "mlp_3D_direct"
+            elif self.mlp_rgb is not None:
+                params = self.mlp_rgb.params.data.cpu()
+                source_name = "mlp_rgb"
+            else:
+                print("[WARN] No source tcnn MLP found, mlp_fused will use random init")
+                return
+
+        print(f"[COPY MLP] Source: {source_name}, params shape: {params.shape}")
+
+        # Actual dimensions
+        in_dim = 40
+        hidden_dim = 32
+        out_dim = 3
+
+        # tcnn padded dimensions (multiples of 16)
+        in_dim_padded = 48  # 40 → 48
+        out_dim_padded = 16  # 3 → 16
+
+        offset = 0
+
+        # Layer 1: tcnn stores as [hidden, in_padded] = [32, 48]
+        # CRITICAL: tcnn pads input with 1s (not zeros)!
+        # W1_tcnn[:, 40:48] @ [1,1,...,1] acts as implicit bias.
+        # Our bias-free format: W1[32, 41] where col 40 = sum(tcnn padding columns)
+        w1_size = in_dim_padded * hidden_dim
+        W1_full = params[offset:offset+w1_size].view(hidden_dim, in_dim_padded)
+        W1_weights = W1_full[:, :in_dim]  # [32, 40] actual weights
+        b1_implicit = W1_full[:, in_dim:].sum(dim=1, keepdim=True)  # [32, 1] implicit bias
+        W1 = torch.cat([W1_weights, b1_implicit], dim=1).contiguous()  # [32, 41]
+        offset += w1_size
+
+        # Layer 2: tcnn stores as [hidden, hidden] = [32, 32]
+        w2_size = hidden_dim * hidden_dim
+        W2 = params[offset:offset+w2_size].view(hidden_dim, hidden_dim).contiguous()
+        offset += w2_size
+
+        # Layer 3: tcnn stores as [out_padded, hidden] = [16, 32], slice to [3, 32]
+        w3_size = hidden_dim * out_dim_padded
+        W3 = params[offset:offset+w3_size].view(out_dim_padded, hidden_dim)[:out_dim, :].contiguous()
+
+        print(f"[COPY MLP] Extracted weights: W1{list(W1.shape)}, W2{list(W2.shape)}, W3{list(W3.shape)}")
+        print(f"[COPY MLP] Implicit bias (W1[:, 40]): mean={b1_implicit.mean():.4f}")
+
+        # Copy to mlp_fused (indices: 0=Linear1, 1=ReLU, 2=Linear2, 3=ReLU, 4=Linear3)
+        with torch.no_grad():
+            self.mlp_fused[0].weight.data.copy_(W1.cuda())  # [32, 41] — col 40 = implicit bias
+            self.mlp_fused[2].weight.data.copy_(W2.cuda())
+            self.mlp_fused[4].weight.data.copy_(W3.cuda())
+
+        print(f"[COPY MLP] Successfully copied {source_name} weights to mlp_fused (bias-free, implicit bias in col 40)")
+
+    def _copy_tcnn_to_pytorch_mlp_3D_direct(self, checkpoint_state_dict=None):
+        """
+        Copy weights from tcnn MLP (mlp_3D_direct or mlp_rgb) to PyTorch MLP (mlp_3D_direct).
+
+        tcnn stores weights with padding (dimensions padded to multiples of 16):
+        - Input: 40 → 48 (padded)
+        - Hidden: 32 (no padding needed)
+        - Output: 3 → 16 (padded)
+
+        tcnn layout (NO BIASES, weights only):
+        - W1: [48, 32] = 1536 floats (we use [40, 32] portion)
+        - W2: [32, 32] = 1024 floats
+        - W3: [32, 16] = 512 floats (we use [32, 3] portion)
+        Total: 3072 floats
+
+        CRITICAL: tcnn pads input with 1s (not zeros)! So W1[:, 40:48] @ [1,...] acts as bias.
+        We extract: b1 = sum(W1[:, 40:48], dim=1)
+        """
+        if self.mlp_3D_direct is None:
+            print("[WARN] mlp_3D_direct is None, cannot copy weights")
+            return
+
+        # First priority: extract directly from checkpoint if mlp_3D_direct.params is there
+        params = None
+        source_name = None
+
+        if checkpoint_state_dict is not None:
+            # Check for mlp_3D_direct.params (old tcnn format)
+            for key, value in checkpoint_state_dict.items():
+                if 'mlp_3D_direct.params' in key:
+                    params = value.cpu()
+                    source_name = f"checkpoint[{key}]"
+                    break
+
+            # Fallback: try mlp_rgb.params (CAT checkpoint)
+            if params is None:
+                for key, value in checkpoint_state_dict.items():
+                    if 'mlp_rgb.params' in key:
+                        params = value.cpu()
+                        source_name = f"checkpoint[{key}]"
+                        break
+
+        # Fallback to existing tcnn MLP in model (shouldn't happen with new code)
+        if params is None:
+            if self.mlp_rgb is not None and hasattr(self.mlp_rgb, 'params'):
+                params = self.mlp_rgb.params.data.cpu()
+                source_name = "mlp_rgb.params"
+            else:
+                print("[WARN] No source tcnn MLP found, mlp_3D_direct will use random init")
+                return
+
+        print(f"[COPY MLP] Source: {source_name}, params shape: {params.shape}")
+
+        # Actual dimensions
+        in_dim = 40
+        hidden_dim = 32
+        out_dim = 3
+
+        # tcnn padded dimensions (multiples of 16)
+        in_dim_padded = 48  # 40 → 48
+        out_dim_padded = 16  # 3 → 16
+
+        # tcnn stores weights as [out, in] - same as PyTorch Linear format!
+        offset = 0
+
+        # Layer 1: tcnn stores as [hidden, in_padded] = [32, 48]
+        w1_size = in_dim_padded * hidden_dim
+        W1_full = params[offset:offset+w1_size].view(hidden_dim, in_dim_padded)
+        W1 = W1_full[:, :in_dim].contiguous()
+        b1 = W1_full[:, in_dim:].sum(dim=1)  # Implicit bias from tcnn padding
+        offset += w1_size
+
+        # Layer 2: tcnn stores as [hidden, hidden] = [32, 32]
+        w2_size = hidden_dim * hidden_dim
+        W2 = params[offset:offset+w2_size].view(hidden_dim, hidden_dim).contiguous()
+        offset += w2_size
+
+        # Layer 3: tcnn stores as [out_padded, hidden] = [16, 32], slice to [3, 32]
+        w3_size = hidden_dim * out_dim_padded
+        W3 = params[offset:offset+w3_size].view(out_dim_padded, hidden_dim)[:out_dim, :].contiguous()
+
+        print(f"[COPY MLP] Extracted weights: W1{list(W1.shape)}, W2{list(W2.shape)}, W3{list(W3.shape)}")
+        print(f"[COPY MLP] Implicit bias b1 from tcnn padding: mean={b1.mean():.4f}")
+
+        # Copy to mlp_3D_direct (indices: 0=Linear1, 1=ReLU, 2=Linear2, 3=ReLU, 4=Linear3)
+        with torch.no_grad():
+            self.mlp_3D_direct[0].weight.data.copy_(W1.cuda())
+            self.mlp_3D_direct[0].bias.data.copy_(b1.cuda())
+            self.mlp_3D_direct[2].weight.data.copy_(W2.cuda())
+            self.mlp_3D_direct[2].bias.data.zero_()  # No bias for hidden layer in tcnn
+            self.mlp_3D_direct[4].weight.data.copy_(W3.cuda())
+            self.mlp_3D_direct[4].bias.data.zero_()  # No bias for output layer
+
+        print(f"[COPY MLP] Successfully copied {source_name} to mlp_3D_direct (PyTorch)")
+
     def initialize_weights(self):
         
         for m in self.mlp_rgb.linears:
@@ -748,9 +1166,47 @@ class INGP(nn.Module):
         print(f"save ingp model at {save_path}")
 
     def load_model(self, exp_path, iteration):
-        
+
         checkpoint = torch.load(os.path.join(exp_path, f'ngp_{iteration}.pth'))
-        self.load_state_dict(checkpoint['model_state_dict'])
+
+        # Check if we're loading a CAT model into 3D_direct mode
+        # In this case, mlp_3D_direct exists but won't be in the checkpoint
+        has_mlp_3D_direct = self.mlp_3D_direct is not None
+        checkpoint_has_mlp_3D_direct = any('mlp_3D_direct' in k for k in checkpoint['model_state_dict'].keys())
+
+        # Check if we're loading a CAT model into 3D_direct_fused mode
+        has_mlp_fused = self.mlp_fused is not None
+        checkpoint_has_mlp_fused = any('mlp_fused' in k for k in checkpoint['model_state_dict'].keys())
+
+        # Check if checkpoint has old tcnn format for mlp_3D_direct
+        checkpoint_has_tcnn_mlp_3D_direct = any('mlp_3D_direct.params' in k for k in checkpoint['model_state_dict'].keys())
+        # Check if checkpoint has new PyTorch format for mlp_3D_direct
+        checkpoint_has_pytorch_mlp_3D_direct = any('mlp_3D_direct.0.weight' in k for k in checkpoint['model_state_dict'].keys())
+
+        # Load with strict=False to allow missing keys
+        if has_mlp_3D_direct and not checkpoint_has_mlp_3D_direct:
+            # Loading CAT model into 3D_direct mode - need to convert mlp_rgb weights
+            self.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            print(f"[3D_DIRECT] Loaded CAT model - initializing mlp_3D_direct from mlp_rgb weights")
+
+            # Copy mlp_rgb weights (tcnn) to mlp_3D_direct (PyTorch)
+            if self.mlp_rgb is not None:
+                self._copy_tcnn_to_pytorch_mlp_3D_direct(checkpoint['model_state_dict'])
+        elif has_mlp_3D_direct and checkpoint_has_tcnn_mlp_3D_direct:
+            # Loading old tcnn 3D_direct checkpoint into new PyTorch 3D_direct mode
+            self.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            print(f"[3D_DIRECT] Loading old tcnn checkpoint - converting to PyTorch MLP")
+            self._copy_tcnn_to_pytorch_mlp_3D_direct(checkpoint['model_state_dict'])
+        elif has_mlp_fused and not checkpoint_has_mlp_fused:
+            self.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            print(f"[3D_DIRECT_FUSED] Loaded CAT/3D_direct model - copying MLP weights to mlp_fused")
+            # Copy weights from checkpoint's mlp_3D_direct or mlp_rgb (tcnn) to mlp_fused (PyTorch)
+            # Pass checkpoint_state_dict so we can extract mlp_3D_direct.params directly
+            # (since mlp_3D_direct doesn't exist in fused mode)
+            self._copy_tcnn_to_pytorch_mlp(checkpoint_state_dict=checkpoint['model_state_dict'])
+        else:
+            self.load_state_dict(checkpoint['model_state_dict'])
+
         # self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         print(f"loading ingp model from {os.path.join(exp_path, f'ngp_{iteration}.pth')}")
         

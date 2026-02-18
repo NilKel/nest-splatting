@@ -33,9 +33,9 @@ settings:
   save_interval: 5000
 
 loss:
-  lambda_normal: 0.05
-  lambda_dist: 1000
-  lambda_mask: 0.1
+  lambda_normal: 0.0
+  lambda_dist: 0
+  lambda_mask: 0.0
 
   normal_iter: 7_000
   dist_iter: 3_000

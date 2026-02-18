@@ -75,7 +75,11 @@ namespace CudaRasterizer
 			const int kernel_type = 0,
 			const int aabb_mode = 0,
 			const float aa = 0.0f,
-			const float aa_threshold = 0.01f);
+			const float aa_threshold = 0.01f,
+			// 3D mode intersection buffer outputs
+			float* intersection_buffer = nullptr,
+			uint32_t* intersection_count = nullptr,
+			uint32_t max_intersections_per_pixel = 0);
 
 		static void backward(
 			const int P, int D, int M, int R,
@@ -131,7 +135,14 @@ namespace CudaRasterizer
 			const float* shapes = nullptr,
 			const int kernel_type = 0,
 			float* dL_dshapes = nullptr,
-			const bool detach_hash_grad = false);
+			const bool detach_hash_grad = false,
+			// MLP gradient outputs for 3D_direct_fused mode (render_mode=5)
+			float* dL_dmlp_W1 = nullptr,
+			float* dL_dmlp_b1 = nullptr,
+			float* dL_dmlp_W2 = nullptr,
+			float* dL_dmlp_b2 = nullptr,
+			float* dL_dmlp_W3 = nullptr,
+			float* dL_dmlp_b3 = nullptr);
 	};
 };
 

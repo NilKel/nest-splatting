@@ -2,17 +2,19 @@ import os
 from argparse import ArgumentParser
 
 dtu_scenes = ['scan24', 'scan37', 'scan40', 'scan55', 'scan63', 'scan65', 'scan69', 'scan83', 'scan97', 'scan105', 'scan106', 'scan110', 'scan114', 'scan118', 'scan122']
-exp_name = "dtu"
-output_dir = f"./output/{exp_name}"
-dataset_dir = "/workspace/DATA/DTU"
-dtu_data = "xxx"
 
 parser = ArgumentParser(description="Full evaluation script parameters")
 parser.add_argument("--skip_training", action="store_true")
 parser.add_argument("--skip_rendering", action="store_true")
 parser.add_argument("--skip_metrics", action="store_true")
 parser.add_argument("--yaml", default="./configs/2dgs.yaml")
+parser.add_argument("--DTU", default="/workspace/DATA/DTU")
+parser.add_argument("--output_path", default="./output/dtu")
 args, _ = parser.parse_known_args()
+
+dataset_dir = args.DTU
+output_dir = args.output_path
+dtu_data = "xxx"
 
 device = 0
 iteration = 30000

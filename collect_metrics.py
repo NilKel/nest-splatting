@@ -485,13 +485,16 @@ def format_combined_quality_table(all_experiments, scenes, dataset_name=None):
                 scene_to_group[s] = group_name
 
     lines = []
-    lines.append(f"  COMBINED TEST METRICS (Averages across scenes)")
+    lines.append(f"  COMBINED TEST METRICS (Averages across scenes - only methods with all {len(scenes)} scenes)")
 
-    # Collect all methods
-    all_methods = set()
-    for scene_exps in all_experiments.values():
+    # Collect all methods and count how many scenes each appears in
+    method_scene_count = defaultdict(set)
+    for scene, scene_exps in all_experiments.items():
         for method, name, _, _, _, _, _ in scene_exps:
-            all_methods.add((method, name))
+            method_scene_count[(method, name)].add(scene)
+
+    # Only include methods that have completed ALL scenes
+    all_methods = {m for m, scene_set in method_scene_count.items() if len(scene_set) == len(scenes)}
 
     # Header - add indoor/outdoor columns for mipnerf360
     if is_mipnerf360:

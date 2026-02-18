@@ -306,7 +306,10 @@ int CudaRasterizer::Rasterizer::forward(
 	const int kernel_type,
 	const int aabb_mode,
 	const float aa,
-	const float aa_threshold)
+	const float aa_threshold,
+	float* intersection_buffer,
+	uint32_t* intersection_count,
+	uint32_t max_intersections_per_pixel)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -445,6 +448,7 @@ int CudaRasterizer::Rasterizer::forward(
 		out_index,
 		cover_pixels,
 		trans_avg,
+		(glm::vec3*)cam_pos,
 		D_diffuse,
 		hash_features_diffuse,
 		level_offsets_diffuse,
@@ -454,7 +458,10 @@ int CudaRasterizer::Rasterizer::forward(
 		shapes,
 		kernel_type,
 		aa,
-		aa_threshold), debug)
+		aa_threshold,
+		intersection_buffer,
+		intersection_count,
+		max_intersections_per_pixel), debug)
 
 	return num_rendered;
 }
@@ -515,7 +522,14 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* shapes,
 	const int kernel_type,
 	float* dL_dshapes,
-	const bool detach_hash_grad)
+	const bool detach_hash_grad,
+	// MLP gradient outputs for 3D_direct_fused mode (render_mode=5)
+	float* dL_dmlp_W1,
+	float* dL_dmlp_b1,
+	float* dL_dmlp_W2,
+	float* dL_dmlp_b2,
+	float* dL_dmlp_W3,
+	float* dL_dmlp_b3)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -573,6 +587,7 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dopacity,
 		dL_dcolor,
 		dL_gradsum,
+		(glm::vec3*)campos,
 		D_diffuse,
 		hash_features_diffuse,
 		level_offsets_diffuse,
@@ -582,7 +597,8 @@ void CudaRasterizer::Rasterizer::backward(
 		shapes,
 		kernel_type,
 		dL_dshapes,
-		detach_hash_grad), debug)
+		detach_hash_grad,
+		dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,

@@ -85,6 +85,7 @@ namespace FORWARD
 		int* out_index,
 		float* cover_pixels,
 		float* trans_avg,
+		const glm::vec3* cam_pos,
 		const uint32_t D_diffuse = 0,
 		const float* hash_features_diffuse = nullptr,
 		const int* level_offsets_diffuse = nullptr,
@@ -94,7 +95,26 @@ namespace FORWARD
 		const float* shapes = nullptr,
 		const int kernel_type = 0,
 		const float aa = 0.0f,
-		const float aa_threshold = 0.01f);
+		const float aa_threshold = 0.01f,
+		// 3D mode intersection buffer outputs
+		float* intersection_buffer = nullptr,      // [H*W * max_intersections_per_pixel, 6]
+		uint32_t* intersection_count = nullptr,    // [H*W] actual count per pixel
+		uint32_t max_intersections_per_pixel = 0); // Cap for memory management
+
+	// Copy MLP weights to constant memory (for 3D_fused and 3D_direct_fused modes)
+	// Must be called from the compilation unit where constant memory is defined
+	void setMlpWeights(
+		const float* W1, const float* b1,
+		const float* W2, const float* b2,
+		const float* W3, const float* b3,
+		bool is_sh_mode);
+
+	// Get MLP weight device pointers (for passing to backward kernel)
+	void getMlpWeightPointers(
+		float** W1, float** b1,
+		float** W2, float** b2,
+		float** W3_sh, float** b3_sh,
+		float** W3_rgb, float** b3_rgb);
 }
 
 

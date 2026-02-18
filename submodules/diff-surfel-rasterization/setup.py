@@ -32,6 +32,7 @@ setup(
             "cuda_rasterizer/forward.cu",
             "cuda_rasterizer/backward.cu",
             "cuda_rasterizer/utils.cu",
+            # mode_3d_direct_fused.cu is included by backward.cu (not compiled separately)
             "rasterize_points.cu",
             "ext.cpp"],
             extra_compile_args={"nvcc": ["-I" + conda_include, "-I" + glm_include]})

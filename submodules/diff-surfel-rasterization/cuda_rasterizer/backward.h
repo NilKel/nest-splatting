@@ -56,6 +56,7 @@ namespace BACKWARD
 		float* dL_dopacity,
 		float* dL_dcolors,
 		float* dL_gradsum,
+		const glm::vec3* cam_pos,
 		const uint32_t D_diffuse = 0,
 		const float* hash_features_diffuse = nullptr,
 		const int* level_offsets_diffuse = nullptr,
@@ -65,7 +66,14 @@ namespace BACKWARD
 		const float* shapes = nullptr,
 		const int kernel_type = 0,
 		float* dL_dshapes = nullptr,
-		const bool detach_hash_grad = false);
+		const bool detach_hash_grad = false,
+		// MLP gradient buffers for fused modes (render_mode=5)
+		float* dL_dmlp_W1 = nullptr,    // [32 * 40] = 1280 floats
+		float* dL_dmlp_b1 = nullptr,    // [32]
+		float* dL_dmlp_W2 = nullptr,    // [32 * 32] = 1024 floats
+		float* dL_dmlp_b2 = nullptr,    // [32]
+		float* dL_dmlp_W3 = nullptr,    // [3 * 32] = 96 floats (RGB mode)
+		float* dL_dmlp_b3 = nullptr);   // [3]
 
 	void preprocess(
 		int P, int D, int M,
@@ -92,5 +100,55 @@ namespace BACKWARD
 		glm::vec2* dL_dscale,
 		glm::vec4* dL_drot);
 }
+
+// Unified backward kernel for 3D mode that reads transMat from geomBuffer
+// Computes dL_dopacity, dL_dtransMat, and dL_dmean2D in one pass from dL_dweight
+// Also accepts dL_duv from hash/xyz gradient path (like cat mode)
+void backward_from_weight_grad(
+    int num_pixels,
+    int N,
+    int W, int H,
+    const float* dL_dweight,
+    const int* gaussian_ids,
+    const int* pixel_ids,
+    const int* pixel_starts,
+    const float* T_values,
+    const float* G_values,
+    const float* alpha_values,
+    const float* opacity_values,
+    const float* s_x_values,
+    const float* s_y_values,
+    const float* rho_flag,
+    const float* dL_duv_x,      // [M] hash/xyz gradient contribution (can be nullptr)
+    const float* dL_duv_y,      // [M] hash/xyz gradient contribution (can be nullptr)
+    const float* transMat,
+    const float* mean2D_precomp, // [N*2] pre-computed mean2D from forward (can be nullptr)
+    float* dL_dopacity,
+    float* dL_dtransMat,
+    float* dL_dmean2D);
+
+// Convert screen-space dL_dtransMat to world-space dL_dscale and dL_drotation
+// This performs the proper coordinate transformation that the native backward does:
+//   P = world2ndc * ndc2pix (includes image dimension scaling!)
+//   dL_dM = P * transpose(dL_dT) + dL_dhomoMat (xyz gradient contribution!)
+//   dL_dscale = [dot(dL_dM[0], R[0]), dot(dL_dM[1], R[1])]
+//   dL_drot = quat_to_rotmat_vjp(rot, dL_dR)
+// Also handles normal gradient from depth/normal loss via dL_dnormal3D
+void transMat_to_scale_rot_grad(
+    int N,
+    int W, int H,                // Image dimensions for ndc2pix transformation
+    const float* dL_dtransMat,   // [N, 9] screen-space transMat gradient
+    const float* dL_dhomoMat,    // [N, 9] xyz gradient contribution (can be nullptr)
+    const float* dL_dmean2D,     // [N, 2] 2D mean gradient (can be nullptr)
+    const float* dL_dnormal3D,   // [N, 3] normal gradient from depth/normal loss (can be nullptr)
+    const float* means3D,        // [N, 3] world-space positions (needed for dL_dmean2D)
+    const float* transMat_precomp, // [N, 9] forward pass transMat (can be nullptr)
+    const float* scales,         // [N, 2]
+    const float* rotations,      // [N, 4] quaternions
+    const float* projmatrix,     // [16] 4x4 projection matrix
+    const float* viewmatrix,     // [16] 4x4 view matrix (for normal gradient transform)
+    float* dL_dscales,           // [N, 2] output
+    float* dL_drots,             // [N, 4] output
+    float* dL_dmeans);           // [N, 3] output (mean position gradients)
 
 #endif
