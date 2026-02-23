@@ -41,7 +41,8 @@ def rasterize_gaussians(
     shapes,
     kernel_type,
     aabb_mode=0,
-    viewdirs_enc=None  # Pre-encoded view directions (H*W, 16) for 3D_direct_fused
+    viewdirs_enc=None,  # Pre-encoded view directions (H*W, 16) for 3D_direct_fused
+    residual_textures=None  # Baked mode (render_mode=6): [N, 192] FP16 residual textures
 ):
     return _RasterizeGaussians.apply(
         means3D,
@@ -66,7 +67,8 @@ def rasterize_gaussians(
         shapes,
         kernel_type,
         aabb_mode,
-        viewdirs_enc
+        viewdirs_enc,
+        residual_textures
     )
 
 class _RasterizeGaussians(torch.autograd.Function):
@@ -105,7 +107,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         shapes,
         kernel_type,
         aabb_mode=0,
-        viewdirs_enc=None  # Pre-encoded view directions (H*W, 16) for 3D_direct_fused
+        viewdirs_enc=None,  # Pre-encoded view directions (H*W, 16) for 3D_direct_fused
+        residual_textures=None  # Baked mode (render_mode=6): [N, 192] FP16 residual textures
     ):
 
         start_event = torch.cuda.Event(enable_timing=True)
@@ -120,6 +123,10 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Handle empty viewdirs_enc tensor
         if viewdirs_enc is None:
             viewdirs_enc = torch.Tensor([]).cuda()
+
+        # Handle empty residual_textures tensor
+        if residual_textures is None:
+            residual_textures = torch.Tensor([]).half().cuda()
 
         # Restructure arguments the way that the C++ lib expects them
         args = (
@@ -167,7 +174,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             hashgrid_settings.aa,
             hashgrid_settings.aa_threshold,
             raster_settings.max_intersections_per_pixel,
-            viewdirs_enc  # Pre-encoded view directions for 3D_direct_fused
+            viewdirs_enc,  # Pre-encoded view directions for 3D_direct_fused
+            residual_textures  # Baked mode residual textures
         )
 
         # Invoke C++/CUDA rasterizer
@@ -342,6 +350,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             None,  # kernel_type
             None,  # aabb_mode
             None,  # viewdirs_enc (no gradient needed - computed from camera)
+            None,  # residual_textures (no gradient - baked mode is inference only)
         )
 
         return grads
@@ -398,7 +407,7 @@ class GaussianRasterizer(nn.Module):
         homotrans = None, ap_level = None, \
         features = None, offsets = None, gridrange = None, \
         features_diffuse = None, offsets_diffuse = None, gridrange_diffuse = None, \
-        render_mode = 0, shapes = None, kernel_type = 0, aabb_mode = 0, viewdirs_enc = None):
+        render_mode = 0, shapes = None, kernel_type = 0, aabb_mode = 0, viewdirs_enc = None, residual_textures = None):
         # viewdirs_enc is ignored in main rasterizer - only used by lean lib (diff_surfel_3D)
 
         raster_settings = self.raster_settings
@@ -469,7 +478,9 @@ class GaussianRasterizer(nn.Module):
             render_mode,
             shapes,
             kernel_type,
-            aabb_mode
+            aabb_mode,
+            viewdirs_enc,
+            residual_textures
         )
 
 def compute_relocation(opacity_old, scale_old, N, binoms, n_max):
@@ -646,37 +657,5 @@ def get_transmat_from_geombuffer(geomBuffer, P):
     """
     return _C.get_transmat_from_geombuffer(geomBuffer, P)
 
-def set_mlp_weights(W1, b1, W2, b2, W3, b3, is_sh_mode=False):
-    """
-    Copy MLP weights to CUDA constant memory for fused in-kernel MLP evaluation.
-    Call this before each render call if weights have changed.
-
-    Args:
-        W1: [32, 40] Layer 1 weights (input → hidden1), row-major for W1[h * 40 + i] access
-        b1: [32] Layer 1 bias
-        W2: [32, 32] Layer 2 weights (hidden1 → hidden2)
-        b2: [32] Layer 2 bias
-        W3: [OUT_DIM, 32] Layer 3 weights (3 for RGB, 48 for SH)
-        b3: [OUT_DIM] Layer 3 bias
-        is_sh_mode: True for 3D_fused (48D SH output), False for 3D_direct_fused (3D RGB)
-    """
-    _C.set_mlp_weights(W1.contiguous(), b1.contiguous(),
-                       W2.contiguous(), b2.contiguous(),
-                       W3.contiguous(), b3.contiguous(),
-                       is_sh_mode)
-
-def get_mlp_grads():
-    """
-    Get MLP gradients from last backward pass (for 3D_direct_fused mode).
-
-    Returns:
-        Tuple of (grad_W1, grad_b1, grad_W2, grad_b2, grad_W3, grad_b3) or None.
-        - grad_W1: [32, 40] Layer 1 weight gradients
-        - grad_b1: [32] Layer 1 bias gradients
-        - grad_W2: [32, 32] Layer 2 weight gradients
-        - grad_b2: [32] Layer 2 bias gradients
-        - grad_W3: [3, 32] Layer 3 weight gradients (RGB mode)
-        - grad_b3: [3] Layer 3 bias gradients
-    """
-    return _RasterizeGaussians.get_mlp_grads()
+    # set_mlp_weights and get_mlp_grads removed — use diff_surfel_3D or diff_surfel_3D_16 libraries
 

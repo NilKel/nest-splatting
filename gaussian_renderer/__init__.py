@@ -26,6 +26,38 @@ except ImportError:
     _lean_rasterizer = None
     LEAN_RASTERIZER_AVAILABLE = False
 
+# FP16 lean library (diff_surfel_3D_16) — FP16 weights + FP16 GEMM shared memory
+try:
+    import diff_surfel_3D_16 as _fp16_rasterizer
+    FP16_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _fp16_rasterizer = None
+    FP16_RASTERIZER_AVAILABLE = False
+
+# TC lean library (diff_surfel_3D_tc) — Tensor Core WMMA for MLP
+try:
+    import diff_surfel_3D_tc as _tc_rasterizer
+    TC_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _tc_rasterizer = None
+    TC_RASTERIZER_AVAILABLE = False
+
+# SH TC library (diff_surfel_3D_sh) — TC WMMA MLP → SH coefficients
+try:
+    import diff_surfel_3D_sh as _sh_tc_rasterizer
+    SH_TC_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _sh_tc_rasterizer = None
+    SH_TC_RASTERIZER_AVAILABLE = False
+
+# SH+residual library (diff_surfel_3D_sh_res) — per-Gaussian SH + tiny hash MLP residual
+try:
+    import diff_surfel_3D_sh_res as _sh_res_rasterizer
+    SH_RES_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _sh_res_rasterizer = None
+    SH_RES_RASTERIZER_AVAILABLE = False
+
 # Import main rasterizer if lean-only mode not set
 if not _USE_LEAN_ONLY:
     try:
@@ -200,7 +232,9 @@ class IntersectionOpacityGrad(torch.autograd.Function):
         # Call unified CUDA kernel that reads transMat from geomBuffer
         # Now includes dL_duv from hash/xyz gradient path!
         # Returns: (dL_dopacity [N], dL_dtransMat [N, 9], dL_dmean2D [N, 2])
-        if LEAN_RASTERIZER_AVAILABLE and _main_rasterizer is None:
+        if FP16_RASTERIZER_AVAILABLE and _fp16_rasterizer is not None:
+            from diff_surfel_3D_16 import backward_from_weight_grad, transmat_to_scale_rot_grad
+        elif LEAN_RASTERIZER_AVAILABLE and _main_rasterizer is None:
             from diff_surfel_3D import backward_from_weight_grad, transmat_to_scale_rot_grad
         else:
             from diff_surfel_rasterization import backward_from_weight_grad, transmat_to_scale_rot_grad
@@ -265,7 +299,9 @@ class IntersectionOpacityGrad(torch.autograd.Function):
             )
 
         # Extract transMat from geomBuffer for the t_vec formula (needed for dL_dmean2D contribution)
-        if LEAN_RASTERIZER_AVAILABLE and _main_rasterizer is None:
+        if FP16_RASTERIZER_AVAILABLE and _fp16_rasterizer is not None:
+            from diff_surfel_3D_16 import get_transmat_from_geombuffer
+        elif LEAN_RASTERIZER_AVAILABLE and _main_rasterizer is None:
             from diff_surfel_3D import get_transmat_from_geombuffer
         else:
             from diff_surfel_rasterization import get_transmat_from_geombuffer
@@ -538,8 +574,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_3D_direct_fused_mode = ingp is not None and hasattr(ingp, 'is_3D_direct_fused_mode') and ingp.is_3D_direct_fused_mode
     # 3D_direct_lean mode: same as 3D_direct_fused but uses lean rasterizer library (faster builds)
     is_3D_direct_lean_mode = ingp is not None and hasattr(ingp, 'is_3D_direct_lean_mode') and ingp.is_3D_direct_lean_mode
-    # Treat lean mode same as fused mode for rendering logic
-    if is_3D_direct_lean_mode:
+    # 3D_direct_fp16 mode: FP16 weights + FP16 GEMM shared memory (diff_surfel_3D_16)
+    is_3D_direct_fp16_mode = ingp is not None and hasattr(ingp, 'is_3D_direct_fp16_mode') and ingp.is_3D_direct_fp16_mode
+    # 3D_direct_TC mode: Tensor Core WMMA for MLP (diff_surfel_3D_tc)
+    is_3D_direct_tc_mode = ingp is not None and hasattr(ingp, 'is_3D_direct_tc_mode') and ingp.is_3D_direct_tc_mode
+    # 3D_SH_TC mode: TC WMMA MLP → 48D SH coefs, viewdir eval in kernel (diff_surfel_3D_sh)
+    is_3D_direct_sh_tc_mode = ingp is not None and hasattr(ingp, 'is_3D_direct_sh_tc_mode') and ingp.is_3D_direct_sh_tc_mode
+    # 3D_SH_res mode: per-Gaussian SH + tiny hash MLP residual (diff_surfel_3D_sh_res)
+    is_3D_SH_res_mode = ingp is not None and hasattr(ingp, 'is_3D_SH_res_mode') and ingp.is_3D_SH_res_mode
+    # Treat lean/fp16/tc/sh_tc/sh_res mode same as fused mode for rendering logic
+    if is_3D_direct_lean_mode or is_3D_direct_fp16_mode or is_3D_direct_tc_mode or is_3D_direct_sh_tc_mode or is_3D_SH_res_mode:
         is_3D_direct_fused_mode = True
 
     hash_in_CUDA = True
@@ -643,6 +687,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             gridrange = ingp.gridrange
             levels = ingp.active_levels
 
+            # FP16 hash features: convert embeddings to half precision
+            # Saves per-frame FP32→FP16 conversion in rasterize_points.cu
+            # Autograd tracks .half() so gradients flow back to the FP32 parameter
+            if is_3D_direct_fp16_mode or is_3D_direct_tc_mode or is_3D_direct_sh_tc_mode:
+                features = features.half()
+
         # Use cached homotrans if available (for fast inference)
         if fast_inference and cache is not None and cache.homotrans is not None:
             homotrans = cache.homotrans
@@ -693,12 +743,66 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             else:
                 shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
 
+        # 3D_SH_res mode: per-Gaussian SH + tiny hash MLP residual
+        # SH handles per-Gaussian view-dependent appearance (evaluated in CUDA preprocessing)
+        # Hash MLP adds view-independent spatial correction per-intersection
+        # No per-Gaussian features needed (hybrid_levels=0)
+        elif is_3D_SH_res_mode:
+            from diff_surfel_3D_sh_res import set_mlp_weights
+
+            # Use standard SH coefficients (NOT per-Gaussian features)
+            shs = pc.get_features
+            colors_precomp = None
+
+            # Hash grid setup (all levels are hash, no hybrid)
+            total_levels = ingp.levels
+            active_hashgrid_levels = ingp.hashgrid_levels if not ingp.hashgrid_disabled else 0
+
+            # Encode levels: (total << 16) | (active_hashgrid << 8) | hybrid=0
+            levels = (total_levels << 16) | (active_hashgrid_levels << 8) | 0
+
+            # Pad offsets
+            if offsets.shape[0] < 17:
+                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
+                padded_offsets[:offsets.shape[0]] = offsets
+                offsets = padded_offsets
+
+            # Upload tiny MLP weights [16,16] each
+            mlp_weights = ingp.get_fused_mlp_weights()
+            if mlp_weights is not None:
+                W1, W2, W3 = mlp_weights
+                set_mlp_weights(W1, W2, W3)
+
+            render_mode = 5  # Fused in-kernel MLP
+
+            # One-time verification
+            global _3D_DIRECT_FUSED_VERIFIED
+            if not _3D_DIRECT_FUSED_VERIFIED:
+                hash_dim = active_hashgrid_levels * ingp.level_dim
+                print(f"[3D_SH_RES] render_mode={render_mode}, "
+                      f"SH=degree-3 (48 params), "
+                      f"hash={active_hashgrid_levels}×{ingp.level_dim}={hash_dim}D, "
+                      f"MLP=16→16→16→3 residual")
+                _3D_DIRECT_FUSED_VERIFIED = True
+
+            # Dimensions: no per-Gaussian features, hash only
+            gaussian_dim = 0
+            hash_dim = active_hashgrid_levels * ingp.level_dim
+            output_dim = 3  # RGB output
+            shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
+
         # 3D_direct_fused mode: fused in-kernel MLP (hash+MLP in CUDA)
         # Like cat mode but MLP runs in-kernel and outputs RGB directly
         # hybrid_levels are per-Gaussian (coarse), remaining levels are hashgrid (fine)
         elif is_3D_direct_fused_mode and ingp.hybrid_levels > 0:
             # Import set_mlp_weights from the appropriate rasterizer
-            if is_3D_direct_lean_mode and LEAN_RASTERIZER_AVAILABLE:
+            if is_3D_direct_sh_tc_mode and SH_TC_RASTERIZER_AVAILABLE:
+                from diff_surfel_3D_sh import set_mlp_weights
+            elif is_3D_direct_tc_mode and TC_RASTERIZER_AVAILABLE:
+                from diff_surfel_3D_tc import set_mlp_weights
+            elif is_3D_direct_fp16_mode and FP16_RASTERIZER_AVAILABLE:
+                from diff_surfel_3D_16 import set_mlp_weights
+            elif is_3D_direct_lean_mode and LEAN_RASTERIZER_AVAILABLE:
                 from diff_surfel_3D import set_mlp_weights
             else:
                 from diff_surfel_rasterization import set_mlp_weights
@@ -734,12 +838,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             mlp_weights = ingp.get_fused_mlp_weights()
             if mlp_weights is not None:
                 W1, W2, W3 = mlp_weights
-                set_mlp_weights(W1, W2, W3, is_sh_mode=False)
+                set_mlp_weights(W1, W2, W3, is_sh_mode=is_3D_direct_sh_tc_mode)
 
             render_mode = 5  # 3D_direct_fused: fused in-kernel MLP
 
             # One-time verification that we're using the fused mode
-            global _3D_DIRECT_FUSED_VERIFIED
             if not _3D_DIRECT_FUSED_VERIFIED:
                 print(f"[3D_DIRECT_FUSED] render_mode={render_mode}, "
                       f"gauss={hybrid_levels_fused}×{ingp.level_dim}={hybrid_levels_fused * ingp.level_dim}D, "
@@ -752,14 +855,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             output_dim = 3  # RGB output from fused MLP
             shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
 
-            # Compute per-pixel view directions (same as 3D_direct mode)
-            # This ensures view encoding is identical: per-pixel, computed once, used for all intersections
-            rays_d, _ = cam2rays(viewpoint_camera)  # [H*W, 3]
-            ray_unit = torch_F.normalize(rays_d, dim=-1).float()  # [H*W, 3] normalized
-
-            # Pre-encode view directions using tcnn (matches 3D_direct mode's _encode_view)
-            # tcnn outputs half precision, convert to float32 for CUDA kernel
-            viewdirs_enc = ingp._encode_view(ray_unit).float().contiguous()  # [H*W, 16]
+            # View direction handling depends on mode:
+            # - SH_TC: no view encoding needed (CUDA kernel computes raw viewdir per-intersection)
+            # - Other fused modes: pre-encode view directions for MLP input
+            if not is_3D_direct_sh_tc_mode:
+                rays_d, _ = cam2rays(viewpoint_camera)  # [H*W, 3]
+                ray_unit = torch_F.normalize(rays_d, dim=-1).float()  # [H*W, 3] normalized
+                viewdirs_enc = ingp._encode_view(ray_unit).float().contiguous()  # [H*W, 16]
 
         # Cat_dropout mode: cat mode with hash dropout during training
         # Uses mode 14 (adaptive_zero kernel) with hardcoded weights
@@ -1078,8 +1180,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         aa_threshold = aa_threshold
     )
 
-    # Use lean rasterizer for 3D_direct_lean mode (faster builds for development)
-    if is_3D_direct_lean_mode and LEAN_RASTERIZER_AVAILABLE:
+    # Use SH_RES, SH_TC, TC, FP16, or lean rasterizer for fused modes
+    if is_3D_SH_res_mode and SH_RES_RASTERIZER_AVAILABLE:
+        rasterizer = _sh_res_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
+    elif is_3D_direct_sh_tc_mode and SH_TC_RASTERIZER_AVAILABLE:
+        rasterizer = _sh_tc_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
+    elif is_3D_direct_tc_mode and TC_RASTERIZER_AVAILABLE:
+        rasterizer = _tc_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
+    elif is_3D_direct_fp16_mode and FP16_RASTERIZER_AVAILABLE:
+        rasterizer = _fp16_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
+    elif is_3D_direct_lean_mode and LEAN_RASTERIZER_AVAILABLE:
         rasterizer = _lean_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
     else:
         rasterizer = GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
@@ -1127,7 +1237,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         aabb_mode_int = 0  # "2dgs" or default
 
-    rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer = rasterizer(
+    # Build rasterizer kwargs
+    rasterizer_kwargs = dict(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -1145,8 +1256,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         shapes = shapes,
         kernel_type = kernel_type,
         aabb_mode = aabb_mode_int,
-        viewdirs_enc = viewdirs_enc,  # Pre-encoded view directions for 3D_direct_fused
     )
+    # 3D_SH_res rasterizer doesn't accept viewdirs_enc (no view encoding needed)
+    if not is_3D_SH_res_mode:
+        rasterizer_kwargs['viewdirs_enc'] = viewdirs_enc
+
+    rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer = rasterizer(**rasterizer_kwargs)
     
     # 3D mode: Process intersection buffer through PyTorch pipeline
     # Recompute xyz from s_x,s_y → hash encode → gather features → MLP → SH → blend → eval

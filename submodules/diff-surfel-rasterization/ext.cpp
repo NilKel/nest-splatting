@@ -23,5 +23,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("backward_from_weight_grad", &BackwardFromWeightGradCUDA);
   m.def("transmat_to_scale_rot_grad", &TransMatToScaleRotGradCUDA);
   m.def("get_transmat_from_geombuffer", &GetTransMatFromGeomBufferCUDA);
-  m.def("set_mlp_weights", &SetMlpWeightsCUDA);
 }

@@ -15,6 +15,7 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include <cuda_fp16.h>
 
 namespace CudaRasterizer
 {
@@ -79,7 +80,9 @@ namespace CudaRasterizer
 			// 3D mode intersection buffer outputs
 			float* intersection_buffer = nullptr,
 			uint32_t* intersection_count = nullptr,
-			uint32_t max_intersections_per_pixel = 0);
+			uint32_t max_intersections_per_pixel = 0,
+			// Baked mode (render_mode=6): per-Gaussian residual textures
+			const __half* residual_textures = nullptr);
 
 		static void backward(
 			const int P, int D, int M, int R,

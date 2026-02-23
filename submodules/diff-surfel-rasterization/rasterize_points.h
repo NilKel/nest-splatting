@@ -61,7 +61,8 @@ RasterizeGaussiansCUDA(
 	const float aa,
 	const float aa_threshold,
 	const int max_intersections_per_pixel,
-	const torch::Tensor& viewdirs_enc);  // Pre-encoded view directions (H*W, 16) for 3D_direct_fused
+	const torch::Tensor& viewdirs_enc,  // Pre-encoded view directions (H*W, 16) for 3D_direct_fused
+	const torch::Tensor& residual_textures);  // Baked mode (render_mode=6): [N, 192] FP16 residual textures
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -190,15 +191,4 @@ torch::Tensor GetTransMatFromGeomBufferCUDA(
     const int P);
 
 // ============================================================================
-// MLP WEIGHT MANAGEMENT FOR FUSED MODES (3D_fused, 3D_direct_fused)
-// ============================================================================
-
-// Copy MLP weights to CUDA constant memory for in-kernel MLP evaluation
-void SetMlpWeightsCUDA(
-    const torch::Tensor& W1,      // [32, 40] or [40, 32] - Layer 1 weights
-    const torch::Tensor& b1,      // [32] - Layer 1 bias
-    const torch::Tensor& W2,      // [32, 32] - Layer 2 weights
-    const torch::Tensor& b2,      // [32] - Layer 2 bias
-    const torch::Tensor& W3,      // [OUT_DIM, 32] - Layer 3 weights
-    const torch::Tensor& b3,      // [OUT_DIM] - Layer 3 bias
-    const bool is_sh_mode);       // true for 48D SH, false for 3D RGB
+// MLP weight management removed — use diff_surfel_3D or diff_surfel_3D_16 libraries for fused modes

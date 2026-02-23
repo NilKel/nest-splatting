@@ -99,22 +99,10 @@ namespace FORWARD
 		// 3D mode intersection buffer outputs
 		float* intersection_buffer = nullptr,      // [H*W * max_intersections_per_pixel, 6]
 		uint32_t* intersection_count = nullptr,    // [H*W] actual count per pixel
-		uint32_t max_intersections_per_pixel = 0); // Cap for memory management
+		uint32_t max_intersections_per_pixel = 0,  // Cap for memory management
+		// Baked mode (render_mode=6): per-Gaussian residual textures
+		const __half* residual_textures = nullptr); // [N, 8, 8, 3] FP16 = [N, 192] half
 
-	// Copy MLP weights to constant memory (for 3D_fused and 3D_direct_fused modes)
-	// Must be called from the compilation unit where constant memory is defined
-	void setMlpWeights(
-		const float* W1, const float* b1,
-		const float* W2, const float* b2,
-		const float* W3, const float* b3,
-		bool is_sh_mode);
-
-	// Get MLP weight device pointers (for passing to backward kernel)
-	void getMlpWeightPointers(
-		float** W1, float** b1,
-		float** W2, float** b2,
-		float** W3_sh, float** b3_sh,
-		float** W3_rgb, float** b3_rgb);
 }
 
 

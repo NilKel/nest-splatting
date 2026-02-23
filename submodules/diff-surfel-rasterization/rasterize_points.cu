@@ -17,6 +17,7 @@
 #include <tuple>
 #include <stdio.h>
 #include <cuda_runtime_api.h>
+#include <cuda_fp16.h>
 #include <memory>
 #include "cuda_rasterizer/config.h"
 #include "cuda_rasterizer/rasterizer.h"
@@ -85,7 +86,8 @@ RasterizeGaussiansCUDA(
 	const float aa,
 	const float aa_threshold,
 	const int max_intersections_per_pixel,
-	const torch::Tensor& viewdirs_enc)
+	const torch::Tensor& viewdirs_enc,
+	const torch::Tensor& residual_textures)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 	AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -270,7 +272,8 @@ RasterizeGaussiansCUDA(
 		aa_threshold,
 		(render_mode == 3) ? intersection_buffer.contiguous().data<float>() : nullptr,
 		(render_mode == 3) ? (uint32_t*)intersection_count.contiguous().data<int>() : nullptr,
-		max_intersections_alloc);
+		max_intersections_alloc,
+		(residual_textures.numel() > 0) ? (const __half*)residual_textures.contiguous().data_ptr<at::Half>() : nullptr);
   }
 
   return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg, intersection_buffer, intersection_count);
@@ -805,40 +808,4 @@ torch::Tensor GetTransMatFromGeomBufferCUDA(
     return transMat;
 }
 
-// ============================================================================
-// MLP WEIGHT MANAGEMENT FOR FUSED MODES (3D_fused, 3D_direct_fused)
-// ============================================================================
-
-// Copy MLP weights from PyTorch tensors to CUDA constant memory
-// Call this before each render call if weights have changed
-void SetMlpWeightsCUDA(
-    const torch::Tensor& W1,      // [40, 32] - Layer 1 weights
-    const torch::Tensor& b1,      // [32] - Layer 1 bias
-    const torch::Tensor& W2,      // [32, 32] - Layer 2 weights
-    const torch::Tensor& b2,      // [32] - Layer 2 bias
-    const torch::Tensor& W3,      // [32, OUT_DIM] - Layer 3 weights (48 for SH, 3 for RGB)
-    const torch::Tensor& b3,      // [OUT_DIM] - Layer 3 bias
-    const bool is_sh_mode         // true for 3D_fused (48D SH), false for 3D_direct_fused (3D RGB)
-) {
-    CHECK_INPUT(W1);
-    CHECK_INPUT(b1);
-    CHECK_INPUT(W2);
-    CHECK_INPUT(b2);
-    CHECK_INPUT(W3);
-    CHECK_INPUT(b3);
-
-    // Ensure tensors are contiguous
-    auto W1_c = W1.contiguous();
-    auto b1_c = b1.contiguous();
-    auto W2_c = W2.contiguous();
-    auto b2_c = b2.contiguous();
-    auto W3_c = W3.contiguous();
-    auto b3_c = b3.contiguous();
-
-    // Call wrapper function in forward.cu where constant memory is defined
-    FORWARD::setMlpWeights(
-        W1_c.data_ptr<float>(), b1_c.data_ptr<float>(),
-        W2_c.data_ptr<float>(), b2_c.data_ptr<float>(),
-        W3_c.data_ptr<float>(), b3_c.data_ptr<float>(),
-        is_sh_mode);
-}
+// SetMlpWeightsCUDA removed — use diff_surfel_3D or diff_surfel_3D_16 libraries for fused modes

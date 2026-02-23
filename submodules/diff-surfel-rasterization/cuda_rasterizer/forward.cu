@@ -17,53 +17,6 @@
 namespace cg = cooperative_groups;
 
 // ============================================================================
-// MLP WEIGHTS IN GLOBAL DEVICE MEMORY (for 3D_fused and 3D_direct_fused modes)
-// Using device pointers instead of constant memory to allow sharing across
-// compilation units (constant memory requires -rdc=true which breaks PyTorch linking)
-// ============================================================================
-__device__ float* d_mlp_W1 = nullptr;      // 40D input → 32D hidden1 (5KB)
-__device__ float* d_mlp_b1 = nullptr;      // 128B
-__device__ float* d_mlp_W2 = nullptr;      // 32D hidden1 → 32D hidden2 (4KB)
-__device__ float* d_mlp_b2 = nullptr;      // 128B
-__device__ float* d_mlp_W3_sh = nullptr;   // For 3D_fused: 32D → 48 SH (6KB)
-__device__ float* d_mlp_W3_rgb = nullptr;  // For 3D_direct_fused: 32D → 3 RGB (384B)
-__device__ float* d_mlp_b3_sh = nullptr;   // 192B
-__device__ float* d_mlp_b3_rgb = nullptr;  // 12B
-
-// Host-side pointers for memory management
-static float* h_mlp_W1 = nullptr;
-static float* h_mlp_b1 = nullptr;
-static float* h_mlp_W2 = nullptr;
-static float* h_mlp_b2 = nullptr;
-static float* h_mlp_W3_sh = nullptr;
-static float* h_mlp_W3_rgb = nullptr;
-static float* h_mlp_b3_sh = nullptr;
-static float* h_mlp_b3_rgb = nullptr;
-static bool mlp_weights_allocated = false;
-
-// Convenience macros to access MLP weights (same names as old constant memory)
-#define mlp_W1 d_mlp_W1
-#define mlp_b1 d_mlp_b1
-#define mlp_W2 d_mlp_W2
-#define mlp_b2 d_mlp_b2
-#define mlp_W3_sh d_mlp_W3_sh
-#define mlp_W3_rgb d_mlp_W3_rgb
-#define mlp_b3_sh d_mlp_b3_sh
-#define mlp_b3_rgb d_mlp_b3_rgb
-
-// MLP gradient buffers (device global memory, allocated once)
-// These accumulate gradients across all intersections, then retrieved by Python
-float* d_dL_dW1 = nullptr;   // [40, 32]
-float* d_dL_db1 = nullptr;   // [32]
-float* d_dL_dW2 = nullptr;   // [32, 32]
-float* d_dL_db2 = nullptr;   // [32]
-float* d_dL_dW3 = nullptr;   // [32, 48] or [32, 3]
-float* d_dL_db3 = nullptr;   // [48] or [3]
-
-// Flag to track if gradient buffers are allocated
-bool mlp_grad_buffers_allocated = false;
-
-// ============================================================================
 // PERFORMANCE TEST MACRO
 // Uncomment to test if powf is the performance bottleneck in the general kernel.
 // When enabled, bypasses the expensive powf(rho, beta/2) with a simple rho (beta=2).
@@ -331,66 +284,6 @@ __device__ void encode_view_direction(const float3& view_dir, float* view_enc) {
 	view_enc[13] = 0.4570457994644658f * x * (5.0f * z * z - 1.0f);  // Y_3^1
 	view_enc[14] = 1.4453057213202769f * (x * x - y * y) * z;  // Y_3^2
 	view_enc[15] = 0.5900435899266435f * x * (x * x - 3.0f * y * y);  // Y_3^3
-}
-
-// MLP forward pass: 40D input → 32D hidden1 → 32D hidden2 → OUT_DIM output
-// Template parameters allow compile-time loop unrolling
-template <int IN_DIM, int HIDDEN_DIM, int OUT_DIM>
-__device__ void mlp_forward_fused(
-	const float* input,       // [IN_DIM] = 40D (24 features + 16 view)
-	float* output,            // [OUT_DIM] = 48 (SH) or 3 (RGB)
-	float* hidden1,           // [HIDDEN_DIM] = 32 (caller-provided buffer)
-	float* hidden2,           // [HIDDEN_DIM] = 32 (caller-provided buffer)
-	bool apply_sigmoid        // true for RGB output, false for SH output
-) {
-	// Layer 1: IN_DIM → HIDDEN_DIM (ReLU)
-	#pragma unroll
-	for (int h = 0; h < HIDDEN_DIM; h++) {
-		float acc = mlp_b1[h];
-		#pragma unroll
-		for (int i = 0; i < IN_DIM; i++) {
-			acc += input[i] * mlp_W1[h * IN_DIM + i];
-		}
-		hidden1[h] = fmaxf(0.0f, acc);  // ReLU
-	}
-
-	// Layer 2: HIDDEN_DIM → HIDDEN_DIM (ReLU)
-	#pragma unroll
-	for (int h = 0; h < HIDDEN_DIM; h++) {
-		float acc = mlp_b2[h];
-		#pragma unroll
-		for (int i = 0; i < HIDDEN_DIM; i++) {
-			acc += hidden1[i] * mlp_W2[h * HIDDEN_DIM + i];
-		}
-		hidden2[h] = fmaxf(0.0f, acc);  // ReLU
-	}
-
-	// Layer 3: HIDDEN_DIM → OUT_DIM (Sigmoid optional)
-	#pragma unroll
-	for (int o = 0; o < OUT_DIM; o++) {
-		float acc;
-		if (OUT_DIM == 48) {
-			acc = mlp_b3_sh[o];
-			#pragma unroll
-			for (int h = 0; h < HIDDEN_DIM; h++) {
-				acc += hidden2[h] * mlp_W3_sh[o * HIDDEN_DIM + h];
-			}
-		} else {
-			acc = mlp_b3_rgb[o];
-			#pragma unroll
-			for (int h = 0; h < HIDDEN_DIM; h++) {
-				acc += hidden2[h] * mlp_W3_rgb[o * HIDDEN_DIM + h];
-			}
-		}
-		output[o] = apply_sigmoid ? (1.0f / (1.0f + expf(-acc))) : acc;
-	}
-}
-
-// SH evaluation for MLP output (48 coefficients → 3 RGB)
-// Format: [sh0_r, sh0_g, sh0_b, sh1_r, ...] = 16 coefficients × 3 RGB
-__device__ void eval_sh_from_mlp(const float* sh_coeffs, const float3& view_dir, float* rgb) {
-	// Use existing eval_sh_raw for degree 3
-	eval_sh_raw(3, sh_coeffs, view_dir, rgb);
 }
 
 // ============================================================================
@@ -974,7 +867,9 @@ renderCUDAsurfelForward(
 	// 3D mode intersection buffer outputs
 	float* __restrict__ intersection_buffer = nullptr,
 	uint32_t* __restrict__ intersection_count = nullptr,
-	const uint32_t max_intersections_per_pixel = 0)
+	const uint32_t max_intersections_per_pixel = 0,
+	// Baked mode (render_mode=6): per-Gaussian residual textures [N, 8, 8, 3] FP16
+	const __half* __restrict__ residual_textures = nullptr)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -1058,11 +953,6 @@ renderCUDAsurfelForward(
 			// 3D mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 			// Hashgrid query happens in PyTorch, not CUDA - so hashgrid_levels = 0
 			hashgrid_levels = 0;
-		} else if(render_mode == 5){
-			// 3D_direct_fused mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
-			// Hash query happens in CUDA kernel (like cat mode), so use active_hashgrid_levels
-			int active_hashgrid_levels = (level >> 8) & 0xFF;
-			hashgrid_levels = active_hashgrid_levels;
 		} else if(level > 16){
 			printf("Error: level %d > 16.", level);
 			return;
@@ -1762,119 +1652,33 @@ renderCUDAsurfelForward(
 
 			break;
 		}
-		case 5: {
-			/* 3D_direct_fused mode: In-kernel MLP evaluation → RGB → accumulate
-			 * This is like 3D_direct mode but runs MLP inside the kernel instead of outputting
-			 * an intersection buffer. Follows the per-intersection paradigm: sum(w_i * MLP(f_i))
-			 *
-			 * Pipeline:
-			 *   1. Compute xyz intersection point
-			 *   2. Get per-Gaussian features from colors_precomp (coarse levels)
-			 *   3. Query hashgrid for fine levels at xyz
-			 *   4. Encode view direction (16D)
-			 *   5. Concatenate: [gauss_feat | hash_feat | view_enc] = 40D
-			 *   6. Run MLP (from constant memory) → 3D RGB
-			 *   7. Accumulate weighted RGB
-			 */
+		// case 5 (3D_direct_fused) removed — use diff_surfel_3D or diff_surfel_3D_16 libraries
+		case 6: {
+			// Baked mode: SH base RGB (from preprocessing) + residual texture
+			// SH evaluation happens in computeColorFromSH during preprocess → rgb[gauss_id*3+ch]
+			// Residual texture: per-Gaussian [8, 8, 3] FP16 → bilinear lookup at (s.x, s.y)
+			int gauss_id = collected_id[j];
 
-			// 0. Compute xyz intersection point (same as cat mode)
-			const float3 pk = collected_pk[j];
-			float3 xyz;
-			if (rho3d <= rho2d) {
-				const float3 sutu = collected_SuTu[j];
-				const float3 svtv = collected_SvTv[j];
-				xyz = {s.x * sutu.x + s.y * svtv.x + pk.x,
-				       s.x * sutu.y + s.y * svtv.y + pk.y,
-				       s.x * sutu.z + s.y * svtv.z + pk.z};
-			} else {
-				xyz = pk;
-			}
+			for (int ch = 0; ch < 3; ch++)
+				feat[ch] = rgb[gauss_id * 3 + ch];
 
-			// Decode level parameter: (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
-			const int hybrid_levels = level & 0xFF;
-			const int per_gaussian_dim = hybrid_levels * l_dim;  // Coarse feature dimension
-
-			// Determine hashgrid levels from active_hashgrid_levels
-			const int active_hashgrid_levels = (level >> 8) & 0xFF;
-			const int hashgrid_dim = active_hashgrid_levels * l_dim;  // Fine feature dimension
-
-			// 1. Get per-Gaussian features (coarse levels)
-			float gauss_feat[20];  // Max 5 hybrid_levels * 4D = 20D
-			if (hybrid_levels > 0 && rgb != nullptr) {
-				int gauss_id = collected_id[j];
-				const float* per_gaussian_feat = &rgb[gauss_id * per_gaussian_dim];
-				for (int i = 0; i < per_gaussian_dim && i < 20; i++) {
-					gauss_feat[i] = per_gaussian_feat[i];
+			if (residual_textures != nullptr) {
+				// Map s-space [-1, 1] → texture space [0, 7]
+				float tex_u = fmaxf(0.0f, fminf(6.999f, (s.x + 1.0f) * 3.5f));
+				float tex_v = fmaxf(0.0f, fminf(6.999f, (s.y + 1.0f) * 3.5f));
+				int u0 = (int)tex_u, v0 = (int)tex_v;
+				float fu = tex_u - u0, fv = tex_v - v0;
+				int u1 = min(u0 + 1, 7), v1 = min(v0 + 1, 7);
+				int base = gauss_id * 192;  // 8*8*3 = 192 halfs per Gaussian
+				for (int ch = 0; ch < 3; ch++) {
+					float c00 = __half2float(residual_textures[base + (v0*8+u0)*3 + ch]);
+					float c10 = __half2float(residual_textures[base + (v0*8+u1)*3 + ch]);
+					float c01 = __half2float(residual_textures[base + (v1*8+u0)*3 + ch]);
+					float c11 = __half2float(residual_textures[base + (v1*8+u1)*3 + ch]);
+					feat[ch] += (1-fu)*(1-fv)*c00 + fu*(1-fv)*c10
+					          + (1-fu)*fv*c01 + fu*fv*c11;
 				}
-			} else {
-				for (int i = 0; i < 20; i++) gauss_feat[i] = 0.0f;
 			}
-
-			// 2. Query hashgrid for fine levels at xyz
-			float hash_feat[4];  // Fine levels: typically 1 level * 4D = 4D
-			if (active_hashgrid_levels > 0) {
-				if (l_dim == 4) {
-					query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug);
-				} else if (l_dim == 2) {
-					query_feature<false, 4, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug);
-				} else {
-					// Fallback: zero hash features
-					for (int i = 0; i < 4; i++) hash_feat[i] = 0.0f;
-				}
-			} else {
-				for (int i = 0; i < 4; i++) hash_feat[i] = 0.0f;
-			}
-
-			// 3. Encode view direction (16D positional encoding)
-			// View direction from camera to intersection point
-			glm::vec3 cp = *cam_pos;
-			float3 view_dir = {xyz.x - cp.x, xyz.y - cp.y, xyz.z - cp.z};
-			float inv_len = rsqrtf(view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z + 1e-7f);
-			view_dir.x *= inv_len; view_dir.y *= inv_len; view_dir.z *= inv_len;
-			float view_enc[16];
-			encode_view_direction(view_dir, view_enc);
-
-			// 4. Build MLP input: [gauss(20) | hash(4) | view(16)] = 40D
-			float mlp_input[40];
-			for (int i = 0; i < 20; i++) mlp_input[i] = gauss_feat[i];
-			for (int i = 0; i < 4; i++)  mlp_input[20 + i] = hash_feat[i];
-			for (int i = 0; i < 16; i++) mlp_input[24 + i] = view_enc[i];
-
-			// 5. Run MLP → RGB (with sigmoid activation)
-			float h1[32], h2[32];  // Hidden layer activations
-			mlp_forward_fused<40, 32, 3>(mlp_input, feat, h1, h2, true);
-
-			// DEBUG: Print activation stats (once per frame)
-			static bool debug_fwd_activations = false;
-			if (!debug_fwd_activations && threadIdx.x == 0 && blockIdx.x == 0 && j == 0) {
-				// Input stats
-				float gauss_sum = 0, hash_sum = 0, view_sum = 0;
-				for (int i = 0; i < 20; i++) gauss_sum += fabsf(gauss_feat[i]);
-				for (int i = 0; i < 4; i++) hash_sum += fabsf(hash_feat[i]);
-				for (int i = 0; i < 16; i++) view_sum += fabsf(view_enc[i]);
-
-				// H1 activation stats
-				float h1_sum = 0, h1_zeros = 0;
-				for (int i = 0; i < 32; i++) { h1_sum += fabsf(h1[i]); if (h1[i] == 0) h1_zeros++; }
-
-				// H2 activation stats
-				float h2_sum = 0, h2_zeros = 0;
-				for (int i = 0; i < 32; i++) { h2_sum += fabsf(h2[i]); if (h2[i] == 0) h2_zeros++; }
-
-				printf("[FWD ACTIVATIONS] gauss_sum=%.4f, hash_sum=%.4f, view_sum=%.4f\n",
-				       gauss_sum, hash_sum, view_sum);
-				printf("[FWD ACTIVATIONS] h1: sum=%.4f, zeros=%d/32\n", h1_sum, (int)h1_zeros);
-				printf("[FWD ACTIVATIONS] h2: sum=%.4f, zeros=%d/32\n", h2_sum, (int)h2_zeros);
-				printf("[FWD ACTIVATIONS] out(sigmoid)=[%.4f,%.4f,%.4f], alpha=%.4f, T=%.4f, w=%.6f\n",
-				       feat[0], feat[1], feat[2], alpha, T, w);
-				debug_fwd_activations = true;
-			}
-
-			// feat now contains RGB values (from sigmoid) - will be accumulated below
 			break;
 		}
 		default:
@@ -1992,87 +1796,6 @@ renderCUDAsurfelForward(
 }
 
 
-// Kernel to set device pointers (needed because __device__ vars can't be set from host directly)
-__global__ void setMlpPointersKernel(
-	float* W1, float* b1, float* W2, float* b2,
-	float* W3_sh, float* b3_sh, float* W3_rgb, float* b3_rgb)
-{
-	d_mlp_W1 = W1;
-	d_mlp_b1 = b1;
-	d_mlp_W2 = W2;
-	d_mlp_b2 = b2;
-	d_mlp_W3_sh = W3_sh;
-	d_mlp_b3_sh = b3_sh;
-	d_mlp_W3_rgb = W3_rgb;
-	d_mlp_b3_rgb = b3_rgb;
-}
-
-// Copy MLP weights to global device memory
-void FORWARD::setMlpWeights(
-	const float* W1, const float* b1,
-	const float* W2, const float* b2,
-	const float* W3, const float* b3,
-	bool is_sh_mode)
-{
-	// Allocate device memory if not already done
-	if (!mlp_weights_allocated) {
-		cudaMalloc(&h_mlp_W1, 40 * 32 * sizeof(float));
-		cudaMalloc(&h_mlp_b1, 32 * sizeof(float));
-		cudaMalloc(&h_mlp_W2, 32 * 32 * sizeof(float));
-		cudaMalloc(&h_mlp_b2, 32 * sizeof(float));
-		cudaMalloc(&h_mlp_W3_sh, 32 * 48 * sizeof(float));
-		cudaMalloc(&h_mlp_b3_sh, 48 * sizeof(float));
-		cudaMalloc(&h_mlp_W3_rgb, 32 * 3 * sizeof(float));
-		cudaMalloc(&h_mlp_b3_rgb, 3 * sizeof(float));
-
-		// Set the device pointers
-		setMlpPointersKernel<<<1, 1>>>(
-			h_mlp_W1, h_mlp_b1, h_mlp_W2, h_mlp_b2,
-			h_mlp_W3_sh, h_mlp_b3_sh, h_mlp_W3_rgb, h_mlp_b3_rgb);
-		cudaDeviceSynchronize();
-
-		mlp_weights_allocated = true;
-		printf("[setMlpWeights] Allocated MLP weight buffers\n");
-	}
-
-	// Copy weights from input (device) to our allocated buffers (device-to-device)
-	cudaMemcpy(h_mlp_W1, W1, 40 * 32 * sizeof(float), cudaMemcpyDeviceToDevice);
-	cudaMemcpy(h_mlp_b1, b1, 32 * sizeof(float), cudaMemcpyDeviceToDevice);
-	cudaMemcpy(h_mlp_W2, W2, 32 * 32 * sizeof(float), cudaMemcpyDeviceToDevice);
-	cudaMemcpy(h_mlp_b2, b2, 32 * sizeof(float), cudaMemcpyDeviceToDevice);
-
-	if (is_sh_mode) {
-		cudaMemcpy(h_mlp_W3_sh, W3, 32 * 48 * sizeof(float), cudaMemcpyDeviceToDevice);
-		cudaMemcpy(h_mlp_b3_sh, b3, 48 * sizeof(float), cudaMemcpyDeviceToDevice);
-	} else {
-		cudaMemcpy(h_mlp_W3_rgb, W3, 32 * 3 * sizeof(float), cudaMemcpyDeviceToDevice);
-		cudaMemcpy(h_mlp_b3_rgb, b3, 3 * sizeof(float), cudaMemcpyDeviceToDevice);
-	}
-
-	// DEBUG: Verify weights were uploaded by reading back first few values
-	float verify[4];
-	cudaMemcpy(verify, h_mlp_W1, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-	printf("[setMlpWeights] VERIFY mlp_W1[0..3]=[%.6f,%.6f,%.6f,%.6f]\n", verify[0], verify[1], verify[2], verify[3]);
-}
-
-// Get MLP weight device pointers for passing to kernels
-void FORWARD::getMlpWeightPointers(
-	float** W1, float** b1,
-	float** W2, float** b2,
-	float** W3_sh, float** b3_sh,
-	float** W3_rgb, float** b3_rgb)
-{
-	*W1 = h_mlp_W1;
-	*b1 = h_mlp_b1;
-	*W2 = h_mlp_W2;
-	*b2 = h_mlp_b2;
-	*W3_sh = h_mlp_W3_sh;
-	*b3_sh = h_mlp_b3_sh;
-	*W3_rgb = h_mlp_W3_rgb;
-	*b3_rgb = h_mlp_b3_rgb;
-}
-
-
 void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
@@ -2116,7 +1839,8 @@ void FORWARD::render(
 	const float aa_threshold,
 	float* intersection_buffer,
 	uint32_t* intersection_count,
-	uint32_t max_intersections_per_pixel)
+	uint32_t max_intersections_per_pixel,
+	const __half* residual_textures)
 {
 	// Determine D_DIFFUSE template parameter for kernel dispatch
 	// For dual hashgrid modes (baseline_double, baseline_blend_double, surface_rgb), use D_diffuse
@@ -2130,21 +1854,21 @@ void FORWARD::render(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg, cam_pos,
 				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold,
-				intersection_buffer, intersection_count, max_intersections_per_pixel);
+				intersection_buffer, intersection_count, max_intersections_per_pixel, residual_textures);
 			break;
 		case 8:
 			renderCUDAsurfelForward<8, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg, cam_pos,
 				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold,
-				intersection_buffer, intersection_count, max_intersections_per_pixel);
+				intersection_buffer, intersection_count, max_intersections_per_pixel, residual_textures);
 			break;
 		case 16:
 			renderCUDAsurfelForward<16, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg, cam_pos,
 				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold,
-				intersection_buffer, intersection_count, max_intersections_per_pixel);
+				intersection_buffer, intersection_count, max_intersections_per_pixel, residual_textures);
 			break;
 	case 24:
 		// Always use D_DIFFUSE=0 template and handle dual hashgrids at runtime

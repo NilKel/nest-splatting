@@ -94,10 +94,12 @@ class Scene:
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
         
         if self.loaded_iter:
+            # Use full_args if available (has kernel type, method, etc.), otherwise use ModelParams args
+            ply_args = self._full_args if self._full_args is not None else args
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
-                                                           "point_cloud.ply"), args = args)
+                                                           "point_cloud.ply"), args = ply_args)
         elif hasattr(self.gaussians, '_loaded_from_checkpoint') and self.gaussians._loaded_from_checkpoint:
             # Gaussians already loaded from warmup checkpoint, skip create_from_pcd
             print(f"[Scene] Using pre-loaded Gaussians ({len(self.gaussians.get_xyz)} points)")

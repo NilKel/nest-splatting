@@ -378,7 +378,7 @@ class GaussianModel:
         
         # Initialize per-Gaussian features for cat mode, 3D mode, and 3D_direct mode
         # Dimension = hybrid_levels * per_level_dim (default: 3 * 4 = 12)
-        if hasattr(args, 'method') and args.method in ["cat", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean"] and hasattr(args, 'hybrid_levels'):
+        if hasattr(args, 'method') and args.method in ["cat", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC"] and hasattr(args, 'hybrid_levels'):
             per_level_dim = 4  # From config encoding.hashgrid.dim
             self._gaussian_feat_dim = args.hybrid_levels * per_level_dim
         else:

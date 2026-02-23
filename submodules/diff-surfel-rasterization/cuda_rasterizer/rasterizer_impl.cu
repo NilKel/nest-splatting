@@ -309,7 +309,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const float aa_threshold,
 	float* intersection_buffer,
 	uint32_t* intersection_count,
-	uint32_t max_intersections_per_pixel)
+	uint32_t max_intersections_per_pixel,
+	const __half* residual_textures)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -461,7 +462,8 @@ int CudaRasterizer::Rasterizer::forward(
 		aa_threshold,
 		intersection_buffer,
 		intersection_count,
-		max_intersections_per_pixel), debug)
+		max_intersections_per_pixel,
+		residual_textures), debug)
 
 	return num_rendered;
 }

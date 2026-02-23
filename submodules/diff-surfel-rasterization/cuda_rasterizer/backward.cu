@@ -12,196 +12,10 @@
 #include "backward.h"
 #include "auxiliary.h"
 #include "hashgrid.h"
-#include "forward.h"  // For FORWARD::getMlpWeightPointers
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <cstdlib>  // for getenv, atoi
 
 namespace cg = cooperative_groups;
-
-// ============================================================================
-// MLP weight pointers are passed as kernel parameters (not via extern device)
-// This avoids cross-compilation-unit issues without -rdc=true
-// ============================================================================
-
-// View direction encoding helper (matching forward.cu)
-__device__ void encode_view_direction_bw(const float3& view_dir, float* view_enc) {
-    const float pi = 3.14159265358979323846f;
-    // Base direction (3D)
-    view_enc[0] = view_dir.x;
-    view_enc[1] = view_dir.y;
-    view_enc[2] = view_dir.z;
-    // Frequency band 1: sin/cos(pi * dir)
-    view_enc[3] = sinf(pi * view_dir.x);
-    view_enc[4] = cosf(pi * view_dir.x);
-    view_enc[5] = sinf(pi * view_dir.y);
-    view_enc[6] = cosf(pi * view_dir.y);
-    view_enc[7] = sinf(pi * view_dir.z);
-    view_enc[8] = cosf(pi * view_dir.z);
-    // Frequency band 2: sin/cos(2*pi * dir)
-    view_enc[9] = sinf(2.0f * pi * view_dir.x);
-    view_enc[10] = cosf(2.0f * pi * view_dir.x);
-    view_enc[11] = sinf(2.0f * pi * view_dir.y);
-    view_enc[12] = cosf(2.0f * pi * view_dir.y);
-    view_enc[13] = sinf(2.0f * pi * view_dir.z);
-    view_enc[14] = cosf(2.0f * pi * view_dir.z);
-    // Pad to 16D
-    view_enc[15] = 0.0f;
-}
-
-// Include mode-specific implementations AFTER extern declarations and function definitions
-// Define guard so mode_3d_direct_fused.cu skips duplicate declarations
-#define BACKWARD_CU_INCLUDES_MODE
-#include "modes/mode_3d_direct_fused.cu"
-
-// MLP forward for backward pass (recomputes activations)
-// Returns output in 'output' and saves hidden activations in h1, h2
-template <int IN_DIM, int HIDDEN_DIM, int OUT_DIM>
-__device__ void mlp_forward_for_backward(
-    const float* input,
-    float* output,
-    float* h1_pre,    // Pre-activation hidden1 (before ReLU)
-    float* h1_post,   // Post-activation hidden1 (after ReLU)
-    float* h2_pre,    // Pre-activation hidden2 (before ReLU)
-    float* h2_post,   // Post-activation hidden2 (after ReLU)
-    const MlpWeights& mlp,
-    bool apply_sigmoid = true
-) {
-    // Layer 1: IN_DIM -> HIDDEN_DIM (ReLU)
-    #pragma unroll
-    for (int h = 0; h < HIDDEN_DIM; h++) {
-        float acc = mlp.b1[h];
-        #pragma unroll
-        for (int i = 0; i < IN_DIM; i++) {
-            acc += input[i] * mlp.W1[h * IN_DIM + i];
-        }
-        h1_pre[h] = acc;
-        h1_post[h] = fmaxf(0.0f, acc);  // ReLU
-    }
-
-    // Layer 2: HIDDEN_DIM -> HIDDEN_DIM (ReLU)
-    #pragma unroll
-    for (int h = 0; h < HIDDEN_DIM; h++) {
-        float acc = mlp.b2[h];
-        #pragma unroll
-        for (int i = 0; i < HIDDEN_DIM; i++) {
-            acc += h1_post[i] * mlp.W2[h * HIDDEN_DIM + i];
-        }
-        h2_pre[h] = acc;
-        h2_post[h] = fmaxf(0.0f, acc);
-    }
-
-    // Layer 3: HIDDEN_DIM -> OUT_DIM (Sigmoid optional)
-    const float* W3 = mlp.W3_rgb;  // Only RGB for now
-    const float* b3 = mlp.b3_rgb;
-
-    #pragma unroll
-    for (int o = 0; o < OUT_DIM; o++) {
-        float acc = b3[o];
-        #pragma unroll
-        for (int h = 0; h < HIDDEN_DIM; h++) {
-            acc += h2_post[h] * W3[o * HIDDEN_DIM + h];
-        }
-        output[o] = apply_sigmoid ? (1.0f / (1.0f + expf(-acc))) : acc;
-    }
-}
-
-// MLP backward pass - computes gradients for weights and input
-// dL_doutput: gradient w.r.t. output (after sigmoid if applied)
-// Uses pre-saved activations from forward pass
-template <int IN_DIM, int HIDDEN_DIM, int OUT_DIM>
-__device__ void mlp_backward(
-    const float* input,
-    const float* output,      // Forward pass output (after sigmoid)
-    const float* dL_doutput,  // Gradient w.r.t. output
-    const float* h1_pre,
-    const float* h1_post,
-    const float* h2_pre,
-    const float* h2_post,
-    float* dL_dinput,         // Gradient w.r.t. input [IN_DIM]
-    // Gradient buffers for weight accumulation (atomic add)
-    float* dL_dW1,            // [HIDDEN_DIM * IN_DIM]
-    float* dL_db1,            // [HIDDEN_DIM]
-    float* dL_dW2,            // [HIDDEN_DIM * HIDDEN_DIM]
-    float* dL_db2,            // [HIDDEN_DIM]
-    float* dL_dW3,            // [OUT_DIM * HIDDEN_DIM]
-    float* dL_db3,            // [OUT_DIM]
-    const MlpWeights& mlp,
-    bool applied_sigmoid = true
-) {
-    const float* W3 = mlp.W3_rgb;  // Only RGB for now
-
-    // Gradient through sigmoid: d(sigmoid)/dz = sigmoid * (1 - sigmoid) = output * (1 - output)
-    float dL_dz3[OUT_DIM];
-    #pragma unroll
-    for (int o = 0; o < OUT_DIM; o++) {
-        if (applied_sigmoid) {
-            float sig = output[o];
-            dL_dz3[o] = dL_doutput[o] * sig * (1.0f - sig);
-        } else {
-            dL_dz3[o] = dL_doutput[o];
-        }
-    }
-
-    // Layer 3 backward: dL_dW3, dL_db3, dL_dh2
-    float dL_dh2_post[HIDDEN_DIM] = {0};
-    #pragma unroll
-    for (int o = 0; o < OUT_DIM; o++) {
-        float dz = dL_dz3[o];
-        // dL_db3[o] += dz
-        atomicAdd(&dL_db3[o], dz);
-        #pragma unroll
-        for (int h = 0; h < HIDDEN_DIM; h++) {
-            // dL_dW3[o,h] += dz * h2_post[h]
-            atomicAdd(&dL_dW3[o * HIDDEN_DIM + h], dz * h2_post[h]);
-            // dL_dh2_post[h] += dz * W3[o,h]
-            dL_dh2_post[h] += dz * W3[o * HIDDEN_DIM + h];
-        }
-    }
-
-    // ReLU backward for layer 2
-    float dL_dz2[HIDDEN_DIM];
-    #pragma unroll
-    for (int h = 0; h < HIDDEN_DIM; h++) {
-        dL_dz2[h] = (h2_pre[h] > 0) ? dL_dh2_post[h] : 0.0f;
-    }
-
-    // Layer 2 backward: dL_dW2, dL_db2, dL_dh1
-    float dL_dh1_post[HIDDEN_DIM] = {0};
-    #pragma unroll
-    for (int h = 0; h < HIDDEN_DIM; h++) {
-        float dz = dL_dz2[h];
-        atomicAdd(&dL_db2[h], dz);
-        #pragma unroll
-        for (int i = 0; i < HIDDEN_DIM; i++) {
-            atomicAdd(&dL_dW2[h * HIDDEN_DIM + i], dz * h1_post[i]);
-            dL_dh1_post[i] += dz * mlp.W2[h * HIDDEN_DIM + i];
-        }
-    }
-
-    // ReLU backward for layer 1
-    float dL_dz1[HIDDEN_DIM];
-    #pragma unroll
-    for (int h = 0; h < HIDDEN_DIM; h++) {
-        dL_dz1[h] = (h1_pre[h] > 0) ? dL_dh1_post[h] : 0.0f;
-    }
-
-    // Layer 1 backward: dL_dW1, dL_db1, dL_dinput
-    #pragma unroll
-    for (int i = 0; i < IN_DIM; i++) {
-        dL_dinput[i] = 0.0f;
-    }
-    #pragma unroll
-    for (int h = 0; h < HIDDEN_DIM; h++) {
-        float dz = dL_dz1[h];
-        atomicAdd(&dL_db1[h], dz);
-        #pragma unroll
-        for (int i = 0; i < IN_DIM; i++) {
-            atomicAdd(&dL_dW1[h * IN_DIM + i], dz * input[i]);
-            dL_dinput[i] += dz * mlp.W1[h * IN_DIM + i];
-        }
-    }
-}
 
 // Backward pass for conversion of spherical harmonics to RGB for
 // each Gaussian.
@@ -676,14 +490,14 @@ renderCUDAsurfelBackward(
 	const int kernel_type = 0,
 	float* __restrict__ dL_dshapes = nullptr,
 	const bool detach_hash_grad = false,
-	// MLP gradient buffers for fused modes (render_mode=5)
+	// MLP gradient buffers (kept in signature for ABI compatibility)
 	float* __restrict__ dL_dmlp_W1 = nullptr,    // [32 * 40]
 	float* __restrict__ dL_dmlp_b1 = nullptr,    // [32]
 	float* __restrict__ dL_dmlp_W2 = nullptr,    // [32 * 32]
 	float* __restrict__ dL_dmlp_b2 = nullptr,    // [32]
 	float* __restrict__ dL_dmlp_W3 = nullptr,    // [3 * 32] for RGB
 	float* __restrict__ dL_dmlp_b3 = nullptr,    // [3]
-	// MLP weight pointers for fused modes (passed from host, not shared via extern)
+	// MLP weight pointers (unused, kept in signature for ABI compatibility)
 	const float* __restrict__ mlp_W1_ptr = nullptr,
 	const float* __restrict__ mlp_b1_ptr = nullptr,
 	const float* __restrict__ mlp_W2_ptr = nullptr,
@@ -691,13 +505,6 @@ renderCUDAsurfelBackward(
 	const float* __restrict__ mlp_W3_rgb_ptr = nullptr,
 	const float* __restrict__ mlp_b3_rgb_ptr = nullptr)
 {
-	// Create MLP weights struct from parameters
-	MlpWeights mlp_weights = {
-		mlp_W1_ptr, mlp_b1_ptr,
-		mlp_W2_ptr, mlp_b2_ptr,
-		mlp_W3_rgb_ptr, mlp_b3_rgb_ptr
-	};
-
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -733,9 +540,7 @@ renderCUDAsurfelBackward(
 	__shared__ uint32_t collected_ap_level[BLOCK_SIZE];
 	__shared__ float collected_shapes[BLOCK_SIZE];  // Beta kernel shape parameter
 
-	// Per-tile MLP gradient accumulators for 3D_direct_fused mode (render_mode=5)
-	// Accumulate to shared memory first, then flush to global once per tile
-	// This reduces atomic contention from millions to ~thousands of ops
+	// Per-tile MLP gradient accumulators (unused, kept for ABI compatibility)
 	__shared__ float tile_dL_dW1[32 * 40];   // 5KB
 	__shared__ float tile_dL_db1[32];        // 128B
 	__shared__ float tile_dL_dW2[32 * 32];   // 4KB
@@ -811,12 +616,6 @@ renderCUDAsurfelBackward(
 			// 3D mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 			// Hashgrid query happens in PyTorch, not CUDA - so actual_levels = 0
 			actual_levels = 0;
-		} else if((render_mode & 0xFF) == 5){
-			// 3D_direct_fused mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
-			// Hash query happens in CUDA kernel (like cat mode), so use active_hashgrid_levels
-			// Note: render_mode may have bit 8 set (0x100) for collaborative GEMM, so mask to get base mode
-			int active_hashgrid_levels = (level >> 8) & 0xFF;
-			actual_levels = active_hashgrid_levels;
 		} else if(level > 16){
 			printf("Error: level %d  > 16.", level);
 			return;
@@ -830,7 +629,7 @@ renderCUDAsurfelBackward(
 	int collec_offsets_diffuse[16] = {0};
 	float voxel_min_diffuse = 0.0f;
 	float voxel_max_diffuse = 0.0f;
-	// NOTE: Changed from compile-time D_DIFFUSE check to runtime check (for modes 4, 5, 12)
+	// NOTE: Changed from compile-time D_DIFFUSE check to runtime check
 	if(level > 0 && level_offsets_diffuse != nullptr && 
 	   (render_mode == 2 || render_mode == 3 || render_mode == 1)){
 		for(int l = 0; l <= level; l++) collec_offsets_diffuse[l] = level_offsets_diffuse[l];
@@ -859,14 +658,6 @@ renderCUDAsurfelBackward(
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
 	}
 
-	// DEBUG: Print dL_dpixel for first inside pixel in mode 5
-	static bool debug_pixel_grad = false;
-	if (!debug_pixel_grad && inside && (render_mode & 0xFF) == 5 && pix_id == 0) {
-		printf("[DEBUG PIXEL GRAD] pix_id=%d, C=%d, dL_dpixel=[%.6f,%.6f,%.6f]\n",
-		       pix_id, C, dL_dpixel[0], dL_dpixel[1], dL_dpixel[2]);
-		debug_pixel_grad = true;
-	}
-
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
 
@@ -874,25 +665,6 @@ renderCUDAsurfelBackward(
 	// screen-space viewport corrdinates (-1 to 1)
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
-
-	// Initialize tile-local MLP gradient buffers for render_mode=5 (3D_direct_fused)
-	// Each thread zeroes a subset of the buffer collaboratively
-	// Note: (render_mode & 0xFF) masks out the bit 8 flag to get base mode
-	if ((render_mode & 0xFF) == 5 && dL_dmlp_W1 != nullptr) {
-		for (int idx = block.thread_rank(); idx < 32 * 40; idx += BLOCK_SIZE)
-			tile_dL_dW1[idx] = 0.0f;
-		for (int idx = block.thread_rank(); idx < 32; idx += BLOCK_SIZE)
-			tile_dL_db1[idx] = 0.0f;
-		for (int idx = block.thread_rank(); idx < 32 * 32; idx += BLOCK_SIZE)
-			tile_dL_dW2[idx] = 0.0f;
-		for (int idx = block.thread_rank(); idx < 32; idx += BLOCK_SIZE)
-			tile_dL_db2[idx] = 0.0f;
-		for (int idx = block.thread_rank(); idx < 3 * 32; idx += BLOCK_SIZE)
-			tile_dL_dW3[idx] = 0.0f;
-		for (int idx = block.thread_rank(); idx < 3; idx += BLOCK_SIZE)
-			tile_dL_db3[idx] = 0.0f;
-		block.sync();
-	}
 
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -927,311 +699,10 @@ renderCUDAsurfelBackward(
 			}
 
 		// NOTE: Per-Gaussian feature caching disabled due to shared memory limits
-		// Features are now queried on-demand in the per-pixel loop (cases 4, 5, 12)
+		// Features are now queried on-demand in the per-pixel loop
 		}
 		block.sync();
 
-		// ============================================================================
-		// MODE 5 (3D_direct_fused): SYNCHRONIZED ITERATION WITH COLLABORATIVE GEMM
-		// All threads must iterate together - no early exit based on 'done'
-		// Bit 8 (0x100) indicates host enabled collaborative GEMM with dynamic smem
-		// ============================================================================
-		if ((render_mode & 0x100) && dL_dmlp_W1 != nullptr) {
-			// Synchronized loop - ALL threads iterate through ALL Gaussians in this batch
-			const int effective_toDo = min(BLOCK_SIZE, toDo);
-			for (int j = 0; j < effective_toDo; j++)
-			{
-				// Determine participation: this pixel contributed to this Gaussian
-				// (matches the contributor--; if(contributor >= last_contributor) continue; logic)
-				const int current_contributor = contributor - j - 1;
-				bool participates = inside && !done && (current_contributor < last_contributor);
-
-				// Load Gaussian data from shared memory
-				const int global_id = collected_id[j];
-				const float2 xy = collected_xy[j];
-				const float3 Tu = collected_Tu[j];
-				const float3 Tv = collected_Tv[j];
-				const float3 Tw = collected_Tw[j];
-				const float4 nor_o = collected_normal_opacity[j];
-				const float opa = nor_o.w;
-				float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
-
-				// Per-pixel intersection data
-				float2 s = {0, 0};
-				float rho3d = 0, rho2d = 0, rho = 0;
-				float c_d = 0, alpha = 0, G = 0, w = 0;
-				float3 xyz = {0, 0, 0};
-
-				// Compute intersection (only for participating pixels)
-				if (participates) {
-					float3 k = {pixf.x * Tw.x - Tu.x, pixf.x * Tw.y - Tu.y, pixf.x * Tw.z - Tu.z};
-					float3 l = {pixf.y * Tw.x - Tv.x, pixf.y * Tw.y - Tv.y, pixf.y * Tw.z - Tv.z};
-					float3 p = cross(k, l);
-
-					if (p.z != 0.0f) {
-						s = {p.x / p.z, p.y / p.z};
-						rho3d = s.x * s.x + s.y * s.y;
-						float2 d = {xy.x - pixf.x, xy.y - pixf.y};
-						rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y);
-						rho = min(rho3d, rho2d);
-						c_d = (rho3d <= rho2d) ? (s.x * Tw.x + s.y * Tw.y) + Tw.z : Tw.z;
-
-						if (c_d >= near_n) {
-							float power = -0.5f * rho;
-							if (power <= 0.0f) {
-								G = expf(power);
-								alpha = min(0.99f, opa * G);
-								if (alpha >= 1.0f / 255.0f) {
-									// CRITICAL: Recover T_before FIRST (matches 2DGS backward)
-									// T starts at T_final, we need T_before = T_after / (1-alpha)
-									T = T / (1.f - alpha);
-									w = alpha * T;
-									// Compute xyz intersection point
-									const float3 pk = collected_pk[j];
-									if (rho3d <= rho2d) {
-										const float3 sutu = collected_SuTu[j];
-										const float3 svtv = collected_SvTv[j];
-										xyz = {s.x * sutu.x + s.y * svtv.x + pk.x,
-										       s.x * sutu.y + s.y * svtv.y + pk.y,
-										       s.x * sutu.z + s.y * svtv.z + pk.z};
-									} else {
-										xyz = pk;
-									}
-								} else participates = false;
-							} else participates = false;
-						} else participates = false;
-					} else participates = false;
-				}
-
-				// ======== MLP BACKWARD WITH COLLABORATIVE GEMM ========
-				// Decode level parameter
-				const int total_levels = level >> 16;
-				const int active_hashgrid_levels = (level >> 8) & 0xFF;
-				const int hybrid_levels = level & 0xFF;
-				const int per_gaussian_dim = hybrid_levels * l_dim;
-
-				// Initialize arrays to zero (zeroes matrix strategy)
-				float my_input[40] = {0};
-				float my_h1_pre[32] = {0}, my_h1_post[32] = {0};
-				float my_h2_pre[32] = {0}, my_h2_post[32] = {0};
-				float my_output[3] = {0};
-				float my_dL_dout[3] = {0};
-				float my_dL_dz1[32] = {0}, my_dL_dz2[32] = {0}, my_dL_dz3[3] = {0};
-				float my_dL_dinput[40] = {0};
-
-				if (participates) {
-					// 1. Get per-Gaussian features (coarse: 20D)
-					for (int i = 0; i < per_gaussian_dim && i < 20; i++) {
-						my_input[i] = colors[global_id * per_gaussian_dim + i];
-					}
-
-					// 2. Query hash features (fine: 4D)
-					if (active_hashgrid_levels > 0 && l_dim == 4) {
-						float hash_feat[4] = {0};
-						uint32_t appearance_level = collected_ap_level[j];
-						query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, if_contract, false);
-						for (int i = 0; i < 4; i++) my_input[20 + i] = hash_feat[i];
-					}
-
-					// 3. Encode view direction (16D)
-					glm::vec3 cp = *cam_pos;
-					float3 view_dir = {xyz.x - cp.x, xyz.y - cp.y, xyz.z - cp.z};
-					float inv_len = rsqrtf(view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z + 1e-7f);
-					view_dir.x *= inv_len; view_dir.y *= inv_len; view_dir.z *= inv_len;
-					float view_enc[16];
-					encode_view_direction_bw(view_dir, view_enc);
-					for (int i = 0; i < 16; i++) my_input[24 + i] = view_enc[i];
-
-					// 4. Recompute MLP forward
-					mlp_forward_for_backward<40, 32, 3>(my_input, my_output, my_h1_pre, my_h1_post, my_h2_pre, my_h2_post, mlp_weights, true);
-
-					// 5. Scale gradient by weight
-					for (int c = 0; c < 3; c++) {
-						my_dL_dout[c] = dL_dpixel[c] * w;
-					}
-
-					// 6. Compute all dL_dz values for collaborative GEMM
-					compute_dL_dz_all(my_h1_pre, my_h1_post, my_h2_pre, my_h2_post,
-					                  my_output, my_dL_dout, my_dL_dz3, my_dL_dz2, my_dL_dz1, mlp_weights);
-
-					// 7. Compute dL_dinput for feature gradients
-					mlp_backward_input_only(my_h1_pre, my_h1_post, my_h2_pre, my_h2_post,
-					                        my_output, my_dL_dout, my_dL_dinput, mlp_weights);
-
-					// DEBUG: Print gradient and activation values (once per frame)
-					static bool debug_printed = false;
-					if (!debug_printed && participates && threadIdx.x == 0) {
-						// Input stats
-						float gauss_sum = 0, hash_sum = 0, view_sum = 0;
-						for (int i = 0; i < 20; i++) gauss_sum += fabsf(my_input[i]);
-						for (int i = 0; i < 4; i++) hash_sum += fabsf(my_input[20 + i]);
-						for (int i = 0; i < 16; i++) view_sum += fabsf(my_input[24 + i]);
-						printf("[BWD INPUT] gauss_sum=%.4f, hash_sum=%.4f, view_sum=%.4f\n", gauss_sum, hash_sum, view_sum);
-
-						// H1 activation stats (post-ReLU)
-						float h1_sum = 0, h1_zeros = 0;
-						for (int i = 0; i < 32; i++) { h1_sum += fabsf(my_h1_post[i]); if (my_h1_post[i] == 0) h1_zeros++; }
-						printf("[BWD H1] sum=%.4f, zeros=%d/32 (dead neurons)\n", h1_sum, (int)h1_zeros);
-
-						// H2 activation stats (post-ReLU)
-						float h2_sum = 0, h2_zeros = 0;
-						for (int i = 0; i < 32; i++) { h2_sum += fabsf(my_h2_post[i]); if (my_h2_post[i] == 0) h2_zeros++; }
-						printf("[BWD H2] sum=%.4f, zeros=%d/32 (dead neurons)\n", h2_sum, (int)h2_zeros);
-
-						// Sigmoid saturation check
-						float sig_grad[3];
-						for (int c = 0; c < 3; c++) sig_grad[c] = my_output[c] * (1.0f - my_output[c]);
-						printf("[BWD OUT] sigmoid=[%.4f,%.4f,%.4f], sig_grad=[%.6f,%.6f,%.6f]\n",
-						       my_output[0], my_output[1], my_output[2], sig_grad[0], sig_grad[1], sig_grad[2]);
-
-						// Gradient chain: dL_dpixel → w → dL_dout
-						printf("[BWD GRAD] w=%.6f, T=%.4f, alpha=%.4f, dL_dpixel=[%.4f,%.4f,%.4f]\n",
-						       w, T, alpha, dL_dpixel[0], dL_dpixel[1], dL_dpixel[2]);
-						printf("[BWD GRAD] dL_dout=[%.6e,%.6e,%.6e]\n", my_dL_dout[0], my_dL_dout[1], my_dL_dout[2]);
-
-						// Per-layer gradient stats (dL_dz)
-						float z3_sum = 0, z2_sum = 0, z1_sum = 0;
-						for (int i = 0; i < 3; i++) z3_sum += fabsf(my_dL_dz3[i]);
-						for (int i = 0; i < 32; i++) z2_sum += fabsf(my_dL_dz2[i]);
-						for (int i = 0; i < 32; i++) z1_sum += fabsf(my_dL_dz1[i]);
-						printf("[BWD LAYERS] dL_dz3_sum=%.6e, dL_dz2_sum=%.6e, dL_dz1_sum=%.6e\n", z3_sum, z2_sum, z1_sum);
-
-						// Final: dL_dinput (gauss[0..19], hash[20..23], view[24..39])
-						float din_gauss = 0, din_hash = 0, din_view = 0;
-						for (int i = 0; i < 20; i++) din_gauss += fabsf(my_dL_dinput[i]);
-						for (int i = 0; i < 4; i++) din_hash += fabsf(my_dL_dinput[20 + i]);
-						for (int i = 0; i < 16; i++) din_view += fabsf(my_dL_dinput[24 + i]);
-						printf("[BWD FEAT] dL_dinput: gauss_sum=%.6e, hash_sum=%.6e, view_sum=%.6e\n", din_gauss, din_hash, din_view);
-						debug_printed = true;
-					}
-				}
-
-				__syncthreads();
-
-				// ======== COLLABORATIVE TILE GEMM (ALL THREADS) ========
-				extern __shared__ float dynamic_smem[];
-				collaborative_mlp_backward_all(
-					my_input, my_h1_post, my_h2_post,
-					my_dL_dz1, my_dL_dz2, my_dL_dz3,
-					tile_dL_dW1, tile_dL_db1,
-					tile_dL_dW2, tile_dL_db2,
-					tile_dL_dW3, tile_dL_db3,
-					dynamic_smem
-				);
-
-				// ======== PER-PIXEL FEATURE & GEOMETRY GRADIENTS ========
-				if (participates) {
-					// DEBUG: Check values being written to feature gradients
-					static bool debug_feat_write = false;
-					if (!debug_feat_write && threadIdx.x == 0) {
-						printf("[DEBUG FEAT WRITE] per_gaussian_dim=%d, hybrid_levels=%d, l_dim=%d, global_id=%d\n",
-						       per_gaussian_dim, hybrid_levels, l_dim, global_id);
-						printf("[DEBUG FEAT WRITE] my_dL_dinput[0..3]=[%.8f,%.8f,%.8f,%.8f]\n",
-						       my_dL_dinput[0], my_dL_dinput[1], my_dL_dinput[2], my_dL_dinput[3]);
-						debug_feat_write = true;
-					}
-
-					// Backprop to per-Gaussian features
-					for (int i = 0; i < per_gaussian_dim && i < 20; i++) {
-						atomicAdd(&(dL_dcolors[global_id * per_gaussian_dim + i]), my_dL_dinput[i]);
-					}
-
-					// Backprop to hash features
-					if (active_hashgrid_levels > 0 && l_dim == 4) {
-						float dL_dhash[4];
-						for (int i = 0; i < 4; i++) dL_dhash[i] = my_dL_dinput[20 + i];
-						float hash_feat_dummy[4];
-						float dL_dxyz_local[3] = {0};
-						uint32_t appearance_level = collected_ap_level[j];
-						query_feature<true, 4, 4>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-						                          appearance_level, hash_features, active_hashgrid_levels,
-						                          l_scale, Base, align_corners, interp, if_contract, false,
-						                          dL_dhash, dL_dfeatures, dL_dxyz_local);
-					}
-
-					// ======== GEOMETRY GRADIENTS ========
-					float dL_dalpha = 0.0f;
-					float feat[C];
-					for (int ch = 0; ch < C; ch++) feat[ch] = my_output[ch];
-
-					// Update accumulators
-					for (int ch = 0; ch < C; ch++) {
-						accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-						last_color[ch] = feat[ch];
-						dL_dalpha += (feat[ch] - accum_rec[ch]) * dL_dpixel[ch];
-					}
-
-					float dL_dz = 0.0f;
-#if RENDER_AXUTILITY
-					const float m_d = far_n / (far_n - near_n) * (1 - near_n / c_d);
-					const float dmd_dd = (far_n * near_n) / ((far_n - near_n) * c_d * c_d);
-					if (current_contributor == median_contributor-1) {
-						dL_dz += dL_dmedian_depth;
-					}
-					dL_dalpha += -last_dL_dT;
-					last_dL_dT = alpha + (1 - alpha) * last_dL_dT;
-					const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A - final_D) * dL_dreg;
-					dL_dz += dL_dmd * dmd_dd;
-
-					accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
-					last_depth = c_d;
-					dL_dalpha += (c_d - accum_depth_rec) * dL_ddepth;
-
-					accum_alpha_rec = last_alpha * 1.0 + (1.f - last_alpha) * accum_alpha_rec;
-					dL_dalpha += (1 - accum_alpha_rec) * dL_daccum;
-
-					for (int ch = 0; ch < 3; ch++) {
-						accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
-						last_normal[ch] = normal[ch];
-						dL_dalpha += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
-						atomicAdd((&dL_dnormal3D[global_id * 3 + ch]), alpha * T * dL_dnormal2D[ch]);
-					}
-#endif
-
-					dL_dalpha *= T;
-					last_alpha = alpha;
-
-					float dL_dG = opa * dL_dalpha;
-
-					// Geometry gradients based on whether rho3d or rho2d was used
-					if (rho3d <= rho2d) {
-						float dG_factor = -G;
-						float2 dL_ds = {
-							dL_dG * dG_factor * s.x + dL_dz * Tw.x,
-							dL_dG * dG_factor * s.y + dL_dz * Tw.y
-						};
-
-						const float3 dz_dTw = {s.x, s.y, 1.0};
-						const float dsx_pz = dL_ds.x / (pixf.x * Tw.z - Tu.z - (pixf.y * Tw.z - Tv.z) * (pixf.x * Tw.y - Tu.y) / (pixf.y * Tw.y - Tv.y));
-						// Simplified geometry gradient (full version has cross products)
-						atomicAdd(&dL_dtransMat[global_id * 9 + 6], dL_dz * dz_dTw.x);
-						atomicAdd(&dL_dtransMat[global_id * 9 + 7], dL_dz * dz_dTw.y);
-						atomicAdd(&dL_dtransMat[global_id * 9 + 8], dL_dz * dz_dTw.z);
-					} else {
-						// 2D fallback case
-						const float dG_ddelx = -G * FilterInvSquare * (xy.x - pixf.x);
-						const float dG_ddely = -G * FilterInvSquare * (xy.y - pixf.y);
-						atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx);
-						atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely);
-						atomicAdd(&dL_dtransMat[global_id * 9 + 8], dL_dz);
-					}
-
-					atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
-
-					// NOTE: T was already updated at the start of this iteration
-					// (T = T / (1-alpha) to recover T_before, matching 2DGS backward)
-					// No T-based termination needed - loop runs through all contributors
-				}
-			}
-			// Update contributor after processing all Gaussians in this batch
-			contributor -= effective_toDo;
-		}
-		// ============================================================================
-		// OTHER MODES: ORIGINAL PER-PIXEL ITERATION (divergent)
-		// ============================================================================
-		else
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
 		{
 			// Keep track of current Gaussian ID. Skip, if this one
@@ -1591,120 +1062,6 @@ renderCUDAsurfelBackward(
 				// 3D mode: All gradients handled in PyTorch post-processing
 				// No CUDA hashgrid backward needed - just skip
 				break;
-			case 5: {
-				// 3D_direct_fused backward: Recompute MLP forward, then backprop
-				// This matches the forward pass logic in case 5
-
-				if (dL_dmlp_W1 == nullptr) {
-					// MLP gradient buffers not provided - skip (shouldn't happen in training)
-					break;
-				}
-
-				// 0. Compute xyz intersection point (same as forward pass)
-				const float3 pk = collected_pk[j];
-				float3 xyz;
-				if (rho3d <= rho2d) {
-					const float3 sutu = collected_SuTu[j];
-					const float3 svtv = collected_SvTv[j];
-					xyz = {s.x * sutu.x + s.y * svtv.x + pk.x,
-					       s.x * sutu.y + s.y * svtv.y + pk.y,
-					       s.x * sutu.z + s.y * svtv.z + pk.z};
-				} else {
-					xyz = pk;
-				}
-
-				// Decode level parameter: (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
-				const int total_levels = level >> 16;
-				const int active_hashgrid_levels = (level >> 8) & 0xFF;
-				const int hybrid_levels = level & 0xFF;
-
-				// Per-Gaussian coarse features: hybrid_levels * l_dim = 5 * 4 = 20D
-				const int per_gaussian_dim = hybrid_levels * l_dim;
-
-				// 1. Reconstruct per-Gaussian features (20D coarse)
-				float gauss_feat[20];
-				for (int i = 0; i < per_gaussian_dim && i < 20; i++) {
-					gauss_feat[i] = colors[global_id * per_gaussian_dim + i];
-				}
-
-				// 2. Query hash features (4D fine) - l_dim features, 1 level
-				float hash_feat[4] = {0};
-				if (active_hashgrid_levels > 0 && l_dim == 4) {
-					query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, false);
-				}
-
-				// 3. Compute view direction (from camera to intersection point)
-				glm::vec3 cp = *cam_pos;
-				float3 view_dir = {xyz.x - cp.x, xyz.y - cp.y, xyz.z - cp.z};
-				float inv_len = rsqrtf(view_dir.x*view_dir.x + view_dir.y*view_dir.y + view_dir.z*view_dir.z + 1e-7f);
-				view_dir.x *= inv_len; view_dir.y *= inv_len; view_dir.z *= inv_len;
-				float view_enc[16];
-				encode_view_direction_bw(view_dir, view_enc);
-
-				// 4. Build MLP input: [gauss(20) | hash(4) | view(16)] = 40D
-				float mlp_input[40];
-				for (int i = 0; i < 20; i++) mlp_input[i] = gauss_feat[i];
-				for (int i = 0; i < 4; i++)  mlp_input[20 + i] = hash_feat[i];
-				for (int i = 0; i < 16; i++) mlp_input[24 + i] = view_enc[i];
-
-				// 5. Recompute MLP forward to get activations
-				float h1_pre[32], h1_post[32], h2_pre[32], h2_post[32];
-				float mlp_output[3];
-				mlp_forward_for_backward<40, 32, 3>(mlp_input, mlp_output, h1_pre, h1_post, h2_pre, h2_post, mlp_weights, true);
-
-				// 6. Compute dL_drgb: gradient from pixel to RGB output
-				// dL_drgb = dL_dpixel * weight (weight = alpha * T = w)
-				float dL_drgb[3];
-				for (int c = 0; c < 3; c++) {
-					// grad_feat[c] already contains the accumulated gradient for this channel
-					// But we need dL_doutput for this specific intersection
-					// The gradient contribution for this intersection is proportional to weight w
-					dL_drgb[c] = dL_dchannels[c] * w;
-				}
-
-				// 7. MLP backward - compute gradients for weights and input
-				// Use TILE-LOCAL shared memory buffers instead of global atomics
-				// This reduces atomic contention by ~256x (one tile = 256 threads)
-				float dL_dinput[40];
-				mlp_backward<40, 32, 3>(
-					mlp_input, mlp_output, dL_drgb,
-					h1_pre, h1_post, h2_pre, h2_post,
-					dL_dinput,
-					tile_dL_dW1, tile_dL_db1,   // Shared memory (tile-local)
-					tile_dL_dW2, tile_dL_db2,   // Shared memory (tile-local)
-					tile_dL_dW3, tile_dL_db3,   // Shared memory (tile-local)
-					mlp_weights,
-					true  // applied_sigmoid
-				);
-
-				// 8. Backprop to per-Gaussian features (first 20D of dL_dinput)
-				for (int i = 0; i < per_gaussian_dim && i < 20; i++) {
-					atomicAdd(&(dL_dcolors[global_id * per_gaussian_dim + i]), dL_dinput[i]);
-				}
-
-				// 9. Backprop to hash features (next 4D of dL_dinput)
-				if (active_hashgrid_levels > 0 && l_dim == 4) {
-					float dL_dhash[4];
-					for (int i = 0; i < 4; i++) {
-						dL_dhash[i] = dL_dinput[20 + i];
-					}
-
-					// Backprop through hashgrid query
-					float hash_feat_dummy[4];
-					query_feature<true, 4, 4>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, false,
-					                           dL_dhash, dL_dfeatures, dL_dxyz);
-				}
-
-				// Note: dL_dview (last 16D) - gradients w.r.t. view direction encoding
-				// These would flow to dL_dxyz through the view direction computation
-				// For simplicity, we skip this as it's a second-order effect
-
-				break;
-			}
 			default: printf("BW unsupported level dim : %d\n", l_dim);
 				break;
 			}
@@ -1972,39 +1329,6 @@ renderCUDAsurfelBackward(
 
 			// Update gradients w.r.t. opacity of the Gaussian
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
-		}
-	}
-
-	// Flush tile-local MLP gradients to global memory (once per tile)
-	// This is the key optimization: we accumulated to shared memory during the loop,
-	// now we flush once with global atomics - reducing contention by ~256x
-	if ((render_mode & 0xFF) == 5 && dL_dmlp_W1 != nullptr) {
-		block.sync();  // Ensure all threads finished accumulating
-
-		// Each thread handles a subset of the weights
-		for (int idx = block.thread_rank(); idx < 32 * 40; idx += BLOCK_SIZE) {
-			if (tile_dL_dW1[idx] != 0.0f)
-				atomicAdd(&dL_dmlp_W1[idx], tile_dL_dW1[idx]);
-		}
-		for (int idx = block.thread_rank(); idx < 32; idx += BLOCK_SIZE) {
-			if (tile_dL_db1[idx] != 0.0f)
-				atomicAdd(&dL_dmlp_b1[idx], tile_dL_db1[idx]);
-		}
-		for (int idx = block.thread_rank(); idx < 32 * 32; idx += BLOCK_SIZE) {
-			if (tile_dL_dW2[idx] != 0.0f)
-				atomicAdd(&dL_dmlp_W2[idx], tile_dL_dW2[idx]);
-		}
-		for (int idx = block.thread_rank(); idx < 32; idx += BLOCK_SIZE) {
-			if (tile_dL_db2[idx] != 0.0f)
-				atomicAdd(&dL_dmlp_b2[idx], tile_dL_db2[idx]);
-		}
-		for (int idx = block.thread_rank(); idx < 3 * 32; idx += BLOCK_SIZE) {
-			if (tile_dL_dW3[idx] != 0.0f)
-				atomicAdd(&dL_dmlp_W3[idx], tile_dL_dW3[idx]);
-		}
-		for (int idx = block.thread_rank(); idx < 3; idx += BLOCK_SIZE) {
-			if (tile_dL_db3[idx] != 0.0f)
-				atomicAdd(&dL_dmlp_b3[idx], tile_dL_db3[idx]);
 		}
 	}
 
@@ -2340,197 +1664,95 @@ void BACKWARD::render(
 	float* dL_dmlp_W3,
 	float* dL_dmlp_b3)
 {
-	// Get MLP weight pointers for passing to the kernel (for 3D_direct_fused mode)
-	float *mlp_W1_ptr = nullptr, *mlp_b1_ptr = nullptr;
-	float *mlp_W2_ptr = nullptr, *mlp_b2_ptr = nullptr;
-	float *mlp_W3_sh_ptr = nullptr, *mlp_b3_sh_ptr = nullptr;
-	float *mlp_W3_rgb_ptr = nullptr, *mlp_b3_rgb_ptr = nullptr;
-	if (render_mode == 5) {
-		FORWARD::getMlpWeightPointers(
-			&mlp_W1_ptr, &mlp_b1_ptr,
-			&mlp_W2_ptr, &mlp_b2_ptr,
-			&mlp_W3_sh_ptr, &mlp_b3_sh_ptr,
-			&mlp_W3_rgb_ptr, &mlp_b3_rgb_ptr);
-	}
-
 	// Determine D_DIFFUSE template parameter for kernel dispatch
 	const uint32_t D_DIFFUSE_TEMPLATE = D_diffuse;
 
-	// Dynamic shared memory for mode 5 (3D_direct_fused) collaborative GEMM
-	// Layer 1 requires: 256*40 + 256*32 = 40KB + 32KB = 72KB
-	size_t smem_size = 0;
-	bool use_collaborative_gemm = false;
-
-	if (render_mode == 5 && dL_dmlp_W1 != nullptr) {
-		// Check for debug override to disable collaborative GEMM
-		static int force_disable = -1;
-		if (force_disable == -1) {
-			const char* env = getenv("DISABLE_COLLABORATIVE_GEMM");
-			force_disable = (env && atoi(env) != 0) ? 1 : 0;
-			if (force_disable) printf("[DEBUG] Collaborative GEMM disabled via env var\n");
-		}
-
-		if (!force_disable) {
-			// Try to enable collaborative GEMM with 36KB shared memory (sub-tiled)
-			// Sub-tile size 128: Layer 1 needs 128*(32+40)*4 = 36864 bytes
-			// Will fall back to atomics if GPU doesn't support it
-			const size_t required_smem = 36864;  // 36KB for sub-tile approach
-			smem_size = required_smem;
-			use_collaborative_gemm = true;
-		}
-	}
-
-	// Set max dynamic shared memory attribute if needed (must be done before launch)
-	// If this fails, the GPU doesn't support enough shared memory - fall back to atomics
-	if (use_collaborative_gemm && smem_size > 0) {
-		// Get GPU's max shared memory per block
-		int device;
-		cudaGetDevice(&device);
-		int max_smem_per_block;
-		cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-
-		// Get kernel's static shared memory usage
-		cudaFuncAttributes attr;
-		cudaFuncGetAttributes(&attr, renderCUDAsurfelBackward<3, 0>);
-
-		// Check if we have enough headroom
-		size_t total_needed = attr.sharedSizeBytes + smem_size;
-
-		static bool printed_info = false;
-		if (!printed_info) {
-			printf("[DEBUG] GPU max shared memory per block (optin): %d bytes\n", max_smem_per_block);
-			printf("[DEBUG] Kernel static shared memory: %zu bytes\n", attr.sharedSizeBytes);
-			printf("[DEBUG] Requested dynamic shared memory: %zu bytes\n", smem_size);
-			printf("[DEBUG] Total needed: %zu bytes\n", total_needed);
-			printed_info = true;
-		}
-
-		if (total_needed > (size_t)max_smem_per_block) {
-			printf("[DEBUG] Total shared memory (%zu) exceeds GPU max (%d), falling back to atomics\n",
-			       total_needed, max_smem_per_block);
-			smem_size = 0;
-			use_collaborative_gemm = false;
-		} else {
-			// Request the larger shared memory allocation
-			cudaError_t err = cudaFuncSetAttribute(renderCUDAsurfelBackward<3, 0>,
-			                                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-			if (err != cudaSuccess) {
-				// Print the actual error for debugging
-				printf("[DEBUG] cudaFuncSetAttribute failed: %s (code %d)\n",
-				       cudaGetErrorString(err), (int)err);
-				// Fall back to atomics-based path
-				smem_size = 0;
-				use_collaborative_gemm = false;
-				cudaGetLastError();  // Clear the error
-			}
-		}
-	}
-
-	// Adjust render_mode for kernel: bit 8 = use collaborative GEMM
-	// render_mode == 5 with bit 8 set -> uses synchronized loop with collaborative GEMM
-	// render_mode == 5 without bit 8 -> falls through to old case 5 in switch statement
-	int adjusted_render_mode = render_mode;
-	if (render_mode == 5 && use_collaborative_gemm) {
-		adjusted_render_mode = 5 | 0x100;  // Set bit 8 to indicate collaborative GEMM
-	}
-
-	// Debug: print shared memory info on first call
-	static bool first_call = true;
-	if (first_call && render_mode == 5) {
-		printf("[DEBUG] render_mode=5, smem_size=%zu, use_collaborative_gemm=%d\n",
-		       smem_size, use_collaborative_gemm ? 1 : 0);
-		first_call = false;
-	}
+	// MLP weight pointers are unused (mode 5 removed), but kept in kernel signature for ABI compatibility
+	const float *mlp_W1_ptr = nullptr, *mlp_b1_ptr = nullptr;
+	const float *mlp_W2_ptr = nullptr, *mlp_b2_ptr = nullptr;
+	const float *mlp_W3_rgb_ptr = nullptr, *mlp_b3_rgb_ptr = nullptr;
 
 	switch (C) {
 		case 3:
-			renderCUDAsurfelBackward<3, 0> <<<grid, block, smem_size>>>(
+			renderCUDAsurfelBackward<3, 0> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, adjusted_render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
 					dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
 					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
 			break;
 		case 8:
-			if (smem_size > 0) cudaFuncSetAttribute(renderCUDAsurfelBackward<8, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-			renderCUDAsurfelBackward<8, 0> <<<grid, block, smem_size>>>(
+			renderCUDAsurfelBackward<8, 0> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, adjusted_render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
 					dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
 					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
 			break;
 		case 16:
-			if (smem_size > 0) cudaFuncSetAttribute(renderCUDAsurfelBackward<16, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-			renderCUDAsurfelBackward<16, 0> <<<grid, block, smem_size>>>(
+			renderCUDAsurfelBackward<16, 0> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, adjusted_render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
 					dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
 					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
 			break;
 	case 24:
 		// Always use D_DIFFUSE=0 template and handle dual hashgrids at runtime
 		// This avoids shared memory issues from instantiating multiple templates
-		if (smem_size > 0) cudaFuncSetAttribute(renderCUDAsurfelBackward<24, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-		renderCUDAsurfelBackward<24, 0> <<<grid, block, smem_size>>>(
+		renderCUDAsurfelBackward<24, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, adjusted_render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
 				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
 					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
 		break;
 	case 32:
-		if (smem_size > 0) cudaFuncSetAttribute(renderCUDAsurfelBackward<32, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-		renderCUDAsurfelBackward<32, 0> <<<grid, block, smem_size>>>(
+		renderCUDAsurfelBackward<32, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, adjusted_render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
 				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
 					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
 		break;
 	case 42:
-		if (smem_size > 0) cudaFuncSetAttribute(renderCUDAsurfelBackward<42, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-		renderCUDAsurfelBackward<42, 0> <<<grid, block, smem_size>>>(
+		renderCUDAsurfelBackward<42, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, adjusted_render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
 				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
 					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
 		break;
 	case 48:
-		if (smem_size > 0) cudaFuncSetAttribute(renderCUDAsurfelBackward<48, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-		renderCUDAsurfelBackward<48, 0> <<<grid, block, smem_size>>>(
+		renderCUDAsurfelBackward<48, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, adjusted_render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
 				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
 					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
 		break;
 	case 72:
-		if (smem_size > 0) cudaFuncSetAttribute(renderCUDAsurfelBackward<72, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-		renderCUDAsurfelBackward<72, 0> <<<grid, block, smem_size>>>(
+		renderCUDAsurfelBackward<72, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, adjusted_render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
 				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
 					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
 		break;
 	case 90:
-		if (smem_size > 0) cudaFuncSetAttribute(renderCUDAsurfelBackward<90, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-		renderCUDAsurfelBackward<90, 0> <<<grid, block, smem_size>>>(
+		renderCUDAsurfelBackward<90, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, adjusted_render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
 				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
 					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
 		break;

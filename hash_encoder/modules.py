@@ -82,8 +82,16 @@ class INGP(nn.Module):
         self.is_3D_direct_fused_mode = args is not None and hasattr(args, 'method') and args.method == "3D_direct_fused"
         # Store args for 3D_direct_lean mode (same as fused but uses lean rasterizer library for faster builds)
         self.is_3D_direct_lean_mode = args is not None and hasattr(args, 'method') and args.method == "3D_direct_lean"
-        # Treat lean mode same as fused mode for MLP/rendering logic
-        if self.is_3D_direct_lean_mode:
+        # Store args for 3D_direct_fp16 mode (FP16 weights + FP16 GEMM shared memory, diff_surfel_3D_16)
+        self.is_3D_direct_fp16_mode = args is not None and hasattr(args, 'method') and args.method == "3D_direct_fp16"
+        # Store args for 3D_direct_TC mode (Tensor Core WMMA for MLP, diff_surfel_3D_tc)
+        self.is_3D_direct_tc_mode = args is not None and hasattr(args, 'method') and args.method == "3D_direct_TC"
+        # Store args for 3D_SH_TC mode (TC WMMA MLP → 48D SH coefs, diff_surfel_3D_sh)
+        self.is_3D_direct_sh_tc_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_TC"
+        # Store args for 3D_SH_res mode (per-Gaussian SH + tiny hash MLP residual, diff_surfel_3D_sh_res)
+        self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_res"
+        # Treat lean/fp16/tc/sh_tc/sh_res mode same as fused mode for MLP/rendering logic
+        if self.is_3D_direct_lean_mode or self.is_3D_direct_fp16_mode or self.is_3D_direct_tc_mode or self.is_3D_direct_sh_tc_mode or self.is_3D_SH_res_mode:
             self.is_3D_direct_fused_mode = True
 
         # hybrid_levels is used by cat, cat_dropout, adaptive_cat, adaptive_zero, adaptive_gate, 3D, 3D_direct, and 3D_direct_fused modes
@@ -217,9 +225,66 @@ class INGP(nn.Module):
 
         # 3D_direct_fused mode: PyTorch MLP for in-kernel evaluation
         # Uses explicit weight matrices (not tcnn) so we can upload to CUDA constant memory
-        # Architecture: 40D input → 32D hidden (ReLU) × 2 → 3D RGB (sigmoid in CUDA)
         self.mlp_fused = None
-        if self.is_3D_direct_fused_mode:
+        if self.is_3D_SH_res_mode:
+            # 3D_SH_res: Tiny view-independent residual MLP (hash features → RGB residual)
+            # Per-Gaussian SH handles view-dependent base color (evaluated in CUDA preprocessing)
+            # MLP only adds a small spatial correction from hash grid
+            total_levels = cfg_model.encoding.levels
+            level_dim = cfg_model.encoding.hashgrid.dim
+            hash_dim = (total_levels - self.hybrid_levels) * level_dim  # All non-hybrid levels
+            mlp_input_dim = hash_dim  # e.g., 4D for 1 hash level
+            # Pad to 16D for WMMA alignment: [hash(4) | bias(1) | pad(11)] = 16
+            mlp_input_padded = ((mlp_input_dim + 1 + 15) // 16) * 16  # +1 for bias, round up to 16
+            hidden_dim = mlp_input_padded  # 16
+
+            print(f'[3D_SH_RES MODE] Building bias-free residual MLP for CUDA:')
+            print(f'  Hash features: {hash_dim}D ({total_levels - self.hybrid_levels} levels × {level_dim}D)')
+            print(f'  MLP input: {mlp_input_dim}D hash + 1D bias + {mlp_input_padded - mlp_input_dim - 1}D pad = {mlp_input_padded}D')
+            print(f'  Architecture: {mlp_input_padded}D → {hidden_dim}D (ReLU) → {hidden_dim}D (ReLU) → {hidden_dim}D (identity, first 3 = RGB residual)')
+            print(f'  Bias-free: L1 uses input padding (col {mlp_input_dim} acts as bias), L2/L3 no bias')
+            print(f'  Per-Gaussian SH: standard degree-3 (16 coefficients × 3 channels)')
+
+            self.mlp_fused = nn.Sequential(
+                nn.Linear(mlp_input_padded, hidden_dim, bias=False),  # W1: [16, 16]
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim, bias=False),         # W2: [16, 16]
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim, bias=False),         # W3: [16, 16] (only first 3 = RGB residual)
+            ).cuda()
+
+            self.mlp_fused_input_dim = mlp_input_dim
+            self.mlp_fused_hash_dim = hash_dim
+            self.mlp_fused_gauss_dim = 0  # No per-Gaussian features (SH handles it)
+
+        elif self.is_3D_direct_sh_tc_mode:
+            # 3D_SH_TC: MLP outputs 48D SH coefficients, NO view direction input
+            # SH evaluation happens in CUDA kernel with per-intersection viewdir
+            total_levels = cfg_model.encoding.levels
+            level_dim = cfg_model.encoding.hashgrid.dim
+            feat_dim = total_levels * level_dim  # 24D (6 levels × 4D)
+            mlp_input_dim = feat_dim  # 24D (no view encoding!)
+
+            print(f'[3D_SH_TC MODE] Building bias-free PyTorch MLP for CUDA SH mode:')
+            print(f'  Features: {feat_dim}D (Gaussian: {self.hybrid_levels * level_dim}D + Hash: {(total_levels - self.hybrid_levels) * level_dim}D)')
+            print(f'  Total input: {mlp_input_dim}D (+ 1D bias = {mlp_input_dim + 1}D, no view encoding)')
+            print(f'  Architecture: {mlp_input_dim + 1}D → 32D (ReLU) → 32D (ReLU) → 48D SH (identity)')
+            print(f'  Bias-free: L1 uses input padding (col 24 acts as bias), L2/L3 no bias')
+
+            self.mlp_fused = nn.Sequential(
+                nn.Linear(mlp_input_dim + 1, 32, bias=False),  # W1: [32, 25] (col 24 = implicit bias)
+                nn.ReLU(),
+                nn.Linear(32, 32, bias=False),                  # W2: [32, 32]
+                nn.ReLU(),
+                nn.Linear(32, 48, bias=False),                  # W3: [48, 32] (16 SH coefs × 3 RGB)
+            ).cuda()
+
+            self.mlp_fused_input_dim = mlp_input_dim
+            self.mlp_fused_hash_dim = (total_levels - self.hybrid_levels) * level_dim
+            self.mlp_fused_gauss_dim = self.hybrid_levels * level_dim
+        elif self.is_3D_direct_fused_mode:
+            # 3D_direct_fused/lean/fp16/TC: MLP outputs 3D RGB with view direction as input
+            # Architecture: 40D input → 32D hidden (ReLU) × 2 → 3D RGB (sigmoid in CUDA)
             total_levels = cfg_model.encoding.levels
             level_dim = cfg_model.encoding.hashgrid.dim
             feat_dim = total_levels * level_dim  # 24D (6 levels × 4D)
@@ -233,9 +298,6 @@ class INGP(nn.Module):
             print(f'  Architecture: {mlp_input_dim + 1}D → 32D (ReLU) → 32D (ReLU) → 3D (sigmoid)')
             print(f'  Bias-free: L1 uses input padding (col 41 acts as bias), L2/L3 no bias')
 
-            # Create explicit PyTorch layers for weight extraction (bias-free)
-            # Layer 1: 41D input (40D features + 1D padding) for implicit bias via W1[:, 40]
-            # Layers 2, 3: no bias
             self.mlp_fused = nn.Sequential(
                 nn.Linear(mlp_input_dim + 1, 32, bias=False),  # W1: [32, 41] (col 41 = implicit bias)
                 nn.ReLU(),
@@ -245,7 +307,6 @@ class INGP(nn.Module):
                 # Note: sigmoid is applied in CUDA kernel, not here
             ).cuda()
 
-            # Store dimensions for weight extraction
             self.mlp_fused_input_dim = mlp_input_dim
             self.mlp_fused_hash_dim = (total_levels - self.hybrid_levels) * level_dim
             self.mlp_fused_gauss_dim = self.hybrid_levels * level_dim
@@ -954,6 +1015,39 @@ class INGP(nn.Module):
 
         # NO transpose - PyTorch [out, in] is already row-major [out][in]
         # which matches CUDA's W[h * in_dim + i] access pattern
+
+        # Pad weights for WMMA alignment (Tensor Core modes)
+        if self.is_3D_SH_res_mode:
+            # 3D_SH_res: All weights are [16, 16] — already WMMA-aligned
+            # But W1 might be smaller if input_dim+1 < 16, so pad
+            import torch
+            actual_input_cols = W1.shape[1]  # e.g., mlp_input_padded (should be 16)
+            if actual_input_cols < 16:
+                W1_padded = torch.zeros(16, 16, device=W1.device, dtype=W1.dtype)
+                W1_padded[:W1.shape[0], :W1.shape[1]] = W1
+                W1 = W1_padded
+            # W3 output: [16, 16] — only first 3 rows used as RGB residual
+            actual_output_rows = W3.shape[0]
+            if actual_output_rows < 16:
+                W3_padded = torch.zeros(16, 16, device=W3.device, dtype=W3.dtype)
+                W3_padded[:W3.shape[0], :W3.shape[1]] = W3
+                W3 = W3_padded
+            return W1.contiguous(), W2.contiguous(), W3.contiguous()
+        elif self.is_3D_direct_sh_tc_mode:
+            import torch
+            # SH mode: W1[32,25] → pad to [32,32], W3[48,32] → already aligned
+            W1_padded = torch.zeros(32, 32, device=W1.device, dtype=W1.dtype)
+            W1_padded[:, :25] = W1
+            # W3 is [48, 32] — already WMMA-aligned, no padding needed
+            return W1_padded.contiguous(), W2.contiguous(), W3.contiguous()
+        elif self.is_3D_direct_tc_mode:
+            import torch
+            W1_padded = torch.zeros(32, 48, device=W1.device, dtype=W1.dtype)
+            W1_padded[:, :41] = W1
+            W3_padded = torch.zeros(16, 32, device=W3.device, dtype=W3.dtype)
+            W3_padded[:3, :] = W3
+            return W1_padded.contiguous(), W2.contiguous(), W3_padded.contiguous()
+
         return W1.contiguous(), W2.contiguous(), W3.contiguous()
 
     def _copy_tcnn_to_pytorch_mlp(self, checkpoint_state_dict=None):

@@ -230,7 +230,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max, full_args=args)
 
         # Initialize per-Gaussian features for cat/cat_dropout/3D_direct/3D_direct_fused mode (trained from scratch after warmup)
-        if args.method in ["cat", "cat_dropout", "3D_direct", "3D_direct_fused", "3D_direct_lean"] and args.hybrid_levels > 0:
+        if args.method in ["cat", "cat_dropout", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC"] and args.hybrid_levels > 0:
             per_level_dim = 4  # From config encoding.hashgrid.dim
             gaussians._gaussian_feat_dim = args.hybrid_levels * per_level_dim
             gaussian_feats = torch.zeros((len(gaussians.get_xyz), gaussians._gaussian_feat_dim), device="cuda").float()
@@ -376,8 +376,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"[3D_DIRECT MODE] Hashgrid features (fine): {num_levels - args.hybrid_levels} × {per_level_dim} = {(num_levels - args.hybrid_levels) * per_level_dim}D")
             print(f"[3D_DIRECT MODE] Max intersections per pixel: {args.max_intersections_per_pixel}")
 
-        elif args.method in ["3D_direct_fused", "3D_direct_lean"]:
-            # 3D_direct_fused/lean mode: fused in-kernel MLP rendering
+        elif args.method == "3D_SH_res":
+            # 3D_SH_res: per-Gaussian SH + tiny hash MLP residual
+            # No per-Gaussian features needed — standard SH handles per-Gaussian appearance
+            gaussians._gaussian_feat_dim = 0
+            gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+
+            num_levels = cfg_model.encoding.levels
+            per_level_dim = cfg_model.encoding.hashgrid.dim
+            n_gaussians = len(gaussians.get_xyz)
+            print(f"[3D_SH_RES MODE] Initialized {n_gaussians} Gaussians")
+            print(f"[3D_SH_RES MODE] Per-Gaussian: standard SH (degree-3, 48 params)")
+            print(f"[3D_SH_RES MODE] Hash levels: {num_levels}, {per_level_dim}D per level")
+            print(f"[3D_SH_RES MODE] MLP: 16D → 16D → 16D → 3D (RGB residual, identity)")
+
+        elif args.method in ["3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC"]:
+            # 3D_direct_fused/lean/SH_TC mode: fused in-kernel MLP rendering
             # Like cat mode but MLP runs inside CUDA kernel, outputs RGB directly
             num_levels = cfg_model.encoding.levels
             per_level_dim = cfg_model.encoding.hashgrid.dim
@@ -546,7 +560,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Load optimizer state from warmup checkpoint
         # For cat/adaptive/adaptive_cat/adaptive_zero/adaptive_gate/diffuse/3D/3D_direct/3D_direct_fused mode, new params won't be in saved state - they train from scratch
         # Also skip for beta/flex/general kernels which add new _shape/_flex_beta params not in warmup checkpoint
-        if args.method not in ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean"] and args.kernel == "gaussian":
+        if args.method not in ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res"] and args.kernel == "gaussian":
             gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
         
         # Move optimizer state to GPU
@@ -1080,14 +1094,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Apply MLP gradients for 3D_direct_fused mode
         # MLP weights are in CUDA constant memory, gradients computed in CUDA backward
         if ingp is not None and hasattr(ingp, 'is_3D_direct_fused_mode') and ingp.is_3D_direct_fused_mode:
-            # Import from lean library if using lean mode
-            if hasattr(ingp, 'is_3D_direct_lean_mode') and ingp.is_3D_direct_lean_mode:
+            # Import from appropriate library based on mode
+            if hasattr(ingp, 'is_3D_SH_res_mode') and ingp.is_3D_SH_res_mode:
+                from diff_surfel_3D_sh_res import get_mlp_grads
+            elif hasattr(ingp, 'is_3D_direct_sh_tc_mode') and ingp.is_3D_direct_sh_tc_mode:
+                from diff_surfel_3D_sh import get_mlp_grads
+            elif hasattr(ingp, 'is_3D_direct_tc_mode') and ingp.is_3D_direct_tc_mode:
+                from diff_surfel_3D_tc import get_mlp_grads
+            elif hasattr(ingp, 'is_3D_direct_fp16_mode') and ingp.is_3D_direct_fp16_mode:
+                from diff_surfel_3D_16 import get_mlp_grads
+            elif hasattr(ingp, 'is_3D_direct_lean_mode') and ingp.is_3D_direct_lean_mode:
                 from diff_surfel_3D import get_mlp_grads
             else:
                 from diff_surfel_rasterization import get_mlp_grads
             mlp_grads = get_mlp_grads()
             if mlp_grads is not None:
                 grad_W1, grad_W2, grad_W3 = mlp_grads
+                # Trim WMMA-padded gradients back to PyTorch MLP dimensions
+                # 3D_SH_res: all [16,16] — no trimming needed (PyTorch MLP matches CUDA)
+                if hasattr(ingp, 'is_3D_direct_sh_tc_mode') and ingp.is_3D_direct_sh_tc_mode:
+                    grad_W1 = grad_W1[:, :25]  # [32, 32] -> [32, 25]
+                    # W3 is [48, 32] — no trimming needed (all 48 SH coefficients used)
+                elif hasattr(ingp, 'is_3D_direct_tc_mode') and ingp.is_3D_direct_tc_mode:
+                    grad_W1 = grad_W1[:, :41]  # [32, 48] -> [32, 41]
+                    grad_W3 = grad_W3[:3, :]   # [16, 32] -> [3, 32]
                 mlp = ingp.mlp_fused
                 # Accumulate gradients (in case there are multiple backward passes)
                 # MLP layout: Linear(41, 32, bias=False), Linear(32, 32, bias=False), Linear(32, 3, bias=False)
@@ -1103,6 +1133,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     mlp[4].weight.grad = grad_W3.clone()
                 else:
                     mlp[4].weight.grad += grad_W3
+
+        # Debug: print gradient norms every 500 iterations
 
         # Total variation regularization on hashgrid - penalizes uniform regions while preserving edges
         # Must be called after backward() and before optimizer.step() as it directly modifies gradients
@@ -1695,7 +1727,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
         f.write("=" * 50 + "\n\n")
 
         f.write(f"Method: {args.method}\n")
-        if args.method in ["cat", "cat_dropout", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean"]:
+        if args.method in ["cat", "cat_dropout", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res"]:
             f.write(f"Hybrid Levels: {args.hybrid_levels}\n")
             if args.method == "cat_dropout":
                 f.write(f"Dropout Lambda: {args.dropout_lambda}\n")
@@ -2492,7 +2524,7 @@ if __name__ == "__main__":
     
     # Method argument - baseline, cat, cat_dropout, adaptive, adaptive_add, adaptive_cat, adaptive_zero, adaptive_gate, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean"],
+                        choices=["baseline", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res"],
                         help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'cat_dropout' (cat with hash dropout during training - use --dropout_lambda), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'adaptive_zero' (cat with weighted hash vs zeros - w=0 skips hash query), 'adaptive_gate' (VQ-AD style gating: soft→STE→hard, L1 regularization toward zeros), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual), '3D' (intersection-based SH rendering), '3D_direct' (intersection-based RGB MLP), or '3D_direct_fused' (fused in-kernel MLP, no intersection buffer)")
     parser.add_argument("--hybrid_levels", type=int, default=3,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")

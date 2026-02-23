@@ -75,7 +75,7 @@ def load_model(model_path, iteration=-1):
     return gaussians, scene, ingp, cfg, pipe, args, iteration
 
 
-def benchmark_mode(mode_name, gaussians, ingp, cameras, bg, pipe, cfg, num_warmup=5, num_passes=3):
+def benchmark_mode(mode_name, gaussians, ingp, cameras, bg, pipe, cfg, num_warmup=5, num_passes=3, benchmark_backward=False):
     """Benchmark a specific mode over all test cameras."""
 
     # Store original mode
@@ -85,55 +85,101 @@ def benchmark_mode(mode_name, gaussians, ingp, cameras, bg, pipe, cfg, num_warmu
 
     # Configure mode
     orig_lean = getattr(ingp, 'is_3D_direct_lean_mode', False)
+    orig_fp16 = getattr(ingp, 'is_3D_direct_fp16_mode', False)
+    orig_tc = getattr(ingp, 'is_3D_direct_tc_mode', False)
     if mode_name == "3D_direct":
         ingp.is_3D_direct_mode = True
         ingp.is_3D_direct_fused_mode = False
         ingp.is_3D_direct_lean_mode = False
+        ingp.is_3D_direct_fp16_mode = False
+        ingp.is_3D_direct_tc_mode = False
         ingp.is_cat_mode = False
     elif mode_name == "3D_direct_fused":
         ingp.is_3D_direct_mode = False
         ingp.is_3D_direct_fused_mode = True
         ingp.is_3D_direct_lean_mode = True  # Use lean library
+        ingp.is_3D_direct_fp16_mode = False
+        ingp.is_3D_direct_tc_mode = False
+        ingp.is_cat_mode = False
+    elif mode_name == "3D_direct_fp16":
+        ingp.is_3D_direct_mode = False
+        ingp.is_3D_direct_fused_mode = True
+        ingp.is_3D_direct_lean_mode = False
+        ingp.is_3D_direct_fp16_mode = True  # Use FP16 library
+        ingp.is_3D_direct_tc_mode = False
+        ingp.is_cat_mode = False
+    elif mode_name == "3D_direct_TC":
+        ingp.is_3D_direct_mode = False
+        ingp.is_3D_direct_fused_mode = True
+        ingp.is_3D_direct_lean_mode = False
+        ingp.is_3D_direct_fp16_mode = False
+        ingp.is_3D_direct_tc_mode = True  # Use TC library
         ingp.is_cat_mode = False
     elif mode_name == "cat":
         ingp.is_3D_direct_mode = False
         ingp.is_3D_direct_fused_mode = False
         ingp.is_3D_direct_lean_mode = False
+        ingp.is_3D_direct_tc_mode = False
         ingp.is_cat_mode = True
 
     print(f"\n=== Benchmarking {mode_name} ({len(cameras)} cameras, {num_passes} passes) ===")
 
     # Warmup with first camera
-    print(f"Warming up ({num_warmup} runs)...")
-    with torch.no_grad():
-        for i in range(num_warmup):
-            try:
+    pass_label = "forward+backward" if benchmark_backward else "forward"
+    print(f"Warming up ({num_warmup} runs, {pass_label})...")
+    for i in range(num_warmup):
+        try:
+            if benchmark_backward:
                 result = render(cameras[0], gaussians, pipe, bg, cfg=cfg, ingp=ingp, iteration=50000)
+                result["render"].sum().backward()
                 torch.cuda.synchronize()
-            except Exception as e:
-                print(f"Warmup {i} failed: {e}")
-                import traceback; traceback.print_exc()
-                ingp.is_3D_direct_mode = orig_3d_direct
-                ingp.is_3D_direct_fused_mode = orig_3d_direct_fused
-                ingp.is_3D_direct_lean_mode = orig_lean
-                ingp.is_cat_mode = orig_cat
-                return None, None
+                # Zero grads for next iteration
+                for p in ingp.parameters():
+                    if p.grad is not None:
+                        p.grad.zero_()
+                if gaussians._xyz.grad is not None:
+                    gaussians._xyz.grad.zero_()
+            else:
+                with torch.no_grad():
+                    result = render(cameras[0], gaussians, pipe, bg, cfg=cfg, ingp=ingp, iteration=50000)
+                    torch.cuda.synchronize()
+        except Exception as e:
+            print(f"Warmup {i} failed: {e}")
+            import traceback; traceback.print_exc()
+            ingp.is_3D_direct_mode = orig_3d_direct
+            ingp.is_3D_direct_fused_mode = orig_3d_direct_fused
+            ingp.is_3D_direct_lean_mode = orig_lean
+            ingp.is_3D_direct_fp16_mode = orig_fp16
+            ingp.is_3D_direct_tc_mode = orig_tc
+            ingp.is_cat_mode = orig_cat
+            return None, None
 
     # Benchmark over all cameras, multiple passes
-    print(f"Benchmarking...")
+    print(f"Benchmarking {pass_label}...")
     times = []
 
-    with torch.no_grad():
-        for p in range(num_passes):
-            for cam in cameras:
-                torch.cuda.synchronize()
-                start = time.perf_counter()
+    for p in range(num_passes):
+        for cam in cameras:
+            torch.cuda.synchronize()
+            start = time.perf_counter()
 
+            if benchmark_backward:
                 result = render(cam, gaussians, pipe, bg, cfg=cfg, ingp=ingp, iteration=50000)
+                result["render"].sum().backward()
+            else:
+                with torch.no_grad():
+                    result = render(cam, gaussians, pipe, bg, cfg=cfg, ingp=ingp, iteration=50000)
 
-                torch.cuda.synchronize()
-                end = time.perf_counter()
-                times.append((end - start) * 1000)  # ms
+            torch.cuda.synchronize()
+            end = time.perf_counter()
+            times.append((end - start) * 1000)  # ms
+
+            if benchmark_backward:
+                for p2 in ingp.parameters():
+                    if p2.grad is not None:
+                        p2.grad.zero_()
+                if gaussians._xyz.grad is not None:
+                    gaussians._xyz.grad.zero_()
 
     avg_time = sum(times) / len(times)
     min_time = min(times)
@@ -147,6 +193,8 @@ def benchmark_mode(mode_name, gaussians, ingp, cameras, bg, pipe, cfg, num_warmu
     ingp.is_3D_direct_mode = orig_3d_direct
     ingp.is_3D_direct_fused_mode = orig_3d_direct_fused
     ingp.is_3D_direct_lean_mode = orig_lean
+    ingp.is_3D_direct_fp16_mode = orig_fp16
+    ingp.is_3D_direct_tc_mode = orig_tc
     ingp.is_cat_mode = orig_cat
 
     return avg_time, fps
@@ -194,34 +242,77 @@ def main():
     # Background
     bg = torch.ones(3, device="cuda")
 
-    results = {}
+    results_fwd = {}
+    results_fwdbw = {}
 
-    # Benchmark 3D_direct (Python MLP)
-    try:
-        t, fps = benchmark_mode("3D_direct", gaussians, ingp, cameras, bg, pipe, cfg)
-        if t: results["3D_direct"] = (t, fps)
-    except Exception as e:
-        print(f"3D_direct failed: {e}")
-        import traceback; traceback.print_exc()
+    modes = ["3D_direct", "3D_direct_fused", "3D_direct_fp16", "3D_direct_TC"]
 
-    # Benchmark 3D_direct_fused (CUDA MLP)
-    try:
-        t, fps = benchmark_mode("3D_direct_fused", gaussians, ingp, cameras, bg, pipe, cfg)
-        if t: results["3D_direct_fused"] = (t, fps)
-    except Exception as e:
-        print(f"3D_direct_fused failed: {e}")
-        import traceback; traceback.print_exc()
+    # Forward-only benchmarks
+    for mode in modes:
+        try:
+            t, fps = benchmark_mode(mode, gaussians, ingp, cameras, bg, pipe, cfg)
+            if t: results_fwd[mode] = (t, fps)
+        except Exception as e:
+            print(f"{mode} forward failed: {e}")
+            import traceback; traceback.print_exc()
+
+    # Free forward-only memory before backward benchmarks
+    torch.cuda.empty_cache()
+
+    # Forward+backward benchmarks (use fewer cameras to avoid OOM)
+    bw_cameras = cameras[:20]  # 20 cameras for backward benchmark
+    for mode in modes:
+        try:
+            t, fps = benchmark_mode(mode, gaussians, ingp, bw_cameras, bg, pipe, cfg, benchmark_backward=True)
+            if t: results_fwdbw[mode] = (t, fps)
+        except Exception as e:
+            print(f"{mode} fwd+bwd failed: {e}")
+            import traceback; traceback.print_exc()
 
     # Summary
     print("\n" + "="*60)
-    print("SUMMARY (Forward Pass Only, avg over all test cameras)")
+    print("SUMMARY (Forward Pass Only)")
     print("="*60)
-    for mode, (t, fps) in results.items():
+    for mode, (t, fps) in results_fwd.items():
         print(f"{mode:20s}: {t:7.2f} ms  ({fps:6.1f} FPS)")
 
-    if "3D_direct" in results and "3D_direct_fused" in results:
-        speedup = results["3D_direct"][0] / results["3D_direct_fused"][0]
-        print(f"\nFused speedup vs Python: {speedup:.2f}x")
+    if "3D_direct" in results_fwd and "3D_direct_fused" in results_fwd:
+        speedup = results_fwd["3D_direct"][0] / results_fwd["3D_direct_fused"][0]
+        print(f"  Fused (FP32) speedup vs Python: {speedup:.2f}x")
+    if "3D_direct" in results_fwd and "3D_direct_fp16" in results_fwd:
+        speedup = results_fwd["3D_direct"][0] / results_fwd["3D_direct_fp16"][0]
+        print(f"  FP16 speedup vs Python: {speedup:.2f}x")
+    if "3D_direct_fused" in results_fwd and "3D_direct_fp16" in results_fwd:
+        speedup = results_fwd["3D_direct_fused"][0] / results_fwd["3D_direct_fp16"][0]
+        print(f"  FP16 speedup vs FP32 fused: {speedup:.2f}x")
+    if "3D_direct" in results_fwd and "3D_direct_TC" in results_fwd:
+        speedup = results_fwd["3D_direct"][0] / results_fwd["3D_direct_TC"][0]
+        print(f"  TC speedup vs Python: {speedup:.2f}x")
+    if "3D_direct_fp16" in results_fwd and "3D_direct_TC" in results_fwd:
+        speedup = results_fwd["3D_direct_fp16"][0] / results_fwd["3D_direct_TC"][0]
+        print(f"  TC speedup vs FP16: {speedup:.2f}x")
+
+    print("\n" + "="*60)
+    print("SUMMARY (Forward + Backward)")
+    print("="*60)
+    for mode, (t, fps) in results_fwdbw.items():
+        print(f"{mode:20s}: {t:7.2f} ms  ({fps:6.1f} FPS)")
+
+    if "3D_direct" in results_fwdbw and "3D_direct_fused" in results_fwdbw:
+        speedup = results_fwdbw["3D_direct"][0] / results_fwdbw["3D_direct_fused"][0]
+        print(f"  Fused (FP32) speedup vs Python: {speedup:.2f}x")
+    if "3D_direct" in results_fwdbw and "3D_direct_fp16" in results_fwdbw:
+        speedup = results_fwdbw["3D_direct"][0] / results_fwdbw["3D_direct_fp16"][0]
+        print(f"  FP16 speedup vs Python: {speedup:.2f}x")
+    if "3D_direct_fused" in results_fwdbw and "3D_direct_fp16" in results_fwdbw:
+        speedup = results_fwdbw["3D_direct_fused"][0] / results_fwdbw["3D_direct_fp16"][0]
+        print(f"  FP16 speedup vs FP32 fused: {speedup:.2f}x")
+    if "3D_direct" in results_fwdbw and "3D_direct_TC" in results_fwdbw:
+        speedup = results_fwdbw["3D_direct"][0] / results_fwdbw["3D_direct_TC"][0]
+        print(f"  TC speedup vs Python: {speedup:.2f}x")
+    if "3D_direct_fp16" in results_fwdbw and "3D_direct_TC" in results_fwdbw:
+        speedup = results_fwdbw["3D_direct_fp16"][0] / results_fwdbw["3D_direct_TC"][0]
+        print(f"  TC speedup vs FP16: {speedup:.2f}x")
 
 
 if __name__ == "__main__":

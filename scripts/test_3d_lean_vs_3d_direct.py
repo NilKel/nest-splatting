@@ -98,14 +98,15 @@ def set_unit_weights(mlp, input_dim=40, hidden_dim=32, output_dim=3):
             mlp[4].weight[i, i] = 1.0
 
 
-def compare_3d_modes(model_path=MODEL_PATH, use_unit_weights=True, num_gaussians=None):
+def compare_3d_modes(model_path=MODEL_PATH, use_unit_weights=True, num_gaussians=None, use_fp16=False):
     """
-    Compare 3D_direct (tcnn) vs 3D_lean (custom CUDA MLP).
+    Compare 3D_direct (tcnn) vs 3D_lean/fp16 (custom CUDA MLP).
 
     Args:
         model_path: Path to trained 3D_direct checkpoint
         use_unit_weights: If True, use unit/diagonal weights for gradient testing
         num_gaussians: Number of Gaussians to keep (for faster testing)
+        use_fp16: If True, use diff_surfel_3D_16 (FP16 weights) instead of diff_surfel_3D
     """
     print("=" * 80)
     print("COMPARING: 3D_direct (tcnn) vs 3D_lean (CUDA MLP)")
@@ -297,14 +298,16 @@ def compare_3d_modes(model_path=MODEL_PATH, use_unit_weights=True, num_gaussians
         grad_xyz_3d_direct = None
 
     # ========== TEST 2: 3D_lean (custom CUDA MLP) ==========
+    lean_method = "3D_direct_fp16" if use_fp16 else "3D_direct_lean"
+    lean_label = "3D_fp16 (FP16 CUDA MLP)" if use_fp16 else "3D_lean (CUDA MLP)"
     print("\n" + "=" * 80)
-    print("TEST 2: 3D_lean mode (CUDA MLP)")
+    print(f"TEST 2: {lean_label}")
     print("=" * 80)
 
-    # Create args for 3D_direct_lean - must set method BEFORE creating INGP
-    # so that INGP constructor sets is_3D_direct_lean_mode=True
+    # Create args for 3D_direct_lean/fp16 - must set method BEFORE creating INGP
+    # so that INGP constructor sets the right mode flag
     args_3d_lean = Namespace(**vars(args))
-    args_3d_lean.method = "3D_direct_lean"
+    args_3d_lean.method = lean_method
 
     # Create new INGP for 3D_lean with the right args
     ingp_lean = INGP(cfg_model, args=args_3d_lean).to('cuda')
@@ -314,6 +317,7 @@ def compare_3d_modes(model_path=MODEL_PATH, use_unit_weights=True, num_gaussians
     print(f"[SETUP] INGP created with method={args_3d_lean.method}")
     print(f"[SETUP] ingp_lean.is_3D_direct_fused_mode={ingp_lean.is_3D_direct_fused_mode}")
     print(f"[SETUP] ingp_lean.is_3D_direct_lean_mode={ingp_lean.is_3D_direct_lean_mode}")
+    print(f"[SETUP] ingp_lean.is_3D_direct_fp16_mode={getattr(ingp_lean, 'is_3D_direct_fp16_mode', False)}")
     print(f"[SETUP] ingp_lean.hybrid_levels={ingp_lean.hybrid_levels}")
     print(f"[SETUP] ingp_lean.levels={ingp_lean.levels}")
 
@@ -364,11 +368,19 @@ def compare_3d_modes(model_path=MODEL_PATH, use_unit_weights=True, num_gaussians
 
         # CRITICAL: Retrieve MLP gradients from CUDA and copy to PyTorch tensors
         # This is done in train.py after backward() - see lines 1080-1110
-        from diff_surfel_3D import get_mlp_grads
+        if use_fp16:
+            from diff_surfel_3D_16 import get_mlp_grads
+        else:
+            from diff_surfel_3D import get_mlp_grads
         mlp_grads = get_mlp_grads()
         print(f"\n  [CUDA GRADS] get_mlp_grads() returned: {mlp_grads is not None}")
         if mlp_grads is not None:
-            grad_W1, grad_b1, grad_W2, grad_b2, grad_W3, grad_b3 = mlp_grads
+            if use_fp16:
+                # FP16 mode: bias-free, returns 3 values (W1, W2, W3)
+                grad_W1, grad_W2, grad_W3 = mlp_grads
+                grad_b1, grad_b2, grad_b3 = None, None, None
+            else:
+                grad_W1, grad_b1, grad_W2, grad_b2, grad_W3, grad_b3 = mlp_grads
             print(f"    grad_W1: {grad_W1.shape if grad_W1 is not None else 'None'}, nonzero={((grad_W1.abs() > 1e-10).sum().item() if grad_W1 is not None else 0)}")
             print(f"    grad_b1: {grad_b1.shape if grad_b1 is not None else 'None'}, nonzero={((grad_b1.abs() > 1e-10).sum().item() if grad_b1 is not None else 0)}")
             print(f"    grad_W2: {grad_W2.shape if grad_W2 is not None else 'None'}, nonzero={((grad_W2.abs() > 1e-10).sum().item() if grad_W2 is not None else 0)}")
@@ -380,23 +392,23 @@ def compare_3d_modes(model_path=MODEL_PATH, use_unit_weights=True, num_gaussians
             mlp = ingp_lean.mlp_fused
             if grad_W1 is not None:
                 mlp[0].weight.grad = grad_W1.clone()
-            if grad_b1 is not None:
+            if grad_b1 is not None and hasattr(mlp[0], 'bias') and mlp[0].bias is not None:
                 mlp[0].bias.grad = grad_b1.clone()
             if grad_W2 is not None:
                 mlp[2].weight.grad = grad_W2.clone()
-            if grad_b2 is not None:
+            if grad_b2 is not None and hasattr(mlp[2], 'bias') and mlp[2].bias is not None:
                 mlp[2].bias.grad = grad_b2.clone()
             if grad_W3 is not None:
                 mlp[4].weight.grad = grad_W3.clone()
-            if grad_b3 is not None:
+            if grad_b3 is not None and hasattr(mlp[4], 'bias') and mlp[4].bias is not None:
                 mlp[4].bias.grad = grad_b3.clone()
         else:
             print("    [WARNING] get_mlp_grads() returned None!")
 
-        # Check MLP bias gradients
-        b1_grad = ingp_lean.mlp_fused[0].bias.grad
-        b2_grad = ingp_lean.mlp_fused[2].bias.grad
-        b3_grad = ingp_lean.mlp_fused[4].bias.grad
+        # Check MLP bias gradients (only for biased MLPs, not FP16 bias-free)
+        b1_grad = ingp_lean.mlp_fused[0].bias.grad if hasattr(ingp_lean.mlp_fused[0], 'bias') and ingp_lean.mlp_fused[0].bias is not None else None
+        b2_grad = ingp_lean.mlp_fused[2].bias.grad if hasattr(ingp_lean.mlp_fused[2], 'bias') and ingp_lean.mlp_fused[2].bias is not None else None
+        b3_grad = ingp_lean.mlp_fused[4].bias.grad if hasattr(ingp_lean.mlp_fused[4], 'bias') and ingp_lean.mlp_fused[4].bias is not None else None
 
         if b1_grad is not None:
             b1_nz = (b1_grad.abs() > 1e-10).nonzero().squeeze(-1).tolist()
@@ -490,19 +502,27 @@ def compare_3d_modes(model_path=MODEL_PATH, use_unit_weights=True, num_gaussians
     if grads_3d_direct and ingp_lean.mlp_fused[0].weight.grad is not None:
         print("\n  MLP Gradient Comparison (3D_direct vs 3D_lean):")
         lean_mlp = ingp_lean.mlp_fused
+        bias_free = not (hasattr(lean_mlp[0], 'bias') and lean_mlp[0].bias is not None)
         for name, ref_grad in grads_3d_direct.items():
             if name == 'W1':
                 lean_grad = lean_mlp[0].weight.grad
+                if bias_free and lean_grad is not None:
+                    # FP16 W1 is [32, 41], ref is [32, 40] — compare first 40 cols
+                    lean_grad = lean_grad[:, :40]
+            elif name == 'b1':
+                if bias_free:
+                    # Implicit bias grad is column 40 of W1
+                    lean_grad = lean_mlp[0].weight.grad[:, 40] if lean_mlp[0].weight.grad is not None else None
+                else:
+                    lean_grad = lean_mlp[0].bias.grad if hasattr(lean_mlp[0], 'bias') and lean_mlp[0].bias is not None else None
             elif name == 'W2':
                 lean_grad = lean_mlp[2].weight.grad
             elif name == 'W3':
                 lean_grad = lean_mlp[4].weight.grad
-            elif name == 'b1':
-                lean_grad = lean_mlp[0].bias.grad
             elif name == 'b2':
-                lean_grad = lean_mlp[2].bias.grad
+                lean_grad = lean_mlp[2].bias.grad if hasattr(lean_mlp[2], 'bias') and lean_mlp[2].bias is not None else None
             elif name == 'b3':
-                lean_grad = lean_mlp[4].bias.grad
+                lean_grad = lean_mlp[4].bias.grad if hasattr(lean_mlp[4], 'bias') and lean_mlp[4].bias is not None else None
             else:
                 continue
 
@@ -513,10 +533,13 @@ def compare_3d_modes(model_path=MODEL_PATH, use_unit_weights=True, num_gaussians
                     lean_grad.flatten().unsqueeze(0)
                 ).item()
                 print(f"    {name}: diff mean={diff.mean().item():.6f}, max={diff.max().item():.6f}, cos_sim={cos_sim:.6f}")
+                print(f"      ref mag={ref_grad.abs().mean().item():.6f}, lean mag={lean_grad.abs().mean().item():.6f}")
                 if diff.max().item() > 0.1 or cos_sim < 0.99:
                     print(f"      [MISMATCH] Significant gradient difference!")
-                    print(f"      3D_direct {name}: mean={ref_grad.abs().mean().item():.6f}")
-                    print(f"      3D_lean {name}:   mean={lean_grad.abs().mean().item():.6f}")
+            elif name in ('b2', 'b3') and bias_free:
+                print(f"    {name}: N/A (bias-free mode, no separate bias gradient)")
+            else:
+                print(f"    {name}: lean_grad is None")
 
     print("\n" + "=" * 80)
 
@@ -526,10 +549,12 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, default=MODEL_PATH)
     parser.add_argument("--no_unit_weights", action="store_true", help="Use trained weights instead of unit weights")
     parser.add_argument("--num_gaussians", type=int, default=None, help="Limit Gaussians (None = use all)")
+    parser.add_argument("--fp16", action="store_true", help="Use FP16 library (diff_surfel_3D_16)")
     cli_args = parser.parse_args()
 
     compare_3d_modes(
         model_path=cli_args.model_path,
         use_unit_weights=False,  # Always use trained weights
-        num_gaussians=cli_args.num_gaussians
+        num_gaussians=cli_args.num_gaussians,
+        use_fp16=cli_args.fp16
     )
