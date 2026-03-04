@@ -7,8 +7,8 @@
 #include <cstdio>
 #include <tuple>
 
-// Forward-only rendering: returns (num_rendered, out_color, out_others, radii, geomBuffer, binningBuffer, imgBuffer)
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+// Forward-only rendering: returns (num_rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer)
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -34,7 +34,12 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& residual_textures,  // [N, 192] FP16 residual textures (empty if SH-only)
 	const torch::Tensor& atlas_texture,      // [H*W*3] FP16 atlas (empty if not atlas mode)
 	const torch::Tensor& atlas_rects,        // [N, 4] float atlas UV rects (empty if not atlas mode)
-	const int atlas_width);                  // atlas dimension (0 if not atlas mode)
+	const int atlas_width,                   // atlas dimension (0 if not atlas mode)
+	const int aabb_mode,                     // 0=square, 1=square+AdR, 2=rect, 3=rect+AdR
+	// Persistent buffers — pass empty on first call, reused on subsequent calls
+	torch::Tensor geomBuffer,
+	torch::Tensor binningBuffer,
+	torch::Tensor imgBuffer);
 
 torch::Tensor markVisible(
 	torch::Tensor& means3D,

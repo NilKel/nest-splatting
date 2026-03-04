@@ -47,7 +47,8 @@ def load_training_config(model_path):
 
 def render_baked(viewpoint_camera, gaussians, pipe, background,
                  residual_textures=None, beta=0.0, kernel_type=0,
-                 atlas_texture=None, atlas_rects=None, atlas_width=0):
+                 atlas_texture=None, atlas_rects=None, atlas_width=0,
+                 aabb_mode=3):
     """Render using diff_surfel_bake_render submodule (SH + residual textures)."""
     from diff_surfel_bake_render import GaussianRasterizationSettings, GaussianRasterizer
 
@@ -68,6 +69,7 @@ def render_baked(viewpoint_camera, gaussians, pipe, background,
         prefiltered=False,
         debug=False,
         beta=beta,
+        aabb_mode=aabb_mode,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -84,7 +86,7 @@ def render_baked(viewpoint_camera, gaussians, pipe, background,
     if kernel_type > 0 and hasattr(gaussians, '_shape') and gaussians._shape is not None and gaussians._shape.numel() > 0:
         shapes = gaussians.get_shape
 
-    result = rasterizer(
+    color, radii = rasterizer(
         means3D=means3D,
         means2D=means2D,
         opacities=opacity,
@@ -99,8 +101,7 @@ def render_baked(viewpoint_camera, gaussians, pipe, background,
         atlas_width=atlas_width,
     )
 
-    rendered_image = result[0]
-    return {"render": rendered_image}
+    return {"render": color}
 
 
 def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,

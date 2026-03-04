@@ -51,7 +51,8 @@ namespace CudaRasterizer
 			const int residual_dim,
 			const __half* atlas_texture,
 			const float* atlas_rects,
-			const int atlas_width);
+			const int atlas_width,
+			const int aabb_mode = 3);
 	};
 };
 

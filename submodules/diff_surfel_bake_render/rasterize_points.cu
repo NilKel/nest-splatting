@@ -28,7 +28,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
 	return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -54,7 +54,12 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& residual_textures,
 	const torch::Tensor& atlas_texture,
 	const torch::Tensor& atlas_rects,
-	const int atlas_width)
+	const int atlas_width,
+	const int aabb_mode,
+	// Persistent buffers — pass empty on first call, reused on subsequent calls
+	torch::Tensor geomBuffer,
+	torch::Tensor binningBuffer,
+	torch::Tensor imgBuffer)
 {
 	if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 		AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -77,16 +82,12 @@ RasterizeGaussiansCUDA(
 	auto int_opts = means3D.options().dtype(torch::kInt32);
 	auto float_opts = means3D.options().dtype(torch::kFloat32);
 
-	torch::Tensor out_color = torch::full({3, H, W}, 0.0, float_opts);
-	int out_dim = 3+3+1+1 + 3;  // depth, alpha, normal, mid_depth, distortion
-	torch::Tensor out_others = torch::full({out_dim, H, W}, 0.0, float_opts);
-	torch::Tensor radii = torch::full({P}, 0, int_opts);
+	// Kernel writes all inside pixels directly — no zeroing needed
+	torch::Tensor out_color = torch::empty({3, H, W}, float_opts);
+	// Kernel zeros all entries in preprocess — no zeroing needed
+	torch::Tensor radii = torch::empty({P}, int_opts);
 
-	torch::Device device(torch::kCUDA);
-	torch::TensorOptions options(torch::kByte);
-	torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
-	torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
-	torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+	// Persistent buffers: resizeFunctional will grow if needed, no-op if already big enough
 	std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
 	std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
 	std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
@@ -135,7 +136,7 @@ RasterizeGaussiansCUDA(
 			tan_fovy,
 			prefiltered,
 			out_color.contiguous().data<float>(),
-			out_others.contiguous().data<float>(),
+			nullptr,  // out_others not needed (RENDER_AXUTILITY=0)
 			radii.contiguous().data<int>(),
 			debug,
 			beta,
@@ -145,10 +146,11 @@ RasterizeGaussiansCUDA(
 			residual_dim,
 			atlas_texture_ptr,
 			atlas_rects_ptr,
-			atlas_width);
+			atlas_width,
+			aabb_mode);
 	}
 
-	return std::make_tuple(rendered, out_color, out_others, radii, geomBuffer, binningBuffer, imgBuffer);
+	return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer);
 }
 
 torch::Tensor markVisible(

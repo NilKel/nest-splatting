@@ -29,6 +29,8 @@ namespace FORWARD
 		const float focal_x, float focal_y,
 		const float tan_fovx, float tan_fovy,
 		int* radii,
+		int* radii_x,
+		int* radii_y,
 		float2* points_xy_image,
 		float* depths,
 		float* transMats,
@@ -38,7 +40,8 @@ namespace FORWARD
 		uint32_t* tiles_touched,
 		bool prefiltered,
 		const float* shapes,
-		const int kernel_type);
+		const int kernel_type,
+		const int aabb_mode = 3);
 
 	void render(
 		const dim3 grid, dim3 block,

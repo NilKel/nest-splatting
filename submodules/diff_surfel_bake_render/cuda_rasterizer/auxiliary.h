@@ -20,7 +20,7 @@
 
 #define PI 3.14159
 #define TIGHTBBOX 0
-#define RENDER_AXUTILITY 1
+#define RENDER_AXUTILITY 0
 #define DEPTH_OFFSET 0
 #define ALPHA_OFFSET 1
 #define NORMAL_OFFSET 2 

@@ -6,7 +6,7 @@ Usage:
 
     settings = GaussianRasterizationSettings(...)
     rasterizer = GaussianRasterizer(settings)
-    color, radii, depth = rasterizer(
+    color, radii = rasterizer(
         means3D=..., means2D=..., opacities=..., shs=...,
         scales=..., rotations=...,
         residual_textures=residual_flat,  # [N, 192] FP16 or None
@@ -17,6 +17,22 @@ from typing import NamedTuple
 import torch.nn as nn
 import torch
 from . import _C
+
+# Module-level persistent CUDA buffers for allocation reuse.
+# After the first frame, geom/binning/img buffers are already the right size
+# and resizeFunctional becomes a no-op (no cudaMalloc).
+_buffer_cache = {}
+
+def _get_buffers(device):
+    key = str(device)
+    if key not in _buffer_cache:
+        dev = torch.device(device)
+        _buffer_cache[key] = {
+            'geom': torch.empty(0, dtype=torch.uint8, device=dev),
+            'binning': torch.empty(0, dtype=torch.uint8, device=dev),
+            'img': torch.empty(0, dtype=torch.uint8, device=dev),
+        }
+    return _buffer_cache[key]
 
 
 def rasterize_gaussians(
@@ -50,6 +66,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         if atlas_rects is None:
             atlas_rects = torch.Tensor([]).float().cuda()
 
+        buffers = _get_buffers(means3D.device)
+
         args = (
             settings.bg,
             means3D,
@@ -76,12 +94,15 @@ class _RasterizeGaussians(torch.autograd.Function):
             atlas_texture,
             atlas_rects,
             atlas_width,
+            settings.aabb_mode,
+            buffers['geom'],
+            buffers['binning'],
+            buffers['img'],
         )
 
-        num_rendered, color, others, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+        num_rendered, color, radii, buffers['geom'], buffers['binning'], buffers['img'] = _C.rasterize_gaussians(*args)
 
-        # No backward needed — inference only
-        return color, radii, others
+        return color, radii
 
     @staticmethod
     def backward(ctx, *grad_outputs):
@@ -102,6 +123,7 @@ class GaussianRasterizationSettings(NamedTuple):
     prefiltered: bool
     debug: bool
     beta: float
+    aabb_mode: int = 3  # 0=square, 1=square+AdR, 2=rect, 3=rect+AdR
 
 
 class GaussianRasterizer(nn.Module):

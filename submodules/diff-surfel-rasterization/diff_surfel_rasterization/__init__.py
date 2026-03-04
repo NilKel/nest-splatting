@@ -214,11 +214,20 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         start_event.record()
 
-        # DEBUG: Check if grad_out_color is zero (would cause all feature gradients to be zero)
-        if ctx.render_mode == 5:
-            grad_mean = grad_out_color.abs().mean().item() if grad_out_color is not None else -1
-            grad_max = grad_out_color.abs().max().item() if grad_out_color is not None else -1
-            print(f"[DEBUG BACKWARD] render_mode=5, grad_out_color mean={grad_mean:.8f}, max={grad_max:.8f}")
+        # DEBUG: Check gradient shapes and NaN/Inf before backward
+        if True:
+            import torch as _t
+            _t.cuda.synchronize()
+            print(f"[BWD DEBUG] render_mode={ctx.render_mode}")
+            print(f"[BWD DEBUG] grad_out_color: shape={grad_out_color.shape if grad_out_color is not None else None}, "
+                  f"nan={_t.isnan(grad_out_color).any().item() if grad_out_color is not None else 'N/A'}, "
+                  f"max={grad_out_color.abs().max().item() if grad_out_color is not None else 'N/A'}")
+            if grad_depth is not None:
+                for ch in range(grad_depth.shape[0]):
+                    ch_nan = _t.isnan(grad_depth[ch]).any().item()
+                    ch_max = grad_depth[ch].abs().max().item()
+                    if ch_nan or ch_max > 0:
+                        print(f"[BWD DEBUG] grad_depth[{ch}]: nan={ch_nan}, max={ch_max}")
 
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
@@ -279,6 +288,11 @@ class _RasterizeGaussians(torch.autograd.Function):
                 viewdirs_enc)  # Pre-encoded view directions
 
         # Compute gradients for relevant tensors by invoking backward method
+        # DEBUG: sync before backward
+        if True:
+            import torch as _t
+            _t.cuda.synchronize()
+            print(f"[BWD DEBUG] Pre C++ backward sync OK")
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
@@ -297,6 +311,11 @@ class _RasterizeGaussians(torch.autograd.Function):
              grad_features_diffuse, grad_shapes,
              grad_mlp_W1, grad_mlp_b1, grad_mlp_W2, grad_mlp_b2, grad_mlp_W3, grad_mlp_b3
             ) = _C.rasterize_gaussians_backward(*args)
+        # DEBUG: sync after backward
+        if True:
+            import torch as _t
+            _t.cuda.synchronize()
+            print(f"[BWD DEBUG] Post C++ backward sync OK")
 
         # Store MLP gradients for 3D_direct_fused mode (render_mode=5)
         # These need to be retrieved by the caller and applied to MLP parameters

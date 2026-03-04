@@ -193,9 +193,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.spatial_lr_scale = ckpt['spatial_lr_scale']
 
         # Apply FPS subsampling to loaded Gaussians if mcmc_fps is enabled
-        if args.mcmc_fps and args.cap_max > 0:
+        if args.mcmc_fps:
             n_loaded = len(gaussians._xyz)
-            if n_loaded > args.cap_max:
+            if args.cap_max > 0 and n_loaded > args.cap_max:
                 print(f"  [FPS] Loaded Gaussians: {n_loaded}, cap_max: {args.cap_max}")
                 print(f"  [FPS] Subsampling loaded Gaussians using FPS...")
 
@@ -223,7 +223,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 print(f"  [FPS] Subsampled to {n_new} Gaussians")
             else:
-                print(f"  [FPS] Skipping - loaded Gaussians ({n_loaded}) <= cap_max ({args.cap_max})")
+                print(f"  [FPS] Skipping FPS - using all {n_loaded} loaded Gaussians as cap_max")
 
         # Create scene (won't reinitialize Gaussians)
         gaussians._loaded_from_checkpoint = True
@@ -571,7 +571,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         # Restore densification state (critical for identical behavior)
         # Skip if FPS subsampling was applied - the sizes won't match
-        fps_was_applied = args.mcmc_fps and args.cap_max > 0 and len(gaussians._xyz) < ckpt['xyz'].shape[0]
+        fps_was_applied = args.mcmc_fps and len(gaussians._xyz) < ckpt['xyz'].shape[0]
         if 'xyz_gradient_accum' in ckpt and not fps_was_applied:
             gaussians.xyz_gradient_accum = ckpt['xyz_gradient_accum'].cuda()
             gaussians.denom = ckpt['denom'].cuda()
@@ -621,6 +621,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         elif cfg_model.settings.if_ingp:
             print(f"\n[INFO] No warmup checkpoint found at {warmup_checkpoint_path}")
             print(f"[INFO] Will train 2DGS for {cfg_model.ingp_stage.initialize} iterations, then save checkpoint.\n")
+
+    # mcmc_fps: auto-set cap_max to current number of Gaussians
+    if args.mcmc_fps:
+        n_current = len(gaussians.get_xyz)
+        if args.cap_max <= 0 or n_current < args.cap_max:
+            print(f"[mcmc_fps] Setting cap_max to current Gaussian count: {n_current}")
+            args.cap_max = n_current
 
     surfel_cfg = cfg_model.surfel
 
@@ -834,6 +841,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             aa = args.aa, aa_threshold = args.aa_threshold, skybox = active_skybox,
             background_mode = background_mode, bg_hashgrid = active_bg_hashgrid,
             detach_hash_grad = args.detach_hash_grad, max_intersections_per_pixel = args.max_intersections_per_pixel)
+        # DEBUG: sync after render to check if forward crashed
+        if iteration == first_iter + 1:
+            torch.cuda.synchronize()
+            print("[DEBUG] Forward+MLP pass completed OK")
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
@@ -1089,7 +1100,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # loss
         total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss
 
+        # DEBUG: print loss components before backward
+        if iteration == first_iter + 1:
+            print(f"[DEBUG] total_loss={total_loss.item():.6f}, loss={loss.item():.6f}, mask={mask_loss.item():.6f}, shape_reg={shape_reg_loss.item():.6f}")
+            torch.cuda.synchronize()
+            print("[DEBUG] Pre-backward sync OK")
+
         total_loss.backward()
+
+        # DEBUG: sync after backward
+        if iteration == first_iter + 1:
+            torch.cuda.synchronize()
+            print("[DEBUG] Backward pass completed OK")
 
         # Apply MLP gradients for 3D_direct_fused mode
         # MLP weights are in CUDA constant memory, gradients computed in CUDA backward

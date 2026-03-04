@@ -626,16 +626,14 @@ renderCUDAsurfelBackward(
 	}
 	
 	// Setup baseline hashgrid offsets once (dual hashgrid mode)
+	// NOTE: Dual hashgrid modes (old surface_rgb=1, baseline_double=2, baseline_blend_double=3)
+	// were removed during render mode cleanup. No current mode uses this path.
+	// The old condition checked render_mode == 1/2/3 which now map to cat/adaptive_zero/3D_direct
+	// — none of which use diffuse hashgrids. Disabled to prevent stack overflow when
+	// cat mode (render_mode=1) enters with encoded level=393477.
 	int collec_offsets_diffuse[16] = {0};
 	float voxel_min_diffuse = 0.0f;
 	float voxel_max_diffuse = 0.0f;
-	// NOTE: Changed from compile-time D_DIFFUSE check to runtime check
-	if(level > 0 && level_offsets_diffuse != nullptr && 
-	   (render_mode == 2 || render_mode == 3 || render_mode == 1)){
-		for(int l = 0; l <= level; l++) collec_offsets_diffuse[l] = level_offsets_diffuse[l];
-		voxel_min_diffuse = gridrange_diffuse[0];
-		voxel_max_diffuse = gridrange_diffuse[1];
-	}
 
 	// NOTE: baseline_blend_double post-processing was removed during render mode cleanup
 	// (it was old mode 3, now deleted)

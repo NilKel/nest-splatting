@@ -138,6 +138,7 @@ __device__ bool compute_aabb(
 }
 
 // Preprocessing kernel: frustum culling, SH eval, transmat computation, tile binning
+// aabb_mode: 0 = square (2DGS default), 1 = square + AdR, 2 = rect, 3 = rect + AdR
 template<int C>
 __global__ void preprocessCUDA(int P, int D, int M,
 	const float* orig_points,
@@ -155,6 +156,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float tan_fovx, const float tan_fovy,
 	const float focal_x, const float focal_y,
 	int* radii,
+	int* radii_x,
+	int* radii_y,
 	float2* points_xy_image,
 	float* depths,
 	float* transMats,
@@ -164,7 +167,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered,
 	const float* shapes,
-	const int kernel_type)
+	const int kernel_type,
+	const int aabb_mode)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -212,12 +216,16 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	transMats[idx * 9 + 7] = T[2].y;
 	transMats[idx * 9 + 8] = T[2].z;
 
-	// Compute AABB with appropriate cutoff
-	float cutoff;
-	bool use_beta_cutoff = (kernel_type >= 1 && kernel_type <= 4);
-	bool use_adr_cutoff = ((kernel_type == 1 || kernel_type == 3 || kernel_type == 4) && shapes != nullptr);
+	// Compute AABB cutoff
+	// aabb_mode: 0 = square, 1 = square + AdR, 2 = rect, 3 = rect + AdR
+	bool use_adr = (aabb_mode == 1 || aabb_mode == 3);
+	bool use_rect = (aabb_mode >= 2);
 
-	if (use_adr_cutoff) {
+	float cutoff;
+	bool is_beta_kernel = (kernel_type >= 1 && kernel_type <= 4);
+
+	if (use_adr && is_beta_kernel && shapes != nullptr) {
+		// AdR: per-Gaussian adaptive cutoff from opacity and shape
 		float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
 		float k = (kernel_type == 4) ? 3.0f : 1.0f;
 
@@ -225,8 +233,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		float shape = shapes[idx];
 
 		if (opacity_val < (1.0f / 255.0f)) {
-			radii[idx] = 0;
-			tiles_touched[idx] = 0;
 			return;
 		}
 
@@ -243,7 +249,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		}
 		cutoff = fmaxf(r_beta, r_lp);
 		cutoff = fminf(cutoff, k + 2.0f);
-	} else if (use_beta_cutoff) {
+	} else if (is_beta_kernel) {
+		// Fixed conservative cutoff for beta kernels (no AdR)
 		float k = (kernel_type == 4) ? 3.0f : 1.0f;
 		float r_lp_typical = sqrtf(2.0f * logf(127.5f));
 		cutoff = fmaxf(k * 1.1f, r_lp_typical);
@@ -256,9 +263,23 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	bool ok = compute_aabb(T, cutoff, point_image, extent);
 	if (!ok) return;
 
-	float radius = ceil(max(max(extent.x, extent.y), cutoff * FilterSize));
+	// Compute tile bounding box
+	float filter_r = cutoff * FilterSize;
+	int rx, ry;
 	uint2 rect_min, rect_max;
-	getRect(point_image, (int)radius, rect_min, rect_max, grid);
+
+	if (use_rect) {
+		// Rectangular AABB: separate X/Y radii for tighter tile coverage
+		rx = (int)ceilf(fmaxf(extent.x, filter_r));
+		ry = (int)ceilf(fmaxf(extent.y, filter_r));
+		getRectXY(point_image, rx, ry, rect_min, rect_max, grid);
+	} else {
+		// Square AABB: max(x, y) as scalar radius (original 2DGS behavior)
+		float radius = ceilf(fmaxf(fmaxf(extent.x, extent.y), filter_r));
+		rx = (int)radius;
+		ry = (int)radius;
+		getRect(point_image, (int)radius, rect_min, rect_max, grid);
+	}
 
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
@@ -276,7 +297,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 
 	depths[idx] = p_view.z;
-	radii[idx] = (int)radius;
+	radii[idx] = max(rx, ry);  // Non-zero signals visible
+	radii_x[idx] = rx;
+	radii_y[idx] = ry;
 	points_xy_image[idx] = point_image;
 	normal_opacity[idx] = {normal.x, normal.y, normal.z, opacities[idx]};
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
@@ -661,6 +684,8 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
 	int* radii,
+	int* radii_x,
+	int* radii_y,
 	float2* points_xy_image,
 	float* depths,
 	float* transMats,
@@ -670,7 +695,8 @@ void FORWARD::preprocess(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered,
 	const float* shapes,
-	const int kernel_type)
+	const int kernel_type,
+	const int aabb_mode)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -689,6 +715,8 @@ void FORWARD::preprocess(int P, int D, int M,
 		tan_fovx, tan_fovy,
 		focal_x, focal_y,
 		radii,
+		radii_x,
+		radii_y,
 		points_xy_image,
 		depths,
 		transMats,
@@ -698,6 +726,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		tiles_touched,
 		prefiltered,
 		shapes,
-		kernel_type
+		kernel_type,
+		aabb_mode
 	);
 }

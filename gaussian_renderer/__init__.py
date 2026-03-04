@@ -1262,7 +1262,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rasterizer_kwargs['viewdirs_enc'] = viewdirs_enc
 
     rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer = rasterizer(**rasterizer_kwargs)
-    
+
     # 3D mode: Process intersection buffer through PyTorch pipeline
     # Recompute xyz from s_x,s_y → hash encode → gather features → MLP → SH → blend → eval
     if is_3D_mode and ingp is not None and intersection_buffer is not None:
