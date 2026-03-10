@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -18,9 +18,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rasterize_gaussians_backward", &RasterizeGaussiansBackwardCUDA);
   m.def("mark_visible", &markVisible);
   m.def("compute_relocation", &compute_relocation_tensor);
-  m.def("compute_opacity_gradient_3D", &ComputeOpacityGradient3DCUDA);
-  m.def("compute_geometry_gradient_3D", &ComputeGeometryGradient3DCUDA);
-  m.def("backward_from_weight_grad", &BackwardFromWeightGradCUDA);
-  m.def("transmat_to_scale_rot_grad", &TransMatToScaleRotGradCUDA);
-  m.def("get_transmat_from_geombuffer", &GetTransMatFromGeomBufferCUDA);
 }

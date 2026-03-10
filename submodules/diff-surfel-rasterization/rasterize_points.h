@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -14,8 +14,8 @@
 #include <cstdio>
 #include <tuple>
 #include <string>
-	
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -59,13 +59,9 @@ RasterizeGaussiansCUDA(
 	const int kernel_type,
 	const int aabb_mode,
 	const float aa,
-	const float aa_threshold,
-	const int max_intersections_per_pixel,
-	const torch::Tensor& viewdirs_enc,  // Pre-encoded view directions (H*W, 16) for 3D_direct_fused
-	const torch::Tensor& residual_textures);  // Baked mode (render_mode=6): [N, 192] FP16 residual textures
+	const float aa_threshold);
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
 	 const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -110,85 +106,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& shape_dims,
 	const torch::Tensor& shapes,
 	const int kernel_type,
-	const bool detach_hash_grad,
-	const torch::Tensor& viewdirs_enc);  // Pre-encoded view directions (H*W, 16) for 3D_direct_fused
-		
+	const bool detach_hash_grad);
+
 torch::Tensor markVisible(
 		torch::Tensor& means3D,
 		torch::Tensor& viewmatrix,
 		torch::Tensor& projmatrix);
-
-// 3D mode opacity gradient with full transmittance chain
-// Returns: (dL_dopacity [N], dL_dalpha [M])
-std::tuple<torch::Tensor, torch::Tensor> ComputeOpacityGradient3DCUDA(
-    const torch::Tensor& dL_dweight,
-    const torch::Tensor& T_values,
-    const torch::Tensor& G_values,
-    const torch::Tensor& alpha_values,
-    const torch::Tensor& gaussian_ids,
-    const torch::Tensor& pixel_starts,
-    const int N);
-
-// 3D mode geometry gradient using geomBuffer
-// Takes dL_dalpha per intersection and computes dL_dtransMat
-// Returns: dL_dtransMat [N, 9]
-torch::Tensor ComputeGeometryGradient3DCUDA(
-    const torch::Tensor& dL_dalpha,
-    const torch::Tensor& opacity_values,
-    const torch::Tensor& G_values,
-    const torch::Tensor& s_x_values,
-    const torch::Tensor& s_y_values,
-    const torch::Tensor& rho_flag,
-    const torch::Tensor& gaussian_ids,
-    const torch::Tensor& pixel_ids,
-    const torch::Tensor& transMat,
-    const int W, const int H,
-    const int N);
-
-// Unified 3D mode backward from weight gradients
-// Takes dL_dweight from PyTorch, reads transMat from geomBuffer internally
-// Also accepts dL_duv from hash/xyz gradient path (like cat mode)
-// Returns: (dL_dopacity [N], dL_dtransMat [N, 9], dL_dmean2D [N, 2])
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> BackwardFromWeightGradCUDA(
-    const torch::Tensor& geomBuffer,
-    const int P,
-    const torch::Tensor& dL_dweight,
-    const torch::Tensor& gaussian_ids,
-    const torch::Tensor& pixel_ids,
-    const torch::Tensor& pixel_starts,
-    const torch::Tensor& T_values,
-    const torch::Tensor& G_values,
-    const torch::Tensor& alpha_values,
-    const torch::Tensor& opacity_values,
-    const torch::Tensor& s_x_values,
-    const torch::Tensor& s_y_values,
-    const torch::Tensor& rho_flag,
-    const torch::Tensor& dL_duv_x,    // [M] hash/xyz gradient contribution (can be empty)
-    const torch::Tensor& dL_duv_y,    // [M] hash/xyz gradient contribution (can be empty)
-    const int W, const int H);
-
-// Convert screen-space dL_dtransMat to world-space dL_dscale and dL_drotation
-// This properly applies the projection matrix (with ndc2pix) to get correct gradients
-// Also incorporates xyz gradient contribution (dL_dhomoMat), 2D mean gradient (dL_dmean2D),
-// and normal gradient from depth/normal loss (dL_dnormal3D)
-// Returns: (dL_dscale [N, 2], dL_drotation [N, 4], dL_dmeans [N, 3])
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> TransMatToScaleRotGradCUDA(
-    const torch::Tensor& dL_dtransMat,  // [N, 9] screen-space transMat gradient
-    const torch::Tensor& dL_dhomoMat,   // [N, 9] xyz gradient contribution (can be empty)
-    const torch::Tensor& dL_dmean2D,    // [N, 2] 2D mean gradient (can be empty)
-    const torch::Tensor& dL_dnormal3D,  // [N, 3] normal gradient from depth/normal loss (can be empty)
-    const torch::Tensor& means3D,       // [N, 3] world-space positions (needed for dL_dmean2D)
-    const torch::Tensor& transMat_precomp, // [N, 9] forward pass transMat (can be empty)
-    const torch::Tensor& scales,        // [N, 2]
-    const torch::Tensor& rotations,     // [N, 4] quaternions
-    const torch::Tensor& projmatrix,    // [4, 4] or [16] projection matrix
-    const torch::Tensor& viewmatrix,    // [4, 4] or [16] view matrix (for normal gradient transform)
-    const int W, const int H);          // Image dimensions for ndc2pix transformation
-
-// Extract transMat from geomBuffer for use in backward
-torch::Tensor GetTransMatFromGeomBufferCUDA(
-    const torch::Tensor& geomBuffer,
-    const int P);
-
-// ============================================================================
-// MLP weight management removed — use diff_surfel_3D or diff_surfel_3D_16 libraries for fused modes

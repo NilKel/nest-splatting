@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -17,13 +17,10 @@
 #include <tuple>
 #include <stdio.h>
 #include <cuda_runtime_api.h>
-#include <cuda_fp16.h>
 #include <memory>
 #include "cuda_rasterizer/config.h"
 #include "cuda_rasterizer/rasterizer.h"
 #include "cuda_rasterizer/rasterizer_impl.h"
-#include "cuda_rasterizer/backward.h"
-#include "cuda_rasterizer/forward.h"
 #include <fstream>
 #include <string>
 #include <functional>
@@ -40,7 +37,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
 	return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -84,10 +81,7 @@ RasterizeGaussiansCUDA(
 	const int kernel_type,
 	const int aabb_mode,
 	const float aa,
-	const float aa_threshold,
-	const int max_intersections_per_pixel,
-	const torch::Tensor& viewdirs_enc,
-	const torch::Tensor& residual_textures)
+	const float aa_threshold)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 	AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -99,16 +93,16 @@ RasterizeGaussiansCUDA(
 
   // Extract dimensions from shape_dims tensor [GS, HS, OS]
   uint32_t GS = 0, HS = 0, OS = 3;  // Defaults
-  
+
   if (shape_dims.numel() == 3) {
     GS = shape_dims[0].item<int>();
     HS = shape_dims[1].item<int>();
     OS = shape_dims[2].item<int>();
   }
-  
+
   // Use OS for output buffer allocation (single or combined output)
   uint32_t C = OS;
-  
+
   CHECK_INPUT(background);
   CHECK_INPUT(means3D);
   CHECK_INPUT(colors);
@@ -126,7 +120,7 @@ RasterizeGaussiansCUDA(
   CHECK_INPUT(features);
   CHECK_INPUT(offsets);
   CHECK_INPUT(gridrange);
-  
+
   CHECK_INPUT(features_diffuse);
   CHECK_INPUT(offsets_diffuse);
   CHECK_INPUT(gridrange_diffuse);
@@ -140,36 +134,20 @@ RasterizeGaussiansCUDA(
   uint32_t D = 0;
   uint32_t D_diffuse = 0;
   bool has_dual_hashgrid = (features_diffuse.numel() > 0 && offsets_diffuse.numel() > 0);
-  
+
   if(Level > 0){
 	D = features.size(1);  // Main hashgrid features per level
 	if(has_dual_hashgrid){
 		D_diffuse = features.size(1);  // Diffuse hashgrid features per level
 	}
   }
-  
+
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
-  // For dual buffer modes (residual_hybrid), allocate separately using GS and HS
-  torch::Tensor out_color;
-  torch::Tensor out_gaussian_rgb;  // For residual_hybrid
-  bool use_dual_buffers = (render_mode == 11 && GS > 0 && HS > 0 && OS == 0);
-  
-  if (use_dual_buffers) {
-    // Residual_hybrid: two separate buffers
-    out_gaussian_rgb = torch::full({GS, H, W}, 0.0, float_opts);
-    out_color = torch::full({HS, H, W}, 0.0, float_opts);
-    C = HS;  // Set C for hashgrid buffer
-  } else {
-    // All other modes: single buffer
-    out_color = torch::full({C, H, W}, 0.0, float_opts);
-  }
-  
+  torch::Tensor out_color = torch::full({C, H, W}, 0.0, float_opts);
+
   int out_dim = 3+3+1+1 + 3 + 3; // record mean_pts & appearance vis color
-    if((has_dual_hashgrid && render_mode == 5) || (has_dual_hashgrid && render_mode == 2)) {  // surface_rgb or baseline_double mode
-    // No extra channels needed - features are already in out_color
-  }
   torch::Tensor out_others = torch::full({out_dim, H, W}, 0.0, float_opts);
   torch::Tensor out_index = torch::full({H, W}, 0.0, int_opts);
 
@@ -180,27 +158,6 @@ RasterizeGaussiansCUDA(
   torch::Tensor cover_pixels = torch::full({record_P, 1}, 0, float_opts);
   torch::Tensor trans_avg = torch::full({record_P, 1}, 0, float_opts);
 
-  // 3D mode intersection buffer allocation (render_mode == 3)
-  torch::Tensor intersection_buffer;
-  torch::Tensor intersection_count;
-  uint32_t max_intersections_alloc = 0;
-  if (render_mode == 3 && max_intersections_per_pixel > 0) {
-    max_intersections_alloc = (uint32_t)max_intersections_per_pixel;
-    // Padded layout: each pixel gets max_intersections_per_pixel slots
-    // Each slot is 12 floats: [gaussian_id, weight, pixel_id, xyz.x, xyz.y, xyz.z, s_x, s_y, rho_flag, alpha, T, G]
-    // xyz.x/y/z = world-space intersection point for hash query (exact match with CAT mode)
-    // s_x, s_y = disk coordinates for backward gradient computation
-    // rho_flag = 1.0 if disk intersection, 0.0 if center fallback
-    // alpha = opacity * G, T = transmittance, G = kernel value
-    int64_t total_slots = (int64_t)H * W * max_intersections_alloc;
-    intersection_buffer = torch::zeros({total_slots, 12}, float_opts);
-    intersection_count = torch::zeros({H * W}, int_opts);
-  } else {
-    // Allocate empty tensors for non-3D modes
-    intersection_buffer = torch::empty({0}, float_opts);
-    intersection_count = torch::empty({0}, int_opts);
-  }
-
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
   torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
@@ -209,7 +166,7 @@ RasterizeGaussiansCUDA(
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
-  
+
   int rendered = 0;
   if(P != 0)
   {
@@ -269,18 +226,13 @@ RasterizeGaussiansCUDA(
 		kernel_type,
 		aabb_mode,
 		aa,
-		aa_threshold,
-		(render_mode == 3) ? intersection_buffer.contiguous().data<float>() : nullptr,
-		(render_mode == 3) ? (uint32_t*)intersection_count.contiguous().data<int>() : nullptr,
-		max_intersections_alloc,
-		(residual_textures.numel() > 0) ? (const __half*)residual_textures.contiguous().data_ptr<at::Half>() : nullptr);
+		aa_threshold);
   }
 
-  return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg, intersection_buffer, intersection_count);
+  return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
 	 const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -325,8 +277,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& shape_dims,
 	const torch::Tensor& shapes,
 	const int kernel_type,
-	const bool detach_hash_grad,
-	const torch::Tensor& viewdirs_enc)
+	const bool detach_hash_grad)
 {
 
   CHECK_INPUT(background);
@@ -344,7 +295,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   CHECK_INPUT(binningBuffer);
   CHECK_INPUT(imageBuffer);
   CHECK_INPUT(geomBuffer);
-  
+
   CHECK_INPUT(features_diffuse);
   CHECK_INPUT(offsets_diffuse);
   CHECK_INPUT(gridrange_diffuse);
@@ -352,60 +303,55 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   const int P = means3D.size(0);
   const int H = dL_dout_color.size(1);
   const int W = dL_dout_color.size(2);
-  
+
   // Extract dimensions from shape_dims tensor [GS, HS, OS]
   uint32_t GS = 0, HS = 0, OS = 3;  // Defaults
-  
+
   if (shape_dims.numel() == 3) {
     GS = shape_dims[0].item<int>();
     HS = shape_dims[1].item<int>();
     OS = shape_dims[2].item<int>();
   }
-  
+
   // Use OS for output dimension (should match forward pass)
   uint32_t C = OS;
-  
+
   uint32_t D = 0;
   uint32_t D_diffuse = 0;
   uint32_t table_size = 0;
   uint32_t table_size_diffuse = 0;
-  
+
   bool has_dual_hashgrid = (features_diffuse.numel() > 0 && offsets_diffuse.numel() > 0);
 
   if(Level > 0){
 	table_size = features.size(0);
 	D = features.size(1);
-	
+
 	if(has_dual_hashgrid){
 		D_diffuse = features_diffuse.size(1);
 		table_size_diffuse = features_diffuse.size(0);
 	}
-	
+
 	// NOTE: C is already set from shape_dims[2] (OS) above
 	// Do NOT recalculate C here - use the explicit value from Python
   }
-  
-  
-  
+
   int M = 0;
   if(sh.size(0) != 0)
-  {	
+  {
 	M = sh.size(1);
   }
 
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
   // For gradients, use actual input dimension from colors_precomp
-  // This matches whatever was passed in (26D for adaptive_cat, 48D for residual_hybrid, etc.)
   int colors_dim = 0;
-  
+
   if (colors.numel() > 0) {
     colors_dim = colors.size(1);  // Actual input dimension
   }
-  
+
   // For baseline mode with no colors_precomp, allocate dummy dL_dcolors to avoid empty tensor access
-  // The kernel will write to it but we won't use the gradients
-  // Must allocate at least C columns since kernel indexes as [global_id * C + ch]
   if (colors_dim == 0) {
     colors_dim = C;  // Match output channels to avoid illegal access
   }
@@ -425,15 +371,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
   // Beta kernel shape gradients
   torch::Tensor dL_dshapes = torch::zeros({P, 1}, means3D.options());
-
-  // MLP gradient buffers for 3D_direct_fused mode (render_mode=5)
-  // Architecture: 40D input -> 32 hidden -> 32 hidden -> 3 RGB
-  torch::Tensor dL_dmlp_W1 = torch::zeros({32, 40}, means3D.options());  // Layer 1 weights
-  torch::Tensor dL_dmlp_b1 = torch::zeros({32}, means3D.options());       // Layer 1 bias
-  torch::Tensor dL_dmlp_W2 = torch::zeros({32, 32}, means3D.options());   // Layer 2 weights
-  torch::Tensor dL_dmlp_b2 = torch::zeros({32}, means3D.options());       // Layer 2 bias
-  torch::Tensor dL_dmlp_W3 = torch::zeros({3, 32}, means3D.options());    // Layer 3 weights (RGB)
-  torch::Tensor dL_dmlp_b3 = torch::zeros({3}, means3D.options());        // Layer 3 bias
 
   if(P != 0)
   {
@@ -455,9 +392,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  transMat_precomp.contiguous().data<float>(),
 	  homotrans.contiguous().data<float>(),
 	  ap_level.contiguous().data<float>(),
-	  features.contiguous().data<float>(), 
-	  offsets.contiguous().data<int>(), 
-	  gridrange.contiguous().data<float>(), 
+	  features.contiguous().data<float>(),
+	  offsets.contiguous().data<int>(),
+	  gridrange.contiguous().data<float>(),
 	  viewmatrix.contiguous().data<float>(),
 	  projmatrix.contiguous().data<float>(),
 	  campos.contiguous().data<float>(),
@@ -473,7 +410,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dout_others.contiguous().data<float>(),
 	  dL_dfeatures.contiguous().data<float>(),
 	  dL_dmeans2D.contiguous().data<float>(),
-	  dL_dnormal.contiguous().data<float>(),  
+	  dL_dnormal.contiguous().data<float>(),
 	  dL_dopacity.contiguous().data<float>(),
 	  dL_dcolors.contiguous().data<float>(),
 	  dL_dmeans3D.contiguous().data<float>(),
@@ -494,29 +431,21 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  shapes_ptr_bw,
 	  kernel_type,
 	  dL_dshapes.contiguous().data<float>(),
-	  detach_hash_grad,
-	  // MLP gradient buffers for 3D_direct_fused mode
-	  (render_mode == 5) ? dL_dmlp_W1.contiguous().data<float>() : nullptr,
-	  (render_mode == 5) ? dL_dmlp_b1.contiguous().data<float>() : nullptr,
-	  (render_mode == 5) ? dL_dmlp_W2.contiguous().data<float>() : nullptr,
-	  (render_mode == 5) ? dL_dmlp_b2.contiguous().data<float>() : nullptr,
-	  (render_mode == 5) ? dL_dmlp_W3.contiguous().data<float>() : nullptr,
-	  (render_mode == 5) ? dL_dmlp_b3.contiguous().data<float>() : nullptr);
+	  detach_hash_grad);
   }
 
-  return std::make_tuple(dL_dfeatures, dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dtransMat, dL_dsh, dL_dscales, dL_drotations, dL_gradsum, dL_dfeatures_diffuse, dL_dshapes,
-                         dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3);
+  return std::make_tuple(dL_dfeatures, dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dtransMat, dL_dsh, dL_dscales, dL_drotations, dL_gradsum, dL_dfeatures_diffuse, dL_dshapes);
 }
 
 torch::Tensor markVisible(
 		torch::Tensor& means3D,
 		torch::Tensor& viewmatrix,
 		torch::Tensor& projmatrix)
-{ 
+{
   const int P = means3D.size(0);
-  
+
   torch::Tensor present = torch::full({P}, false, means3D.options().dtype(at::kBool));
- 
+
   if(P != 0)
   {
 	CudaRasterizer::Rasterizer::markVisible(P,
@@ -525,287 +454,6 @@ torch::Tensor markVisible(
 		projmatrix.contiguous().data<float>(),
 		present.contiguous().data<bool>());
   }
-  
+
   return present;
 }
-
-// Forward declaration of kernels from backward.cu
-__global__ void compute_opacity_gradient_3D_kernel(
-    int M, int N, int num_pixels,
-    const float* __restrict__ dL_dweight,
-    const float* __restrict__ T_values,
-    const float* __restrict__ G_values,
-    const float* __restrict__ alpha_values,
-    const int* __restrict__ gaussian_ids,
-    const int* __restrict__ pixel_starts,
-    float* __restrict__ dL_dopacity,
-    float* __restrict__ dL_dalpha_out);
-
-__global__ void compute_geometry_gradient_3D_kernel(
-    int M, int N, int W, int H,
-    const float* __restrict__ dL_dalpha,
-    const float* __restrict__ opacity_values,
-    const float* __restrict__ G_values,
-    const float* __restrict__ s_x_values,
-    const float* __restrict__ s_y_values,
-    const float* __restrict__ rho_flag,
-    const int* __restrict__ gaussian_ids,
-    const int* __restrict__ pixel_ids,
-    const float* __restrict__ transMat,
-    float* __restrict__ dL_dtransMat);
-
-// PyTorch wrapper for 3D mode opacity gradient computation
-// Returns: (dL_dopacity [N], dL_dalpha [M])
-std::tuple<torch::Tensor, torch::Tensor> ComputeOpacityGradient3DCUDA(
-    const torch::Tensor& dL_dweight,      // [M]
-    const torch::Tensor& T_values,        // [M]
-    const torch::Tensor& G_values,        // [M]
-    const torch::Tensor& alpha_values,    // [M]
-    const torch::Tensor& gaussian_ids,    // [M] int
-    const torch::Tensor& pixel_starts,    // [num_pixels+1] int
-    const int N)                          // num Gaussians
-{
-    CHECK_INPUT(dL_dweight);
-    CHECK_INPUT(T_values);
-    CHECK_INPUT(G_values);
-    CHECK_INPUT(alpha_values);
-    CHECK_INPUT(gaussian_ids);
-    CHECK_INPUT(pixel_starts);
-
-    int M = dL_dweight.size(0);
-    int num_pixels = pixel_starts.size(0) - 1;
-
-    torch::Tensor dL_dopacity = torch::zeros({N}, dL_dweight.options());
-    torch::Tensor dL_dalpha = torch::zeros({M}, dL_dweight.options());
-
-    if (M > 0 && num_pixels > 0) {
-        int threads = 256;
-        int blocks = (num_pixels + threads - 1) / threads;
-        compute_opacity_gradient_3D_kernel<<<blocks, threads>>>(
-            M, N, num_pixels,
-            dL_dweight.contiguous().data_ptr<float>(),
-            T_values.contiguous().data_ptr<float>(),
-            G_values.contiguous().data_ptr<float>(),
-            alpha_values.contiguous().data_ptr<float>(),
-            gaussian_ids.contiguous().data_ptr<int>(),
-            pixel_starts.contiguous().data_ptr<int>(),
-            dL_dopacity.data_ptr<float>(),
-            dL_dalpha.data_ptr<float>()
-        );
-    }
-
-    return std::make_tuple(dL_dopacity, dL_dalpha);
-}
-
-// PyTorch wrapper for 3D mode geometry gradient computation
-// Takes dL_dalpha per intersection and computes dL_dtransMat using geomBuffer
-// Returns: dL_dtransMat [N, 9]
-torch::Tensor ComputeGeometryGradient3DCUDA(
-    const torch::Tensor& dL_dalpha,       // [M] per-intersection dL_dalpha
-    const torch::Tensor& opacity_values,  // [M] per-intersection opacity
-    const torch::Tensor& G_values,        // [M] kernel value
-    const torch::Tensor& s_x_values,      // [M] intersection s.x
-    const torch::Tensor& s_y_values,      // [M] intersection s.y
-    const torch::Tensor& rho_flag,        // [M] 1.0=disk, 0.0=center
-    const torch::Tensor& gaussian_ids,    // [M] int
-    const torch::Tensor& pixel_ids,       // [M] int
-    const torch::Tensor& transMat,        // [N, 9] from geomBuffer
-    const int W, const int H,             // Image dimensions
-    const int N)                          // num Gaussians
-{
-    CHECK_INPUT(dL_dalpha);
-    CHECK_INPUT(opacity_values);
-    CHECK_INPUT(G_values);
-    CHECK_INPUT(s_x_values);
-    CHECK_INPUT(s_y_values);
-    CHECK_INPUT(rho_flag);
-    CHECK_INPUT(gaussian_ids);
-    CHECK_INPUT(pixel_ids);
-    CHECK_INPUT(transMat);
-
-    int M = dL_dalpha.size(0);
-
-    torch::Tensor dL_dtransMat = torch::zeros({N, 9}, dL_dalpha.options());
-
-    if (M > 0) {
-        int threads = 256;
-        int blocks = (M + threads - 1) / threads;
-        compute_geometry_gradient_3D_kernel<<<blocks, threads>>>(
-            M, N, W, H,
-            dL_dalpha.contiguous().data_ptr<float>(),
-            opacity_values.contiguous().data_ptr<float>(),
-            G_values.contiguous().data_ptr<float>(),
-            s_x_values.contiguous().data_ptr<float>(),
-            s_y_values.contiguous().data_ptr<float>(),
-            rho_flag.contiguous().data_ptr<float>(),
-            gaussian_ids.contiguous().data_ptr<int>(),
-            pixel_ids.contiguous().data_ptr<int>(),
-            transMat.contiguous().data_ptr<float>(),
-            dL_dtransMat.data_ptr<float>()
-        );
-    }
-
-    return dL_dtransMat;
-}
-
-// PyTorch wrapper for unified 3D mode backward computation
-// Takes dL_dweight from PyTorch, reads transMat from geomBuffer internally
-// Also accepts dL_duv from hash/xyz gradient path (like cat mode)
-// Returns: (dL_dopacity [N], dL_dtransMat [N, 9], dL_dmean2D [N, 2])
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> BackwardFromWeightGradCUDA(
-    const torch::Tensor& geomBuffer,      // Raw geomBuffer from forward
-    const int P,                          // Number of Gaussians (for geomBuffer parsing)
-    const torch::Tensor& dL_dweight,      // [M] gradients from PyTorch
-    const torch::Tensor& gaussian_ids,    // [M] int
-    const torch::Tensor& pixel_ids,       // [M] int
-    const torch::Tensor& pixel_starts,    // [num_pixels+1] int
-    const torch::Tensor& T_values,        // [M] transmittance
-    const torch::Tensor& G_values,        // [M] kernel value
-    const torch::Tensor& alpha_values,    // [M] alpha
-    const torch::Tensor& opacity_values,  // [M] per-intersection opacity
-    const torch::Tensor& s_x_values,      // [M] intersection s.x
-    const torch::Tensor& s_y_values,      // [M] intersection s.y
-    const torch::Tensor& rho_flag,        // [M] 1.0=disk, 0.0=center
-    const torch::Tensor& dL_duv_x,        // [M] hash/xyz gradient contribution (can be empty)
-    const torch::Tensor& dL_duv_y,        // [M] hash/xyz gradient contribution (can be empty)
-    const int W, const int H)             // Image dimensions
-{
-    CHECK_INPUT(dL_dweight);
-    CHECK_INPUT(gaussian_ids);
-    CHECK_INPUT(pixel_ids);
-    CHECK_INPUT(pixel_starts);
-    CHECK_INPUT(T_values);
-    CHECK_INPUT(G_values);
-    CHECK_INPUT(alpha_values);
-    CHECK_INPUT(opacity_values);
-    CHECK_INPUT(s_x_values);
-    CHECK_INPUT(s_y_values);
-    CHECK_INPUT(rho_flag);
-
-    int M = dL_dweight.size(0);
-    int num_pixels = pixel_starts.size(0) - 1;
-
-    // Allocate output tensors
-    torch::Tensor dL_dopacity = torch::zeros({P}, dL_dweight.options());
-    torch::Tensor dL_dtransMat = torch::zeros({P, 9}, dL_dweight.options());
-    torch::Tensor dL_dmean2D = torch::zeros({P, 2}, dL_dweight.options());
-
-    if (M > 0 && num_pixels > 0) {
-        // Parse geomBuffer to get transMat pointer
-        char* geom_buffer = reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr());
-        CudaRasterizer::GeometryState geomState = CudaRasterizer::GeometryState::fromChunk(geom_buffer, P);
-
-        // Get pointers for dL_duv (can be nullptr if tensors are empty)
-        const float* dL_duv_x_ptr = (dL_duv_x.numel() > 0) ? dL_duv_x.contiguous().data_ptr<float>() : nullptr;
-        const float* dL_duv_y_ptr = (dL_duv_y.numel() > 0) ? dL_duv_y.contiguous().data_ptr<float>() : nullptr;
-
-        // Call the unified backward kernel
-        // Use pre-computed means2D from geomBuffer for consistent 2D fallback gradients
-        backward_from_weight_grad(
-            num_pixels, P, W, H,
-            dL_dweight.contiguous().data_ptr<float>(),
-            gaussian_ids.contiguous().data_ptr<int>(),
-            pixel_ids.contiguous().data_ptr<int>(),
-            pixel_starts.contiguous().data_ptr<int>(),
-            T_values.contiguous().data_ptr<float>(),
-            G_values.contiguous().data_ptr<float>(),
-            alpha_values.contiguous().data_ptr<float>(),
-            opacity_values.contiguous().data_ptr<float>(),
-            s_x_values.contiguous().data_ptr<float>(),
-            s_y_values.contiguous().data_ptr<float>(),
-            rho_flag.contiguous().data_ptr<float>(),
-            dL_duv_x_ptr,
-            dL_duv_y_ptr,
-            geomState.transMat,  // Read directly from geomBuffer!
-            reinterpret_cast<const float*>(geomState.means2D),  // Pre-computed mean2D [N, 2]
-            dL_dopacity.data_ptr<float>(),
-            dL_dtransMat.data_ptr<float>(),
-            dL_dmean2D.data_ptr<float>()
-        );
-    }
-
-    return std::make_tuple(dL_dopacity, dL_dtransMat, dL_dmean2D);
-}
-
-// PyTorch wrapper for transMat to scale/rotation gradient conversion
-// This properly converts screen-space dL_dtransMat to world-space dL_dscale and dL_drotation
-// Also incorporates xyz gradient contribution (dL_dhomoMat) and 2D mean gradient (dL_dmean2D)
-// Returns: (dL_dscale [N, 2], dL_drotation [N, 4], dL_dmeans [N, 3])
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> TransMatToScaleRotGradCUDA(
-    const torch::Tensor& dL_dtransMat,  // [N, 9] screen-space transMat gradient
-    const torch::Tensor& dL_dhomoMat,   // [N, 9] xyz gradient contribution (can be empty)
-    const torch::Tensor& dL_dmean2D,    // [N, 2] 2D mean gradient (can be empty)
-    const torch::Tensor& dL_dnormal3D,  // [N, 3] normal gradient from depth/normal loss (can be empty)
-    const torch::Tensor& means3D,       // [N, 3] world-space positions (needed for dL_dmean2D)
-    const torch::Tensor& transMat_precomp, // [N, 9] forward pass transMat (can be empty)
-    const torch::Tensor& scales,        // [N, 2]
-    const torch::Tensor& rotations,     // [N, 4] quaternions
-    const torch::Tensor& projmatrix,    // [4, 4] or [16] projection matrix
-    const torch::Tensor& viewmatrix,    // [4, 4] or [16] view matrix (for normal gradient transform)
-    const int W, const int H)           // Image dimensions for ndc2pix transformation
-{
-    CHECK_INPUT(dL_dtransMat);
-    CHECK_INPUT(scales);
-    CHECK_INPUT(rotations);
-    CHECK_INPUT(projmatrix);
-
-    int N = dL_dtransMat.size(0);
-
-    // Allocate output tensors
-    torch::Tensor dL_dscales = torch::zeros({N, 2}, dL_dtransMat.options());
-    torch::Tensor dL_drots = torch::zeros({N, 4}, dL_dtransMat.options());
-    torch::Tensor dL_dmeans = torch::zeros({N, 3}, dL_dtransMat.options());
-
-    if (N > 0) {
-        // Get pointers for optional gradient contributions (can be nullptr if tensor is empty)
-        const float* dL_dhomoMat_ptr = (dL_dhomoMat.numel() > 0) ? dL_dhomoMat.contiguous().data_ptr<float>() : nullptr;
-        const float* dL_dmean2D_ptr = (dL_dmean2D.numel() > 0) ? dL_dmean2D.contiguous().data_ptr<float>() : nullptr;
-        const float* dL_dnormal3D_ptr = (dL_dnormal3D.numel() > 0) ? dL_dnormal3D.contiguous().data_ptr<float>() : nullptr;
-        const float* means3D_ptr = (means3D.numel() > 0) ? means3D.contiguous().data_ptr<float>() : nullptr;
-        const float* transMat_precomp_ptr = (transMat_precomp.numel() > 0) ? transMat_precomp.contiguous().data_ptr<float>() : nullptr;
-        const float* viewmatrix_ptr = (viewmatrix.numel() > 0) ? viewmatrix.contiguous().data_ptr<float>() : nullptr;
-
-        transMat_to_scale_rot_grad(
-            N,
-            W, H,  // Image dimensions for ndc2pix
-            dL_dtransMat.contiguous().data_ptr<float>(),
-            dL_dhomoMat_ptr,
-            dL_dmean2D_ptr,
-            dL_dnormal3D_ptr,
-            means3D_ptr,
-            transMat_precomp_ptr,
-            scales.contiguous().data_ptr<float>(),
-            rotations.contiguous().data_ptr<float>(),
-            projmatrix.contiguous().data_ptr<float>(),
-            viewmatrix_ptr,
-            dL_dscales.data_ptr<float>(),
-            dL_drots.data_ptr<float>(),
-            dL_dmeans.data_ptr<float>()
-        );
-    }
-
-    return std::make_tuple(dL_dscales, dL_drots, dL_dmeans);
-}
-
-// Extract transMat from geomBuffer
-// Returns: transMat [P, 9] as a float tensor
-torch::Tensor GetTransMatFromGeomBufferCUDA(
-    const torch::Tensor& geomBuffer,
-    const int P)
-{
-    CHECK_INPUT(geomBuffer);
-
-    torch::Tensor transMat = torch::zeros({P, 9}, torch::TensorOptions().dtype(torch::kFloat32).device(geomBuffer.device()));
-
-    if (P > 0) {
-        char* geom_buffer = reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr());
-        CudaRasterizer::GeometryState geomState = CudaRasterizer::GeometryState::fromChunk(geom_buffer, P);
-
-        // Copy transMat from geomBuffer to output tensor
-        cudaMemcpy(transMat.data_ptr<float>(), geomState.transMat, P * 9 * sizeof(float), cudaMemcpyDeviceToDevice);
-    }
-
-    return transMat;
-}
-
-// SetMlpWeightsCUDA removed — use diff_surfel_3D or diff_surfel_3D_16 libraries for fused modes

@@ -489,21 +489,7 @@ renderCUDAsurfelBackward(
 	const float* __restrict__ shapes = nullptr,
 	const int kernel_type = 0,
 	float* __restrict__ dL_dshapes = nullptr,
-	const bool detach_hash_grad = false,
-	// MLP gradient buffers (kept in signature for ABI compatibility)
-	float* __restrict__ dL_dmlp_W1 = nullptr,    // [32 * 40]
-	float* __restrict__ dL_dmlp_b1 = nullptr,    // [32]
-	float* __restrict__ dL_dmlp_W2 = nullptr,    // [32 * 32]
-	float* __restrict__ dL_dmlp_b2 = nullptr,    // [32]
-	float* __restrict__ dL_dmlp_W3 = nullptr,    // [3 * 32] for RGB
-	float* __restrict__ dL_dmlp_b3 = nullptr,    // [3]
-	// MLP weight pointers (unused, kept in signature for ABI compatibility)
-	const float* __restrict__ mlp_W1_ptr = nullptr,
-	const float* __restrict__ mlp_b1_ptr = nullptr,
-	const float* __restrict__ mlp_W2_ptr = nullptr,
-	const float* __restrict__ mlp_b2_ptr = nullptr,
-	const float* __restrict__ mlp_W3_rgb_ptr = nullptr,
-	const float* __restrict__ mlp_b3_rgb_ptr = nullptr)
+	const bool detach_hash_grad = false)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -540,19 +526,6 @@ renderCUDAsurfelBackward(
 	__shared__ uint32_t collected_ap_level[BLOCK_SIZE];
 	__shared__ float collected_shapes[BLOCK_SIZE];  // Beta kernel shape parameter
 
-	// Per-tile MLP gradient accumulators (unused, kept for ABI compatibility)
-	__shared__ float tile_dL_dW1[32 * 40];   // 5KB
-	__shared__ float tile_dL_db1[32];        // 128B
-	__shared__ float tile_dL_dW2[32 * 32];   // 4KB
-	__shared__ float tile_dL_db2[32];        // 128B
-	__shared__ float tile_dL_dW3[3 * 32];    // 384B
-	__shared__ float tile_dL_db3[3];         // 12B
-
-	// Shared memory for per-Gaussian baseline features (dual hashgrid mode)
-	// NOTE: Disabled for baseline_double/baseline_blend_double due to shared memory limits  
-	// We query on-demand instead (less efficient but fits in shared memory)
-	// Legacy comment - this shared memory block is currently disabled
-	// __shared__ float collected_feat_pk[BLOCK_SIZE][16 * 4];  // Max 16 levels × 4 features per Gaussian
 
 	// get total rendered points number per pixel.
 	const int render_number = other_maps[pix_id + NUM_OFFSET * H * W];
@@ -599,7 +572,7 @@ renderCUDAsurfelBackward(
 	float voxel_min = 0.0f;
 	float voxel_max = 0.0f;
 	if(level > 0){
-		// For cat mode (render_mode==1) and adaptive_zero (render_mode==2), level is encoded as:
+		// For cat mode (render_mode==1), level is encoded as:
 		// (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 		// Decode to get actual hashgrid levels for offset copying
 		int actual_levels = level;
@@ -607,15 +580,6 @@ renderCUDAsurfelBackward(
 			// cat mode: Extract active_hashgrid_levels from encoded value
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			actual_levels = active_hashgrid_levels;  // Use ACTIVE hashgrid levels for coarse-to-fine
-		} else if((render_mode & 0xFF) == 2){
-			// adaptive_zero mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
-			// Note: render_mode may have inference flag in upper bits, so mask to get base mode
-			int active_hashgrid_levels = (level >> 8) & 0xFF;
-			actual_levels = active_hashgrid_levels;
-		} else if(render_mode == 3){
-			// 3D mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
-			// Hashgrid query happens in PyTorch, not CUDA - so actual_levels = 0
-			actual_levels = 0;
 		} else if(level > 16){
 			printf("Error: level %d  > 16.", level);
 			return;
@@ -625,18 +589,10 @@ renderCUDAsurfelBackward(
 		voxel_max = gridrange[1];
 	}
 	
-	// Setup baseline hashgrid offsets once (dual hashgrid mode)
-	// NOTE: Dual hashgrid modes (old surface_rgb=1, baseline_double=2, baseline_blend_double=3)
-	// were removed during render mode cleanup. No current mode uses this path.
-	// The old condition checked render_mode == 1/2/3 which now map to cat/adaptive_zero/3D_direct
-	// — none of which use diffuse hashgrids. Disabled to prevent stack overflow when
-	// cat mode (render_mode=1) enters with encoded level=393477.
+	// Dual hashgrid offsets (unused by current modes, kept for interface compatibility)
 	int collec_offsets_diffuse[16] = {0};
 	float voxel_min_diffuse = 0.0f;
 	float voxel_max_diffuse = 0.0f;
-
-	// NOTE: baseline_blend_double post-processing was removed during render mode cleanup
-	// (it was old mode 3, now deleted)
 
 	// for compute gradient with respect to depth and normal
 	float last_depth = 0;
@@ -927,26 +883,42 @@ renderCUDAsurfelBackward(
 					}
 				}
 
-				// Backprop through hashgrid at xyz - pass grad_feat slice directly like case 0
+				// Backprop through hashgrid at xyz
+				// Use separate buffers to avoid stack overflow: query_feature<true, 16*4, LD>
+				// zeros C=64 elements, but feat/grad_feat are only C=24 (kernel template).
 				if (hashgrid_levels > 0) {
+					float feat_hashgrid[16 * 4] = {0};
+					float grad_feat_hashgrid[16 * 4] = {0};
+					const int hashgrid_dim = hashgrid_levels * l_dim;
+
+					// Copy hash portion of grad_feat into separate buffer
+					for(int i = 0; i < hashgrid_dim; i++){
+						grad_feat_hashgrid[i] = grad_feat[per_gaussian_dim + i];
+					}
+
 					if(l_dim == 2) {
-						query_feature<true, 16 * 4, 2>(&feat[per_gaussian_dim], xyz, voxel_min, voxel_max, collec_offsets,
+						query_feature<true, 16 * 4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
 							appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
-							&grad_feat[per_gaussian_dim], dL_dfeatures, dL_dxyz);
+							grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
 					} else if(l_dim == 4) {
-						query_feature<true, 16 * 4, 4>(&feat[per_gaussian_dim], xyz, voxel_min, voxel_max, collec_offsets,
+						query_feature<true, 16 * 4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
 							appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
-							&grad_feat[per_gaussian_dim], dL_dfeatures, dL_dxyz);
+							grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
 					} else if(l_dim == 8) {
-						query_feature<true, 16 * 4, 8>(&feat[per_gaussian_dim], xyz, voxel_min, voxel_max, collec_offsets,
+						query_feature<true, 16 * 4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
 							appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
-							&grad_feat[per_gaussian_dim], dL_dfeatures, dL_dxyz);
+							grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
 					} else if(l_dim == 12) {
-						query_feature<true, 16 * 4, 12>(&feat[per_gaussian_dim], xyz, voxel_min, voxel_max, collec_offsets,
+						query_feature<true, 16 * 4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
 							appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
-							&grad_feat[per_gaussian_dim], dL_dfeatures, dL_dxyz);
+							grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
 					} else {
 						printf("BW unsupported level dim : %d\n", l_dim);
+					}
+
+					// Copy hash features back into feat array
+					for(int i = 0; i < hashgrid_dim; i++){
+						feat[per_gaussian_dim + i] = feat_hashgrid[i];
 					}
 				}
 
@@ -959,108 +931,7 @@ renderCUDAsurfelBackward(
 
 				break;
 			}
-		case 2: {
-			/* adaptive_zero mode backward:
-			 * Forward: coarse = gauss (no weight), fine = weight * hash
-			 * Gradients:
-			 *   d_gauss_coarse = grad_coarse (no weight scaling)
-			 *   d_hash = weight * grad_fine
-			 *   d_weight = sum(hash * grad_fine)
-			 */
-
-			const int total_levels = (level >> 16) & 0xFF;
-			const int hashgrid_levels = (level >> 8) & 0xFF;
-			const int hybrid_levels = level & 0xFF;
-			const int per_level_dim = l_dim;
-			const int per_gaussian_dim = hybrid_levels * per_level_dim;
-
-			// Validate decoded values
-			if (total_levels == 0 || total_levels > 32 || hashgrid_levels > 32 || hybrid_levels > 32) {
-				if (debug) {
-					printf("BW Error: adaptive_zero invalid level values. level=%d, total=%d, hash=%d, hybrid=%d\n",
-					       level, total_levels, hashgrid_levels, hybrid_levels);
-				}
-				break;
-			}
-
-			int gauss_id = collected_id[j];
-			// Layout: [coarse_features (per_gaussian_dim) | weight (1)]
-			const float weight = colors[gauss_id * (per_gaussian_dim + 1) + per_gaussian_dim];
-
-			// Coarse levels: dL/dgauss = dL/dfeat (NO weight scaling, unlike adaptive_cat)
-			for(int i = 0; i < per_gaussian_dim; i++) {
-				atomicAdd(&dL_dcolors[gauss_id * (per_gaussian_dim + 1) + i], grad_feat[i]);
-			}
-
-			// Fine levels: gradient for weight and hashgrid
-			float dL_dweight = 0.0f;
-			if (hashgrid_levels > 0 && weight > 1e-6f) {
-				// Re-query hashgrid for gradient computation
-				float hash_feat[16 * 4];
-
-				if(l_dim == 2) {
-					query_feature<false, 16*4, 2>(hash_feat, xyz, voxel_min, voxel_max,
-					                               collec_offsets, appearance_level, hash_features,
-					                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
-				} else if(l_dim == 4) {
-					query_feature<false, 16*4, 4>(hash_feat, xyz, voxel_min, voxel_max,
-					                               collec_offsets, appearance_level, hash_features,
-					                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
-				} else if(l_dim == 8) {
-					query_feature<false, 16*4, 8>(hash_feat, xyz, voxel_min, voxel_max,
-					                               collec_offsets, appearance_level, hash_features,
-					                               hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug);
-				}
-
-				// Gradient for weight: dL/dw = sum(hash * dL/dfeat_fine)
-				for(int i = 0; i < hashgrid_levels * per_level_dim; i++) {
-					dL_dweight += hash_feat[i] * grad_feat[per_gaussian_dim + i];
-				}
-
-				// Gradient for hashgrid: dL/dhash = weight * dL/dfeat_fine
-				float grad_hash[16 * 4];
-				for(int i = 0; i < hashgrid_levels * per_level_dim; i++) {
-					grad_hash[i] = weight * grad_feat[per_gaussian_dim + i];
-				}
-
-				// Backprop through hashgrid
-				float hash_feat_dummy[16 * 4];
-				if(l_dim == 2) {
-					query_feature<true, 16*4, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max,
-					                              collec_offsets, appearance_level, hash_features,
-					                              hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
-					                              grad_hash, dL_dfeatures, dL_dxyz);
-				} else if(l_dim == 4) {
-					query_feature<true, 16*4, 4>(hash_feat_dummy, xyz, voxel_min, voxel_max,
-					                              collec_offsets, appearance_level, hash_features,
-					                              hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
-					                              grad_hash, dL_dfeatures, dL_dxyz);
-				} else if(l_dim == 8) {
-					query_feature<true, 16*4, 8>(hash_feat_dummy, xyz, voxel_min, voxel_max,
-					                              collec_offsets, appearance_level, hash_features,
-					                              hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
-					                              grad_hash, dL_dfeatures, dL_dxyz);
-				}
-
-				// Detach hashgrid positional gradients if requested (for frequency separation)
-				// This prevents high-frequency hashgrid features from moving Gaussian positions
-				if(detach_hash_grad) {
-					dL_dxyz[0] = 0.0f;
-					dL_dxyz[1] = 0.0f;
-					dL_dxyz[2] = 0.0f;
-				}
-			}
-
-			// Write weight gradient
-			atomicAdd(&dL_dcolors[gauss_id * (per_gaussian_dim + 1) + per_gaussian_dim], dL_dweight);
-
-			break;
-		}
-			case 3:
-				// 3D mode: All gradients handled in PyTorch post-processing
-				// No CUDA hashgrid backward needed - just skip
-				break;
-			default: printf("BW unsupported level dim : %d\n", l_dim);
+			default: printf("BW unsupported render_mode : %d\n", render_mode & 0xFF);
 				break;
 			}
 
@@ -1654,49 +1525,29 @@ void BACKWARD::render(
 	const float* shapes,
 	const int kernel_type,
 	float* dL_dshapes,
-	const bool detach_hash_grad,
-	float* dL_dmlp_W1,
-	float* dL_dmlp_b1,
-	float* dL_dmlp_W2,
-	float* dL_dmlp_b2,
-	float* dL_dmlp_W3,
-	float* dL_dmlp_b3)
+	const bool detach_hash_grad)
 {
-	// Determine D_DIFFUSE template parameter for kernel dispatch
-	const uint32_t D_DIFFUSE_TEMPLATE = D_diffuse;
-
-	// MLP weight pointers are unused (mode 5 removed), but kept in kernel signature for ABI compatibility
-	const float *mlp_W1_ptr = nullptr, *mlp_b1_ptr = nullptr;
-	const float *mlp_W2_ptr = nullptr, *mlp_b2_ptr = nullptr;
-	const float *mlp_W3_rgb_ptr = nullptr, *mlp_b3_rgb_ptr = nullptr;
-
 	switch (C) {
 		case 3:
 			renderCUDAsurfelBackward<3, 0> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
-					dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
-					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 			break;
 		case 8:
 			renderCUDAsurfelBackward<8, 0> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
-					dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
-					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 			break;
 		case 16:
 			renderCUDAsurfelBackward<16, 0> <<<grid, block>>>(
 					ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 					means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 					dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
-					dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
-					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
+					hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 			break;
 	case 24:
 		// Always use D_DIFFUSE=0 template and handle dual hashgrids at runtime
@@ -1705,682 +1556,45 @@ void BACKWARD::render(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
-				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
-					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	case 32:
 		renderCUDAsurfelBackward<32, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
-				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
-					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	case 42:
 		renderCUDAsurfelBackward<42, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
-				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
-					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	case 48:
 		renderCUDAsurfelBackward<48, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
-				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
-					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	case 72:
 		renderCUDAsurfelBackward<72, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
-				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
-					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	case 90:
 		renderCUDAsurfelBackward<90, 0> <<<grid, block>>>(
 				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 				means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
 				dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
-				dL_dmlp_W1, dL_dmlp_b1, dL_dmlp_W2, dL_dmlp_b2, dL_dmlp_W3, dL_dmlp_b3,
-					mlp_W1_ptr, mlp_b1_ptr, mlp_W2_ptr, mlp_b2_ptr, mlp_W3_rgb_ptr, mlp_b3_rgb_ptr);
+				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad);
 		break;
 	default:
 		printf("Unsupported channel count: %d\n", C);
 	}
 
-}
-
-// Compute opacity gradients for 3D mode with full transmittance chain
-// This kernel processes intersections per pixel back-to-front to correctly
-// compute dL/dalpha including the transmittance chain effect
-// Outputs dL_dalpha per intersection for use by geometry gradient kernel
-__global__ void compute_opacity_gradient_3D_kernel(
-    int M,                                      // Total intersections
-    int N,                                      // Total Gaussians
-    int num_pixels,                             // H * W
-    const float* __restrict__ dL_dweight,       // [M] from PyTorch
-    const float* __restrict__ T_values,         // [M] transmittance
-    const float* __restrict__ G_values,         // [M] kernel value
-    const float* __restrict__ alpha_values,     // [M] alpha
-    const int* __restrict__ gaussian_ids,       // [M] Gaussian indices
-    const int* __restrict__ pixel_starts,       // [num_pixels+1] boundaries
-    float* __restrict__ dL_dopacity,            // [N] opacity gradient output
-    float* __restrict__ dL_dalpha_out)          // [M] per-intersection dL_dalpha output
-{
-    // One thread per pixel
-    int pix_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pix_id >= num_pixels) return;
-
-    int start = pixel_starts[pix_id];
-    int end = pixel_starts[pix_id + 1];
-
-    float last_dL_dT = 0.0f;
-
-    // Process back-to-front (matches backward.cu logic)
-    for (int i = end - 1; i >= start; i--) {
-        float dL_dw = dL_dweight[i];
-        float alpha = alpha_values[i];
-        float T = T_values[i];
-        float G = G_values[i];
-        int gid = gaussian_ids[i];
-
-        // Full transmittance chain gradient (same as backward.cu)
-        // dL_dalpha = (dL_dweight - last_dL_dT) * T
-        float dL_dalpha = (dL_dw - last_dL_dT) * T;
-
-        // Propagate transmittance chain
-        // last_dL_dT = dL_dweight * alpha + (1 - alpha) * last_dL_dT
-        last_dL_dT = dL_dw * alpha + (1.0f - alpha) * last_dL_dT;
-
-        // dL_dopacity = G * dL_dalpha (opacity gradient)
-        atomicAdd(&dL_dopacity[gid], G * dL_dalpha);
-
-        // Output dL_dalpha for use by geometry gradient kernel
-        dL_dalpha_out[i] = dL_dalpha;
-    }
-}
-
-// Compute geometry gradients for 3D mode using geomBuffer's transMat
-// This kernel takes dL_dalpha per intersection and computes dL_dtransMat
-// which is then used by preprocess backward to get exact scale/rotation/position gradients
-__global__ void compute_geometry_gradient_3D_kernel(
-    int M,                                      // Total intersections
-    int N,                                      // Total Gaussians
-    int W, int H,                               // Image dimensions
-    const float* __restrict__ dL_dalpha,        // [M] from opacity kernel
-    const float* __restrict__ opacity_values,   // [M] per-intersection opacity
-    const float* __restrict__ G_values,         // [M] kernel value
-    const float* __restrict__ s_x_values,       // [M] intersection s.x
-    const float* __restrict__ s_y_values,       // [M] intersection s.y
-    const float* __restrict__ rho_flag,         // [M] 1.0=disk, 0.0=center
-    const int* __restrict__ gaussian_ids,       // [M] Gaussian indices
-    const int* __restrict__ pixel_ids,          // [M] pixel indices
-    const float* __restrict__ transMat,         // [N*9] from geomBuffer
-    float* __restrict__ dL_dtransMat)           // [N*9] output
-{
-    // One thread per intersection
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= M) return;
-
-    // Skip center intersections (rho2d < rho3d) - they don't contribute to transMat grads
-    // Only disk intersections (rho3d <= rho2d) have gradients through transMat
-    if (rho_flag[idx] < 0.5f) return;
-
-    int gid = gaussian_ids[idx];
-    int pix_id = pixel_ids[idx];
-
-    // Pixel coordinates (center of pixel)
-    float pixf_x = (float)(pix_id % W) + 0.5f;
-    float pixf_y = (float)(pix_id / W) + 0.5f;
-
-    // Get transMat for this Gaussian (Tu, Tv, Tw as 3 rows of 3 elements each)
-    float Tu_x = transMat[gid * 9 + 0], Tu_y = transMat[gid * 9 + 1], Tu_z = transMat[gid * 9 + 2];
-    float Tv_x = transMat[gid * 9 + 3], Tv_y = transMat[gid * 9 + 4], Tv_z = transMat[gid * 9 + 5];
-    float Tw_x = transMat[gid * 9 + 6], Tw_y = transMat[gid * 9 + 7], Tw_z = transMat[gid * 9 + 8];
-
-    // Compute k, l vectors (same as forward pass)
-    // k = -Tu + pixf.x * Tw
-    // l = -Tv + pixf.y * Tw
-    float3 k = {-Tu_x + pixf_x * Tw_x, -Tu_y + pixf_x * Tw_y, -Tu_z + pixf_x * Tw_z};
-    float3 l = {-Tv_x + pixf_y * Tw_x, -Tv_y + pixf_y * Tw_y, -Tv_z + pixf_y * Tw_z};
-
-    // p = cross(k, l)
-    float3 p = {k.y * l.z - k.z * l.y, k.z * l.x - k.x * l.z, k.x * l.y - k.y * l.x};
-
-    // Avoid division by zero
-    if (fabsf(p.z) < 1e-7f) return;
-
-    // Get intersection values
-    float s_x = s_x_values[idx];
-    float s_y = s_y_values[idx];
-    float G = G_values[idx];
-    float opa = opacity_values[idx];
-    float dL_da = dL_dalpha[idx];
-
-    // dL_dG = opacity * dL_dalpha
-    float dL_dG = opa * dL_da;
-
-    // For Gaussian kernel: dG_factor = -G (dG/drho = -0.5*G, drho/ds = 2*s, so dG/ds = -G*s)
-    float dG_factor = -G;
-
-    // Compute dL_ds
-    float dL_ds_x = dL_dG * dG_factor * s_x;
-    float dL_ds_y = dL_dG * dG_factor * s_y;
-
-    // dL_dp from dL_ds (matches backward.cu lines 1244-1246)
-    float dsx_pz = dL_ds_x / p.z;
-    float dsy_pz = dL_ds_y / p.z;
-    float3 dL_dp = {dsx_pz, dsy_pz, -(dsx_pz * s_x + dsy_pz * s_y)};
-
-    // dL_dk = cross(l, dL_dp), dL_dl = cross(dL_dp, k) (matches backward.cu lines 1247-1248)
-    float3 dL_dk = {l.y * dL_dp.z - l.z * dL_dp.y, l.z * dL_dp.x - l.x * dL_dp.z, l.x * dL_dp.y - l.y * dL_dp.x};
-    float3 dL_dl = {dL_dp.y * k.z - dL_dp.z * k.y, dL_dp.z * k.x - dL_dp.x * k.z, dL_dp.x * k.y - dL_dp.y * k.x};
-
-    // dL_dTu, dL_dTv, dL_dTw (matches backward.cu lines 1250-1255)
-    float3 dL_dTu = {-dL_dk.x, -dL_dk.y, -dL_dk.z};
-    float3 dL_dTv = {-dL_dl.x, -dL_dl.y, -dL_dl.z};
-    float3 dL_dTw = {
-        pixf_x * dL_dk.x + pixf_y * dL_dl.x,
-        pixf_x * dL_dk.y + pixf_y * dL_dl.y,
-        pixf_x * dL_dk.z + pixf_y * dL_dl.z
-    };
-
-    // Accumulate into dL_dtransMat (matches backward.cu lines 1259-1267)
-    atomicAdd(&dL_dtransMat[gid * 9 + 0], dL_dTu.x);
-    atomicAdd(&dL_dtransMat[gid * 9 + 1], dL_dTu.y);
-    atomicAdd(&dL_dtransMat[gid * 9 + 2], dL_dTu.z);
-    atomicAdd(&dL_dtransMat[gid * 9 + 3], dL_dTv.x);
-    atomicAdd(&dL_dtransMat[gid * 9 + 4], dL_dTv.y);
-    atomicAdd(&dL_dtransMat[gid * 9 + 5], dL_dTv.z);
-    atomicAdd(&dL_dtransMat[gid * 9 + 6], dL_dTw.x);
-    atomicAdd(&dL_dtransMat[gid * 9 + 7], dL_dTw.y);
-    atomicAdd(&dL_dtransMat[gid * 9 + 8], dL_dTw.z);
-}
-
-// Unified backward kernel for 3D mode that reads transMat from geomBuffer
-// Computes both dL_dopacity and dL_dtransMat in one pass
-// This avoids needing to expose transMat to Python
-// NEW: Also accepts dL_duv from hash/xyz gradient path (like cat mode)
-__global__ void backward_from_weight_grad_kernel(
-    int num_pixels,                             // H * W (for pixel iteration)
-    int N,                                      // Total Gaussians
-    int W, int H,                               // Image dimensions
-    const float* __restrict__ dL_dweight,       // [M] from PyTorch
-    const int* __restrict__ gaussian_ids,       // [M] Gaussian indices
-    const int* __restrict__ pixel_ids,          // [M] pixel indices
-    const int* __restrict__ pixel_starts,       // [num_pixels+1] boundaries
-    const float* __restrict__ T_values,         // [M] transmittance
-    const float* __restrict__ G_values,         // [M] kernel value
-    const float* __restrict__ alpha_values,     // [M] alpha
-    const float* __restrict__ opacity_values,   // [M] per-intersection opacity
-    const float* __restrict__ s_x_values,       // [M] intersection s.x
-    const float* __restrict__ s_y_values,       // [M] intersection s.y
-    const float* __restrict__ rho_flag,         // [M] 1.0=disk, 0.0=center
-    const float* __restrict__ dL_duv_x,         // [M] xyz gradient contribution to s.x (from hash backward)
-    const float* __restrict__ dL_duv_y,         // [M] xyz gradient contribution to s.y (from hash backward)
-    const float* __restrict__ transMat,         // [N*9] from geomBuffer (accessed directly)
-    const float* __restrict__ mean2D_precomp,   // [N*2] pre-computed mean2D (x,y) from forward pass
-    float* __restrict__ dL_dopacity,            // [N] opacity gradient output
-    float* __restrict__ dL_dtransMat,           // [N*9] transMat gradient output
-    float* __restrict__ dL_dmean2D)             // [N*2] mean2D gradient output (for densification/position)
-{
-    // One thread per pixel
-    int pix_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pix_id >= num_pixels) return;
-
-    int start = pixel_starts[pix_id];
-    int end = pixel_starts[pix_id + 1];
-
-    if (start >= end) return;  // No intersections for this pixel
-
-    // Get actual pixel ID from the intersection buffer (all intersections in range share same pixel)
-    // IMPORTANT: pix_id is just an index into unique pixels, NOT the actual pixel coordinate!
-    int actual_pixel_id = pixel_ids[start];
-    // NOTE: Native CUDA kernel uses integer pixel coordinates WITHOUT +0.5 offset!
-    // This must match forward.cu line 589: float2 pixf = { (float)pix.x, (float)pix.y};
-    float pixf_x = (float)(actual_pixel_id % W);
-    float pixf_y = (float)(actual_pixel_id / W);
-
-    float last_dL_dT = 0.0f;
-
-    // Process back-to-front (matches backward.cu logic for transmittance chain)
-    for (int i = end - 1; i >= start; i--) {
-        float dL_dw = dL_dweight[i];
-        float alpha = alpha_values[i];
-        float T = T_values[i];
-        float G = G_values[i];
-        float opa = opacity_values[i];
-        float s_x = s_x_values[i];
-        float s_y = s_y_values[i];
-        float is_disk = rho_flag[i];  // 1.0 = disk intersection, 0.0 = center
-        int gid = gaussian_ids[i];
-
-        // Full transmittance chain gradient (same as backward.cu)
-        float dL_dalpha = (dL_dw - last_dL_dT) * T;
-        last_dL_dT = dL_dw * alpha + (1.0f - alpha) * last_dL_dT;
-
-        // dL_dopacity = G * dL_dalpha
-        atomicAdd(&dL_dopacity[gid], G * dL_dalpha);
-
-        // Get transMat for this Gaussian (Tu, Tv, Tw as 3 rows)
-        float Tu_x = transMat[gid * 9 + 0], Tu_y = transMat[gid * 9 + 1], Tu_z = transMat[gid * 9 + 2];
-        float Tv_x = transMat[gid * 9 + 3], Tv_y = transMat[gid * 9 + 4], Tv_z = transMat[gid * 9 + 5];
-        float Tw_x = transMat[gid * 9 + 6], Tw_y = transMat[gid * 9 + 7], Tw_z = transMat[gid * 9 + 8];
-
-        // Handle rho2d case (center intersection) - gradient through mean2D directly
-        if (is_disk < 0.5f) {
-            // Use pre-computed mean2D from forward pass (matches native backward which reads from points_xy_image)
-            // This avoids any mismatch due to different cutoff values or numerical precision
-            float mean2D_x, mean2D_y;
-            if (mean2D_precomp != nullptr) {
-                mean2D_x = mean2D_precomp[gid * 2 + 0];
-                mean2D_y = mean2D_precomp[gid * 2 + 1];
-            } else {
-                // Fallback: compute mean2D using t_vec formula (MUST match forward compute_aabb!)
-                // Forward: t = (cutoff², cutoff², -1), d = dot(t, T[2]*T[2]), f = t/d
-                // mean2D = (dot(f, T[0]*T[2]), dot(f, T[1]*T[2]))
-                float3 Tu = {Tu_x, Tu_y, Tu_z};
-                float3 Tv = {Tv_x, Tv_y, Tv_z};
-                float3 Tw = {Tw_x, Tw_y, Tw_z};
-
-                // t_vec = (9, 9, -1) corresponds to cutoff=3 (used with ADAPTIVE_CUTOFF)
-                // For default cutoff=4, use (16, 16, -1)
-                float3 t_vec = {9.0f, 9.0f, -1.0f};
-                float3 Tw_sq = {Tw.x * Tw.x, Tw.y * Tw.y, Tw.z * Tw.z};
-                float d_denom = t_vec.x * Tw_sq.x + t_vec.y * Tw_sq.y + t_vec.z * Tw_sq.z;
-
-                // Avoid division by zero
-                if (fabsf(d_denom) < 1e-7f) continue;
-
-                float3 f = {t_vec.x / d_denom, t_vec.y / d_denom, t_vec.z / d_denom};
-
-                // Tu_dot_Tw = Tu * Tw elementwise (for dot(f, Tu*Tw))
-                float Tu_dot_Tw = f.x * (Tu.x * Tw.x) + f.y * (Tu.y * Tw.y) + f.z * (Tu.z * Tw.z);
-                float Tv_dot_Tw = f.x * (Tv.x * Tw.x) + f.y * (Tv.y * Tw.y) + f.z * (Tv.z * Tw.z);
-
-                mean2D_x = Tu_dot_Tw;
-                mean2D_y = Tv_dot_Tw;
-            }
-
-            // d = mean2D - pixel (matches native kernel convention)
-            float d_x = mean2D_x - pixf_x;
-            float d_y = mean2D_y - pixf_y;
-
-            // dL_dG = opacity * dL_dalpha
-            float dL_dG = opa * dL_dalpha;
-
-            // FilterInvSquare = 2.0 for anti-aliasing (matches forward.cu)
-            const float FilterInvSquare = 2.0f;
-
-            // For Gaussian kernel: dG/drho2d = -G, rho2d = FilterInvSquare * (d.x² + d.y²)
-            // dG/dd.x = dG/drho2d * drho2d/dd.x = -G * 2*FilterInvSquare*d.x
-            // dG_factor_2d * d.x = dG/dd.x, so dG_factor_2d = -G * FilterInvSquare * 2 / 2 = -G * FilterInvSquare
-            float dG_factor_2d = -G * FilterInvSquare;
-
-            float dG_ddelx = dG_factor_2d * d_x;
-            float dG_ddely = dG_factor_2d * d_y;
-
-            atomicAdd(&dL_dmean2D[gid * 2 + 0], dL_dG * dG_ddelx);
-            atomicAdd(&dL_dmean2D[gid * 2 + 1], dL_dG * dG_ddely);
-
-            continue;
-        }
-
-        // Compute k, l vectors (same as forward pass)
-        float3 k = {-Tu_x + pixf_x * Tw_x, -Tu_y + pixf_x * Tw_y, -Tu_z + pixf_x * Tw_z};
-        float3 l = {-Tv_x + pixf_y * Tw_x, -Tv_y + pixf_y * Tw_y, -Tv_z + pixf_y * Tw_z};
-
-        // p = cross(k, l)
-        float3 p = {k.y * l.z - k.z * l.y, k.z * l.x - k.x * l.z, k.x * l.y - k.y * l.x};
-
-        // Avoid division by zero
-        if (fabsf(p.z) < 1e-7f) continue;
-
-        // dL_dG = opacity * dL_dalpha
-        float dL_dG = opa * dL_dalpha;
-
-        // For Gaussian kernel: dG/ds = -G * s
-        float dG_factor = -G;
-
-        // Compute dL_ds from kernel shape gradient
-        float dL_ds_x = dL_dG * dG_factor * s_x;
-        float dL_ds_y = dL_dG * dG_factor * s_y;
-
-        // ADD dL_duv contribution from hash/xyz gradient path (matches cat mode backward.cu lines 1240-1241)
-        // This is the crucial term that connects hash feature gradients to geometry
-        if (dL_duv_x != nullptr && dL_duv_y != nullptr) {
-            dL_ds_x += dL_duv_x[i];
-            dL_ds_y += dL_duv_y[i];
-        }
-
-        // dL_dp from dL_ds (matches backward.cu)
-        float dsx_pz = dL_ds_x / p.z;
-        float dsy_pz = dL_ds_y / p.z;
-        float3 dL_dp = {dsx_pz, dsy_pz, -(dsx_pz * s_x + dsy_pz * s_y)};
-
-        // dL_dk = cross(l, dL_dp), dL_dl = cross(dL_dp, k)
-        float3 dL_dk = {l.y * dL_dp.z - l.z * dL_dp.y, l.z * dL_dp.x - l.x * dL_dp.z, l.x * dL_dp.y - l.y * dL_dp.x};
-        float3 dL_dl = {dL_dp.y * k.z - dL_dp.z * k.y, dL_dp.z * k.x - dL_dp.x * k.z, dL_dp.x * k.y - dL_dp.y * k.x};
-
-        // dL_dTu, dL_dTv, dL_dTw (matches backward.cu)
-        float3 dL_dTu = {-dL_dk.x, -dL_dk.y, -dL_dk.z};
-        float3 dL_dTv = {-dL_dl.x, -dL_dl.y, -dL_dl.z};
-        float3 dL_dTw = {
-            pixf_x * dL_dk.x + pixf_y * dL_dl.x,
-            pixf_x * dL_dk.y + pixf_y * dL_dl.y,
-            pixf_x * dL_dk.z + pixf_y * dL_dl.z
-        };
-
-        // Accumulate into dL_dtransMat
-        atomicAdd(&dL_dtransMat[gid * 9 + 0], dL_dTu.x);
-        atomicAdd(&dL_dtransMat[gid * 9 + 1], dL_dTu.y);
-        atomicAdd(&dL_dtransMat[gid * 9 + 2], dL_dTu.z);
-        atomicAdd(&dL_dtransMat[gid * 9 + 3], dL_dTv.x);
-        atomicAdd(&dL_dtransMat[gid * 9 + 4], dL_dTv.y);
-        atomicAdd(&dL_dtransMat[gid * 9 + 5], dL_dTv.z);
-        atomicAdd(&dL_dtransMat[gid * 9 + 6], dL_dTw.x);
-        atomicAdd(&dL_dtransMat[gid * 9 + 7], dL_dTw.y);
-        atomicAdd(&dL_dtransMat[gid * 9 + 8], dL_dTw.z);
-
-        // NOTE: For disk path (rho3d <= rho2d), dL_dmean2D is NOT computed in render backward!
-        // It will be derived from dL_dT in transMat_to_scale_rot_grad_kernel (matching native backward).
-        // Only the 2D fallback path (above) computes dL_dmean2D directly from Gaussian kernel gradient.
-    }
-}
-
-// Host wrapper to launch the unified backward kernel
-void backward_from_weight_grad(
-    int num_pixels,
-    int N,
-    int W, int H,
-    const float* dL_dweight,
-    const int* gaussian_ids,
-    const int* pixel_ids,
-    const int* pixel_starts,
-    const float* T_values,
-    const float* G_values,
-    const float* alpha_values,
-    const float* opacity_values,
-    const float* s_x_values,
-    const float* s_y_values,
-    const float* rho_flag,
-    const float* dL_duv_x,      // [M] hash/xyz gradient contribution (can be nullptr)
-    const float* dL_duv_y,      // [M] hash/xyz gradient contribution (can be nullptr)
-    const float* transMat,
-    const float* mean2D_precomp, // [N*2] pre-computed mean2D from forward (can be nullptr)
-    float* dL_dopacity,
-    float* dL_dtransMat,
-    float* dL_dmean2D)
-{
-    const int block_size = 256;
-    const int grid_size = (num_pixels + block_size - 1) / block_size;
-
-    backward_from_weight_grad_kernel<<<grid_size, block_size>>>(
-        num_pixels, N, W, H,
-        dL_dweight, gaussian_ids, pixel_ids, pixel_starts,
-        T_values, G_values, alpha_values, opacity_values,
-        s_x_values, s_y_values, rho_flag,
-        dL_duv_x, dL_duv_y,
-        transMat,
-        mean2D_precomp,
-        dL_dopacity, dL_dtransMat, dL_dmean2D
-    );
-}
-
-// =============================================================================
-// New kernel: Convert dL_dtransMat to dL_dscale and dL_drotation
-// This performs the proper coordinate space conversion that the native backward does:
-//   dL_dM = P * transpose(dL_dT)
-//   dL_dscale = [dot(dL_dM[0], R[0]), dot(dL_dM[1], R[1])]
-//   dL_dR = [dL_dM[0] * scale.x, dL_dM[1] * scale.y, 0]
-//   dL_drot = quat_to_rotmat_vjp(rot, dL_dR)
-// =============================================================================
-
-__global__ void transMat_to_scale_rot_grad_kernel(
-    int N,
-    int W, int H,  // Image dimensions for ndc2pix transformation
-    const float* __restrict__ dL_dtransMat,   // [N, 9] - screen-space transMat gradient
-    const float* __restrict__ dL_dhomoMat,    // [N, 9] - xyz gradient contribution (can be nullptr)
-                                               // Layout: [col0.xyz, col1.xyz, col2.xyz] where each is sum(dL_dxyz * s)
-    const float* __restrict__ dL_dmean2D,     // [N, 2] - 2D mean gradient (can be nullptr)
-    const float* __restrict__ dL_dnormal3D,   // [N, 3] - normal gradient from depth/normal loss (can be nullptr)
-    const float* __restrict__ means3D,         // [N, 3] - world-space positions (needed for dL_dmean2D)
-    const float* __restrict__ transMat_precomp, // [N, 9] - forward pass transMat (can be nullptr, will reconstruct if needed)
-    const float* __restrict__ scales,          // [N, 2]
-    const float* __restrict__ rotations,       // [N, 4] - quaternions (w,x,y,z stored as x,y,z,w in glm)
-    const float* __restrict__ projmatrix,      // [16] - 4x4 projection matrix (column-major)
-    const float* __restrict__ viewmatrix,      // [16] - 4x4 view matrix (for normal gradient transform)
-    float* __restrict__ dL_dscales,            // [N, 2] output
-    float* __restrict__ dL_drots,              // [N, 4] output
-    float* __restrict__ dL_dmeans)             // [N, 3] output
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
-
-    // Read scale and rotation for this Gaussian
-    glm::vec2 scale = glm::vec2(scales[idx * 2 + 0], scales[idx * 2 + 1]);
-    glm::vec4 rot = glm::vec4(
-        rotations[idx * 4 + 0],  // w component (stored in x)
-        rotations[idx * 4 + 1],  // x component (stored in y)
-        rotations[idx * 4 + 2],  // y component (stored in z)
-        rotations[idx * 4 + 3]   // z component (stored in w)
-    );
-
-    // Compute rotation matrix R from quaternion
-    glm::mat3 R = quat_to_rotmat(rot);
-
-    // Build world2ndc matrix from projmatrix (first 3 rows of the 4x4 projection)
-    // projmatrix is column-major: [col0, col1, col2, col3]
-    glm::mat4 world2ndc = glm::mat4(
-        projmatrix[0], projmatrix[4], projmatrix[8], projmatrix[12],
-        projmatrix[1], projmatrix[5], projmatrix[9], projmatrix[13],
-        projmatrix[2], projmatrix[6], projmatrix[10], projmatrix[14],
-        projmatrix[3], projmatrix[7], projmatrix[11], projmatrix[15]
-    );
-
-    // Build ndc2pix transformation (matches forward.cu and native backward)
-    // This converts from NDC [-1,1] to pixel coordinates [0,W-1] x [0,H-1]
-    glm::mat3x4 ndc2pix = glm::mat3x4(
-        glm::vec4(float(W) / 2.0f, 0.0f, 0.0f, float(W-1) / 2.0f),
-        glm::vec4(0.0f, float(H) / 2.0f, 0.0f, float(H-1) / 2.0f),
-        glm::vec4(0.0f, 0.0f, 0.0f, 1.0f)
-    );
-
-    // Compute P = world2ndc * ndc2pix (this matches the native backward exactly)
-    glm::mat3x4 P = world2ndc * ndc2pix;
-
-    // Read dL_dT (3x3 in row-major layout: Tu, Tv, Tw as rows)
-    // Stored as [Tu.x, Tu.y, Tu.z, Tv.x, Tv.y, Tv.z, Tw.x, Tw.y, Tw.z]
-    glm::mat3 dL_dT = glm::mat3(
-        dL_dtransMat[idx * 9 + 0], dL_dtransMat[idx * 9 + 1], dL_dtransMat[idx * 9 + 2],
-        dL_dtransMat[idx * 9 + 3], dL_dtransMat[idx * 9 + 4], dL_dtransMat[idx * 9 + 5],
-        dL_dtransMat[idx * 9 + 6], dL_dtransMat[idx * 9 + 7], dL_dtransMat[idx * 9 + 8]
-    );
-
-    // Handle dL_dmean2D contribution using t_vec formula (matches compute_transmat_aabb)
-    // NOTE: The mean2D used in render is from compute_aabb which uses the same t_vec formula.
-    // Both compute_aabb (forward) and compute_transmat_aabb (backward) use:
-    //   t = (cutoff², cutoff², -1) with cutoff=3 → t_vec = (9, 9, -1)
-    //   mean2D = dot(f, T[0]*T[2]), dot(f, T[1]*T[2]) where f = t / dot(t, T[2]*T[2])
-    if (dL_dmean2D != nullptr && transMat_precomp != nullptr) {
-        float dL_dm2D_x = dL_dmean2D[idx * 2 + 0];
-        float dL_dm2D_y = dL_dmean2D[idx * 2 + 1];
-
-        if (dL_dm2D_x != 0.0f || dL_dm2D_y != 0.0f) {
-            // Get transMat T from forward pass (columns as T[0], T[1], T[2])
-            glm::mat3 T = glm::mat3(
-                transMat_precomp[idx * 9 + 0], transMat_precomp[idx * 9 + 1], transMat_precomp[idx * 9 + 2],
-                transMat_precomp[idx * 9 + 3], transMat_precomp[idx * 9 + 4], transMat_precomp[idx * 9 + 5],
-                transMat_precomp[idx * 9 + 6], transMat_precomp[idx * 9 + 7], transMat_precomp[idx * 9 + 8]
-            );
-
-            // Same t_vec formula as native backward (matches forward compute_aabb with cutoff=3)
-            glm::vec3 t_vec = glm::vec3(9.0f, 9.0f, -1.0f);
-            float d = glm::dot(t_vec, T[2] * T[2]);
-
-            // Avoid division by zero
-            if (fabsf(d) < 1e-7f) return;
-
-            glm::vec3 f_vec = t_vec * (1.0f / d);
-            glm::vec3 dL_dT0 = dL_dm2D_x * f_vec * T[2];
-            glm::vec3 dL_dT1 = dL_dm2D_y * f_vec * T[2];
-            glm::vec3 dL_dT3 = dL_dm2D_x * f_vec * T[0] + dL_dm2D_y * f_vec * T[1];
-            glm::vec3 dL_df = dL_dm2D_x * T[0] * T[2] + dL_dm2D_y * T[1] * T[2];
-            float dL_dd = glm::dot(dL_df, f_vec) * (-1.0f / d);
-            glm::vec3 dd_dT3 = t_vec * T[2] * 2.0f;
-            dL_dT3 += dL_dd * dd_dT3;
-
-            // Add to dL_dT
-            dL_dT[0] += dL_dT0;
-            dL_dT[1] += dL_dT1;
-            dL_dT[2] += dL_dT3;
-        }
-    }
-
-    // Convert screen-space gradient to world-space: dL_dM = P * transpose(dL_dT)
-    // dL_dM is 3x4 (columns are the gradients for splat2world matrix columns)
-    glm::mat3x4 dL_dM = P * glm::transpose(dL_dT);
-
-    // Add xyz gradient contribution (dL_dhomoMat) if provided
-    // This is pre-computed in Python as sum over intersections of (dL_dxyz * s)
-    // Layout: [col0.xyz, col1.xyz, col2.xyz]
-    // - col0: sum(dL_dxyz * s_x) for scale_x direction
-    // - col1: sum(dL_dxyz * s_y) for scale_y direction
-    // - col2: sum(dL_dxyz) for mean position
-    if (dL_dhomoMat != nullptr) {
-        // Column 0 contribution (indices 0-2)
-        dL_dM[0].x += dL_dhomoMat[idx * 9 + 0];
-        dL_dM[0].y += dL_dhomoMat[idx * 9 + 1];
-        dL_dM[0].z += dL_dhomoMat[idx * 9 + 2];
-        // Column 1 contribution (indices 3-5)
-        dL_dM[1].x += dL_dhomoMat[idx * 9 + 3];
-        dL_dM[1].y += dL_dhomoMat[idx * 9 + 4];
-        dL_dM[1].z += dL_dhomoMat[idx * 9 + 5];
-        // Column 2 contribution (indices 6-8) - for mean gradient
-        dL_dM[2].x += dL_dhomoMat[idx * 9 + 6];
-        dL_dM[2].y += dL_dhomoMat[idx * 9 + 7];
-        dL_dM[2].z += dL_dhomoMat[idx * 9 + 8];
-    }
-
-    // Compute normal gradient contribution (matches compute_transmat_aabb in native backward)
-    // Normal in view space is computed in forward as: normal = transformVec4x3(R[:,2], viewmatrix)
-    // where R[:,2] is the z-column of the rotation matrix (the normal direction in world space).
-    // The backward transforms dL_dnormal3D through viewmatrix transpose back to world space.
-    glm::vec3 dL_dtn_vec(0.0f);
-    if (dL_dnormal3D != nullptr && viewmatrix != nullptr) {
-        float3 dL_dn = {dL_dnormal3D[idx * 3 + 0], dL_dnormal3D[idx * 3 + 1], dL_dnormal3D[idx * 3 + 2]};
-
-        // Check if there's any normal gradient
-        if (dL_dn.x != 0.0f || dL_dn.y != 0.0f || dL_dn.z != 0.0f) {
-            // Compute the normal in view space (same as forward: transformVec4x3(R[:,2], viewmatrix))
-            // For 2D surfels with scale_z = 1, normal = R[:,2]
-            glm::vec3 normal_world = R[2];  // Third column of rotation matrix
-            float3 normal_view = transformVec4x3({normal_world.x, normal_world.y, normal_world.z}, viewmatrix);
-
-            // Handle normalization gradient (NORMALIZE_SURFACE_NORMALS is defined in forward)
-            // Forward normalizes the view-space normal before outputting
-            float normal_len = sqrtf(normal_view.x * normal_view.x + normal_view.y * normal_view.y + normal_view.z * normal_view.z);
-            float3 dL_dnormal_unnorm;
-            if (normal_len > 1e-7f) {
-                float inv_len = 1.0f / normal_len;
-                float3 normal_normalized = {normal_view.x * inv_len, normal_view.y * inv_len, normal_view.z * inv_len};
-                float dot_grad_norm = dL_dn.x * normal_normalized.x + dL_dn.y * normal_normalized.y + dL_dn.z * normal_normalized.z;
-                dL_dnormal_unnorm.x = (dL_dn.x - dot_grad_norm * normal_normalized.x) * inv_len;
-                dL_dnormal_unnorm.y = (dL_dn.y - dot_grad_norm * normal_normalized.y) * inv_len;
-                dL_dnormal_unnorm.z = (dL_dn.z - dot_grad_norm * normal_normalized.z) * inv_len;
-            } else {
-                dL_dnormal_unnorm = make_float3(0.0f, 0.0f, 0.0f);
-            }
-
-            // Transform back to world space: dL_dtn = viewmatrix^T * dL_dnormal_unnorm
-            float3 dL_dtn = transformVec4x3Transpose(dL_dnormal_unnorm, viewmatrix);
-            dL_dtn_vec = glm::vec3(dL_dtn.x, dL_dtn.y, dL_dtn.z);
-        }
-    }
-
-    // Extract dL_dRS from dL_dM (first two columns plus normal gradient in third)
-    // This matches compute_transmat_aabb in native backward which uses dL_dtn for the normal
-    glm::mat3 dL_dRS = glm::mat3(
-        glm::vec3(dL_dM[0]),  // dL_dM column 0 -> vec3
-        glm::vec3(dL_dM[1]),  // dL_dM column 1 -> vec3
-        dL_dtn_vec            // Normal gradient contribution (was zeros before)
-    );
-
-    // Compute scale gradients: dL_dscale.x = dot(dL_dRS[0], R[0])
-    // R[0] is first column of rotation matrix (the u-axis direction in world space)
-    dL_dscales[idx * 2 + 0] = glm::dot(dL_dRS[0], R[0]);
-    dL_dscales[idx * 2 + 1] = glm::dot(dL_dRS[1], R[1]);
-
-    // Compute rotation gradients: dL_dR = [dL_dRS[0] * scale.x, dL_dRS[1] * scale.y, 0]
-    glm::mat3 dL_dR = glm::mat3(
-        dL_dRS[0] * glm::vec3(scale.x),
-        dL_dRS[1] * glm::vec3(scale.y),
-        dL_dRS[2]  // zeros
-    );
-
-    // Convert rotation matrix gradient to quaternion gradient
-    glm::vec4 dL_drot = quat_to_rotmat_vjp(rot, dL_dR);
-
-    // Write output
-    dL_drots[idx * 4 + 0] = dL_drot.x;
-    dL_drots[idx * 4 + 1] = dL_drot.y;
-    dL_drots[idx * 4 + 2] = dL_drot.z;
-    dL_drots[idx * 4 + 3] = dL_drot.w;
-
-    // Write mean gradient from column 2
-    if (dL_dmeans != nullptr) {
-        dL_dmeans[idx * 3 + 0] = dL_dM[2].x;
-        dL_dmeans[idx * 3 + 1] = dL_dM[2].y;
-        dL_dmeans[idx * 3 + 2] = dL_dM[2].z;
-    }
-}
-
-// Host wrapper for transMat to scale/rotation gradient conversion
-void transMat_to_scale_rot_grad(
-    int N,
-    int W, int H,  // Image dimensions for ndc2pix transformation
-    const float* dL_dtransMat,   // [N, 9] screen-space transMat gradient
-    const float* dL_dhomoMat,    // [N, 9] xyz gradient contribution (can be nullptr)
-    const float* dL_dmean2D,     // [N, 2] 2D mean gradient (can be nullptr)
-    const float* dL_dnormal3D,   // [N, 3] normal gradient (can be nullptr)
-    const float* means3D,        // [N, 3] world-space positions (needed for dL_dmean2D)
-    const float* transMat_precomp, // [N, 9] forward pass transMat (can be nullptr)
-    const float* scales,
-    const float* rotations,
-    const float* projmatrix,
-    const float* viewmatrix,     // [16] 4x4 view matrix (for normal gradient transform)
-    float* dL_dscales,
-    float* dL_drots,
-    float* dL_dmeans)
-{
-    const int block_size = 256;
-    const int grid_size = (N + block_size - 1) / block_size;
-
-    transMat_to_scale_rot_grad_kernel<<<grid_size, block_size>>>(
-        N,
-        W, H,
-        dL_dtransMat,
-        dL_dhomoMat,
-        dL_dmean2D,
-        dL_dnormal3D,
-        means3D,
-        transMat_precomp,
-        scales,
-        rotations,
-        projmatrix,
-        viewmatrix,
-        dL_dscales,
-        dL_drots,
-        dL_dmeans
-    );
 }

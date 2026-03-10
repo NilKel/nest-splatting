@@ -100,3 +100,6 @@ slurm_jobs/
 *.zip
 *.tar.gz
 *.rar
+
+# ECCV supplemental
+eccv_suppl/

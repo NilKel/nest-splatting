@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -15,7 +15,6 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
-#include <cuda_fp16.h>
 
 namespace CudaRasterizer
 {
@@ -76,13 +75,7 @@ namespace CudaRasterizer
 			const int kernel_type = 0,
 			const int aabb_mode = 0,
 			const float aa = 0.0f,
-			const float aa_threshold = 0.01f,
-			// 3D mode intersection buffer outputs
-			float* intersection_buffer = nullptr,
-			uint32_t* intersection_count = nullptr,
-			uint32_t max_intersections_per_pixel = 0,
-			// Baked mode (render_mode=6): per-Gaussian residual textures
-			const __half* residual_textures = nullptr);
+			const float aa_threshold = 0.01f);
 
 		static void backward(
 			const int P, int D, int M, int R,
@@ -138,14 +131,7 @@ namespace CudaRasterizer
 			const float* shapes = nullptr,
 			const int kernel_type = 0,
 			float* dL_dshapes = nullptr,
-			const bool detach_hash_grad = false,
-			// MLP gradient outputs for 3D_direct_fused mode (render_mode=5)
-			float* dL_dmlp_W1 = nullptr,
-			float* dL_dmlp_b1 = nullptr,
-			float* dL_dmlp_W2 = nullptr,
-			float* dL_dmlp_b2 = nullptr,
-			float* dL_dmlp_W3 = nullptr,
-			float* dL_dmlp_b3 = nullptr);
+			const bool detach_hash_grad = false);
 	};
 };
 

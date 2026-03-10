@@ -1257,11 +1257,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         kernel_type = kernel_type,
         aabb_mode = aabb_mode_int,
     )
-    # 3D_SH_res rasterizer doesn't accept viewdirs_enc (no view encoding needed)
-    if not is_3D_SH_res_mode:
+    # Other rasterizers (lean, fp16, etc.) still accept viewdirs_enc
+    if viewdirs_enc is not None and not isinstance(rasterizer, GaussianRasterizer):
         rasterizer_kwargs['viewdirs_enc'] = viewdirs_enc
-
-    rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer = rasterizer(**rasterizer_kwargs)
+    rasterizer_output = rasterizer(**rasterizer_kwargs)
+    # Main rasterizer returns 5 values; other rasterizers (lean, fp16, etc.) return 8 (with intersection_buffer, intersection_count, geomBuffer)
+    if len(rasterizer_output) == 8:
+        rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer = rasterizer_output
+    elif len(rasterizer_output) == 6:
+        rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, geomBuffer = rasterizer_output
+        intersection_buffer = None
+        intersection_count = None
+    else:
+        rendered_image, radii, allmap, transmittance_avg, num_covered_pixels = rasterizer_output
+        intersection_buffer = None
+        intersection_count = None
+        geomBuffer = None
 
     # 3D mode: Process intersection buffer through PyTorch pipeline
     # Recompute xyz from s_x,s_y → hash encode → gather features → MLP → SH → blend → eval

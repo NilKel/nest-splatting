@@ -409,7 +409,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"[3D_DIRECT_FUSED MODE] Hashgrid features (fine): {num_levels - args.hybrid_levels} × {per_level_dim} = {(num_levels - args.hybrid_levels) * per_level_dim}D")
 
         # Initialize beta kernel shape parameter (if using beta or beta_scaled kernel)
-        print(f"[DEBUG] Checking beta kernel init: args.kernel={args.kernel}")
         if args.kernel in ["beta", "beta_scaled"]:
             # Initialize _shape such that sigmoid(_shape) * 4 + 0.001 starts close to 4.0 (soft Gaussian-like)
             # sigmoid(5.0) ≈ 0.993 -> 0.993 * 4 + 0.001 ≈ 3.97
@@ -558,10 +557,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.training_setup(opt)
         
         # Load optimizer state from warmup checkpoint
-        # For cat/adaptive/adaptive_cat/adaptive_zero/adaptive_gate/diffuse/3D/3D_direct/3D_direct_fused mode, new params won't be in saved state - they train from scratch
-        # Also skip for beta/flex/general kernels which add new _shape/_flex_beta params not in warmup checkpoint
-        if args.method not in ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res"] and args.kernel == "gaussian":
-            gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
+        # Skip if method/kernel adds new params not in saved state (they train from scratch)
+        # Also skip if param group counts don't match (checkpoint from different config)
+        skip_methods = ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res"]
+        if args.method not in skip_methods and args.kernel == "gaussian":
+            ckpt_groups = len(ckpt['optimizer_state']['param_groups'])
+            cur_groups = len(gaussians.optimizer.param_groups)
+            if ckpt_groups == cur_groups:
+                gaussians.optimizer.load_state_dict(ckpt['optimizer_state'])
+            else:
+                print(f"  [WARN] Optimizer state mismatch: checkpoint has {ckpt_groups} param groups, current model has {cur_groups}. Skipping optimizer state load.")
         
         # Move optimizer state to GPU
         for state in gaussians.optimizer.state.values():
@@ -744,9 +749,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         actual_beta = torch.sigmoid(torch.tensor(raw_shape)).item() * 5.0
         print(f"[BETA KERNEL] Shape frozen at β={actual_beta:.3f} (raw={raw_shape:.3f}, requires_grad=False)")
 
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
 
-        torch.cuda.synchronize()
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -841,11 +845,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             aa = args.aa, aa_threshold = args.aa_threshold, skybox = active_skybox,
             background_mode = background_mode, bg_hashgrid = active_bg_hashgrid,
             detach_hash_grad = args.detach_hash_grad, max_intersections_per_pixel = args.max_intersections_per_pixel)
-        # DEBUG: sync after render to check if forward crashed
-        if iteration == first_iter + 1:
-            torch.cuda.synchronize()
-            print("[DEBUG] Forward+MLP pass completed OK")
-
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
         gt_image = viewpoint_cam.original_image.cuda()
@@ -897,12 +896,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             else:
                 gt_alpha = viewpoint_cam.gt_alpha_mask.cuda().float()
                 # Debug: print mask info on first iteration
-                if iteration == first_iter + 1:
+                if iteration <= first_iter + 1:
                     print(f"[DEBUG gt_alpha] Using gt_alpha_mask for {viewpoint_cam.image_name}")
                     print(f"[DEBUG gt_alpha] Shape: {gt_alpha.shape}, min: {gt_alpha.min():.3f}, max: {gt_alpha.max():.3f}, mean: {gt_alpha.mean():.3f}")
         else:
             gt_alpha = (gt_image != 0).any(dim=0, keepdim=True).float()
-            if iteration == first_iter + 1:
+            if iteration <= first_iter + 1:
                 print(f"[DEBUG gt_alpha] Using fallback (non-black pixels) for {viewpoint_cam.image_name}")
         
         try:
@@ -1101,17 +1100,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss
 
         # DEBUG: print loss components before backward
-        if iteration == first_iter + 1:
-            print(f"[DEBUG] total_loss={total_loss.item():.6f}, loss={loss.item():.6f}, mask={mask_loss.item():.6f}, shape_reg={shape_reg_loss.item():.6f}")
-            torch.cuda.synchronize()
-            print("[DEBUG] Pre-backward sync OK")
-
         total_loss.backward()
-
-        # DEBUG: sync after backward
-        if iteration == first_iter + 1:
-            torch.cuda.synchronize()
-            print("[DEBUG] Backward pass completed OK")
 
         # Apply MLP gradients for 3D_direct_fused mode
         # MLP weights are in CUDA constant memory, gradients computed in CUDA backward

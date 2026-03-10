@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -13,7 +13,6 @@
 #define CUDA_RASTERIZER_FORWARD_H_INCLUDED
 
 #include <cuda.h>
-#include <cuda_fp16.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #define GLM_FORCE_CUDA
@@ -39,12 +38,10 @@ namespace FORWARD
 		const float focal_x, float focal_y,
 		const float tan_fovx, float tan_fovy,
 		int* radii,
-		int* radii_x,  // Separate X radius for rectangular AABB
-		int* radii_y,  // Separate Y radius for rectangular AABB
+		int* radii_x,
+		int* radii_y,
 		float2* points_xy_image,
 		float* depths,
-		// float* isovals,
-		// float3* normals,
 		float* transMats,
 		float* colors,
 		float4* normal_opacity,
@@ -86,7 +83,6 @@ namespace FORWARD
 		int* out_index,
 		float* cover_pixels,
 		float* trans_avg,
-		const glm::vec3* cam_pos,
 		const uint32_t D_diffuse = 0,
 		const float* hash_features_diffuse = nullptr,
 		const int* level_offsets_diffuse = nullptr,
@@ -96,15 +92,8 @@ namespace FORWARD
 		const float* shapes = nullptr,
 		const int kernel_type = 0,
 		const float aa = 0.0f,
-		const float aa_threshold = 0.01f,
-		// 3D mode intersection buffer outputs
-		float* intersection_buffer = nullptr,      // [H*W * max_intersections_per_pixel, 6]
-		uint32_t* intersection_count = nullptr,    // [H*W] actual count per pixel
-		uint32_t max_intersections_per_pixel = 0,  // Cap for memory management
-		// Baked mode (render_mode=6): per-Gaussian residual textures
-		const __half* residual_textures = nullptr); // [N, 8, 8, 3] FP16 = [N, 192] half
+		const float aa_threshold = 0.01f);
 
 }
-
 
 #endif
