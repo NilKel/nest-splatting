@@ -220,7 +220,7 @@ if __name__ == "__main__":
                         choices=["baseline", "cat", "adaptive", "adaptive_add", "diffuse", 
                                 "specular", "diffuse_ngp", "diffuse_offset"],
                         help="Rendering method (must match training)")
-    parser.add_argument("--hybrid_levels", type=int, default=3,
+    parser.add_argument("--hybrid_levels", type=int, default=5,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
     parser.add_argument("--num_warmup", type=int, default=10,
                         help="Number of warmup iterations")

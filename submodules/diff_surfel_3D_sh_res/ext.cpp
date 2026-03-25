@@ -24,6 +24,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("transmat_to_scale_rot_grad", &TransMatToScaleRotGradCUDA);
   m.def("get_transmat_from_geombuffer", &GetTransMatFromGeomBufferCUDA);
   m.def("set_mlp_weights", &SetMlpWeightsCUDA);
+  m.def("set_contrib_thresh", &SetContribThreshCUDA);
   m.def("reset_backward_profile", &ResetBackwardProfileCUDA);
   m.def("read_backward_profile", &ReadBackwardProfileCUDA);
 }

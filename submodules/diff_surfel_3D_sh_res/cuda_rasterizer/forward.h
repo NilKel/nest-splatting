@@ -53,7 +53,8 @@ namespace FORWARD
 		bool prefiltered,
 		const float* shapes = nullptr,
 		const int kernel_type = 0,
-		const int aabb_mode = 0);
+		const int aabb_mode = 0,
+		const int render_mode = 0);
 
 	// Main rasterization method.
 	void render(
@@ -102,7 +103,12 @@ namespace FORWARD
 		uint32_t* intersection_count = nullptr,    // [H*W] actual count per pixel
 		uint32_t max_intersections_per_pixel = 0,  // Cap for memory management
 		// Pre-encoded view directions for 3D_direct_fused (H*W, 16)
-		const float* viewdirs_enc = nullptr);
+		const float* viewdirs_enc = nullptr,
+		// Separate SH RGB pointer for 3D_SH_cat (render_mode=6)
+		const float* rgb_override = nullptr);
+
+	// Set contribution threshold for hash query skip: w = T*alpha (0 = disabled)
+	void setContribThresh(float val);
 
 	// Copy MLP weights to global device memory (bias-free, all [16×16])
 	void setMlpWeights(

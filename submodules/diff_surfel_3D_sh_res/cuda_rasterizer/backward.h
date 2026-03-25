@@ -71,7 +71,9 @@ namespace BACKWARD
 		// MLP gradient buffers for 3D_SH_res (render_mode=5, bias-free, all [16×16])
 		float* dL_dmlp_W1 = nullptr,    // [16 * 16] = 256 floats
 		float* dL_dmlp_W2 = nullptr,    // [16 * 16] = 256 floats
-		float* dL_dmlp_W3 = nullptr);   // [16 * 16] = 256 floats
+		float* dL_dmlp_W3 = nullptr,    // [16 * 16] = 256 floats
+		// DC SH features for 3D_SH_cat (render_mode=6)
+		const float* dc_features = nullptr);
 
 	void preprocess(
 		int P, int D, int M,

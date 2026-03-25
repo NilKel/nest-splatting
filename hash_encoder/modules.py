@@ -90,8 +90,11 @@ class INGP(nn.Module):
         self.is_3D_direct_sh_tc_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_TC"
         # Store args for 3D_SH_res mode (per-Gaussian SH + tiny hash MLP residual, diff_surfel_3D_sh_res)
         self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_res"
-        # Treat lean/fp16/tc/sh_tc/sh_res mode same as fused mode for MLP/rendering logic
-        if self.is_3D_direct_lean_mode or self.is_3D_direct_fp16_mode or self.is_3D_direct_tc_mode or self.is_3D_direct_sh_tc_mode or self.is_3D_SH_res_mode:
+        # Store args for 3D_SH_cat mode (per-Gaussian SH + hash+DC MLP residual, diff_surfel_3D_sh_res)
+        self.is_3D_SH_cat_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_cat"
+        self.freeze_mlp = args is not None and hasattr(args, 'freeze_mlp') and args.freeze_mlp
+        # Treat lean/fp16/tc/sh_tc/sh_res/sh_cat mode same as fused mode for MLP/rendering logic
+        if self.is_3D_direct_lean_mode or self.is_3D_direct_fp16_mode or self.is_3D_direct_tc_mode or self.is_3D_direct_sh_tc_mode or self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode:
             self.is_3D_direct_fused_mode = True
 
         # hybrid_levels is used by cat, cat_dropout, adaptive_cat, adaptive_zero, adaptive_gate, 3D, 3D_direct, and 3D_direct_fused modes
@@ -226,7 +229,59 @@ class INGP(nn.Module):
         # 3D_direct_fused mode: PyTorch MLP for in-kernel evaluation
         # Uses explicit weight matrices (not tcnn) so we can upload to CUDA constant memory
         self.mlp_fused = None
-        if self.is_3D_SH_res_mode:
+        if self.is_3D_SH_cat_mode:
+            # 3D_SH_cat: MLP input = [hash(4) | DC_SH(3) | bias(1) | pad(8)] = 16D
+            # Same architecture as 3D_SH_res but with extra DC SH identity input
+            total_levels = cfg_model.encoding.levels
+            level_dim = cfg_model.encoding.hashgrid.dim
+            hash_dim = (total_levels - self.hybrid_levels) * level_dim  # All non-hybrid levels
+            dc_dim = 3  # DC SH (3 RGB channels)
+            mlp_input_dim = hash_dim + dc_dim  # e.g., 4 + 3 = 7D
+            # Pad to 16D for WMMA alignment: [hash(4) | dc(3) | bias(1) | pad(8)] = 16
+            mlp_input_padded = ((mlp_input_dim + 1 + 15) // 16) * 16  # +1 for bias, round up to 16
+            hidden_dim = mlp_input_padded  # 16
+
+            print(f'[3D_SH_CAT MODE] Building bias-free residual MLP for CUDA:')
+            print(f'  Hash features: {hash_dim}D ({total_levels - self.hybrid_levels} levels × {level_dim}D)')
+            print(f'  DC SH input: {dc_dim}D (per-Gaussian identity)')
+            print(f'  MLP input: {hash_dim}D hash + {dc_dim}D DC_SH + 1D bias + {mlp_input_padded - mlp_input_dim - 1}D pad = {mlp_input_padded}D')
+            print(f'  Architecture: {mlp_input_padded}D → {hidden_dim}D (ReLU) → {hidden_dim}D (ReLU) → {hidden_dim}D (identity, first 3 = RGB residual)')
+            print(f'  Bias-free: L1 uses input padding (col {mlp_input_dim} acts as bias), L2/L3 no bias')
+            print(f'  Per-Gaussian SH: standard degree-3 (16 coefficients × 3 channels)')
+
+            self.mlp_fused = nn.Sequential(
+                nn.Linear(mlp_input_padded, hidden_dim, bias=False),  # W1: [16, 16]
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim, bias=False),         # W2: [16, 16]
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim, bias=False),         # W3: [16, 16] (only first 3 = RGB residual)
+            ).cuda()
+
+            self.mlp_fused_input_dim = mlp_input_dim
+            self.mlp_fused_hash_dim = hash_dim
+            self.mlp_fused_gauss_dim = 0  # No per-Gaussian features (SH handles it)
+
+            if self.freeze_mlp:
+                freeze_from = getattr(args, 'freeze_mlp_from', None)
+                if freeze_from:
+                    import glob as _glob
+                    ngp_files = _glob.glob(os.path.join(freeze_from, "ngp_*.pth"))
+                    if ngp_files:
+                        iters = [int(os.path.basename(f).replace("ngp_", "").replace(".pth", "")) for f in ngp_files]
+                        ckpt_path = os.path.join(freeze_from, f"ngp_{max(iters)}.pth")
+                        ckpt = torch.load(ckpt_path, map_location='cuda', weights_only=False)
+                        sd = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+                        mlp_sd = {k.replace('mlp_fused.', ''): v for k, v in sd.items() if 'mlp_fused' in k}
+                        self.mlp_fused.load_state_dict(mlp_sd)
+                        print(f'  [FREEZE_MLP] Loaded MLP weights from {ckpt_path}')
+                    else:
+                        print(f'  [FREEZE_MLP] WARNING: no ngp checkpoint found in {freeze_from}, using random init')
+                else:
+                    print(f'  [FREEZE_MLP] MLP weights frozen at random init')
+                for p in self.mlp_fused.parameters():
+                    p.requires_grad_(False)
+
+        elif self.is_3D_SH_res_mode:
             # 3D_SH_res: Tiny view-independent residual MLP (hash features → RGB residual)
             # Per-Gaussian SH handles view-dependent base color (evaluated in CUDA preprocessing)
             # MLP only adds a small spatial correction from hash grid
@@ -329,6 +384,13 @@ class INGP(nn.Module):
 
         lr_spec = training_args.params.spec_lr
 
+        # Apply LR scaling for 3D_SH_res mode
+        if self.args is not None and hasattr(self.args, 'res_lr_scale') and self.args.res_lr_scale != 1.0:
+            if self.args.method in ["3D_SH_res", "3D_SH_cat"]:
+                print(f"[3D_SH_RES] Scaling hash/MLP LR by {self.args.res_lr_scale}: encoding {lr_encoding} -> {lr_encoding * self.args.res_lr_scale}, mlp {lr_mlp_rgb} -> {lr_mlp_rgb * self.args.res_lr_scale}")
+                lr_encoding *= self.args.res_lr_scale
+                lr_mlp_rgb *= self.args.res_lr_scale
+
         l = []
         # Only add hash_encoding if it exists (not disabled in cat mode or diffuse mode)
         if self.hash_encoding is not None:
@@ -344,7 +406,8 @@ class INGP(nn.Module):
         if hasattr(self, 'mlp_3D_direct') and self.mlp_3D_direct is not None:
             l.append({'params': self.mlp_3D_direct.parameters(), 'lr': lr_mlp_rgb, "name": "mlp_3D_direct"})
         # Add mlp_fused for 3D_direct_fused mode (PyTorch MLP for CUDA constant memory)
-        if hasattr(self, 'mlp_fused') and self.mlp_fused is not None:
+        # Skip when freeze_mlp: weights stay at init, no optimizer state needed
+        if hasattr(self, 'mlp_fused') and self.mlp_fused is not None and not self.freeze_mlp:
             l.append({'params': self.mlp_fused.parameters(), 'lr': lr_mlp_rgb, "name": "mlp_fused"})
 
         # For diffuse mode, create a dummy optimizer (no INGP params to optimize)
@@ -1017,8 +1080,8 @@ class INGP(nn.Module):
         # which matches CUDA's W[h * in_dim + i] access pattern
 
         # Pad weights for WMMA alignment (Tensor Core modes)
-        if self.is_3D_SH_res_mode:
-            # 3D_SH_res: All weights are [16, 16] — already WMMA-aligned
+        if self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode:
+            # 3D_SH_res / 3D_SH_cat: All weights are [16, 16] — already WMMA-aligned
             # But W1 might be smaller if input_dim+1 < 16, so pad
             import torch
             actual_input_cols = W1.shape[1]  # e.g., mlp_input_padded (should be 16)

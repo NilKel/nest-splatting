@@ -60,36 +60,66 @@ __device__ __forceinline__ void mlp_forward_inline(
     bool apply_sigmoid,
     const MlpWeights& mlp  // MLP weight pointers
 ) {
-    // Layer 1: input[16] -> h1[16] with ReLU
+    // Convert input to FP16 once
+    __half input_h[TC_INPUT_DIM];
+    #pragma unroll
+    for (int i = 0; i < TC_INPUT_DIM; i++)
+        input_h[i] = __float2half(input[i]);
+
+    // Layer 1: input[16] -> h1[16] with ReLU — FP16 __half2 dot products
     #pragma unroll
     for (int h = 0; h < TC_HIDDEN_DIM; h++) {
-        float acc = 0;
+        __half2 acc2 = __float2half2_rn(0.0f);
+        const __half* w1_row = &mlp.W1[h * TC_INPUT_DIM];
         #pragma unroll
-        for (int i = 0; i < TC_INPUT_DIM; i++) {
-            acc += input[i] * __half2float(mlp.W1[h * TC_INPUT_DIM + i]);
+        for (int i = 0; i < TC_INPUT_DIM; i += 2) {
+            __half2 in2 = *reinterpret_cast<const __half2*>(&input_h[i]);
+            __half2 wt2 = *reinterpret_cast<const __half2*>(&w1_row[i]);
+            acc2 = __hfma2(in2, wt2, acc2);
         }
-        h1[h] = fmaxf(0.0f, acc);  // ReLU
+        float acc = __half2float(acc2.x) + __half2float(acc2.y);
+        h1[h] = fmaxf(0.0f, acc);  // ReLU (store FP32 for backward)
     }
 
-    // Layer 2: h1[16] -> h2[16] with ReLU
+    // Convert h1 to FP16 for layer 2
+    __half h1_h[TC_HIDDEN_DIM];
+    #pragma unroll
+    for (int i = 0; i < TC_HIDDEN_DIM; i++)
+        h1_h[i] = __float2half(h1[i]);
+
+    // Layer 2: h1[16] -> h2[16] with ReLU — FP16 __half2 dot products
     #pragma unroll
     for (int h = 0; h < TC_HIDDEN_DIM; h++) {
-        float acc = 0;
+        __half2 acc2 = __float2half2_rn(0.0f);
+        const __half* w2_row = &mlp.W2[h * TC_HIDDEN_DIM];
         #pragma unroll
-        for (int i = 0; i < TC_HIDDEN_DIM; i++) {
-            acc += h1[i] * __half2float(mlp.W2[h * TC_HIDDEN_DIM + i]);
+        for (int i = 0; i < TC_HIDDEN_DIM; i += 2) {
+            __half2 in2 = *reinterpret_cast<const __half2*>(&h1_h[i]);
+            __half2 wt2 = *reinterpret_cast<const __half2*>(&w2_row[i]);
+            acc2 = __hfma2(in2, wt2, acc2);
         }
-        h2[h] = fmaxf(0.0f, acc);  // ReLU
+        float acc = __half2float(acc2.x) + __half2float(acc2.y);
+        h2[h] = fmaxf(0.0f, acc);  // ReLU (store FP32 for backward)
     }
 
-    // Layer 3: h2[16] -> output[3] with identity (residual) or sigmoid
+    // Convert h2 to FP16 for layer 3
+    __half h2_h[TC_HIDDEN_DIM];
+    #pragma unroll
+    for (int i = 0; i < TC_HIDDEN_DIM; i++)
+        h2_h[i] = __float2half(h2[i]);
+
+    // Layer 3: h2[16] -> output[3] — FP16 __half2 dot products
     #pragma unroll
     for (int o = 0; o < ORIG_OUTPUT_DIM; o++) {
-        float acc = 0;
+        __half2 acc2 = __float2half2_rn(0.0f);
+        const __half* w3_row = &mlp.W3[o * TC_HIDDEN_DIM];
         #pragma unroll
-        for (int h = 0; h < TC_HIDDEN_DIM; h++) {
-            acc += h2[h] * __half2float(mlp.W3[o * TC_HIDDEN_DIM + h]);
+        for (int h = 0; h < TC_HIDDEN_DIM; h += 2) {
+            __half2 in2 = *reinterpret_cast<const __half2*>(&h2_h[h]);
+            __half2 wt2 = *reinterpret_cast<const __half2*>(&w3_row[h]);
+            acc2 = __hfma2(in2, wt2, acc2);
         }
+        float acc = __half2float(acc2.x) + __half2float(acc2.y);
         if (apply_sigmoid) {
             output[o] = 1.0f / (1.0f + expf(-acc));
         } else {

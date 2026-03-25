@@ -52,7 +52,7 @@ if __name__ == "__main__":
     parser.add_argument("--method", type=str, default="baseline",
                         choices=["baseline", "cat", "adaptive", "diffuse", "specular", "diffuse_ngp", "diffuse_offset"],
                         help="Rendering method (must match training)")
-    parser.add_argument("--hybrid_levels", type=int, default=3,
+    parser.add_argument("--hybrid_levels", type=int, default=5,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only, must match training)")
     parser.add_argument("--eval_depth", action="store_true",
                         help="Render and save depth maps (expected and median)")

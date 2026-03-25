@@ -197,6 +197,9 @@ void SetMlpWeightsCUDA(
     const torch::Tensor& W2,      // [16, 16] - Layer 2 weights
     const torch::Tensor& W3);     // [16, 16] - Layer 3 weights (only first 3 rows = RGB residual)
 
+// Set hash query transmittance threshold (skip hash+MLP when T < val, 0 = disabled)
+void SetContribThreshCUDA(float val);
+
 // ============================================================================
 // BACKWARD KERNEL PROFILING
 // ============================================================================

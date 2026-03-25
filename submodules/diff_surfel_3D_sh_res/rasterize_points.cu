@@ -494,10 +494,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  kernel_type,
 	  dL_dshapes.contiguous().data<float>(),
 	  detach_hash_grad,
-	  // MLP gradient buffers for 3D_SH_res mode (bias-free, all [16×16])
-	  (render_mode == 5) ? dL_dmlp_W1.contiguous().data<float>() : nullptr,
-	  (render_mode == 5) ? dL_dmlp_W2.contiguous().data<float>() : nullptr,
-	  (render_mode == 5) ? dL_dmlp_W3.contiguous().data<float>() : nullptr);
+	  // MLP gradient buffers for 3D_SH_res/3D_SH_cat mode (bias-free, all [16×16])
+	  // Bit 9 (0x200) = freeze_mlp: skip weight gradients (pass nullptr)
+	  ((render_mode & 0xFF) == 5 || (render_mode & 0xFF) == 6) && !(render_mode & 0x200) ? dL_dmlp_W1.contiguous().data<float>() : nullptr,
+	  ((render_mode & 0xFF) == 5 || (render_mode & 0xFF) == 6) && !(render_mode & 0x200) ? dL_dmlp_W2.contiguous().data<float>() : nullptr,
+	  ((render_mode & 0xFF) == 5 || (render_mode & 0xFF) == 6) && !(render_mode & 0x200) ? dL_dmlp_W3.contiguous().data<float>() : nullptr);
   }
 
   return std::make_tuple(dL_dfeatures, dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dtransMat, dL_dsh, dL_dscales, dL_drotations, dL_gradsum, dL_dfeatures_diffuse, dL_dshapes,
@@ -829,6 +830,10 @@ void SetMlpWeightsCUDA(
         W1_c.data_ptr<float>(),
         W2_c.data_ptr<float>(),
         W3_c.data_ptr<float>());
+}
+
+void SetContribThreshCUDA(float val) {
+    FORWARD::setContribThresh(val);
 }
 
 // ============================================================================

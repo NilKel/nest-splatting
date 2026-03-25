@@ -519,8 +519,9 @@ renderBakedCUDA(
 					float c10 = __half2float(atlas_texture[idx10 + ch]);
 					float c01 = __half2float(atlas_texture[idx01 + ch]);
 					float c11 = __half2float(atlas_texture[idx11 + ch]);
-					feat[ch] += (1-fu)*(1-fv)*c00 + fu*(1-fv)*c10
+					float res = (1-fu)*(1-fv)*c00 + fu*(1-fv)*c10
 					          + (1-fu)*fv*c01 + fu*fv*c11;
+					feat[ch] += fmaxf(0.0f, res);  // ReLU to match training kernel
 				}
 			}
 			// Shared mode: fixed 8×8 per-Gaussian texture
@@ -595,7 +596,8 @@ renderBakedCUDA(
 						float c10 = __half2float(residual_textures[base + (v0*8+u1)*3 + ch]);
 						float c01 = __half2float(residual_textures[base + (v1*8+u0)*3 + ch]);
 						float c11 = __half2float(residual_textures[base + (v1*8+u1)*3 + ch]);
-						feat[ch] += w00*c00 + w10*c10 + w01*c01 + w11*c11;
+						float res = w00*c00 + w10*c10 + w01*c01 + w11*c11;
+						feat[ch] += fmaxf(0.0f, res);  // ReLU to match training kernel
 					}
 				}
 			}

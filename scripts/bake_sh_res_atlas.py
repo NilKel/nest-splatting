@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Bake 3D_SH_res model with adaptive per-Gaussian UV resolution into a packed atlas.
+Bake 3D_SH_res or 3D_SH_cat model with adaptive per-Gaussian UV resolution into a packed atlas.
 
 Resolution per Gaussian = next power of 2 above (hash cells across Gaussian).
 This ensures every texel is finer than the finest hashgrid cell.
+
+3D_SH_res MLP input: [hash(4) | bias(1) | pad(11)] = 16D
+3D_SH_cat MLP input: [hash(4) | DC_SH(3) | bias(1) | pad(8)] = 16D
 
 Output:
   - baked.ply: Gaussians with original SH coefficients (unchanged)
@@ -12,8 +15,8 @@ Output:
   - bake_meta.json: metadata
 
 Usage:
-    python scripts/bake_sh_res_atlas.py --model_path outputs/nerf_synthetic/chair/3D_SH_res/betscaled
-    python scripts/bake_sh_res_atlas.py --model_path ... --max_res 64 --ss 2
+    python scripts/bake_sh_res_atlas.py --model_path outputs/.../3D_SH_res/run_name
+    python scripts/bake_sh_res_atlas.py --model_path outputs/.../3D_SH_cat/run_name
 """
 
 import os, sys, json, pickle, glob, math
@@ -113,13 +116,15 @@ def shelf_pack_atlas(resolutions, atlas_width=4096):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = ArgumentParser(description="Bake 3D_SH_res → adaptive atlas (3D RGB residual)")
+    parser = ArgumentParser(description="Bake 3D_SH_res/3D_SH_cat → adaptive atlas (3D RGB residual)")
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--iteration", type=int, default=-1)
     parser.add_argument("--uv_extent", type=float, default=4.0)
     parser.add_argument("--max_res", type=int, default=128, help="Max per-Gaussian resolution")
     parser.add_argument("--min_res", type=int, default=4, help="Min per-Gaussian resolution")
     parser.add_argument("--atlas_width", type=int, default=4096)
+    parser.add_argument("--atlas_budget_mb", type=float, default=0,
+                        help="Max atlas size in MB. Progressively downgrades resolutions to fit. 0=unlimited.")
     parser.add_argument("--ss", type=int, default=1, help="Supersample factor")
     parser.add_argument("--output_dir", type=str, default=None)
     bake_args = parser.parse_args()
@@ -134,7 +139,8 @@ def main():
     config_yaml_path = os.path.join(bake_args.model_path, "config.yaml")
     cfg = Config(config_yaml_path) if os.path.exists(config_yaml_path) else Config(args.yaml)
 
-    assert args.method == "3D_SH_res", f"Expected 3D_SH_res, got {args.method}"
+    assert args.method in ("3D_SH_res", "3D_SH_cat"), f"Expected 3D_SH_res or 3D_SH_cat, got {args.method}"
+    is_cat_mode = (args.method == "3D_SH_cat")
 
     # Auto-detect iteration
     iteration = bake_args.iteration
@@ -192,19 +198,58 @@ def main():
         gaussians.get_scaling, cell_size, uv_extent=uv_extent,
         max_res=bake_args.max_res, min_res=bake_args.min_res)
 
-    print(f"\n[BAKE] Adaptive resolution distribution:")
+    # Budget-fit: progressively halve the largest resolution group until atlas fits
+    atlas_width = bake_args.atlas_width
+    if bake_args.atlas_budget_mb > 0:
+        budget_texels = int(bake_args.atlas_budget_mb * 1024 * 1024 / 6)  # 3ch × FP16 = 6 bytes/texel
+        while True:
+            total_texels = int((resolutions.long() ** 2).sum().item())
+            if total_texels <= budget_texels:
+                break
+            # Halve the largest resolution group
+            cur_max = resolutions.max().item()
+            if cur_max <= bake_args.min_res:
+                print(f"[BUDGET] Cannot fit within {bake_args.atlas_budget_mb} MB even at min_res={bake_args.min_res}")
+                break
+            mask = (resolutions == cur_max)
+            resolutions[mask] = cur_max // 2
+            n_downgraded = mask.sum().item()
+            new_mb = total_texels * 6 / 1024 / 1024
+            print(f"[BUDGET] Downgraded {n_downgraded:,} Gaussians: {cur_max}→{cur_max//2} "
+                  f"(~{new_mb:.0f} MB → target {bake_args.atlas_budget_mb:.0f} MB)")
+
+    # =========================================================================
+    # Step 2: Pack atlas
+    # =========================================================================
+    centers = gaussians.get_xyz        # [N, 3]
+    quats = gaussians.get_rotation     # [N, 4]
+    scales = gaussians.get_scaling     # [N, 2]
+    R0, R1 = quat_to_rotcols(quats)   # [N, 3] each
+
+    mlp = ingp.mlp_fused
+    mlp.eval()
+    hash_dim = ingp.mlp_fused_hash_dim
+    mlp_input_padded = mlp[0].weight.shape[1]
+
+    if is_cat_mode:
+        dc_start = hash_dim       # 4
+        bias_col = hash_dim + 3   # 7
+        SH_C0 = 0.28209479177387814
+        dc_sh = SH_C0 * gaussians.get_features[:, 0, :] + 0.5  # [N, 3]
+        print(f"[BAKE] 3D_SH_cat: DC_SH at cols {dc_start}-{dc_start+2}, bias at col {bias_col}")
+        print(f"[BAKE] DC_SH stats: mean={dc_sh.mean():.4f}, min={dc_sh.min():.4f}, max={dc_sh.max():.4f}")
+    else:
+        bias_col = hash_dim
+
+    print(f"\n[BAKE] Resolution distribution:")
     unique_res = resolutions.unique().sort().values
     for res_val in unique_res:
         count = (resolutions == res_val.item()).sum().item()
         print(f"  {res_val.item():>4}×{res_val.item():<4}: {count:>7,} Gaussians")
 
-    # =========================================================================
-    # Step 2: Pack atlas
-    # =========================================================================
     atlas_rects, atlas_height, used_rows, utilization = shelf_pack_atlas(
-        resolutions, atlas_width=bake_args.atlas_width)
+        resolutions, atlas_width=atlas_width)
     atlas_rects = atlas_rects.cuda()
-    atlas_width = bake_args.atlas_width
 
     atlas_mb = atlas_height * atlas_width * 3 * 2 / 1024 / 1024
     print(f"\n[ATLAS] Packed: {atlas_width}×{atlas_height}, "
@@ -216,22 +261,11 @@ def main():
     # =========================================================================
     # Step 3: Bake hash+MLP per resolution group
     # =========================================================================
-    centers = gaussians.get_xyz        # [N, 3]
-    quats = gaussians.get_rotation     # [N, 4]
-    scales = gaussians.get_scaling     # [N, 2]
-    R0, R1 = quat_to_rotcols(quats)   # [N, 3] each
-
-    mlp = ingp.mlp_fused
-    mlp.eval()
-    hash_dim = ingp.mlp_fused_hash_dim
-    mlp_input_padded = mlp[0].weight.shape[1]
-    bias_col = hash_dim
-
     ss = bake_args.ss
 
     for res_val in unique_res:
         res = res_val.item()
-        bake_res = res * ss  # supersample resolution
+        bake_res = res * ss
         mask = (resolutions == res)
         indices = mask.nonzero(as_tuple=True)[0]
         n_group = len(indices)
@@ -239,21 +273,16 @@ def main():
         print(f"\n[BAKE] Resolution {res}×{res} (ss={ss}× → {bake_res}×{bake_res}): "
               f"{n_group:,} Gaussians")
 
-        # Build UV grid for this resolution (texel-center convention)
         step = 2.0 * uv_extent / bake_res
         coords = torch.arange(bake_res, dtype=torch.float32, device='cuda')
         uv_1d = (coords + 0.5) * step - uv_extent
-
-        # meshgrid with indexing='ij':
-        #   uu[i, j] = uv_1d[i]  (i = u index, varies along dim 0)
-        #   vv[i, j] = uv_1d[j]  (j = v index, varies along dim 1)
         uu, vv = torch.meshgrid(uv_1d, uv_1d, indexing='ij')
-        u_flat = uu.reshape(-1)  # [bake_res^2], flat index k = i*bake_res + j
+        u_flat = uu.reshape(-1)
         v_flat = vv.reshape(-1)
         n_pts = bake_res * bake_res
 
-        # Process in chunks to limit VRAM
-        max_batch = max(1, 2 * (1024**3) // (3 * 4 * n_pts))
+        max_samples = 2 * (1024**3) // 160
+        max_batch = max(1, max_samples // n_pts)
         chunk_size = min(n_group, max_batch)
 
         for ci_start in range(0, n_group, chunk_size):
@@ -261,48 +290,41 @@ def main():
             batch_indices = indices[ci_start:ci_end]
             n_batch = len(batch_indices)
 
-            c = centers[batch_indices]             # [B, 3]
-            sx = scales[batch_indices, 0:1]        # [B, 1]
-            sy = scales[batch_indices, 1:2]        # [B, 1]
-            r0 = R0[batch_indices]                 # [B, 3]
-            r1 = R1[batch_indices]                 # [B, 3]
+            c = centers[batch_indices]
+            sx = scales[batch_indices, 0:1]
+            sy = scales[batch_indices, 1:2]
+            r0 = R0[batch_indices]
+            r1 = R1[batch_indices]
 
-            # xyz = center + u * sx * R0 + v * sy * R1   [B, n_pts, 3]
             xyz = (c.unsqueeze(1)
                    + u_flat.unsqueeze(0).unsqueeze(-1) * (sx.unsqueeze(1) * r0.unsqueeze(1))
                    + v_flat.unsqueeze(0).unsqueeze(-1) * (sy.unsqueeze(1) * r1.unsqueeze(1)))
-            xyz_flat = xyz.reshape(-1, 3)  # [B*n_pts, 3]
+            xyz_flat = xyz.reshape(-1, 3)
 
             with torch.no_grad():
                 hash_feat = ingp._encode_3D(xyz_flat)
                 mlp_input = torch.zeros(xyz_flat.shape[0], mlp_input_padded, device='cuda')
                 mlp_input[:, :hash_dim] = hash_feat[:, :hash_dim]
                 mlp_input[:, bias_col] = 1.0
-                mlp_out = mlp(mlp_input)
-                rgb_residual = mlp_out[:, :3]  # [B*n_pts, 3]
 
-            # Reshape to [B, bake_res, bake_res, 3] where dim1=u(i), dim2=v(j)
+                if is_cat_mode:
+                    dc_batch = dc_sh[batch_indices]
+                    dc_expanded = dc_batch.unsqueeze(1).expand(-1, n_pts, -1).reshape(-1, 3)
+                    mlp_input[:, dc_start:dc_start+3] = dc_expanded
+
+                mlp_out = mlp(mlp_input)
+                rgb_residual = mlp_out[:, :3].clamp(min=0.0)  # ReLU to match training kernel
+
             residual = rgb_residual.reshape(n_batch, bake_res, bake_res, 3)
 
-            # Box-filter downsample if ss > 1
             if ss > 1:
                 residual = residual.view(n_batch, res, ss, res, ss, 3).mean(dim=(2, 4))
-                # Now [B, res, res, 3] where dim1=u(i), dim2=v(j)
 
             # Write to atlas
-            # Atlas convention: atlas[row, col, ch] where row=v, col=u
-            # Bake convention: residual[b, i(u), j(v), ch]
-            # Render kernel: au = u0 + (s.x+E)/(2E)*u_span - 0.5  → col from s.x
-            #                av = v0 + (s.y+E)/(2E)*v_span - 0.5  → row from s.y
-            # At bake texel (i, j): s.x = uv_1d[i], s.y = uv_1d[j]
-            #   → atlas col = u0 + i, atlas row = v0 + j
-            # So: atlas[v0+j, u0+i] = residual[b, i, j]
-            #   = atlas[v0:v0+res, u0:u0+res] = residual[b].permute(1, 0, 2)  (swap u↔v)
-            rects = atlas_rects[batch_indices]  # [B, 4]
+            rects = atlas_rects[batch_indices]
             for b in range(n_batch):
                 u0 = int(rects[b, 0].item())
                 v0 = int(rects[b, 1].item())
-                # residual[b] is [res(u), res(v), 3] → transpose to [res(v), res(u), 3] for atlas
                 atlas[v0:v0+res, u0:u0+res, :] = residual[b].permute(1, 0, 2)
 
             del xyz, xyz_flat, hash_feat, mlp_input, mlp_out, rgb_residual, residual

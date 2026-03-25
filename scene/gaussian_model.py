@@ -458,6 +458,33 @@ class GaussianModel:
             self.kernel_type = "gaussian"
             self._shape = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
+    def reinitial_pts(self, pts, rgb):
+        """Reinitialize Gaussian parameters from point positions and RGB colors.
+
+        Used by GaussianSpa Phase 1: after importance-based pruning, reinitialize
+        scales from nearest-neighbor distances, reset rotations and opacities.
+        """
+        fused_color = RGB2SH(rgb)
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        dist2 = torch.clamp_min(distCUDA2(pts), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 2)
+        rots = torch.zeros((pts.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((pts.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        self._xyz = nn.Parameter(pts.detach().clone().requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._appearance_level = nn.Parameter(torch.zeros(pts.shape[0], 1, device="cuda").requires_grad_(False))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -1066,6 +1093,82 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
         assert(self._xyz.shape[0] == self._appearance_level.shape[0])
+
+    @torch.no_grad()
+    def morton_sort(self):
+        """Sort all Gaussian parameters by Morton (z-order) code of their 3D positions.
+        Improves spatial locality for hash table lookups and cache efficiency."""
+        xyz = self._xyz.detach()
+        N = xyz.shape[0]
+        if N == 0:
+            return
+
+        # Normalize positions to [0, 1023] range for 10-bit Morton encoding
+        xyz_min = xyz.min(dim=0).values
+        xyz_max = xyz.max(dim=0).values
+        xyz_range = (xyz_max - xyz_min).clamp(min=1e-6)
+        xyz_norm = ((xyz - xyz_min) / xyz_range * 1023.0).clamp(0, 1023).long()
+
+        # Compute 30-bit Morton code (interleave 10 bits of x, y, z)
+        def expand_bits(v):
+            # Spread 10 bits across 30 bits: 0b...zyx -> 0b...z00y00x00
+            v = (v | (v << 16)) & 0x030000FF
+            v = (v | (v << 8))  & 0x0300F00F
+            v = (v | (v << 4))  & 0x030C30C3
+            v = (v | (v << 2))  & 0x09249249
+            return v
+
+        x_exp = expand_bits(xyz_norm[:, 0])
+        y_exp = expand_bits(xyz_norm[:, 1])
+        z_exp = expand_bits(xyz_norm[:, 2])
+        morton_codes = x_exp | (y_exp << 1) | (z_exp << 2)
+
+        order = torch.argsort(morton_codes)
+
+        # Reorder all optimizer param groups (params + Adam states)
+        for group in self.optimizer.param_groups:
+            if group["name"] in ("mlp", "env"):
+                continue
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+            new_param = nn.Parameter(group["params"][0].data[order].contiguous().requires_grad_(True))
+            if stored_state is not None:
+                stored_state["exp_avg"] = stored_state["exp_avg"][order].contiguous()
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][order].contiguous()
+                del self.optimizer.state[group['params'][0]]
+                self.optimizer.state[new_param] = stored_state
+            else:
+                del self.optimizer.state[group['params'][0]]
+            group["params"][0] = new_param
+
+        # Update member references
+        for group in self.optimizer.param_groups:
+            name = group["name"]
+            param = group["params"][0]
+            if name == "xyz": self._xyz = param
+            elif name == "f_dc": self._features_dc = param
+            elif name == "f_rest": self._features_rest = param
+            elif name == "opacity": self._opacity = param
+            elif name == "scaling": self._scaling = param
+            elif name == "rotation": self._rotation = param
+            elif name == "ap_level": self._appearance_level = param
+            elif name == "gaussian_features": self._gaussian_features = param
+            elif name == "gamma": self._gamma = param
+            elif name == "adaptive_features": self._adaptive_features = param
+            elif name == "adaptive_cat_weight" and hasattr(self, '_adaptive_cat_weight'): self._adaptive_cat_weight = param
+            elif name == "adaptive_zero_weight": self._adaptive_zero_weight = param
+            elif name == "gate_logits": self._gate_logits = param
+            elif name == "shape": self._shape = param
+            elif name == "flex_beta": self._flex_beta = param
+
+        # Handle frozen shape (not in optimizer)
+        if hasattr(self, '_shape') and self._shape.numel() > 0 and not self._shape.requires_grad:
+            self._shape = nn.Parameter(self._shape.data[order].contiguous(), requires_grad=False)
+
+        # Reorder non-optimizer tensors
+        self.xyz_gradient_accum = self.xyz_gradient_accum[order].contiguous()
+        self.feat_gradient_accum = self.feat_gradient_accum[order].contiguous()
+        self.denom = self.denom[order].contiguous()
+        self.max_radii2D = self.max_radii2D[order].contiguous()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter, pixels = None):
 

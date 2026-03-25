@@ -20,6 +20,9 @@
 
 namespace cg = cooperative_groups;
 
+// Contribution threshold (defined in forward.cu)
+extern __device__ float d_contrib_thresh;
+
 // ============================================================================
 // BACKWARD KERNEL PROFILING (clock64 instrumentation)
 // Measures cycle counts per phase of the mode 5 backward, thread 0 per block
@@ -147,6 +150,76 @@ __device__ void mlp_backward(
         #pragma unroll
         for (int i = 0; i < IN_DIM; i++) {
             atomicAdd(&dL_dW1[h * IN_DIM + i], dz * input[i]);
+            dL_dinput[i] += dz * __half2float(mlp.W1[h * IN_DIM + i]);
+        }
+    }
+}
+
+// Input-only backward: same as mlp_backward but skips weight gradient atomicAdds.
+// Used for freeze_mlp mode where we only need dL/d_input for hash gradients.
+template<int IN_DIM, int HIDDEN_DIM, int OUT_DIM>
+__device__ void mlp_backward_input_only(
+    const float* input,
+    const float* output,
+    const float* dL_doutput,
+    const float* h1_post,
+    const float* h2_post,
+    float* dL_dinput,
+    const MlpWeights& mlp,
+    bool applied_sigmoid = true
+) {
+    float dL_dz3[OUT_DIM];
+    #pragma unroll
+    for (int o = 0; o < OUT_DIM; o++) {
+        if (applied_sigmoid) {
+            float sig = output[o];
+            dL_dz3[o] = dL_doutput[o] * sig * (1.0f - sig);
+        } else {
+            dL_dz3[o] = dL_doutput[o];
+        }
+    }
+
+    float dL_dh2_post[HIDDEN_DIM] = {0};
+    #pragma unroll
+    for (int o = 0; o < OUT_DIM; o++) {
+        float dz = dL_dz3[o];
+        #pragma unroll
+        for (int h = 0; h < HIDDEN_DIM; h++) {
+            dL_dh2_post[h] += dz * __half2float(mlp.W3[o * HIDDEN_DIM + h]);
+        }
+    }
+
+    float dL_dz2[HIDDEN_DIM];
+    #pragma unroll
+    for (int h = 0; h < HIDDEN_DIM; h++) {
+        dL_dz2[h] = (h2_post[h] > 0) ? dL_dh2_post[h] : 0.0f;
+    }
+
+    float dL_dh1_post[HIDDEN_DIM] = {0};
+    #pragma unroll
+    for (int h = 0; h < HIDDEN_DIM; h++) {
+        float dz = dL_dz2[h];
+        #pragma unroll
+        for (int i = 0; i < HIDDEN_DIM; i++) {
+            dL_dh1_post[i] += dz * __half2float(mlp.W2[h * HIDDEN_DIM + i]);
+        }
+    }
+
+    float dL_dz1[HIDDEN_DIM];
+    #pragma unroll
+    for (int h = 0; h < HIDDEN_DIM; h++) {
+        dL_dz1[h] = (h1_post[h] > 0) ? dL_dh1_post[h] : 0.0f;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < IN_DIM; i++) {
+        dL_dinput[i] = 0.0f;
+    }
+    #pragma unroll
+    for (int h = 0; h < HIDDEN_DIM; h++) {
+        float dz = dL_dz1[h];
+        #pragma unroll
+        for (int i = 0; i < IN_DIM; i++) {
             dL_dinput[i] += dz * __half2float(mlp.W1[h * IN_DIM + i]);
         }
     }
@@ -417,8 +490,12 @@ renderCUDA(
 			// Keep track of current Gaussian ID. Skip, if this one
 			// is behind the last contributor for this pixel.
 			contributor--;
-			if (contributor >= last_contributor)
+			if (contributor >= last_contributor) {
+				// Once contributor wraps past 0 (uint32 underflow), all remaining
+				// Gaussians will also be skipped. Mark done for tile-level early exit.
+				if (contributor > toDo) { done = true; }
 				continue;
+			}
 
 			// compute ray-splat intersection as before
 			// Fisrt compute two homogeneous planes, See Eq. (8)
@@ -431,13 +508,13 @@ renderCUDA(
 			float3 p = cross(k, l);
 			if (p.z == 0.0) continue;
 			float2 s = {p.x / p.z, p.y / p.z};
-			float rho3d = (s.x * s.x + s.y * s.y); 
+			float rho3d = (s.x * s.x + s.y * s.y);
 			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
-			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y); 
+			float rho2d = FilterInvSquare * (d.x * d.x + d.y * d.y);
 
 		// compute intersection and depth
 		float rho = min(rho3d, rho2d);
-		float c_d = (rho3d <= rho2d) ? (s.x * Tw.x + s.y * Tw.y) + Tw.z : Tw.z; 
+		float c_d = (rho3d <= rho2d) ? (s.x * Tw.x + s.y * Tw.y) + Tw.z : Tw.z;
 		if (c_d < near_n) continue;
 		float4 nor_o = collected_normal_opacity[j];
 		float normal[3] = {nor_o.x, nor_o.y, nor_o.z};  // Already normalized in preprocessing
@@ -636,7 +713,9 @@ renderCUDAsurfelBackward(
 	// MLP weight pointers for 3D_SH_res (bias-free, FP16, all [16×16])
 	const __half* __restrict__ mlp_W1_ptr = nullptr,
 	const __half* __restrict__ mlp_W2_ptr = nullptr,
-	const __half* __restrict__ mlp_W3_ptr = nullptr)
+	const __half* __restrict__ mlp_W3_ptr = nullptr,
+	// DC SH features for 3D_SH_cat (render_mode=6)
+	const float* __restrict__ dc_features = nullptr)
 {
 	// Create MLP weights struct from parameters (bias-free, all [16×16])
 	MlpWeights mlp_weights = {
@@ -666,8 +745,7 @@ renderCUDAsurfelBackward(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_normal_opacity[BLOCK_SIZE];
-
-	// __shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float collected_colors[C * BLOCK_SIZE];
 
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
@@ -761,10 +839,10 @@ renderCUDAsurfelBackward(
 			// 3D mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 			// Hashgrid query happens in PyTorch, not CUDA - so actual_levels = 0
 			actual_levels = 0;
-		} else if((render_mode & 0xFF) == 5){
-			// 3D_direct_fused mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+		} else if((render_mode & 0xFF) == 5 || (render_mode & 0xFF) == 6){
+			// 3D_SH_res / 3D_SH_cat mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 			// Hash query happens in CUDA kernel (like cat mode), so use active_hashgrid_levels
-			// Note: render_mode may have bit 8 set (0x100) for collaborative GEMM, so mask to get base mode
+			// Note: render_mode may have bit flags set, so mask to get base mode
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			actual_levels = active_hashgrid_levels;
 		} else if(level > 16){
@@ -820,24 +898,26 @@ renderCUDAsurfelBackward(
 	// Note: 3D_SH_res does not use view direction encoding (MLP is view-independent)
 	// View dependence comes from SH evaluation in preprocessing
 
-	// Initialize tile-local MLP gradient buffers for render_mode=5 (3D_SH_res)
-	// Each thread zeroes a subset of the buffer collaboratively
-	// Note: (render_mode & 0xFF) masks out the bit 8 flag to get base mode
-	if ((render_mode & 0xFF) == 5 && dL_dmlp_W1 != nullptr) {
+	// Load MLP weights into shared memory and optionally zero gradient buffers
+	// Note: (render_mode & 0xFF) masks out bit flags to get base mode
+	if ((render_mode & 0xFF) == 5 || (render_mode & 0xFF) == 6) {
 		const int tid = block.thread_rank();
-		for (int idx = tid; idx < W1_SIZE; idx += BLOCK_SIZE)
-			tile_dL_dW1[idx] = 0.0f;
-		for (int idx = tid; idx < W2_SIZE; idx += BLOCK_SIZE)
-			tile_dL_dW2[idx] = 0.0f;
-		for (int idx = tid; idx < W3_SIZE; idx += BLOCK_SIZE)
-			tile_dL_dW3[idx] = 0.0f;
-		// Load MLP weights into shared memory (eliminates global reads in backward)
+		// Always load MLP weights (needed for both full backward and input-only backward)
 		for (int idx = tid; idx < W1_SIZE; idx += BLOCK_SIZE)
 			smem_mlp_W1[idx] = mlp_weights.W1[idx];
 		for (int idx = tid; idx < W2_SIZE; idx += BLOCK_SIZE)
 			smem_mlp_W2[idx] = mlp_weights.W2[idx];
 		for (int idx = tid; idx < W3_SIZE; idx += BLOCK_SIZE)
 			smem_mlp_W3[idx] = mlp_weights.W3[idx];
+		// Zero gradient buffers only when weight grads are needed (not freeze_mlp)
+		if (dL_dmlp_W1 != nullptr) {
+			for (int idx = tid; idx < W1_SIZE; idx += BLOCK_SIZE)
+				tile_dL_dW1[idx] = 0.0f;
+			for (int idx = tid; idx < W2_SIZE; idx += BLOCK_SIZE)
+				tile_dL_dW2[idx] = 0.0f;
+			for (int idx = tid; idx < W3_SIZE; idx += BLOCK_SIZE)
+				tile_dL_dW3[idx] = 0.0f;
+		}
 		block.sync();
 	}
 
@@ -863,6 +943,9 @@ renderCUDAsurfelBackward(
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
 			
 			collected_size[block.thread_rank()] =  PI * scales[coll_id].x * scales[coll_id].y;
+			// Cache evaluated colors (RGB) in shared memory
+			for (int ch = 0; ch < C; ch++)
+				collected_colors[ch * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + ch];
 			// from 2dgs eq.(5)
 			if(homotrans != nullptr){
 				collected_SuTu[block.thread_rank()] = {homotrans[16 * coll_id+0], homotrans[16 * coll_id+4], homotrans[16 * coll_id+8]};
@@ -1036,9 +1119,10 @@ renderCUDAsurfelBackward(
 				float my_residual[ORIG_OUTPUT_DIM] = {0};
 				float my_dL_dz3[TC_OUTPUT_DIM] = {0};
 
+				bool skip_hash = (d_contrib_thresh > 0.0f && w < d_contrib_thresh);
 				if (participates) {
-					// 1. Query hash features (4D)
-					if (active_hashgrid_levels > 0 && l_dim == 4) {
+					// 1. Query hash features (4D) — skip for tail pixels (matches forward)
+					if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
 						float hash_feat[4] = {0};
 						uint32_t appearance_level = collected_ap_level[j];
 						query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
@@ -1058,16 +1142,17 @@ renderCUDAsurfelBackward(
 					for (int ch = 0; ch < 3; ch++)
 						sh_color[ch] = colors[global_id * 3 + ch];
 
-					// 4. Identity backward → dL_dz3 (no sigmoid derivative)
-					// dL/d(feat) = dL/d(pixel) * w, and feat = SH + residual
-					// So dL/d(residual) = dL/d(feat) = dL/d(pixel) * w
+					// 4. Decoupled ReLU backward → dL_dz3 for residual
+					// feat = ReLU(SH_color) + ReLU(residual), so dL/d(residual) uses ReLU'(residual) only
 					#pragma unroll
 					for (int o = 0; o < ORIG_OUTPUT_DIM; o++) {
-						my_dL_dz3[o] = dL_dpixel[o] * w;
+						float relu_grad = (my_residual[o] > 0.0f) ? 1.0f : 0.0f;
+						my_dL_dz3[o] = dL_dpixel[o] * w * relu_grad;
 					}
 					// Positions 3-15 of dL_dz3 stay zero (WMMA padding)
 
-					// 5. Accumulate dL to SH colors (same gradient flows to both)
+					// 5. Accumulate dL to SH colors (SH already ReLU'd in preprocessing,
+					// gradient passes through — clamping handled by computeColorFromSH backward)
 					for (int ch = 0; ch < 3; ch++) {
 						atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_dpixel[ch] * w);
 					}
@@ -1130,8 +1215,9 @@ renderCUDAsurfelBackward(
 					}
 
 					// Backprop to hash features - dL_dxyz flows to geometry
+					// Skip hash backward for tail pixels (matches forward skip)
 					float dL_dxyz[3] = {0, 0, 0};
-					if (active_hashgrid_levels > 0 && l_dim == 4) {
+					if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
 						float dL_dhash[4];
 						for (int i = 0; i < 4; i++) dL_dhash[i] = my_dL_dinput[i];
 						float hash_feat_dummy[4];
@@ -1144,12 +1230,12 @@ renderCUDAsurfelBackward(
 
 					// ======== GEOMETRY GRADIENTS ========
 					float dL_dalpha = 0.0f;
-					// feat = SH_color + residual (recompute for alpha gradient)
+					// feat = ReLU(SH_color) + ReLU(residual) (recompute for alpha gradient)
 					float feat[C];
 					float sh_color_recomp[3];
 					for (int ch = 0; ch < 3; ch++) {
 						sh_color_recomp[ch] = colors[global_id * 3 + ch];
-						feat[ch] = sh_color_recomp[ch] + my_residual[ch];
+						feat[ch] = sh_color_recomp[ch] + fmaxf(0.0f, my_residual[ch]);
 					}
 
 					// Update accumulators
@@ -1332,6 +1418,11 @@ renderCUDAsurfelBackward(
 			}
 			// Update contributor after processing all Gaussians in this batch
 			contributor -= effective_toDo;
+			// Mark pixel done once all its contributing Gaussians have been processed
+			// (contributor underflows past 0 for uint32, or explicitly reaches 0)
+			if (inside && (contributor == 0 || contributor > toDo)) {
+				done = true;
+			}
 		}
 		// ============================================================================
 		// OTHER MODES: ORIGINAL PER-PIXEL ITERATION (divergent)
@@ -1342,8 +1433,12 @@ renderCUDAsurfelBackward(
 			// Keep track of current Gaussian ID. Skip, if this one
 			// is behind the last contributor for this pixel.
 			contributor--;
-			if (contributor >= last_contributor)
+			if (contributor >= last_contributor) {
+				// Once contributor wraps past 0 (uint32 underflow), all remaining
+				// Gaussians will also be skipped. Mark done for tile-level early exit.
+				if (contributor > toDo) { done = true; }
 				continue;
+			}
 
 			// compute ray-splat intersection as before
 			// Fisrt compute two homogeneous planes, See Eq. (8)
@@ -1474,7 +1569,7 @@ renderCUDAsurfelBackward(
 			if(level == 0){
 				for (int ch = 0; ch < C; ch++)
 				{
-					const float c = colors[global_id * C + ch];
+					const float c = collected_colors[ch * BLOCK_SIZE + j];
 
 					// Update last color (to be used in the next iteration)
 					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
@@ -1547,8 +1642,7 @@ renderCUDAsurfelBackward(
 				break;
 			case 5: {
 				// 3D_SH_res backward: SH base color + hash MLP residual
-				// feat = SH_color + MLP(hash(xyz)), identity activation
-				if (dL_dmlp_W1 == nullptr) break;
+				// feat = ReLU(SH) + ReLU(MLP(hash(xyz))), identity MLP activation
 
 				// 0. Compute xyz intersection point (same as forward pass)
 				const float3 pk = collected_pk[j];
@@ -1565,9 +1659,10 @@ renderCUDAsurfelBackward(
 
 				const int active_hashgrid_levels = (level >> 8) & 0xFF;
 
-				// 1. Query hash features (4D)
+				// 1. Query hash features (4D) — skip for tail pixels (matches forward)
+				bool skip_hash = (d_contrib_thresh > 0.0f && w < d_contrib_thresh);
 				float hash_feat[4] = {0};
-				if (active_hashgrid_levels > 0 && l_dim == 4) {
+				if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
 					query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 					                           appearance_level, hash_features, active_hashgrid_levels,
 					                           l_scale, Base, align_corners, interp, contract, false);
@@ -1585,31 +1680,47 @@ renderCUDAsurfelBackward(
 				MlpWeights smem_mlp2 = {smem_mlp_W1, smem_mlp_W2, smem_mlp_W3};
 				mlp_forward_inline(mlp_input, residual, h1_post, h2_post, false, smem_mlp2);
 
-				// 4. dL/d(feat) = dL/d(pixel) * w
-				// feat = SH_color + residual → dL/d(residual) = dL/d(feat) = dL/d(pixel) * w
+				// 4. Decoupled ReLU backward
+				// feat = ReLU(SH) + ReLU(residual)
+				// dL/d(residual) uses ReLU'(residual) only
 				float dL_drgb[3];
-				for (int c = 0; c < 3; c++)
-					dL_drgb[c] = dL_dchannels[c] * w;
+				for (int c = 0; c < 3; c++) {
+					float relu_grad = (residual[c] > 0.0f) ? 1.0f : 0.0f;
+					dL_drgb[c] = dL_dchannels[c] * w * relu_grad;
+				}
 
-				// 5. Accumulate dL to SH colors
+				// 5. Accumulate dL to SH colors (SH already ReLU'd, gradient passes through)
 				for (int ch = 0; ch < 3; ch++)
-					atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_drgb[ch]);
+					atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_dchannels[ch] * w);
 
-				// 6. MLP backward (legacy per-pixel atomic path, identity activation)
+				// 6. MLP backward
 				float dL_dinput_full[TC_INPUT_DIM];
-				mlp_backward<TC_INPUT_DIM, TC_HIDDEN_DIM, ORIG_OUTPUT_DIM>(
-					mlp_input, residual, dL_drgb,
-					h1_post, h2_post,
-					dL_dinput_full,
-					tile_dL_dW1,
-					tile_dL_dW2,
-					tile_dL_dW3,
-					smem_mlp2,
-					false  // identity activation, no sigmoid
-				);
+				if (dL_dmlp_W1 != nullptr) {
+					// Full backward: weight grads + input grads
+					mlp_backward<TC_INPUT_DIM, TC_HIDDEN_DIM, ORIG_OUTPUT_DIM>(
+						mlp_input, residual, dL_drgb,
+						h1_post, h2_post,
+						dL_dinput_full,
+						tile_dL_dW1,
+						tile_dL_dW2,
+						tile_dL_dW3,
+						smem_mlp2,
+						false  // identity activation, no sigmoid
+					);
+				} else {
+					// freeze_mlp: input grads only (for hash backward), skip weight grads
+					mlp_backward_input_only<TC_INPUT_DIM, TC_HIDDEN_DIM, ORIG_OUTPUT_DIM>(
+						mlp_input, residual, dL_drgb,
+						h1_post, h2_post,
+						dL_dinput_full,
+						smem_mlp2,
+						false
+					);
+				}
 
 				// 7. Backprop to hash features (first 4D of dL_dinput)
-				if (active_hashgrid_levels > 0 && l_dim == 4) {
+				// Skip hash backward for tail pixels (matches forward skip)
+				if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
 					float dL_dhash[4];
 					for (int i = 0; i < 4; i++)
 						dL_dhash[i] = dL_dinput_full[i];
@@ -1621,14 +1732,111 @@ renderCUDAsurfelBackward(
 					                           dL_dhash, dL_dfeatures, dL_dxyz);
 				}
 
-				// 8. Set feat = SH + residual for alpha gradient computation below
+				// 8. Set feat = ReLU(SH) + ReLU(residual) for alpha gradient computation below
 				for (int ch = 0; ch < C; ch++) {
-					feat[ch] = colors[global_id * 3 + ch] + residual[ch];
+					feat[ch] = colors[global_id * 3 + ch] + fmaxf(0.0f, residual[ch]);
 				}
 
 				break;
 			}
-			default: printf("BW unsupported level dim : %d\n", l_dim);
+			case 6: {
+				// 3D_SH_cat backward: SH base color + hash+DC MLP residual
+				// feat = ReLU(SH) + ReLU(MLP([hash(4)|dc_sh(3)|bias(1)]))
+
+				// 0. Compute xyz intersection point
+				const float3 pk = collected_pk[j];
+				float3 xyz;
+				if (rho3d <= rho2d) {
+					const float3 sutu = collected_SuTu[j];
+					const float3 svtv = collected_SvTv[j];
+					xyz = {s.x * sutu.x + s.y * svtv.x + pk.x,
+					       s.x * sutu.y + s.y * svtv.y + pk.y,
+					       s.x * sutu.z + s.y * svtv.z + pk.z};
+				} else {
+					xyz = pk;
+				}
+
+				const int active_hashgrid_levels = (level >> 8) & 0xFF;
+
+				// 1. Query hash features (4D) — skip for tail pixels (matches forward)
+				bool skip_hash = (d_contrib_thresh > 0.0f && w < d_contrib_thresh);
+				float hash_feat[4] = {0};
+				if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
+					query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
+					                           appearance_level, hash_features, active_hashgrid_levels,
+					                           l_scale, Base, align_corners, interp, contract, false);
+				}
+
+				// 2. Build MLP input: [hash(4) | dc_sh(3) | bias(1) | pad(8)] = 16D
+				float mlp_input[TC_INPUT_DIM];
+				for (int i = 0; i < TC_INPUT_DIM; i++) mlp_input[i] = 0.0f;
+				for (int i = 0; i < 4; i++) mlp_input[i] = hash_feat[i];
+				if (dc_features != nullptr) {
+					for (int i = 0; i < 3; i++) mlp_input[4 + i] = dc_features[global_id * 3 + i];
+				}
+				mlp_input[7] = 1.0f;  // bias
+
+				// 3. Recompute MLP forward
+				float h1_post[TC_HIDDEN_DIM], h2_post[TC_HIDDEN_DIM];
+				float residual[ORIG_OUTPUT_DIM];
+				MlpWeights smem_mlp2 = {smem_mlp_W1, smem_mlp_W2, smem_mlp_W3};
+				mlp_forward_inline(mlp_input, residual, h1_post, h2_post, false, smem_mlp2);
+
+				// 4. Decoupled ReLU backward
+				float dL_drgb[3];
+				for (int c = 0; c < 3; c++) {
+					float relu_grad = (residual[c] > 0.0f) ? 1.0f : 0.0f;
+					dL_drgb[c] = dL_dchannels[c] * w * relu_grad;
+				}
+
+				// 5. Accumulate dL to SH colors
+				for (int ch = 0; ch < 3; ch++)
+					atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_dchannels[ch] * w);
+
+				// 6. MLP backward
+				float dL_dinput_full[TC_INPUT_DIM];
+				if (dL_dmlp_W1 != nullptr) {
+					mlp_backward<TC_INPUT_DIM, TC_HIDDEN_DIM, ORIG_OUTPUT_DIM>(
+						mlp_input, residual, dL_drgb,
+						h1_post, h2_post,
+						dL_dinput_full,
+						tile_dL_dW1,
+						tile_dL_dW2,
+						tile_dL_dW3,
+						smem_mlp2,
+						false
+					);
+				} else {
+					mlp_backward_input_only<TC_INPUT_DIM, TC_HIDDEN_DIM, ORIG_OUTPUT_DIM>(
+						mlp_input, residual, dL_drgb,
+						h1_post, h2_post,
+						dL_dinput_full,
+						smem_mlp2,
+						false
+					);
+				}
+
+				// 7. Backprop to hash features — skip for tail pixels
+				if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
+					float dL_dhash[4];
+					for (int i = 0; i < 4; i++)
+						dL_dhash[i] = dL_dinput_full[i];
+
+					float hash_feat_dummy[4];
+					query_feature<true, 4, 4>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
+					                           appearance_level, hash_features, active_hashgrid_levels,
+					                           l_scale, Base, align_corners, interp, contract, false,
+					                           dL_dhash, dL_dfeatures, dL_dxyz);
+				}
+
+				// 8. Set feat for alpha gradient computation
+				for (int ch = 0; ch < C; ch++) {
+					feat[ch] = colors[global_id * 3 + ch] + fmaxf(0.0f, residual[ch]);
+				}
+
+				break;
+			}
+			default: printf("BW unsupported render_mode : %d\n", render_mode & 0xFF);
 				break;
 			}
 
@@ -1899,7 +2107,7 @@ renderCUDAsurfelBackward(
 	}
 
 	// Flush tile-local MLP gradients to global memory (once per tile, bias-free)
-	if ((render_mode & 0xFF) == 5 && dL_dmlp_W1 != nullptr) {
+	if (((render_mode & 0xFF) == 5 || (render_mode & 0xFF) == 6) && dL_dmlp_W1 != nullptr) {
 		block.sync();
 		unsigned long long _prof_flush_t0 = clock64();
 		MODES::flush_tile_mlp_grads(
@@ -2241,13 +2449,14 @@ void BACKWARD::render(
 	const bool detach_hash_grad,
 	float* dL_dmlp_W1,
 	float* dL_dmlp_W2,
-	float* dL_dmlp_W3)
+	float* dL_dmlp_W3,
+	const float* dc_features)
 {
-	// Get MLP weight pointers for passing to the kernel (for 3D_direct_fused mode, FP16)
+	// Get MLP weight pointers for passing to the kernel (for fused MLP modes, FP16)
 	__half *mlp_W1_ptr = nullptr;
 	__half *mlp_W2_ptr = nullptr;
 	__half *mlp_W3_ptr = nullptr;
-	if (render_mode == 5) {
+	if ((render_mode & 0xFF) == 5 || (render_mode & 0xFF) == 6) {
 		FORWARD::getMlpWeightPointers(
 			&mlp_W1_ptr,
 			&mlp_W2_ptr,
@@ -2262,7 +2471,7 @@ void BACKWARD::render(
 	size_t smem_size = 0;
 	bool use_collaborative_gemm = false;
 
-	if (render_mode == 5 && dL_dmlp_W1 != nullptr) {
+	if (((render_mode & 0xFF) == 5 || (render_mode & 0xFF) == 6) && dL_dmlp_W1 != nullptr) {
 		// Check for debug override to disable collaborative GEMM
 		static int force_disable = -1;
 		if (force_disable == -1) {
@@ -2315,8 +2524,8 @@ void BACKWARD::render(
 
 	// Adjust render_mode for kernel: bit 8 = use collaborative GEMM
 	int adjusted_render_mode = render_mode;
-	if (render_mode == 5 && use_collaborative_gemm) {
-		adjusted_render_mode = 5 | 0x100;  // Set bit 8 to indicate collaborative GEMM
+	if (((render_mode & 0xFF) == 5 || (render_mode & 0xFF) == 6) && use_collaborative_gemm) {
+		adjusted_render_mode = render_mode | 0x100;  // Set bit 8 to indicate collaborative GEMM
 	}
 
 	// FP16 lean library: only C=3 (RGB) is needed for mode 5
@@ -2330,7 +2539,8 @@ void BACKWARD::render(
 			dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
 			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, adjusted_render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
 			dL_dmlp_W1, dL_dmlp_W2, dL_dmlp_W3,
-			mlp_W1_ptr, mlp_W2_ptr, mlp_W3_ptr);
+			mlp_W1_ptr, mlp_W2_ptr, mlp_W3_ptr,
+			dc_features);
 
 }
 

@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 from random import randint
 from utils.loss_utils import l1_loss, ssim
+from optimizing_spa import OptimizingSpa
 from gaussian_renderer import render, network_gui
 import sys
 import traceback
@@ -85,12 +86,15 @@ import matplotlib.pyplot as plt
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, args):
 
+    training_start_time = time.time()
+
     testing_iterations += [opt.iterations]
     saving_iterations += [opt.iterations]
 
     test_psnr = []
     train_psnr = []
     iter_list = []
+    optimizing_spa = None
 
     scene_name = args.scene_name
     tb_writer = prepare_output_and_logger(dataset, scene_name, args.yaml, args)
@@ -169,7 +173,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.training_setup(opt)
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
-    elif cfg_model.settings.if_ingp and os.path.exists(warmup_checkpoint_path) and not args.scratch:
+    elif cfg_model.settings.if_ingp and args.method != "2dgs" and os.path.exists(warmup_checkpoint_path) and not args.scratch:
         # Load warmup checkpoint - skip 2DGS phase
         print("\n" + "="*70)
         print("  LOADING 2DGS WARMUP CHECKPOINT")
@@ -382,13 +386,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians._gaussian_feat_dim = 0
             gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
+            # Reinitialize SH to cancel the +0.5 bias in computeColorFromSH
+            # DC = -0.5/SH_C0 → SH_C0 * DC + 0.5 = 0 → clamp(0, 0) = 0 (black baseline)
+            # This lets the hashgrid+MLP learn full appearance from scratch
+            SH_C0 = 0.28209479177387814
+            n_gaussians = len(gaussians.get_xyz)
+            features_dc = torch.full((n_gaussians, 1, 3), -0.5 / SH_C0, device="cuda").float()
+            gaussians._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+            features_rest = torch.zeros((n_gaussians, 15, 3), device="cuda").float()
+            gaussians._features_rest = nn.Parameter(features_rest.requires_grad_(True))
+            gaussians.active_sh_degree = 0
+
+            # Freeze SH for first 1k iterations so hashgrid+MLP can learn first
+            sh_freeze_until = first_iter + 1000
+            gaussians._sh_freeze_until = sh_freeze_until
+
             num_levels = cfg_model.encoding.levels
             per_level_dim = cfg_model.encoding.hashgrid.dim
-            n_gaussians = len(gaussians.get_xyz)
-            print(f"[3D_SH_RES MODE] Initialized {n_gaussians} Gaussians")
-            print(f"[3D_SH_RES MODE] Per-Gaussian: standard SH (degree-3, 48 params)")
+            print(f"[3D_SH_RES MODE] Initialized {n_gaussians} Gaussians with fresh SH (degree 0 → 3)")
+            print(f"[3D_SH_RES MODE] SH frozen until iteration {sh_freeze_until} (hashgrid trains first)")
             print(f"[3D_SH_RES MODE] Hash levels: {num_levels}, {per_level_dim}D per level")
             print(f"[3D_SH_RES MODE] MLP: 16D → 16D → 16D → 3D (RGB residual, identity)")
+
+        elif args.method == "3D_SH_cat":
+            # 3D_SH_cat: per-Gaussian SH + hash+DC MLP residual
+            # Same as 3D_SH_res but MLP input includes DC SH for per-Gaussian identity
+            gaussians._gaussian_feat_dim = 0
+            gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+
+            # Reinitialize SH to cancel the +0.5 bias in computeColorFromSH
+            SH_C0 = 0.28209479177387814
+            n_gaussians = len(gaussians.get_xyz)
+            features_dc = torch.full((n_gaussians, 1, 3), -0.5 / SH_C0, device="cuda").float()
+            gaussians._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+            features_rest = torch.zeros((n_gaussians, 15, 3), device="cuda").float()
+            gaussians._features_rest = nn.Parameter(features_rest.requires_grad_(True))
+            gaussians.active_sh_degree = 0
+
+            num_levels = cfg_model.encoding.levels
+            per_level_dim = cfg_model.encoding.hashgrid.dim
+            print(f"[3D_SH_CAT MODE] Initialized {n_gaussians} Gaussians with fresh SH (degree 0 → 3)")
+            print(f"[3D_SH_CAT MODE] Hash levels: {num_levels}, {per_level_dim}D per level")
+            print(f"[3D_SH_CAT MODE] MLP input: [hash(4)|DC_SH(3)|bias(1)]=8D → 16D → 16D → 3D (RGB residual)")
 
         elif args.method in ["3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC"]:
             # 3D_direct_fused/lean/SH_TC mode: fused in-kernel MLP rendering
@@ -559,7 +598,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Load optimizer state from warmup checkpoint
         # Skip if method/kernel adds new params not in saved state (they train from scratch)
         # Also skip if param group counts don't match (checkpoint from different config)
-        skip_methods = ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res"]
+        skip_methods = ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat"]
         if args.method not in skip_methods and args.kernel == "gaussian":
             ckpt_groups = len(ckpt['optimizer_state']['param_groups'])
             cur_groups = len(gaussians.optimizer.param_groups)
@@ -592,10 +631,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Resume from after the warmup iteration
         first_iter = ckpt['iteration']
         loaded_from_warmup = True
-        
+
         print(f"  GS Alpha masks loaded: {len(gs_alpha_masks)}")
         print(f"  Densification state: {'restored' if 'xyz_gradient_accum' in ckpt else 'reset (old checkpoint)'}")
         print(f"  Resuming from iteration {first_iter + 1}")
+
         print("="*70 + "\n")
     else:
         # Normal initialization - train from scratch
@@ -677,8 +717,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
 
     ingp_model = None
-    if cfg_model.settings.if_ingp:
+    if cfg_model.settings.if_ingp and args.method != "2dgs":
         ingp_model = INGP(cfg_model, args=args).to('cuda')
+
+    # Set hash query transmittance threshold (skip hash+MLP when T < threshold)
+    if args.contribution_thresh > 0.0 and args.method in ["3D_SH_res", "3D_SH_cat"]:
+        from diff_surfel_3D_sh_res import set_contrib_thresh
+        set_contrib_thresh(args.contribution_thresh)
+        print(f"[CONTRIB_THRESH] Skipping hash query when w = T*alpha < {args.contribution_thresh}")
 
     # Initialize learnable skybox for background modeling
     skybox = None
@@ -753,7 +799,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
-        gaussians.update_learning_rate(iteration)
+        # LR schedule: reset to "iteration 5000" after GSPA Phase 1 pruning
+        if args.gspa and iteration >= args.gspa_simp_iter:
+            gaussians.update_learning_rate(iteration - args.gspa_simp_iter + 5000)
+        else:
+            gaussians.update_learning_rate(iteration)
 
         opacity_reset_interval = opt.opacity_reset_interval
         densification_interval = opt.densification_interval
@@ -787,9 +837,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         active_levels = None
 
         if ingp is not None:
-            active_levels = ingp.set_active_levels(iteration)
-            optim_ngp = True
-            optim_gaussian = ingp.optim_gaussian
+            # 3D_SH_res warmup: disable hash/MLP for first N iterations
+            if args.res_warmup > 0 and args.method in ["3D_SH_res", "3D_SH_cat"] and iteration < args.res_warmup:
+                ingp.hashgrid_disabled = True
+                optim_ngp = False
+                optim_gaussian = True
+            else:
+                if args.res_warmup > 0 and args.method in ["3D_SH_res", "3D_SH_cat"] and iteration == args.res_warmup:
+                    ingp.hashgrid_disabled = False
+                    tqdm.write(f"[3D_SH_RES] Enabling hash/MLP residual at iteration {iteration}")
+
+                active_levels = ingp.set_active_levels(iteration)
+                optim_ngp = True
+                optim_gaussian = ingp.optim_gaussian
             if iteration % surfel_cfg.update_interval == 0 and optim_gaussian \
                 and beta < surfel_cfg.tg_beta and active_levels == cfg_model.encoding.levels:
                 
@@ -798,7 +858,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 beta += surfel_cfg.tg_beta / update_times
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
+        # When GSPA is active, delay SH increases until after Phase 1 (importance pruning)
+        # When SH is frozen (3D_SH_res warmup), delay SH increases until unfrozen
+        sh_frozen = hasattr(gaussians, '_sh_freeze_until') and iteration < gaussians._sh_freeze_until
+        if hasattr(gaussians, '_sh_freeze_until') and iteration == gaussians._sh_freeze_until:
+            tqdm.write(f"[3D_SH_RES] SH unfrozen at iteration {iteration}, enabling SH optimization")
+        if iteration % 1000 == 0 and (not args.gspa or iteration > args.gspa_simp_iter) and not sh_frozen:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
@@ -837,6 +902,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         bg_start_iter = max(args.bg_hashgrid_start_iter, cfg_model.ingp_stage.switch_iter)
         active_bg_hashgrid = bg_hashgrid if (bg_hashgrid is not None and iteration >= bg_start_iter) else None
 
+        # Debug: verify SH is zero on first iteration for 3D_SH_res
+        if iteration == first_iter + 1 and args.method in ["3D_SH_res", "3D_SH_cat"]:
+            dc_norm = gaussians._features_dc.data.abs().max().item()
+            rest_norm = gaussians._features_rest.data.abs().max().item()
+            print(f"[DEBUG] First iter SH check: DC max={dc_norm:.6f}, REST max={rest_norm:.6f}, "
+                  f"active_sh_degree={gaussians.active_sh_degree}")
+
+        # Timing: forward pass
+        if iteration % 500 == 0:
+            torch.cuda.synchronize()
+            _t_fwd_start = time.time()
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, current_bg, ingp = ingp,
             beta = beta, iteration = iteration, cfg = cfg_model, record_transmittance = record_transmittance,
             use_xyz_mode = args.use_xyz_mode, decompose_mode = dataset.decompose_mode,
@@ -845,6 +922,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             aa = args.aa, aa_threshold = args.aa_threshold, skybox = active_skybox,
             background_mode = background_mode, bg_hashgrid = active_bg_hashgrid,
             detach_hash_grad = args.detach_hash_grad, max_intersections_per_pixel = args.max_intersections_per_pixel)
+
+        if iteration % 500 == 0:
+            torch.cuda.synchronize()
+            _t_fwd_end = time.time()
+
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
         gt_image = viewpoint_cam.original_image.cuda()
@@ -895,14 +977,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gt_alpha = (gt_image != 0).any(dim=0, keepdim=True).float()
             else:
                 gt_alpha = viewpoint_cam.gt_alpha_mask.cuda().float()
-                # Debug: print mask info on first iteration
-                if iteration <= first_iter + 1:
-                    print(f"[DEBUG gt_alpha] Using gt_alpha_mask for {viewpoint_cam.image_name}")
-                    print(f"[DEBUG gt_alpha] Shape: {gt_alpha.shape}, min: {gt_alpha.min():.3f}, max: {gt_alpha.max():.3f}, mean: {gt_alpha.mean():.3f}")
         else:
             gt_alpha = (gt_image != 0).any(dim=0, keepdim=True).float()
-            if iteration <= first_iter + 1:
-                print(f"[DEBUG gt_alpha] Using fallback (non-black pixels) for {viewpoint_cam.image_name}")
         
         try:
             if cfg_model.settings.gs_alpha and ingp is not None:
@@ -1096,17 +1172,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if args.l1_hash > 0 and ingp is not None and hasattr(ingp, 'hash_encoding') and ingp.hash_encoding is not None:
             l1_hash_loss = args.l1_hash * torch.abs(ingp.hash_encoding.embeddings).mean()
 
+        # GaussianSpa ADMM sparsification loss (only on z/u update iterations, matching paper)
+        gspa_loss = torch.tensor(0.0, device="cuda")
+        if args.gspa and optimizing_spa is not None and iteration > args.gspa_start_iter and iteration <= args.gspa_stop_iter and iteration % args.gspa_interval == 0:
+            gspa_loss = optimizing_spa.compute_spa_loss()
+
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss + gspa_loss
 
         # DEBUG: print loss components before backward
+        if iteration % 500 == 0:
+            torch.cuda.synchronize()
+            _t_bwd_start = time.time()
+
         total_loss.backward()
+
+        if iteration % 500 == 0:
+            torch.cuda.synchronize()
+            _t_bwd_end = time.time()
 
         # Apply MLP gradients for 3D_direct_fused mode
         # MLP weights are in CUDA constant memory, gradients computed in CUDA backward
-        if ingp is not None and hasattr(ingp, 'is_3D_direct_fused_mode') and ingp.is_3D_direct_fused_mode:
+        # Skip when freeze_mlp is active (no weight gradients computed)
+        if ingp is not None and hasattr(ingp, 'is_3D_direct_fused_mode') and ingp.is_3D_direct_fused_mode and not ingp.freeze_mlp:
             # Import from appropriate library based on mode
-            if hasattr(ingp, 'is_3D_SH_res_mode') and ingp.is_3D_SH_res_mode:
+            if (hasattr(ingp, 'is_3D_SH_res_mode') and ingp.is_3D_SH_res_mode) or \
+               (hasattr(ingp, 'is_3D_SH_cat_mode') and ingp.is_3D_SH_cat_mode):
                 from diff_surfel_3D_sh_res import get_mlp_grads
             elif hasattr(ingp, 'is_3D_direct_sh_tc_mode') and ingp.is_3D_direct_sh_tc_mode:
                 from diff_surfel_3D_sh import get_mlp_grads
@@ -1145,7 +1236,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     mlp[4].weight.grad += grad_W3
 
-        # Debug: print gradient norms every 500 iterations
 
         # Total variation regularization on hashgrid - penalizes uniform regions while preserving edges
         # Must be called after backward() and before optimizer.step() as it directly modifies gradients
@@ -1236,6 +1326,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
                         beta_vals = gaussians.get_shape
                         loss_dict["Gnβ"] = f"{beta_vals.mean().item():.2f}"
+                if args.gspa and optimizing_spa is not None and iteration > args.gspa_start_iter and iteration <= args.gspa_stop_iter:
+                    loss_dict["GSPA"] = f"{gspa_loss.item():.5f}"
                 progress_bar.set_postfix(loss_dict)
 
                 progress_bar.update(10)
@@ -1395,8 +1487,49 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         if iteration <= cfg_model.training_cfg.reset_until_iter:
                             gaussians.reset_opacity()
 
+            # GaussianSpa two-phase sparsification pipeline
+            if args.gspa:
+                # Phase 1: Importance-based pre-pruning at simp_iter
+                if iteration == args.gspa_simp_iter:
+                    # Phase 1 disabled for debugging
+                    print(f"[GSPA] Phase 1 SKIPPED (debugging): {len(gaussians.get_xyz)} Gaussians unchanged")
+
+                # Phase 2: ADMM sparsification (start_iter to stop_iter)
+                if iteration == args.gspa_start_iter:
+                    optimizing_spa = OptimizingSpa(
+                        gaussians, rho=args.gspa_rho, prune_ratio=args.gspa_ratio)
+                    optimizing_spa.update_z_u(update_u=False)  # Initial z-only update
+                    n = len(gaussians.get_xyz)
+                    print(f"\n[GSPA] ADMM started: {n} Gaussians, "
+                          f"rho={args.gspa_rho}, ratio={args.gspa_ratio}, "
+                          f"interval={args.gspa_interval}, stop={args.gspa_stop_iter}")
+                elif optimizing_spa is not None and iteration > args.gspa_start_iter and iteration <= args.gspa_stop_iter:
+                    optimizing_spa.handle_densification_change()
+                    if iteration % args.gspa_interval == 0:
+                        optimizing_spa.update_z_u()
+                if iteration == args.gspa_stop_iter and optimizing_spa is not None:
+                    optimizing_spa.prune()
+                    optimizing_spa = None
+
+            # Morton z-order sort for cache locality
+            if args.morton_interval > 0 and iteration % args.morton_interval == 0 and iteration <= args.morton_end_iter:
+                gaussians.morton_sort()
+                if iteration % args.morton_interval == 0:
+                    tqdm.write(f"[Morton] Sorted {len(gaussians.get_xyz)} Gaussians at iter {iteration}")
+
             # Optimizer step
             if iteration < opt.iterations:
+
+                # Freeze SH gradients for first 1k iterations in 3D_SH_res (hashgrid trains first)
+                if hasattr(gaussians, '_sh_freeze_until') and iteration < gaussians._sh_freeze_until:
+                    if gaussians._features_dc.grad is not None:
+                        gaussians._features_dc.grad.zero_()
+                    if gaussians._features_rest.grad is not None:
+                        gaussians._features_rest.grad.zero_()
+
+                if iteration % 500 == 0:
+                    torch.cuda.synchronize()
+                    _t_opt_start = time.time()
 
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
@@ -1404,6 +1537,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if optim_ngp:
                     ingp.current_optimizer.step()
                     ingp.current_optimizer.zero_grad(set_to_none = True)
+
+                if iteration % 500 == 0:
+                    torch.cuda.synchronize()
+                    _t_opt_end = time.time()
+                    # Per-pixel intersection stats
+                    gs_num = render_pkg.get("gaussian_num", None)
+                    gs_stats = ""
+                    if gs_num is not None:
+                        gs_map = gs_num.squeeze()
+                        gs_stats = (f" | isect: max={gs_map.max().item():.0f}, "
+                                    f"mean={gs_map.mean().item():.1f}, "
+                                    f"median={gs_map.median().item():.0f}")
+                    tqdm.write(f"[TIMING {iteration}] fwd={(_t_fwd_end-_t_fwd_start)*1000:.1f}ms, "
+                              f"bwd={(_t_bwd_end-_t_bwd_start)*1000:.1f}ms, "
+                              f"opt={(_t_opt_end-_t_opt_start)*1000:.1f}ms, "
+                              f"total={(_t_opt_end-_t_fwd_start)*1000:.1f}ms"
+                              f"{gs_stats}")
 
                 # Skybox optimizer step (only after switch_iter when skybox is active)
                 if skybox is not None and iteration >= cfg_model.ingp_stage.switch_iter:
@@ -1464,7 +1614,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             from utils.image_utils import colormap
             
             save_interval = cfg_model.settings.save_interval
-            if (iteration )  % save_interval == 0:
+            _save_this_iter = (iteration % save_interval == 0) or (14990 <= iteration <= 15010)
+            if _save_this_iter:
 
                 output_path = os.path.join(scene.model_path, 'training_output')
 
@@ -1500,6 +1651,65 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     hash_image = torch.clamp(render_pkg_hash["render"], 0.0, 1.0)
                     hash_name = os.path.join(output_path, str(iteration) + '_hash.png')
                     save_img_u8(hash_image.permute(1,2,0).detach().cpu().numpy(), hash_name)
+
+                # Save decomposed renders for 3D_SH_res and 3D_SH_cat modes (SH-only and texture-only)
+                if args.method in ["3D_SH_res", "3D_SH_cat"] and ingp is not None and not getattr(ingp, 'hashgrid_disabled', False):
+                    # Fresh full render (after optimizer step) to compare with decomposition
+                    with torch.no_grad():
+                        render_pkg_full2 = render(viewpoint_cam, gaussians, pipe, current_bg, ingp=ingp,
+                            beta=beta, iteration=iteration, cfg=cfg_model, decompose_mode=None,
+                            is_training=False)
+                        full2_raw = render_pkg_full2["render"]
+
+                    # SH-only render (hashgrid disabled, residual ≈ 0)
+                    render_pkg_sh = render(viewpoint_cam, gaussians, pipe, current_bg, ingp=ingp,
+                        beta=beta, iteration=iteration, cfg=cfg_model, decompose_mode='sh_only',
+                        is_training=False)
+                    sh_raw = render_pkg_sh["render"]
+                    sh_image = torch.clamp(sh_raw, 0.0, 1.0)
+                    sh_name = os.path.join(output_path, str(iteration) + '_sh_only.png')
+                    save_img_u8(sh_image.permute(1,2,0).detach().cpu().numpy(), sh_name)
+
+                    # Texture-only render (SH zeroed, only MLP residual)
+                    render_pkg_tex = render(viewpoint_cam, gaussians, pipe, current_bg, ingp=ingp,
+                        beta=beta, iteration=iteration, cfg=cfg_model, decompose_mode='tex_only',
+                        is_training=False)
+                    tex_raw = render_pkg_tex["render"]
+                    tex_image = torch.clamp(tex_raw, 0.0, 1.0)
+                    tex_name = os.path.join(output_path, str(iteration) + '_tex_only.png')
+                    save_img_u8(tex_image.permute(1,2,0).detach().cpu().numpy(), tex_name)
+
+                    # Save SH+residual summed image (should match full render)
+                    sum_image = torch.clamp(sh_raw + tex_raw, 0.0, 1.0)
+                    sum_name = os.path.join(output_path, str(iteration) + '_sh_plus_tex.png')
+                    save_img_u8(sum_image.permute(1,2,0).detach().cpu().numpy(), sum_name)
+
+                    # Debug: decomposition stats
+                    full_raw = image  # from training render (before optimizer step)
+                    dc_max = gaussians._features_dc.data.abs().max().item()
+                    rest_max = gaussians._features_rest.data.abs().max().item()
+                    tqdm.write(f"[DECOMPOSE {iteration}] SH DC max={dc_max:.4f}, REST max={rest_max:.4f}, "
+                              f"sh_degree={gaussians.active_sh_degree}")
+                    tqdm.write(f"[DECOMPOSE {iteration}] train_img: mean={full_raw.mean():.4f}, "
+                              f"fresh_full: mean={full2_raw.mean():.4f}, "
+                              f"sh_only: mean={sh_raw.mean():.4f}, tex_only: mean={tex_raw.mean():.4f}, "
+                              f"sh+tex: mean={(sh_raw + tex_raw).mean():.4f}")
+                    tqdm.write(f"[DECOMPOSE {iteration}] train_vs_fresh diff: {(full_raw - full2_raw).abs().mean():.6f}, "
+                              f"fresh_vs_decompose diff: {(full2_raw - sh_raw - tex_raw).abs().mean():.6f}")
+                    # Compare alpha maps to check if geometry differs between renders
+                    alpha_full = render_pkg_full2.get("rend_alpha", None)
+                    alpha_sh = render_pkg_sh.get("rend_alpha", None)
+                    alpha_tex = render_pkg_tex.get("rend_alpha", None)
+                    if alpha_full is not None and alpha_sh is not None and alpha_tex is not None:
+                        tqdm.write(f"[DECOMPOSE {iteration}] alpha: full={alpha_full.mean():.4f}, "
+                                  f"sh_only={alpha_sh.mean():.4f}, tex_only={alpha_tex.mean():.4f}, "
+                                  f"full_vs_sh_diff={((alpha_full - alpha_sh).abs().mean()):.6f}, "
+                                  f"full_vs_tex_diff={((alpha_full - alpha_tex).abs().mean()):.6f}")
+                    # Save diff image (amplified 10x for visibility)
+                    diff_raw = (full2_raw - sh_raw - tex_raw).abs() * 10
+                    diff_image = torch.clamp(diff_raw, 0.0, 1.0)
+                    diff_name = os.path.join(output_path, str(iteration) + '_decompose_diff_10x.png')
+                    save_img_u8(diff_image.permute(1,2,0).detach().cpu().numpy(), diff_name)
 
                 # Save FG/BG separation if skybox is active
                 if "render_fg" in render_pkg:
@@ -1654,10 +1864,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         stride=25, skip_decomposition=True, skybox=skybox, background_mode=background_mode, bg_hashgrid=bg_hashgrid)
     
     # Save training log with point count and framerate
-    save_training_log(scene, gaussians, final_ingp, pipe, args, cfg_model, iteration)
+    save_training_log(scene, gaussians, final_ingp, pipe, args, cfg_model, iteration, training_start_time)
 
 
-def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
+def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration, training_start_time=None):
     """Save training statistics to training_log.txt."""
     import time
 
@@ -1738,7 +1948,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
         f.write("=" * 50 + "\n\n")
 
         f.write(f"Method: {args.method}\n")
-        if args.method in ["cat", "cat_dropout", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res"]:
+        if args.method in ["cat", "cat_dropout", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat"]:
             f.write(f"Hybrid Levels: {args.hybrid_levels}\n")
             if args.method == "cat_dropout":
                 f.write(f"Dropout Lambda: {args.dropout_lambda}\n")
@@ -1792,10 +2002,22 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration):
         f.write("-" * 30 + "\n")
         f.write(f"Render FPS: {fps:.2f}\n")
         f.write(f"Time per frame: {ms_per_frame:.2f} ms\n")
-    
+        if training_start_time is not None:
+            total_seconds = time.time() - training_start_time
+            hours = int(total_seconds // 3600)
+            minutes = int((total_seconds % 3600) // 60)
+            seconds = int(total_seconds % 60)
+            f.write(f"Total training time: {hours}h {minutes}m {seconds}s ({total_seconds:.1f}s)\n")
+
     print(f"[LOG] Training log saved to: {log_path}")
     print(f"[LOG] Number of Gaussians: {num_gaussians:,}")
     print(f"[LOG] Render FPS: {fps:.2f} ({ms_per_frame:.2f} ms/frame)")
+    if training_start_time is not None:
+        total_seconds = time.time() - training_start_time
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        seconds = int(total_seconds % 60)
+        print(f"[LOG] Total training time: {hours}h {minutes}m {seconds}s")
 
 
 def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteration, cfg_model, args,
@@ -1856,6 +2078,11 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     is_adaptive_cat_mode = (ingp is not None and hasattr(ingp, 'is_adaptive_cat_mode') and ingp.is_adaptive_cat_mode)
     do_adaptive_cat_decomposition = is_adaptive_cat_mode and not skip_decomposition
 
+    # 3D_SH_res / 3D_SH_cat decomposition: SH-only vs texture(hash+MLP)-only
+    is_3D_SH_res_mode = (ingp is not None and hasattr(ingp, 'is_3D_SH_res_mode') and ingp.is_3D_SH_res_mode)
+    is_3D_SH_cat_mode = (ingp is not None and hasattr(ingp, 'is_3D_SH_cat_mode') and ingp.is_3D_SH_cat_mode)
+    do_sh_res_decomposition = (is_3D_SH_res_mode or is_3D_SH_cat_mode) and not skip_decomposition
+
     # Adaptive_zero decomposition: visualize zeros-only vs hash contributors
     is_adaptive_zero_mode = (ingp is not None and hasattr(ingp, 'is_adaptive_zero_mode') and ingp.is_adaptive_zero_mode)
     do_adaptive_zero_decomposition = is_adaptive_zero_mode and not skip_decomposition
@@ -1871,6 +2098,13 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
         bg_output_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'bg_only'))
         os.makedirs(bg_output_dir, exist_ok=True)
         print(f"[FINAL] BG hashgrid visualization enabled: saving BG-only renders for first {bg_vis_frames} frames")
+
+    if do_sh_res_decomposition:
+        sh_only_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'sh_only'))
+        tex_only_dir = os.path.join(scene.model_path, output_subdir.replace('renders', 'tex_only'))
+        os.makedirs(sh_only_dir, exist_ok=True)
+        os.makedirs(tex_only_dir, exist_ok=True)
+        print(f"[FINAL] 3D_SH_res decomposition enabled: saving SH-only and texture-only renders")
 
     if do_cat_decomposition:
         # Create directories for decomposed renders
@@ -2091,6 +2325,24 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
                     flex_beta_map, render_alpha, min_display=0.0, max_display=10.0
                 )
                 save_img_u8(flex_beta_heatmap, os.path.join(flex_beta_output_dir, f"{idx:03d}_flex_beta.png"))
+
+            # 3D_SH_res decomposition: SH-only and texture(hash+MLP)-only
+            if do_sh_res_decomposition:
+                # SH-only: disable hashgrid, residual ≈ 0
+                sh_pkg = render(viewpoint, gaussians, pipe, background,
+                                ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                decompose_mode='sh_only')
+                sh_rendered = torch.clamp(sh_pkg["render"], 0.0, 1.0)
+                save_img_u8(sh_rendered.permute(1, 2, 0).cpu().numpy(),
+                           os.path.join(sh_only_dir, f"{idx:03d}_sh.png"))
+
+                # Texture-only: zero SH, only MLP residual
+                tex_pkg = render(viewpoint, gaussians, pipe, background,
+                                 ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                                 decompose_mode='tex_only')
+                tex_rendered = torch.clamp(tex_pkg["render"], 0.0, 1.0)
+                save_img_u8(tex_rendered.permute(1, 2, 0).cpu().numpy(),
+                           os.path.join(tex_only_dir, f"{idx:03d}_tex.png"))
 
             # Cat mode decomposition: render with masked features
             if do_cat_decomposition:
@@ -2490,26 +2742,23 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
 
         torch.cuda.empty_cache()
 
-def merge_cfg_to_args(args, cfg):
+def merge_cfg_to_args(args, cfg, cli_args=None):
     """Merge specific sections from config into args
-    
-    Note: For white_background, CLI flag takes precedence over config
+
+    CLI arguments take precedence over config values.
+    cli_args: set of argument names explicitly passed on the command line.
     """
     target_sections = ['training_cfg', 'settings', 'loss']
-    
-    # Store CLI white_background value before merging
-    cli_white_background = args.white_background if hasattr(args, 'white_background') else None
-    
+
     for section in target_sections:
         if hasattr(cfg, section):
             section_dict = getattr(cfg, section)
             if isinstance(section_dict, dict):
                 for k, v in section_dict.items():
+                    # CLI takes precedence over yaml
+                    if cli_args is not None and k in cli_args:
+                        continue
                     setattr(args, k, v)
-    
-    # Restore CLI white_background if it was explicitly set
-    if cli_white_background is not None and cli_white_background:
-        args.white_background = cli_white_background
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
@@ -2535,9 +2784,9 @@ if __name__ == "__main__":
     
     # Method argument - baseline, cat, cat_dropout, adaptive, adaptive_add, adaptive_cat, adaptive_zero, adaptive_gate, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res"],
+                        choices=["baseline", "2dgs", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat"],
                         help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'cat_dropout' (cat with hash dropout during training - use --dropout_lambda), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'adaptive_zero' (cat with weighted hash vs zeros - w=0 skips hash query), 'adaptive_gate' (VQ-AD style gating: soft→STE→hard, L1 regularization toward zeros), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual), '3D' (intersection-based SH rendering), '3D_direct' (intersection-based RGB MLP), or '3D_direct_fused' (fused in-kernel MLP, no intersection buffer)")
-    parser.add_argument("--hybrid_levels", type=int, default=3,
+    parser.add_argument("--hybrid_levels", type=int, default=5,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
     parser.add_argument("--decompose_mode", type=str, default=None,
                         choices=[None, "gaussian_only", "ngp_only"],
@@ -2548,6 +2797,14 @@ if __name__ == "__main__":
                         help="Hash dropout rate for cat_dropout mode: fraction of Gaussians that don't query hash during training (0.2 = 20%% dropout)")
     parser.add_argument("--lambda_adaptive", type=float, default=0.001,
                         help="Regularization weight for adaptive mode to encourage per-Gaussian features")
+    parser.add_argument("--freeze_mlp", action="store_true",
+                        help="Freeze MLP weights (random init or from --freeze_mlp_from). Only hashgrid learns. Skips MLP weight gradient computation in CUDA.")
+    parser.add_argument("--freeze_mlp_from", type=str, default=None,
+                        help="Load frozen MLP weights from this model_path (loads ngp checkpoint's mlp_fused weights)")
+    parser.add_argument("--res_lr_scale", type=float, default=1.0,
+                        help="Scale factor for hash encoding and MLP learning rates in 3D_SH_res mode (e.g. 0.1 = 10x lower LR)")
+    parser.add_argument("--res_warmup", type=int, default=0,
+                        help="Disable hash/MLP residual for this many iterations in 3D_SH_res mode (e.g. 10000 = SH-only for first 10k iters)")
     parser.add_argument("--eval_depth", action="store_true",
                         help="Render and save depth maps (expected and median) during final evaluation")
     parser.add_argument("--use_xyz_mode", action="store_true",
@@ -2710,7 +2967,51 @@ if __name__ == "__main__":
                         help="Warmup checkpoint tag. Creates/loads warmup_checkpoint_{tag}.pth instead of warmup_checkpoint.pth. "
                              "Useful for maintaining separate warmup checkpoints for different configurations (e.g., --warmup beta).")
 
+    # GaussianSpa ADMM sparsification
+    parser.add_argument("--gspa", action="store_true",
+                        help="Enable GaussianSpa ADMM-based sparsification")
+    parser.add_argument("--gspa_rho", type=float, default=0.0005,
+                        help="ADMM penalty weight (default: 0.0005)")
+    parser.add_argument("--gspa_ratio", type=float, default=0.8,
+                        help="ADMM phase: fraction of remaining Gaussians to prune (default: 0.8)")
+    parser.add_argument("--gspa_start_iter", type=int, default=15200,
+                        help="Iteration to start ADMM sparsification (default: 15200)")
+    parser.add_argument("--gspa_stop_iter", type=int, default=25200,
+                        help="Iteration to end ADMM and hard prune (default: 25200)")
+    parser.add_argument("--gspa_interval", type=int, default=50,
+                        help="z/u update frequency during ADMM phase (default: 50)")
+    parser.add_argument("--gspa_simp_iter", type=int, default=15000,
+                        help="Phase 1: importance-based pre-pruning iteration (default: 15000)")
+    parser.add_argument("--gspa_prune_ratio1", type=float, default=0.5,
+                        help="Phase 1: fraction of Gaussians to prune by importance (default: 0.5)")
+    parser.add_argument("--gspa_imp_metric", type=str, default="indoor",
+                        help="Importance metric: 'indoor' (sum weights) or 'outdoor' (weight/area)")
+
+    # Morton z-order sorting for cache locality
+    parser.add_argument("--morton_interval", type=int, default=0,
+                        help="Apply Morton z-order sorting every N iterations (0 = disabled, recommended: 5000)")
+    parser.add_argument("--morton_end_iter", type=int, default=15000,
+                        help="Stop periodic Morton sorting after this iteration (default: 15000)")
+
+    # Contribution threshold: skip hash query when effective contribution w = T*alpha is below threshold
+    parser.add_argument("--contribution_thresh", type=float, default=0.0,
+                        help="Skip hash query when w = T*alpha < threshold, MLP runs with zero features (0.0 = disabled, try 0.01)")
+
     args = parser.parse_args(sys.argv[1:])
+
+    # Track which args were explicitly set on CLI (so yaml doesn't override them)
+    cli_args = set()
+    for action in parser._actions:
+        for opt in action.option_strings:
+            key = opt.lstrip('-').replace('-', '_')
+            if key in sys.argv[1:] or opt in sys.argv[1:]:
+                cli_args.add(action.dest)
+                break
+    # Also check positional-style: --iterations 10100 → "iterations" is action.dest
+    for i, arg in enumerate(sys.argv[1:]):
+        if arg.startswith('--'):
+            dest = arg.lstrip('-').replace('-', '_')
+            cli_args.add(dest)
 
     # --bce_solo implies --bce
     if args.bce_solo:
@@ -2785,7 +3086,7 @@ if __name__ == "__main__":
         print(f"  (Use --kernel beta for learnable beta kernel, --kernel flex for Gaussian with learnable sharpening)")
 
     cfg_model = Config(args.yaml)
-    merge_cfg_to_args(args, cfg_model)
+    merge_cfg_to_args(args, cfg_model, cli_args=cli_args)
     
     # Cold start mode: override config to enable hash_in_CUDA from start
     if args.cold:

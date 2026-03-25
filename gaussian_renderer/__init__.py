@@ -582,8 +582,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_3D_direct_sh_tc_mode = ingp is not None and hasattr(ingp, 'is_3D_direct_sh_tc_mode') and ingp.is_3D_direct_sh_tc_mode
     # 3D_SH_res mode: per-Gaussian SH + tiny hash MLP residual (diff_surfel_3D_sh_res)
     is_3D_SH_res_mode = ingp is not None and hasattr(ingp, 'is_3D_SH_res_mode') and ingp.is_3D_SH_res_mode
-    # Treat lean/fp16/tc/sh_tc/sh_res mode same as fused mode for rendering logic
-    if is_3D_direct_lean_mode or is_3D_direct_fp16_mode or is_3D_direct_tc_mode or is_3D_direct_sh_tc_mode or is_3D_SH_res_mode:
+    # 3D_SH_cat mode: per-Gaussian SH + hash+DC MLP residual (diff_surfel_3D_sh_res)
+    is_3D_SH_cat_mode = ingp is not None and hasattr(ingp, 'is_3D_SH_cat_mode') and ingp.is_3D_SH_cat_mode
+    # Treat lean/fp16/tc/sh_tc/sh_res/sh_cat mode same as fused mode for rendering logic
+    if is_3D_direct_lean_mode or is_3D_direct_fp16_mode or is_3D_direct_tc_mode or is_3D_direct_sh_tc_mode or is_3D_SH_res_mode or is_3D_SH_cat_mode:
         is_3D_direct_fused_mode = True
 
     hash_in_CUDA = True
@@ -743,16 +745,34 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             else:
                 shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
 
-        # 3D_SH_res mode: per-Gaussian SH + tiny hash MLP residual
-        # SH handles per-Gaussian view-dependent appearance (evaluated in CUDA preprocessing)
-        # Hash MLP adds view-independent spatial correction per-intersection
-        # No per-Gaussian features needed (hybrid_levels=0)
-        elif is_3D_SH_res_mode:
+        # 3D_SH_cat mode: per-Gaussian SH + hash+DC_SH MLP residual
+        # Same as 3D_SH_res but MLP input = [hash(4) | DC_SH(3) | bias(1)]
+        # DC SH (unactivated) gives per-Gaussian identity to the MLP
+        elif is_3D_SH_cat_mode:
             from diff_surfel_3D_sh_res import set_mlp_weights
 
-            # Use standard SH coefficients (NOT per-Gaussian features)
+            # Full SH for view-dependent base color (evaluated in CUDA preprocessing)
             shs = pc.get_features
-            colors_precomp = None
+
+            # DC SH for MLP input: raw SH_C0 * coeff + 0.5 (same as computeColorFromSH DC term)
+            SH_C0 = 0.28209479177387814
+            dc_sh = SH_C0 * pc.get_features[:, 0, :] + 0.5  # [N, 3]
+            colors_precomp = dc_sh.contiguous()
+
+            # Decompose mode for 3D_SH_cat:
+            #   'sh_only': zero MLP weights → residual = 0, only SH contributes
+            #   'tex_only': zero SH via rgb_override → sh_color = 0, only MLP residual contributes
+            _zero_mlp_weights = False
+            if decompose_mode == 'sh_only':
+                _zero_mlp_weights = True
+            elif decompose_mode == 'tex_only':
+                # For mode 6: SH eval goes into geomState.rgb which becomes rgb_override
+                # Zero out shs so computeColorFromSH produces 0.5, then we need true zeros...
+                # Actually for mode 6, rgb_override = geomState.rgb, so zero out shs
+                # But clamp(0 + 0.5, 0) = 0.5, not 0. Instead, set shs to produce -0.5:
+                shs = torch.zeros_like(shs)
+                # Set DC to -0.5/SH_C0 so that SH_C0 * dc + 0.5 = 0
+                shs[:, 0, :] = -0.5 / SH_C0
 
             # Hash grid setup (all levels are hash, no hybrid)
             total_levels = ingp.levels
@@ -767,16 +787,91 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 padded_offsets[:offsets.shape[0]] = offsets
                 offsets = padded_offsets
 
-            # Upload tiny MLP weights [16,16] each
-            mlp_weights = ingp.get_fused_mlp_weights()
-            if mlp_weights is not None:
-                W1, W2, W3 = mlp_weights
-                set_mlp_weights(W1, W2, W3)
+            # Upload MLP weights (zero for sh_only decomposition)
+            if _zero_mlp_weights:
+                mlp_weights = ingp.get_fused_mlp_weights()
+                if mlp_weights is not None:
+                    W1, W2, W3 = mlp_weights
+                    set_mlp_weights(torch.zeros_like(W1), torch.zeros_like(W2), torch.zeros_like(W3))
+            else:
+                mlp_weights = ingp.get_fused_mlp_weights()
+                if mlp_weights is not None:
+                    W1, W2, W3 = mlp_weights
+                    set_mlp_weights(W1, W2, W3)
 
-            render_mode = 5  # Fused in-kernel MLP
+            render_mode = 6  # 3D_SH_cat: hash+DC MLP
+            if ingp.freeze_mlp:
+                render_mode |= 0x200  # bit 9: skip MLP weight gradients in CUDA backward
 
             # One-time verification
             global _3D_DIRECT_FUSED_VERIFIED
+            if not _3D_DIRECT_FUSED_VERIFIED:
+                hash_dim = active_hashgrid_levels * ingp.level_dim
+                print(f"[3D_SH_CAT] render_mode={render_mode}, "
+                      f"SH=degree-3 (48 params), "
+                      f"hash={active_hashgrid_levels}×{ingp.level_dim}={hash_dim}D, "
+                      f"MLP input=[hash(4)|DC_SH(3)|bias(1)]=8D, "
+                      f"MLP=16→16→16→3 residual")
+                _3D_DIRECT_FUSED_VERIFIED = True
+
+            # Dimensions: no per-Gaussian features, hash only
+            gaussian_dim = 0
+            hash_dim = active_hashgrid_levels * ingp.level_dim
+            output_dim = 3  # RGB output
+            shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
+
+        # 3D_SH_res mode: per-Gaussian SH + tiny hash MLP residual
+        # SH handles per-Gaussian view-dependent appearance (evaluated in CUDA preprocessing)
+        # Hash MLP adds view-independent spatial correction per-intersection
+        # No per-Gaussian features needed (hybrid_levels=0)
+        elif is_3D_SH_res_mode:
+            from diff_surfel_3D_sh_res import set_mlp_weights
+
+            # Use standard SH coefficients (NOT per-Gaussian features)
+            shs = pc.get_features
+            colors_precomp = None
+
+            # Decompose mode for 3D_SH_res:
+            #   'sh_only': zero MLP weights → residual = 0, only SH contributes
+            #   'tex_only': colors_precomp = zeros → sh_color = 0, only MLP residual contributes
+            _zero_mlp_weights = False
+            if decompose_mode == 'sh_only':
+                _zero_mlp_weights = True
+            elif decompose_mode == 'tex_only':
+                # Pass zeros as colors_precomp and drop SH; CUDA uses colors_precomp as rgb
+                shs = None
+                colors_precomp = torch.zeros(means3D.shape[0], 3, device="cuda")
+
+            # Hash grid setup (all levels are hash, no hybrid)
+            total_levels = ingp.levels
+            active_hashgrid_levels = ingp.hashgrid_levels if not ingp.hashgrid_disabled else 0
+
+            # Encode levels: (total << 16) | (active_hashgrid << 8) | hybrid=0
+            levels = (total_levels << 16) | (active_hashgrid_levels << 8) | 0
+
+            # Pad offsets
+            if offsets.shape[0] < 17:
+                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
+                padded_offsets[:offsets.shape[0]] = offsets
+                offsets = padded_offsets
+
+            # Upload MLP weights (zero for sh_only decomposition)
+            if _zero_mlp_weights:
+                mlp_weights = ingp.get_fused_mlp_weights()
+                if mlp_weights is not None:
+                    W1, W2, W3 = mlp_weights
+                    set_mlp_weights(torch.zeros_like(W1), torch.zeros_like(W2), torch.zeros_like(W3))
+            else:
+                mlp_weights = ingp.get_fused_mlp_weights()
+                if mlp_weights is not None:
+                    W1, W2, W3 = mlp_weights
+                    set_mlp_weights(W1, W2, W3)
+
+            render_mode = 5  # Fused in-kernel MLP
+            if ingp.freeze_mlp:
+                render_mode |= 0x200  # bit 9: skip MLP weight gradients in CUDA backward
+
+            # One-time verification
             if not _3D_DIRECT_FUSED_VERIFIED:
                 hash_dim = active_hashgrid_levels * ingp.level_dim
                 print(f"[3D_SH_RES] render_mode={render_mode}, "
@@ -1181,7 +1276,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
 
     # Use SH_RES, SH_TC, TC, FP16, or lean rasterizer for fused modes
-    if is_3D_SH_res_mode and SH_RES_RASTERIZER_AVAILABLE:
+    if (is_3D_SH_res_mode or is_3D_SH_cat_mode) and SH_RES_RASTERIZER_AVAILABLE:
         rasterizer = _sh_res_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
     elif is_3D_direct_sh_tc_mode and SH_TC_RASTERIZER_AVAILABLE:
         rasterizer = _sh_tc_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)

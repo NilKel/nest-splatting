@@ -60,7 +60,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--yaml", type=str, default="tiny")
     parser.add_argument("--method", type=str, default="baseline")
-    parser.add_argument("--hybrid_levels", type=int, default=3)
+    parser.add_argument("--hybrid_levels", type=int, default=5)
     parser.add_argument("--kernel", type=str, default="gaussian")
     parser.add_argument("--fg_only", action="store_true",
                         help="Render FG only (Gaussians + main hashgrid, no BG hashgrid)")

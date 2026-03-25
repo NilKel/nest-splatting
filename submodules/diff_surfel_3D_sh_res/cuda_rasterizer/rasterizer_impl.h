@@ -42,6 +42,14 @@ namespace CudaRasterizer
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
 
+		// Separated depth sort: pre-sort Gaussians by depth, then sort expanded list by tile_id only
+		uint32_t* depth_order;          // [P] maps sorted position → original Gaussian index
+		uint32_t* depth_sort_buf1;      // [P] temp: depth keys unsorted / tiles_touched gathered
+		uint32_t* depth_sort_buf2;      // [P] temp: depth keys sorted
+		uint32_t* depth_sort_buf3;      // [P] temp: identity values
+		size_t depth_sort_size;
+		char* depth_sort_workspace;
+
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
 

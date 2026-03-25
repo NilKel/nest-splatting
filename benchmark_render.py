@@ -36,7 +36,7 @@ if __name__ == "__main__":
                                 "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", 
                                 "hybrid_SH_post", "residual_hybrid"],
                         help="Rendering method (must match training)")
-    parser.add_argument("--hybrid_levels", type=int, default=3,
+    parser.add_argument("--hybrid_levels", type=int, default=5,
                         help="Number of coarse levels (cat mode only)")
     parser.add_argument("--warmup", type=int, default=10,
                         help="Number of warmup iterations before timing")

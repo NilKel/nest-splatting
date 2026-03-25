@@ -133,6 +133,21 @@ With `--hybrid_levels 5` and 6 total levels:
 
 5. **Missing geometry gradients in 3D_direct_fused backward**: Was only writing `dL_dtransMat[6..8]` (Tw). Fixed by adding full Tu, Tv, Tw computation from cat mode reference.
 
+## 3D_SH_res Activation Combos (Experimental Log)
+
+SH_color = `computeColorFromSH()` = `clamp(SH_eval + 0.5, 0)` (standard 3DGS SH activation).
+MLP residual = identity output (unbounded, no sigmoid on MLP output layer).
+
+| # | Forward activation | Backward | Quality (chair) | Notes |
+|---|---|---|---|---|
+| 1 | `ReLU(SH) + residual` (unbounded residual) | identity for res, clamp for SH | baseline | can go negative from residual |
+| 2 | `sigmoid(ReLU(SH) + residual)` | sigmoid derivative | slightly worse than #1 | double-activation squashes range |
+| 3 | `ReLU(ReLU(SH) + residual)` | ReLU derivative on sum | doesn't work with MCMC | outer ReLU can zero SH+res |
+| 4 | `sigmoid(raw_SH + residual)` | sigmoid derivative, no SH clamp | **tested** | no ReLU anywhere |
+| 5 | `ReLU(SH) + ReLU(residual)` (current) | decoupled ReLU | **testing** | negative res zeroed, can't cancel SH |
+
+Standard 3DGS baseline (no residual): `clamp(SH_eval + 0.5, 0)` — ReLU activation.
+
 ## Current Status: 3D_direct_fused Backward
 
 ### What Works

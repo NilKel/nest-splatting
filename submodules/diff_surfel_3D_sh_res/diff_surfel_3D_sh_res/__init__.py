@@ -272,10 +272,10 @@ class _RasterizeGaussians(torch.autograd.Function):
              grad_mlp_W1, grad_mlp_W2, grad_mlp_W3
             ) = _C.rasterize_gaussians_backward(*args)
 
-        # Store MLP gradients for 3D_SH_res mode (render_mode=5)
+        # Store MLP gradients for fused MLP modes (render_mode=5 or 6)
         # These need to be retrieved by the caller and applied to MLP parameters
-        # Use mask to handle bit 8 flag (collaborative GEMM enabled)
-        if (render_mode & 0xFF) == 5:
+        # Use mask to handle bit flags (collaborative GEMM, freeze_mlp)
+        if (render_mode & 0xFF) in (5, 6):
             _RasterizeGaussians._last_mlp_grads = (
                 grad_mlp_W1, grad_mlp_W2, grad_mlp_W3
             )
@@ -385,7 +385,8 @@ class GaussianRasterizer(nn.Module):
         raster_settings = self.raster_settings
         hashgrid_settings = self.hashgrid_settings
 
-        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+        # render_mode 6 (3D_SH_cat) needs BOTH: shs for full SH eval, colors_precomp for DC SH
+        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None and (render_mode & 0xFF) != 6):
             raise Exception('Please provide excatly one of either SHs or precomputed colors!')
 
         if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
@@ -643,6 +644,10 @@ def set_mlp_weights(W1, W2, W3):
     _C.set_mlp_weights(W1.contiguous(),
                        W2.contiguous(),
                        W3.contiguous())
+
+def set_contrib_thresh(val):
+    """Set contribution threshold. Skip hash query when w = T*alpha < val (0 = disabled)."""
+    _C.set_contrib_thresh(val)
 
 def get_mlp_grads():
     """

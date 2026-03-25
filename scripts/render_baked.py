@@ -106,7 +106,8 @@ def render_baked(viewpoint_camera, gaussians, pipe, background,
 
 def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                   residual_textures, save_dir, num_warmup, num_benchmark,
-                  atlas_texture=None, atlas_rects=None, atlas_width=0):
+                  atlas_texture=None, atlas_rects=None, atlas_width=0,
+                  aabb_mode=3):
     """Render all test views, compute metrics, benchmark FPS. Save images to save_dir."""
     os.makedirs(save_dir, exist_ok=True)
 
@@ -118,7 +119,8 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                                  beta=beta, kernel_type=kernel_type,
                                  atlas_texture=atlas_texture,
                                  atlas_rects=atlas_rects,
-                                 atlas_width=atlas_width)
+                                 atlas_width=atlas_width,
+                                 aabb_mode=aabb_mode)
             rendered = result["render"]
             gt = cam.original_image[:3].cuda()
 
@@ -203,7 +205,7 @@ def main():
 
     gaussians = GaussianModel(dataset.sh_degree)
 
-    baked_dir = render_args.baked_dir or os.path.join(render_args.model_path, "baked")
+    baked_dir = render_args.baked_dir or os.path.join(render_args.model_path, "baked_atlas")
     baked_ply = os.path.join(baked_dir, "baked.ply")
 
     gaussians.load_ply(baked_ply)
@@ -277,6 +279,12 @@ def main():
     beta = cfg_model.surfel.tg_beta
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
+    # Map aabb string to int
+    aabb_str = getattr(args, 'aabb', 'rect')
+    aabb_map = {'square': 0, 'adr_only': 1, 'rect': 2, 'adr': 3, 'adr_rect': 3}
+    aabb_mode = aabb_map.get(aabb_str, 2)
+    print(f"[RENDER] aabb_mode={aabb_mode} (from '{aabb_str}')")
+
     render_dir = os.path.join(baked_dir, "renders")
     all_metrics = {}
 
@@ -289,6 +297,7 @@ def main():
         save_dir=sh_dir,
         num_warmup=render_args.num_warmup,
         num_benchmark=render_args.num_benchmark,
+        aabb_mode=aabb_mode,
     )
     all_metrics["sh_only"] = sh_metrics
     print(f"  PSNR: {sh_metrics['psnr']:.2f} dB  |  SSIM: {sh_metrics['ssim']:.4f}  |  "
@@ -309,6 +318,7 @@ def main():
             atlas_texture=atlas_texture,
             atlas_rects=atlas_rects,
             atlas_width=atlas_width,
+            aabb_mode=aabb_mode,
         )
         all_metrics[mode_name] = res_metrics
         print(f"  PSNR: {res_metrics['psnr']:.2f} dB  |  SSIM: {res_metrics['ssim']:.4f}  |  "
