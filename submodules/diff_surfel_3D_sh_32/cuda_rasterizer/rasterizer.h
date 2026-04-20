@@ -3,7 +3,7 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use
+ * This software is free for non-commercial, research and evaluation use 
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
@@ -15,6 +15,7 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include <cuda_fp16.h>
 
 namespace CudaRasterizer
 {
@@ -49,7 +50,7 @@ namespace CudaRasterizer
 			const float* transMat_precomp,
 			const float* homotrans,
 			const float* ap_level,
-			const float* hash_features,
+			const __half* hash_features,
 			const int* level_offsets,
 			const float* gridrange,
 			const float* viewmatrix,
@@ -63,8 +64,6 @@ namespace CudaRasterizer
 			int* radii = nullptr,
 			float* cover_pixels = nullptr,
 			float* trans_avg = nullptr,
-			float* max_weight = nullptr,
-			float* accum_weights = nullptr,
 			bool debug = false,
 			const float beta = 0.0,
 			const uint32_t D_diffuse = 0,
@@ -77,7 +76,11 @@ namespace CudaRasterizer
 			const int kernel_type = 0,
 			const int aabb_mode = 0,
 			const float aa = 0.0f,
-			const float aa_threshold = 0.01f);
+			const float aa_threshold = 0.01f,
+			// 3D mode intersection buffer outputs
+			float* intersection_buffer = nullptr,
+			uint32_t* intersection_count = nullptr,
+			uint32_t max_intersections_per_pixel = 0);
 
 		static void backward(
 			const int P, int D, int M, int R,
@@ -95,7 +98,7 @@ namespace CudaRasterizer
 			const float* transMat_precomp,
 			const float* homotrans,
 			const float* ap_level,
-			const float* hash_features,
+			const __half* hash_features,
 			const int* level_offsets,
 			const float* gridrange,
 			const float* viewmatrix,
@@ -133,7 +136,11 @@ namespace CudaRasterizer
 			const float* shapes = nullptr,
 			const int kernel_type = 0,
 			float* dL_dshapes = nullptr,
-			const bool detach_hash_grad = false);
+			const bool detach_hash_grad = false,
+			// MLP gradient outputs for 3D_SH_res (render_mode=5, bias-free, all [16×16])
+			float* dL_dmlp_W1 = nullptr,
+			float* dL_dmlp_W2 = nullptr,
+			float* dL_dmlp_W3 = nullptr);
 	};
 };
 

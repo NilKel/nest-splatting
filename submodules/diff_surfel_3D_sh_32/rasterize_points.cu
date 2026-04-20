@@ -164,7 +164,7 @@ RasterizeGaussiansCUDA(
     out_color = torch::full({C, H, W}, 0.0, float_opts);
   }
   
-  int out_dim = 3+3+1+1 + 3 + 3 + 1 + 1 + 1; // + w_square_sum
+  int out_dim = 3+3+1+1 + 3 + 3 + 1 + 1; // record mean_pts & appearance vis color + overdraw + max_contributor_depth
     if((has_dual_hashgrid && render_mode == 5) || (has_dual_hashgrid && render_mode == 2)) {  // surface_rgb or baseline_double mode
     // No extra channels needed - features are already in out_color
   }
@@ -388,15 +388,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   
   int M = 0;
   if(sh.size(0) != 0)
-  {
-	M = sh.size(1);
-  } else if (sh.dim() >= 2) {
-	// P=0 but SH tensor still has shape info — preserve M for gradient shape
+  {	
 	M = sh.size(1);
   }
 
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
-  torch::Tensor dL_dmeans2D = torch::zeros({P, 4}, means3D.options());
+  torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
   // For gradients, use actual input dimension from colors_precomp
   // This matches whatever was passed in (26D for adaptive_cat, 48D for residual_hybrid, etc.)
   int colors_dim = 0;
@@ -425,15 +422,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
   torch::Tensor dL_gradsum = torch::zeros({P, 1}, means3D.options());
 
-  // Kernel shape gradients: [P, 1] for beta/general/flex, [P, 2] for nexel (gamma_x, gamma_y)
-  int shape_dim = (kernel_type == 5) ? 2 : 1;
-  torch::Tensor dL_dshapes = torch::zeros({P, shape_dim}, means3D.options());
+  // Beta kernel shape gradients
+  torch::Tensor dL_dshapes = torch::zeros({P, 1}, means3D.options());
 
-  // MLP gradient buffers for 3D_SH_res mode (render_mode=5, bias-free, all [16×16])
-  // Architecture: 16D input (4D hash + 1.0 bias + 11 zero pad) -> 16 hidden -> 16 hidden -> 16 output (first 3 = RGB residual)
-  torch::Tensor dL_dmlp_W1 = torch::zeros({16, 16}, means3D.options());  // Layer 1 weights [16×16]
-  torch::Tensor dL_dmlp_W2 = torch::zeros({16, 16}, means3D.options());  // Layer 2 weights [16×16]
-  torch::Tensor dL_dmlp_W3 = torch::zeros({16, 16}, means3D.options());  // Layer 3 weights [16×16]
+  // MLP gradient buffers for 3D_SH_32 mode (render_mode=5, bias-free, all [32×32])
+  // Architecture: 32D input (hash + 1.0 bias + pad) -> 32 hidden -> 32 hidden -> 32 output (first 3 = RGB residual)
+  torch::Tensor dL_dmlp_W1 = torch::zeros({32, 32}, means3D.options());  // Layer 1 weights [32×32]
+  torch::Tensor dL_dmlp_W2 = torch::zeros({32, 32}, means3D.options());  // Layer 2 weights [32×32]
+  torch::Tensor dL_dmlp_W3 = torch::zeros({32, 32}, means3D.options());  // Layer 3 weights [32×32]
 
   if(P != 0)
   {
@@ -851,23 +847,9 @@ void SetOverdrawLambdaCUDA(float val) {
     BACKWARD::setOverdrawLambda(val);
 }
 
-void SetWeightRegLambdaCUDA(float val) {
-    FORWARD::setWeightRegLambda(val);
-    BACKWARD::setWeightRegLambda(val);
-}
-
 void SetActivationBiasCUDA(float sh_bias, float res_bias) {
     FORWARD::setActivationBias(sh_bias, res_bias);
     BACKWARD::setResBias(res_bias);
-}
-
-void SetAntiAliasCUDA(float factor, float focal) {
-    FORWARD::setAntiAlias(factor, focal);
-}
-
-void SetAaKernelSizeCUDA(float val) {
-    FORWARD::setAaKernelSize(val);
-    BACKWARD::setAaKernelSize(val);
 }
 
 // Defined in rasterizer_impl.cu

@@ -140,7 +140,7 @@ class GridEncoder(nn.Module):
         self.reset_parameters()
     
     def reset_parameters(self):
-        
+
         nn.init.kaiming_uniform_(self.embeddings)
 
 

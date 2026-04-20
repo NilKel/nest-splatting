@@ -206,17 +206,8 @@ void SetCountThreshCUDA(int val);
 // Set overdraw regularization lambda (0 = disabled)
 void SetOverdrawLambdaCUDA(float val);
 
-// Set weight-squared regularization lambda (CUDA backward gradient)
-void SetWeightRegLambdaCUDA(float val);
-
 // Set activation biases: color = ReLU(SH + sh_bias) + ReLU(residual + res_bias)
 void SetActivationBiasCUDA(float sh_bias, float res_bias);
-
-// Set Nexels-style anti-aliasing params (hash-grid down-weighting)
-void SetAntiAliasCUDA(float factor, float focal);
-
-// Set AA-2DGS mip filter kernel size σ (0 disables, typical 0.1).
-void SetAaKernelSizeCUDA(float val);
 
 // Set depth sort toggle (true = separated depth sort, false = standard sort)
 void SetDepthSortCUDA(bool val);

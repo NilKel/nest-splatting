@@ -165,9 +165,9 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
         gaussians.get_scaling, cell_size, uv_extent=uv_extent,
         max_res=max_res, min_res=min_res)
 
-    # Budget-constrain: iteratively halve max_res until atlas fits
+    # Budget-constrain: iteratively halve max_res until atlas fits (0 = unlimited)
     effective_max = max_res
-    while effective_max > min_res:
+    while atlas_budget_mb > 0 and effective_max > min_res:
         clamped = resolutions.clamp(max=effective_max)
         total_texels = (clamped.long() ** 2).sum().item()
         atlas_size_mb = total_texels * 3 * 2 / (1024 * 1024)  # FP16, 3 channels

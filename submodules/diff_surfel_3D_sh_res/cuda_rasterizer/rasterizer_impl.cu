@@ -31,6 +31,10 @@ namespace cg = cooperative_groups;
 #include "forward.h"
 #include "backward.h"
 
+// Depth sort toggle (defined in forward.cu)
+// Host-side depth sort toggle (set via SetDepthSortCUDA in rasterize_points.cu)
+bool g_depth_sort = false;
+
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
 uint32_t getHigherMsb(uint32_t n)
@@ -444,62 +448,94 @@ int CudaRasterizer::Rasterizer::forward(
 		render_mode
 	), debug)
 
-	// === Separated depth sort: sort Gaussians by depth first, then tile-bin ===
+	bool use_depth_sort = g_depth_sort;
 
-	// Step 1: Sort P Gaussians by depth (32-bit sort on P entries — much smaller than num_rendered)
-	initDepthSortKeys << <(P + 255) / 256, 256 >> > (
-		P, geomState.depths, geomState.depth_sort_buf1, geomState.depth_sort_buf3);
-	CHECK_CUDA(, debug)
-
-	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
-		geomState.depth_sort_workspace, geomState.depth_sort_size,
-		geomState.depth_sort_buf1, geomState.depth_sort_buf2,
-		geomState.depth_sort_buf3, geomState.depth_order,
-		P, 0, 32), debug)
-
-	// Step 2: Gather tiles_touched in depth-sorted order, then prefix sum
-	gatherTilesTouched << <(P + 255) / 256, 256 >> > (
-		P, geomState.tiles_touched, geomState.depth_order, geomState.depth_sort_buf1);
-	CHECK_CUDA(, debug)
-
-	// Prefix sum on gathered (depth-sorted) tiles_touched
-	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size,
-		geomState.depth_sort_buf1, geomState.point_offsets, P), debug)
-
-	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
+
+	if (use_depth_sort) {
+		// === Separated depth sort: sort Gaussians by depth first, then tile-bin ===
+
+		// Step 1: Sort P Gaussians by depth (32-bit sort on P entries — much smaller than num_rendered)
+		initDepthSortKeys << <(P + 255) / 256, 256 >> > (
+			P, geomState.depths, geomState.depth_sort_buf1, geomState.depth_sort_buf3);
+		CHECK_CUDA(, debug)
+
+		CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+			geomState.depth_sort_workspace, geomState.depth_sort_size,
+			geomState.depth_sort_buf1, geomState.depth_sort_buf2,
+			geomState.depth_sort_buf3, geomState.depth_order,
+			P, 0, 32), debug)
+
+		// Step 2: Gather tiles_touched in depth-sorted order, then prefix sum
+		gatherTilesTouched << <(P + 255) / 256, 256 >> > (
+			P, geomState.tiles_touched, geomState.depth_order, geomState.depth_sort_buf1);
+		CHECK_CUDA(, debug)
+
+		// Prefix sum on gathered (depth-sorted) tiles_touched
+		CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size,
+			geomState.depth_sort_buf1, geomState.point_offsets, P), debug)
+	} else {
+		// === Standard sort: prefix sum on tiles_touched directly ===
+		CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size,
+			geomState.tiles_touched, geomState.point_offsets, P), debug)
+	}
+
+	// Retrieve total number of Gaussian instances
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
-	// Step 3: Duplicate in depth-sorted order — entries within each tile are depth-ordered
-	// Keys contain tile_id only (upper 32 bits), no depth in lower bits
-	duplicateWithKeysSorted << <(P + 255) / 256, 256 >> > (
-		P,
-		geomState.means2D,
-		geomState.point_offsets,
-		binningState.point_list_keys_unsorted,
-		binningState.point_list_unsorted,
-		radii,
-		geomState.radii_x,
-		geomState.radii_y,
-		geomState.depth_order,
-		tile_grid)
-	CHECK_CUDA(, debug)
+	if (use_depth_sort) {
+		// Step 3: Duplicate in depth-sorted order — entries within each tile are depth-ordered
+		// Keys contain tile_id only (upper 32 bits), no depth in lower bits
+		duplicateWithKeysSorted << <(P + 255) / 256, 256 >> > (
+			P,
+			geomState.means2D,
+			geomState.point_offsets,
+			binningState.point_list_keys_unsorted,
+			binningState.point_list_unsorted,
+			radii,
+			geomState.radii_x,
+			geomState.radii_y,
+			geomState.depth_order,
+			tile_grid)
+		CHECK_CUDA(, debug)
 
-	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+		int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
-	// Step 4: Sort by tile_id only (bits [32, 32+bit]) — stable sort preserves within-tile depth order
-	// This is much faster than sorting all 32+bit bits: only ceil(bit/8) ≈ 1-2 radix passes
-	// instead of ceil((32+bit)/8) ≈ 5-6 passes on the full num_rendered entries
-	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
-		binningState.list_sorting_space,
-		binningState.sorting_size,
-		binningState.point_list_keys_unsorted, binningState.point_list_keys,
-		binningState.point_list_unsorted, binningState.point_list,
-		num_rendered, 32, 32 + bit), debug)
+		// Step 4: Sort by tile_id only (bits [32, 32+bit]) — stable sort preserves within-tile depth order
+		CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+			binningState.list_sorting_space,
+			binningState.sorting_size,
+			binningState.point_list_keys_unsorted, binningState.point_list_keys,
+			binningState.point_list_unsorted, binningState.point_list,
+			num_rendered, 32, 32 + bit), debug)
+	} else {
+		// Standard: duplicateWithKeys encodes tile_id|depth, full radix sort
+		duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+			P,
+			geomState.means2D,
+			geomState.depths,
+			geomState.point_offsets,
+			binningState.point_list_keys_unsorted,
+			binningState.point_list_unsorted,
+			radii,
+			geomState.radii_x,
+			geomState.radii_y,
+			tile_grid)
+		CHECK_CUDA(, debug)
+
+		int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+
+		CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+			binningState.list_sorting_space,
+			binningState.sorting_size,
+			binningState.point_list_keys_unsorted, binningState.point_list_keys,
+			binningState.point_list_unsorted, binningState.point_list,
+			num_rendered, 0, 32 + bit), debug)
+	}
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
@@ -558,7 +594,7 @@ int CudaRasterizer::Rasterizer::forward(
 		intersection_count,
 		max_intersections_per_pixel,
 		nullptr,  // viewdirs_enc
-		((render_mode & 0xFF) == 6) ? geomState.rgb : nullptr  // rgb_override: full SH eval for 3D_SH_cat
+		((render_mode & 0xFF) == 6) ? geomState.rgb : nullptr   // rgb_override: mode 6 needs SH colors separately from features (which has DC SH)
 		), debug)
 
 	return num_rendered;
@@ -678,7 +714,7 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dfeatures,
 		dL_dtransMat,
 		dL_dhomoMat,
-		(float3*)dL_dmean2D,
+		(float4*)dL_dmean2D,
 		dL_dnormal,
 		dL_dopacity,
 		dL_dcolor,
@@ -715,7 +751,7 @@ void CudaRasterizer::Rasterizer::backward(
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
 		(glm::vec3*)campos,
-		(float3*)dL_dmean2D, // gradient inputs
+		(float4*)dL_dmean2D, // gradient inputs
 		dL_dnormal,		     // gradient inputs
 		dL_dtransMat,
 		dL_dhomoMat,
@@ -723,5 +759,6 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dsh,
 		(glm::vec3*)dL_dmean3D,
 		(glm::vec2*)dL_dscale,
-		(glm::vec4*)dL_drot), debug)
+		(glm::vec4*)dL_drot,
+		(render_mode & 0x800) != 0), debug)
 }

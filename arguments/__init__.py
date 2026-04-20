@@ -100,6 +100,7 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
 
         self.pixel_densify_from_iter = 3000
+        self.freeze_sh = False
 
         super().__init__(parser, "Optimization Parameters")
 

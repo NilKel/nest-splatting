@@ -27,10 +27,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_contrib_thresh", &SetContribThreshCUDA);
   m.def("set_count_thresh", &SetCountThreshCUDA);
   m.def("set_overdraw_lambda", &SetOverdrawLambdaCUDA);
-  m.def("set_weight_reg_lambda", &SetWeightRegLambdaCUDA);
   m.def("set_activation_bias", &SetActivationBiasCUDA);
-  m.def("set_anti_alias", &SetAntiAliasCUDA);
-  m.def("set_aa_kernel_size", &SetAaKernelSizeCUDA);
   m.def("set_depth_sort", &SetDepthSortCUDA);
   m.def("reset_backward_profile", &ResetBackwardProfileCUDA);
   m.def("read_backward_profile", &ReadBackwardProfileCUDA);

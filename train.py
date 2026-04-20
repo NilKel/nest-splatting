@@ -76,6 +76,7 @@ from hash_encoder.modules import INGP
 from hash_encoder.config import Config
 from scene.background import LearnableSkybox, SphereHashGridBackground
 from utils.render_utils import save_img_u8, convert_gray_to_cmap, create_intersection_heatmap, create_intersection_histogram, create_flex_beta_heatmap
+from utils.mesh_reinit import tsdf_mesh_reinit
 from utils.point_utils import cam2rays
 from utils.render_utils import gsnum_trans_color
 import open3d as o3d
@@ -84,11 +85,42 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 
+
+def _colorize_max_contrib_idx(max_idx_map):
+    """Turn a per-pixel max-contributor Gaussian id map into an [H, W, 3] uint8-ready
+    float array in [0, 1] via a hash-based cyclic colormap. Pixels with no
+    contributor (id < 0) render as black.
+
+    Args:
+        max_idx_map: torch tensor of shape [1, H, W] or [H, W], integer dtype.
+    Returns:
+        numpy array [H, W, 3] in [0, 1] suitable for save_img_u8.
+    """
+    arr = max_idx_map.squeeze().detach().cpu().numpy().astype(np.int64)  # [H, W]
+    H, W = arr.shape
+    invalid = arr < 0
+    # Hash each id to a stable color via three multiplicatively-mixed primes.
+    # Clamp the negative/invalid slots before the modulo hash to keep the integer
+    # math defined; we'll black them out afterwards.
+    hashed = np.clip(arr, 0, None)
+    r = ((hashed * 2654435761) & 0xFFFFFF) / 0xFFFFFF
+    g = ((hashed * 40503 + 31) & 0xFFFFFF) / 0xFFFFFF
+    b = ((hashed * 1442695040888963407 + 11) & 0xFFFFFF) / 0xFFFFFF
+    rgb = np.stack([r, g, b], axis=-1).astype(np.float32)
+    if invalid.any():
+        rgb[invalid] = 0.0
+    return rgb
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, args):
 
     training_start_time = time.time()
 
+    # Pass mini flag to OptimizationParams so training_setup can pick SparseGaussianAdam
+    opt.mini = getattr(args, 'mini', False)
+
     testing_iterations += [opt.iterations]
+    testing_iterations += [1]  # Also evaluate at first iteration for debugging
     saving_iterations += [opt.iterations]
 
     test_psnr = []
@@ -110,6 +142,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     # Set kernel type for beta kernel support
     gaussians.kernel_type = args.kernel
+    # Set densification gradient mode (vanilla = signed, abs = AbsGS)
+    gaussians.use_absgs = (args.grads == "abs")
 
     # Check for warmup checkpoint in data directory
     # If --warmup tag is specified, use warmup_checkpoint_{tag}.pth
@@ -127,7 +161,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("  Skipping 2DGS warmup phase and all checkpoint loading")
         print("  Training Nest representation from scratch with hash_in_CUDA=True")
         print("="*70 + "\n")
-        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max, full_args=args)
+        mini_res_scales = [1.0, 0.5] if (args.mini and args.mini_warmup) else [1.0]
+        scene = Scene(dataset, gaussians, resolution_scales=mini_res_scales,
+                      mcmc_fps=(args.mcmc_fps and not args.init_ply),
+                      cap_max=args.cap_max, full_args=args)
+
+        # Override initialization with external PLY (same logic as else branch)
+        if args.init_ply:
+            print(f"\n[INIT_PLY] Loading Gaussians from: {args.init_ply}")
+            gaussians.load_ply(args.init_ply, args=args)
+            n_gs = len(gaussians.get_xyz)
+            print(f"[INIT_PLY] Loaded {n_gs} Gaussians, SH degree={gaussians.active_sh_degree}")
+            if args.mcmc or args.mcmc_fps or args.mcmc_deficit:
+                print(f"[INIT_PLY] cap_max: {args.cap_max} → {max(args.cap_max, n_gs)}")
+                args.cap_max = max(args.cap_max, n_gs)
+            gaussians._appearance_level = nn.Parameter(
+                torch.ones(n_gs, 1, device="cuda") * 24, requires_grad=False)
+            if hasattr(args, 'method') and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
+                gaussians._gaussian_feat_dim = 0
+                gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            gaussians.max_radii2D = torch.zeros(n_gs, device="cuda")
+            print(f"[INIT_PLY] Using loaded geometry + SH as initialization\n")
 
         # Initialize flex kernel per-Gaussian beta parameter (if using flex kernel)
         if args.kernel == "flex":
@@ -380,52 +434,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"[3D_DIRECT MODE] Hashgrid features (fine): {num_levels - args.hybrid_levels} × {per_level_dim} = {(num_levels - args.hybrid_levels) * per_level_dim}D")
             print(f"[3D_DIRECT MODE] Max intersections per pixel: {args.max_intersections_per_pixel}")
 
-        elif args.method == "3D_SH_res":
-            # 3D_SH_res: per-Gaussian SH + tiny hash MLP residual
-            # No per-Gaussian features needed — standard SH handles per-Gaussian appearance
+        elif args.method == "3D_SH_32":
+            # 3D_SH_32: per-Gaussian SH + 32-dim hash MLP residual
+            # Same as 3D_SH_res but with 32-dim hidden MLP
             gaussians._gaussian_feat_dim = 0
             gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
-            # Reinitialize SH to cancel the +0.5 bias in computeColorFromSH
-            # DC = -0.5/SH_C0 → SH_C0 * DC + 0.5 = 0 → clamp(0, 0) = 0 (black baseline)
-            # This lets the hashgrid+MLP learn full appearance from scratch
-            SH_C0 = 0.28209479177387814
+            num_levels = cfg_model.encoding.levels
+            per_level_dim = cfg_model.encoding.hashgrid.dim
             n_gaussians = len(gaussians.get_xyz)
-            features_dc = torch.full((n_gaussians, 1, 3), -0.5 / SH_C0, device="cuda").float()
-            gaussians._features_dc = nn.Parameter(features_dc.requires_grad_(True))
-            features_rest = torch.zeros((n_gaussians, 15, 3), device="cuda").float()
-            gaussians._features_rest = nn.Parameter(features_rest.requires_grad_(True))
-            gaussians.active_sh_degree = 0
+            print(f"[3D_SH_32 MODE] Initialized {n_gaussians} Gaussians")
+            print(f"[3D_SH_32 MODE] Per-Gaussian: standard SH (degree-3, 48 params)")
+            print(f"[3D_SH_32 MODE] Hash levels: {num_levels}, {per_level_dim}D per level")
+            print(f"[3D_SH_32 MODE] MLP: 32D → 32D → 32D → 3D (RGB residual, identity)")
 
-            # Freeze SH for first 1k iterations so hashgrid+MLP can learn first
-            sh_freeze_until = first_iter + 1000
-            gaussians._sh_freeze_until = sh_freeze_until
+        elif args.method == "3D_SH_res":
+            # 3D_SH_res: per-Gaussian SH + tiny hash MLP residual
+            # No per-Gaussian features needed — standard SH handles per-Gaussian appearance
+            # SH is kept from warmup checkpoint (or point cloud init) — not reinitialized
+            gaussians._gaussian_feat_dim = 0
+            gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
             num_levels = cfg_model.encoding.levels
             per_level_dim = cfg_model.encoding.hashgrid.dim
-            print(f"[3D_SH_RES MODE] Initialized {n_gaussians} Gaussians with fresh SH (degree 0 → 3)")
-            print(f"[3D_SH_RES MODE] SH frozen until iteration {sh_freeze_until} (hashgrid trains first)")
+            n_gaussians = len(gaussians.get_xyz)
+            print(f"[3D_SH_RES MODE] Initialized {n_gaussians} Gaussians")
+            print(f"[3D_SH_RES MODE] Per-Gaussian: standard SH (degree-3, 48 params)")
             print(f"[3D_SH_RES MODE] Hash levels: {num_levels}, {per_level_dim}D per level")
             print(f"[3D_SH_RES MODE] MLP: 16D → 16D → 16D → 3D (RGB residual, identity)")
 
         elif args.method == "3D_SH_cat":
             # 3D_SH_cat: per-Gaussian SH + hash+DC MLP residual
             # Same as 3D_SH_res but MLP input includes DC SH for per-Gaussian identity
+            # SH is kept from warmup checkpoint (or point cloud init) — not reinitialized
             gaussians._gaussian_feat_dim = 0
             gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
-            # Reinitialize SH to cancel the +0.5 bias in computeColorFromSH
-            SH_C0 = 0.28209479177387814
-            n_gaussians = len(gaussians.get_xyz)
-            features_dc = torch.full((n_gaussians, 1, 3), -0.5 / SH_C0, device="cuda").float()
-            gaussians._features_dc = nn.Parameter(features_dc.requires_grad_(True))
-            features_rest = torch.zeros((n_gaussians, 15, 3), device="cuda").float()
-            gaussians._features_rest = nn.Parameter(features_rest.requires_grad_(True))
-            gaussians.active_sh_degree = 0
-
             num_levels = cfg_model.encoding.levels
             per_level_dim = cfg_model.encoding.hashgrid.dim
-            print(f"[3D_SH_CAT MODE] Initialized {n_gaussians} Gaussians with fresh SH (degree 0 → 3)")
+            n_gaussians = len(gaussians.get_xyz)
+            print(f"[3D_SH_CAT MODE] Initialized {n_gaussians} Gaussians")
+            print(f"[3D_SH_CAT MODE] Per-Gaussian: standard SH (degree-3, 48 params)")
             print(f"[3D_SH_CAT MODE] Hash levels: {num_levels}, {per_level_dim}D per level")
             print(f"[3D_SH_CAT MODE] MLP input: [hash(4)|DC_SH(3)|bias(1)]=8D → 16D → 16D → 3D (RGB residual)")
 
@@ -598,7 +647,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Load optimizer state from warmup checkpoint
         # Skip if method/kernel adds new params not in saved state (they train from scratch)
         # Also skip if param group counts don't match (checkpoint from different config)
-        skip_methods = ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat"]
+        skip_methods = ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat", "3D_SH_32"]
         if args.method not in skip_methods and args.kernel == "gaussian":
             ckpt_groups = len(ckpt['optimizer_state']['param_groups'])
             cur_groups = len(gaussians.optimizer.param_groups)
@@ -639,7 +688,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print("="*70 + "\n")
     else:
         # Normal initialization - train from scratch
-        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max, full_args=args)
+        mini_res_scales = [1.0, 0.5] if (args.mini and args.mini_warmup) else [1.0]
+        # Skip mcmc_fps subsampling when init_ply is provided (we'll load our own points)
+        scene = Scene(dataset, gaussians, resolution_scales=mini_res_scales,
+                      mcmc_fps=(args.mcmc_fps and not args.init_ply),
+                      cap_max=args.cap_max, full_args=args)
+
+        # Override initialization with external PLY
+        if args.init_ply:
+            print(f"\n[INIT_PLY] Loading Gaussians from: {args.init_ply}")
+            gaussians.load_ply(args.init_ply, args=args)
+            n_gs = len(gaussians.get_xyz)
+            print(f"[INIT_PLY] Loaded {n_gs} Gaussians, SH degree={gaussians.active_sh_degree}")
+
+            # Override cap_max to match loaded PLY if user didn't set a specific value
+            if args.mcmc or args.mcmc_fps or args.mcmc_deficit:
+                print(f"[INIT_PLY] cap_max: {args.cap_max} → {max(args.cap_max, n_gs)} (at least loaded PLY count)")
+                args.cap_max = max(args.cap_max, n_gs)
+
+            # Ensure ap_level is 24
+            gaussians._appearance_level = nn.Parameter(
+                torch.ones(n_gs, 1, device="cuda") * 24, requires_grad=False)
+
+            # Re-initialize per-Gaussian features for the target method
+            if hasattr(args, 'method') and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
+                gaussians._gaussian_feat_dim = 0
+                gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            elif hasattr(args, 'method') and args.method in ["cat"] and hasattr(args, 'hybrid_levels'):
+                per_level_dim = 4
+                gaussians._gaussian_feat_dim = args.hybrid_levels * per_level_dim
+                if hasattr(gaussians, '_gaussian_features') and gaussians._gaussian_features.numel() > 0 and gaussians._gaussian_features.shape[1] == gaussians._gaussian_feat_dim:
+                    print(f"[INIT_PLY] Keeping existing per-Gaussian features ({gaussians._gaussian_feat_dim}D)")
+                else:
+                    gaussians._gaussian_features = nn.Parameter(
+                        torch.randn(n_gs, gaussians._gaussian_feat_dim, device="cuda") * 0.01)
+                    print(f"[INIT_PLY] Re-initialized per-Gaussian features ({gaussians._gaussian_feat_dim}D)")
+
+            # Reset accumulators for new Gaussian count
+            gaussians.max_radii2D = torch.zeros(n_gs, device="cuda")
+
+            print(f"[INIT_PLY] Using loaded geometry + SH as initialization\n")
 
         # Initialize flex kernel per-Gaussian beta parameter (if using flex kernel)
         if args.kernel == "flex":
@@ -698,8 +786,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     # Random background mode: use black BG until 10k iters, then random uniform background until 20k, then black again
     use_random_bg = args.random_background
-    random_bg_start_iter = 10000
-    random_bg_end_iter = 12000
+    random_bg_start_iter = 0
+    random_bg_end_iter = 14000
     if use_random_bg:
         print(f"Using black background until iteration {random_bg_start_iter}, then random uniform background until {random_bg_end_iter}, then black background (eval will use black background)")
 
@@ -716,15 +804,72 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
+    mini_sh_unfreeze_iter = 0  # Set by depth reinit to temporarily freeze SH
+    mini_last_visibility = None  # MSv2: visibility mask for SparseGaussianAdam
+    minimc_noise_disabled_until = 0  # MiniMC: disable MCMC noise after depth reinit
+
     ingp_model = None
     if cfg_model.settings.if_ingp and args.method != "2dgs":
         ingp_model = INGP(cfg_model, args=args).to('cuda')
 
     # Set hash query transmittance threshold (skip hash+MLP when T < threshold)
-    if args.contribution_thresh > 0.0 and args.method in ["3D_SH_res", "3D_SH_cat"]:
-        from diff_surfel_3D_sh_res import set_contrib_thresh
+    if args.contribution_thresh > 0.0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
+        if args.method == "3D_SH_32":
+            from diff_surfel_3D_sh_32 import set_contrib_thresh
+        else:
+            from diff_surfel_3D_sh_res import set_contrib_thresh
         set_contrib_thresh(args.contribution_thresh)
         print(f"[CONTRIB_THRESH] Skipping hash query when w = T*alpha < {args.contribution_thresh}")
+
+    if args.count_thresh > 0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
+        if args.method == "3D_SH_32":
+            from diff_surfel_3D_sh_32 import set_count_thresh
+        else:
+            from diff_surfel_3D_sh_res import set_count_thresh
+        set_count_thresh(args.count_thresh)
+        print(f"[COUNT_THRESH] Skipping hash query after {args.count_thresh} contributing Gaussians per pixel")
+
+    if args.overdraw_reg > 0.0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
+        if args.method == "3D_SH_32":
+            from diff_surfel_3D_sh_32 import set_overdraw_lambda
+        else:
+            from diff_surfel_3D_sh_res import set_overdraw_lambda
+        set_overdraw_lambda(args.overdraw_reg)
+        print(f"[OVERDRAW_REG] Overdraw regularization lambda = {args.overdraw_reg}")
+
+    if args.weight_reg > 0.0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
+        if args.method == "3D_SH_32":
+            from diff_surfel_3D_sh_32 import set_weight_reg_lambda
+        else:
+            from diff_surfel_3D_sh_res import set_weight_reg_lambda
+        set_weight_reg_lambda(args.weight_reg)
+        print(f"[WEIGHT_REG] Weight-squared regularization lambda = {args.weight_reg} (CUDA gradient)")
+
+    if args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
+        if args.method == "3D_SH_32":
+            from diff_surfel_3D_sh_32 import set_activation_bias
+        else:
+            from diff_surfel_3D_sh_res import set_activation_bias
+        _sh_bias, _res_bias = args.activation_bias
+        set_activation_bias(sh_bias=_sh_bias, res_bias=_res_bias)
+        from gaussian_renderer import set_default_activation_bias
+        set_default_activation_bias(_sh_bias, _res_bias)
+        print(f"[ACTIVATION_BIAS] SH bias={_sh_bias}, residual bias={_res_bias}")
+
+    if args.depth_sort and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
+        if args.method == "3D_SH_32":
+            from diff_surfel_3D_sh_32 import set_depth_sort
+        else:
+            from diff_surfel_3D_sh_res import set_depth_sort
+        set_depth_sort(True)
+        print(f"[DEPTH_SORT] Using separated depth sort")
+
+    if args.aa_2dgs > 0.0 and args.method == "3D_SH_res":
+        from diff_surfel_3D_sh_res import set_aa_kernel_size
+        set_aa_kernel_size(args.aa_2dgs)
+        print(f"[AA-2DGS] Jacobian mip-filter kernel σ = {args.aa_2dgs} (3D_SH_res standard Gaussian path)")
+    elif args.aa_2dgs > 0.0:
+        raise RuntimeError(f"--aa_2dgs is only supported for --method 3D_SH_res, got {args.method}")
 
     # Initialize learnable skybox for background modeling
     skybox = None
@@ -795,15 +940,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         actual_beta = torch.sigmoid(torch.tensor(raw_shape)).item() * 5.0
         print(f"[BETA KERNEL] Shape frozen at β={actual_beta:.3f} (raw={raw_shape:.3f}, requires_grad=False)")
 
+    if args.sh_freeze_iter > 0:
+        print(f"[SH_FREEZE] SH parameters (f_dc, f_rest) frozen for first {args.sh_freeze_iter} iterations")
+
     for iteration in range(first_iter, opt.iterations + 1):
 
         iter_start.record()
 
-        # LR schedule: reset to "iteration 5000" after GSPA Phase 1 pruning
-        if args.gspa and iteration >= args.gspa_simp_iter:
+        # LR schedule: reset to "iteration 5000" after GSPA Phase 1 pruning.
+        # Under --minispa, Phase 1 is skipped (silhouette reinit serves that role)
+        # and the reinit itself calls reset_xyz_lr_schedule — don't double-shift.
+        if args.gspa and iteration >= args.gspa_simp_iter and not args.minispa:
             gaussians.update_learning_rate(iteration - args.gspa_simp_iter + 5000)
         else:
             gaussians.update_learning_rate(iteration)
+
+        # Freeze/unfreeze SH learning rates
+        if args.sh_freeze_iter > 0:
+            if iteration <= args.sh_freeze_iter:
+                for param_group in gaussians.optimizer.param_groups:
+                    if param_group["name"] in ["f_dc", "f_rest"]:
+                        if iteration == 1:
+                            param_group["_saved_lr"] = param_group["lr"]
+                        param_group["lr"] = 0.0
+            elif iteration == args.sh_freeze_iter + 1:
+                for param_group in gaussians.optimizer.param_groups:
+                    if param_group["name"] in ["f_dc", "f_rest"] and "_saved_lr" in param_group:
+                        param_group["lr"] = param_group["_saved_lr"]
+                        print(f"\n[SH_UNFREEZE] Unfreezing {param_group['name']} at iter {iteration}, lr={param_group['lr']:.6f}")
 
         opacity_reset_interval = opt.opacity_reset_interval
         densification_interval = opt.densification_interval
@@ -838,12 +1002,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if ingp is not None:
             # 3D_SH_res warmup: disable hash/MLP for first N iterations
-            if args.res_warmup > 0 and args.method in ["3D_SH_res", "3D_SH_cat"] and iteration < args.res_warmup:
+            if args.res_warmup > 0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"] and iteration < args.res_warmup:
                 ingp.hashgrid_disabled = True
                 optim_ngp = False
                 optim_gaussian = True
             else:
-                if args.res_warmup > 0 and args.method in ["3D_SH_res", "3D_SH_cat"] and iteration == args.res_warmup:
+                if args.res_warmup > 0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"] and iteration == args.res_warmup:
                     ingp.hashgrid_disabled = False
                     tqdm.write(f"[3D_SH_RES] Enabling hash/MLP residual at iteration {iteration}")
 
@@ -857,19 +1021,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.base_opacity += surfel_cfg.tg_base_alpha / update_times
                 beta += surfel_cfg.tg_beta / update_times
 
+        # Unfreeze SH after depth reinit grace period
+        if mini_sh_unfreeze_iter > 0 and iteration == mini_sh_unfreeze_iter:
+            for pg in gaussians.optimizer.param_groups:
+                if pg["name"] == "f_dc":
+                    pg["lr"] = opt.feature_lr
+                elif pg["name"] == "f_rest":
+                    pg["lr"] = opt.feature_lr / 20.0
+            mini_sh_unfreeze_iter = 0
+            tqdm.write(f"[MINI] Unfroze SH at iter {iteration}")
+
         # Every 1000 its we increase the levels of SH up to a maximum degree
         # When GSPA is active, delay SH increases until after Phase 1 (importance pruning)
-        # When SH is frozen (3D_SH_res warmup), delay SH increases until unfrozen
-        sh_frozen = hasattr(gaussians, '_sh_freeze_until') and iteration < gaussians._sh_freeze_until
-        if hasattr(gaussians, '_sh_freeze_until') and iteration == gaussians._sh_freeze_until:
-            tqdm.write(f"[3D_SH_RES] SH unfrozen at iteration {iteration}, enabling SH optimization")
-        if iteration % 1000 == 0 and (not args.gspa or iteration > args.gspa_simp_iter) and not sh_frozen:
+        # When sh_freeze_iter is set, delay SH increases until after unfreeze
+        # When --mini is active, lock SH at degree 0 until simp1 (matches MSv2 paper)
+        sh_base_iter = max(args.sh_freeze_iter, args.gspa_simp_iter if args.gspa else 0)
+        if iteration > sh_base_iter and (iteration - sh_base_iter) % 1000 == 0:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        # Mini warmup: alternate between 0.5x and 1.0x resolution until simp1
+        if args.mini and args.mini_warmup and iteration < args.mini_simp_iter1:
+            warmup_scale = [1.0, 0.5][iteration % 2]
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras(scale=warmup_scale).copy()
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        else:
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         record_transmittance = if_pixel_densify_enhance & (iteration >= opt.pixel_densify_from_iter) & (iteration < opt.densify_until_iter)
         
@@ -903,7 +1083,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         active_bg_hashgrid = bg_hashgrid if (bg_hashgrid is not None and iteration >= bg_start_iter) else None
 
         # Debug: verify SH is zero on first iteration for 3D_SH_res
-        if iteration == first_iter + 1 and args.method in ["3D_SH_res", "3D_SH_cat"]:
+        if iteration == first_iter + 1 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
             dc_norm = gaussians._features_dc.data.abs().max().item()
             rest_norm = gaussians._features_rest.data.abs().max().item()
             print(f"[DEBUG] First iter SH check: DC max={dc_norm:.6f}, REST max={rest_norm:.6f}, "
@@ -921,14 +1101,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             dropout_lambda = args.dropout_lambda, is_training = True, aabb_mode = args.aabb,
             aa = args.aa, aa_threshold = args.aa_threshold, skybox = active_skybox,
             background_mode = background_mode, bg_hashgrid = active_bg_hashgrid,
-            detach_hash_grad = args.detach_hash_grad, max_intersections_per_pixel = args.max_intersections_per_pixel)
+            detach_hash_grad = args.detach_hash_grad, max_intersections_per_pixel = args.max_intersections_per_pixel,
+            lowpass = args.lowpass, pixel_center = args.pixel_center,
+            antialiasing = args.antialiasing, sv_metric = args.sv_metric)
 
         if iteration % 500 == 0:
             torch.cuda.synchronize()
             _t_fwd_end = time.time()
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        
+
+        # MSv2 SparseGaussianAdam: track visibility for sparse optimizer step
+        if args.mini:
+            mini_last_visibility = radii > 0
+
         gt_image = viewpoint_cam.original_image.cuda()
         
         # Apply random background for unbiased opacity training
@@ -1014,7 +1200,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         mask_loss = lambda_mask * mask_error
 
         normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
-        normal_loss = lambda_normal * (normal_error).mean()
+        if args.w_normal > 0.0 and iteration > cfg_model.loss.normal_iter:
+            # Weighted normal consistency: relax where RGB error is high
+            mse_per_pixel_n = ((image - gt_image) ** 2).mean(dim=0, keepdim=True).detach()
+            w_n = torch.exp(-args.w_normal_gamma * mse_per_pixel_n)
+            normal_loss = args.w_normal * (w_n * normal_error).mean()
+        else:
+            normal_loss = lambda_normal * (normal_error).mean()
         dist_loss = lambda_dist * (rend_dist).mean()
 
         # Adaptive mode: regularization to encourage per-Gaussian features
@@ -1047,14 +1239,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Regularize ACTIVATED values (after sigmoid/exp) - following 3dgrut MCMC implementation
         mcmc_opacity_reg = torch.tensor(0.0, device="cuda")
         mcmc_scale_reg = torch.tensor(0.0, device="cuda")
-        bce_phase_active = args.bce and iteration > (opt.iterations - args.bce_iter)
-        if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
-            # If --bce_solo, skip MCMC regularization during BCE phase to let BCE work alone
-            if not (args.bce_solo and bce_phase_active):
-                # Regularize activated opacity (after sigmoid) to encourage low opacity -> sparsity
+        bce_start_iter = opt.iterations - args.bce_iter
+        bce_phase_active = args.bce and iteration > bce_start_iter
+        # Adaptive BCE: compute opacity statistic at BCE start and use as decision boundary
+        if (args.bce_solo_adaptive or args.bce_adaptive) and iteration == bce_start_iter + 1:
+            with torch.no_grad():
+                opacities = gaussians.get_opacity.squeeze()
+                if args.bce_adaptive_stat == "mean":
+                    threshold = opacities.mean().item()
+                else:
+                    threshold = opacities.median().item()
+            args._bce_adaptive_threshold = threshold
+            print(f"\n[BCE_ADAPTIVE] Setting threshold to {args.bce_adaptive_stat} opacity: {threshold:.4f}")
+        # If --bce_solo, skip opacity/scale regularization during BCE phase to let BCE work alone
+        if not (args.bce_solo and bce_phase_active):
+            if args.opacity_reg > 0:
                 mcmc_opacity_reg = args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
-                # Regularize activated scale (after exp) to encourage small scales -> compact Gaussians
+            if args.scale_reg > 0:
                 mcmc_scale_reg = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
+
+        # --feature voronoi: L1 loss on SV colors (sparsification) to match sphericalvoronoi reference
+        sv_l1_loss = torch.tensor(0.0, device="cuda")
+        if args.feature == "voronoi" and args.sv_l1 > 0 and gaussians._sv_colors.numel() > 0:
+            sv_l1_loss = args.sv_l1 * gaussians._sv_colors.abs().sum(dim=-1).mean()
 
         # Adaptive_cat entropy regularization - encourage binary blend weights (0 or 1)
         adaptive_cat_reg_loss = torch.tensor(0.0, device="cuda")
@@ -1118,14 +1325,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # BCE opacity regularization - encourage binary opacity (0 or 1) to reduce foggy Gaussians
         # Applied only in the last bce_iter iterations
         bce_opacity_loss = torch.tensor(0.0, device="cuda")
-        if args.bce and iteration > (opt.iterations - args.bce_iter):
+        if args.bce and iteration > bce_start_iter:
             # Get activated opacity (after sigmoid, in [0, 1])
             opacity = gaussians.get_opacity.squeeze()  # (N,)
             eps = 1e-7
-            # BCE with target=opacity encourages opacity to be 0 or 1
-            # BCE(p, p) = -p*log(p) - (1-p)*log(1-p) = entropy
-            # This is minimized when p is 0 or 1
-            bce = -(opacity * torch.log(opacity + eps) + (1 - opacity) * torch.log(1 - opacity + eps))
+            # Adaptive threshold: use mean opacity computed at BCE start as decision boundary
+            # Standard (t=0.5): entropy H(p) = -p*log(p) - (1-p)*log(1-p), pushes toward 0 or 1
+            # Adaptive: t = mean opacity, used as decision boundary (not target!)
+            #   opacity > t → target=1 (push up), opacity < t → target=0 (push down)
+            t = getattr(args, '_bce_adaptive_threshold', 0.5)
+            if t == 0.5:
+                # Standard entropy: symmetric, self-targeting
+                bce = -(opacity * torch.log(opacity + eps) + (1 - opacity) * torch.log(1 - opacity + eps))
+            else:
+                # Adaptive: hard-assign targets based on threshold
+                target = (opacity > t).float().detach()
+                bce = -(target * torch.log(opacity + eps) + (1 - target) * torch.log(1 - opacity + eps))
             bce_opacity_loss = args.bce_lambda * bce.mean()
 
         # Beta kernel shape regularization - encourage shapes toward 0 (hard flat disks)
@@ -1172,13 +1387,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if args.l1_hash > 0 and ingp is not None and hasattr(ingp, 'hash_encoding') and ingp.hash_encoding is not None:
             l1_hash_loss = args.l1_hash * torch.abs(ingp.hash_encoding.embeddings).mean()
 
+        # L1 regularization on higher-order SH (features_rest) — keep SH low-frequency,
+        # force hashgrid to learn high-frequency spatial detail
+        l1_sh_rest_loss = torch.tensor(0.0, device="cuda")
+        if args.l1_sh_rest > 0:
+            l1_sh_rest_loss = args.l1_sh_rest * torch.abs(gaussians._features_rest).mean()
+
         # GaussianSpa ADMM sparsification loss (only on z/u update iterations, matching paper)
         gspa_loss = torch.tensor(0.0, device="cuda")
         if args.gspa and optimizing_spa is not None and iteration > args.gspa_start_iter and iteration <= args.gspa_stop_iter and iteration % args.gspa_interval == 0:
             gspa_loss = optimizing_spa.compute_spa_loss()
 
+        # Weighted overdraw regularization: error-guided relaxation
+        # w(r) = exp(-gamma * MSE(r)), penalty relaxed where RGB error is high
+        w_overdraw_loss = torch.tensor(0.0, device="cuda")
+        if args.w_overdraw_reg > 0.0:
+            od_map = render_pkg.get('render_overdraw')
+            if od_map is not None and od_map.numel() > 0:
+                # Per-pixel MSE (detached — no gradients through the weight)
+                mse_per_pixel = ((image - gt_image) ** 2).mean(dim=0, keepdim=True).detach()  # [1, H, W]
+                w_r = torch.exp(-args.w_overdraw_gamma * mse_per_pixel)  # [1, H, W]
+                w_overdraw_loss = args.w_overdraw_reg * (w_r * od_map).mean()
+
+        # Weight-squared regularization: penalize (1 - sum(w_i^2)) per pixel
+        # --weight_reg: CUDA backward handles gradient with fixed lambda
+        # --w_weight_reg: dynamically adjusts CUDA lambda based on mean reconstruction error
+        #   High error → low lambda (relax regularization), low error → full lambda
+        if args.w_weight_reg > 0.0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
+            avg_mse = ((image - gt_image) ** 2).mean().detach().item()
+            effective_lambda = args.w_weight_reg * float(np.exp(-args.w_weight_gamma * avg_mse))
+            if args.method == "3D_SH_32":
+                from diff_surfel_3D_sh_32 import set_weight_reg_lambda
+            else:
+                from diff_surfel_3D_sh_res import set_weight_reg_lambda
+            set_weight_reg_lambda(effective_lambda)
+
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss + gspa_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss + l1_sh_rest_loss + gspa_loss + w_overdraw_loss + sv_l1_loss
+
+        # --minimc per-step error accumulation: BENCHED.
+        # Replaced by the full-view sweep inside `minimc_sweep_and_relocate`,
+        # which is dispatched once per `--minimc_relocate_interval`.
 
         # DEBUG: print loss components before backward
         if iteration % 500 == 0:
@@ -1196,7 +1445,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Skip when freeze_mlp is active (no weight gradients computed)
         if ingp is not None and hasattr(ingp, 'is_3D_direct_fused_mode') and ingp.is_3D_direct_fused_mode and not ingp.freeze_mlp:
             # Import from appropriate library based on mode
-            if (hasattr(ingp, 'is_3D_SH_res_mode') and ingp.is_3D_SH_res_mode) or \
+            if hasattr(ingp, 'is_3D_SH_32_mode') and ingp.is_3D_SH_32_mode:
+                from diff_surfel_3D_sh_32 import get_mlp_grads
+            elif (hasattr(ingp, 'is_3D_SH_res_mode') and ingp.is_3D_SH_res_mode) or \
                (hasattr(ingp, 'is_3D_SH_cat_mode') and ingp.is_3D_SH_cat_mode):
                 from diff_surfel_3D_sh_res import get_mlp_grads
             elif hasattr(ingp, 'is_3D_direct_sh_tc_mode') and ingp.is_3D_direct_sh_tc_mode:
@@ -1214,6 +1465,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 grad_W1, grad_W2, grad_W3 = mlp_grads
                 # Trim WMMA-padded gradients back to PyTorch MLP dimensions
                 # 3D_SH_res: all [16,16] — no trimming needed (PyTorch MLP matches CUDA)
+                # 3D_SH_32: all [32,32] — no trimming needed (PyTorch MLP matches CUDA)
                 if hasattr(ingp, 'is_3D_direct_sh_tc_mode') and ingp.is_3D_direct_sh_tc_mode:
                     grad_W1 = grad_W1[:, :25]  # [32, 32] -> [32, 25]
                     # W3 is [48, 32] — no trimming needed (all 48 SH coefficients used)
@@ -1260,8 +1512,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ema_mcmc_loss_for_log = 0.4 * mcmc_total + 0.6 * ema_mcmc_loss_for_log
 
             if iteration % 10 == 0:
-                # For MCMC, show alive Gaussians (opacity > 0.005) instead of total
-                if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
+                # For MCMC / MiniMC, show alive Gaussians (opacity > 0.005) instead of total
+                if args.mcmc or args.mcmc_deficit or args.mcmc_fps or args.minimc:
                     n_alive = (gaussians.get_opacity > 0.005).sum().item()
                     points_str = f"{int(n_alive)}/{len(gaussians.get_xyz)}"
                 else:
@@ -1271,13 +1523,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "Points": points_str,
                 }
-                # Add MCMC loss to progress bar if enabled (hide during BCE solo phase)
-                if (args.mcmc or args.mcmc_deficit or args.mcmc_fps) and not (args.bce_solo and bce_phase_active):
+                # Add opacity/scale regularization to progress bar if active
+                if args.opacity_reg > 0:
                     loss_dict["OpR"] = f"{mcmc_opacity_reg.item():.{5}f}"
+                if args.scale_reg > 0:
                     loss_dict["ScR"] = f"{mcmc_scale_reg.item():.{5}f}"
                 # Add BCE phase indicator to progress bar
                 if bce_phase_active:
-                    loss_dict["BCE"] = "ON"
+                    t = getattr(args, '_bce_adaptive_threshold', 0.5)
+                    loss_dict["BCE"] = f"t={t:.2f}"
                 # Add adaptive_cat metrics to progress bar
                 if args.method == "adaptive_cat" and hasattr(gaussians, '_adaptive_cat_weight') and gaussians._adaptive_cat_weight.numel() > 0:
                     weights = torch.sigmoid(gaussians._adaptive_cat_weight)
@@ -1307,7 +1561,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         loss_dict["Spr"] = f"{adaptive_gate_reg_loss.item():.{5}f}"
                 # Add BCE opacity loss to progress bar if active
                 if args.bce and bce_opacity_loss.item() > 0:
-                    loss_dict["BCE"] = f"{bce_opacity_loss.item():.{5}f}"
+                    t = getattr(args, '_bce_adaptive_threshold', 0.5)
+                    loss_dict["BCE"] = f"{bce_opacity_loss.item():.5f}(t={t:.2f})"
                 # Add beta kernel shape stats to progress bar (always show when using beta/beta_scaled kernel)
                 if args.kernel in ["beta", "beta_scaled"]:
                     loss_dict["ShR"] = f"{shape_reg_loss.item():.5f}"
@@ -1321,6 +1576,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         beta_vals = gaussians.get_flex_beta
                         loss_dict["Fxβ"] = f"{beta_vals.mean().item():.2f}"
                 # Add general kernel beta stats to progress bar
+                if args.w_normal > 0.0 and normal_loss.item() > 0:
+                    loss_dict["wN"] = f"{normal_loss.item():.5f}"
+                if args.overdraw_reg > 0.0:
+                    od_map = render_pkg.get('render_overdraw')
+                    if od_map is not None:
+                        loss_dict["OD"] = f"{od_map.mean().item():.1f}"
+                if args.w_overdraw_reg > 0.0:
+                    loss_dict["wOD"] = f"{w_overdraw_loss.item():.5f}"
+                if args.w_weight_reg > 0.0:
+                    avg_mse_disp = ((image - gt_image) ** 2).mean().item()
+                    eff_lambda = args.w_weight_reg * float(np.exp(-args.w_weight_gamma * avg_mse_disp))
+                    loss_dict["wwR"] = f"{eff_lambda:.4f}"
                 if args.kernel == "general":
                     loss_dict["GnR"] = f"{general_beta_reg_loss.item():.5f}"
                     if hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
@@ -1446,8 +1713,114 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if bg_hashgrid is not None:
                     bg_hashgrid.save_model(scene.model_path, iteration)
 
-            # Densification / MCMC Relocation
-            if iteration < opt.densify_until_iter and optim_gaussian:
+            # MCMC depth reinit: replacement of all Gaussians from depth maps
+            # Triggers at mcmc_depth_reinit, then every reinit_interval until reinit_end
+            _reinit_end = args.reinit_end if args.reinit_end >= 0 else max(0, opt.iterations - 15000)
+            _do_reinit = False
+            if args.mcmc_depth_reinit > 0 and (args.mcmc or args.mcmc_deficit or args.mcmc_fps):
+                if iteration == args.mcmc_depth_reinit:
+                    _do_reinit = True
+                elif args.reinit_interval > 0 and iteration > args.mcmc_depth_reinit and iteration <= _reinit_end:
+                    if (iteration - args.mcmc_depth_reinit) % args.reinit_interval == 0:
+                        _do_reinit = True
+            if _do_reinit:
+                n_before = len(gaussians.get_xyz)
+                torch.cuda.empty_cache()
+
+                # Save pre-reinit renders (depth + RGB + alpha) for first training view
+                output_path = os.path.join(scene.model_path, 'training_output')
+                os.makedirs(output_path, exist_ok=True)
+                with torch.no_grad():
+                    dbg_cam = scene.getTrainCameras()[0]
+                    dbg_pkg = render(dbg_cam, gaussians, pipe, background, beta=beta,
+                                     iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                     record_transmittance=False, is_training=False)
+                    dbg_img = torch.clamp(dbg_pkg['render'], 0.0, 1.0)
+                    dbg_depth_mean = dbg_pkg['depth_expected']
+                    dbg_depth_median = dbg_pkg['depth_median']
+                    dbg_depth_max = dbg_pkg['depth_max_contributor']
+                    dbg_alpha = dbg_pkg['rend_alpha']
+                    save_img_u8(dbg_img.permute(1, 2, 0).cpu().numpy(),
+                                os.path.join(output_path, f'{iteration}_pre_reinit_rgb.png'))
+                    save_img_u8(dbg_alpha.repeat(3, 1, 1).permute(1, 2, 0).cpu().numpy(),
+                                os.path.join(output_path, f'{iteration}_pre_reinit_alpha.png'))
+                    depth_np = dbg_depth_mean.squeeze().cpu().numpy()
+                    save_img_u8(convert_gray_to_cmap(depth_np, map_mode='turbo', revert=False),
+                                os.path.join(output_path, f'{iteration}_pre_reinit_depth_mean.png'))
+                    depth_med_np = dbg_depth_median.squeeze().cpu().numpy()
+                    save_img_u8(convert_gray_to_cmap(depth_med_np, map_mode='turbo', revert=False),
+                                os.path.join(output_path, f'{iteration}_pre_reinit_depth_median.png'))
+                    depth_max_np = dbg_depth_max.squeeze().cpu().numpy()
+                    save_img_u8(convert_gray_to_cmap(depth_max_np, map_mode='turbo', revert=False),
+                                os.path.join(output_path, f'{iteration}_pre_reinit_depth_maxcontrib.png'))
+                    del dbg_pkg
+
+                views = scene.getTrainCameras()
+                all_reinit_data = []
+                N_total = len(gaussians.get_xyz)
+                for v in views:
+                    with torch.no_grad():
+                        rpkg = render(v, gaussians, pipe, background, beta=beta,
+                                      iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                      record_transmittance=False, is_training=False)
+                        gt_img = v.original_image.cuda()
+                        # Use max-contributor depth if available, fall back to median
+                        reinit_depth = rpkg.get('depth_max_contributor', None)
+                        if reinit_depth is None or reinit_depth.numel() == 0:
+                            reinit_depth = rpkg['depth_median']
+                        data = gaussians.mini_depth_reinit(
+                            [reinit_depth.detach()],
+                            [rpkg['rend_alpha'].detach()],
+                            [v],
+                            gt_images=[gt_img],
+                            normal_maps=[rpkg['rend_normal'].detach()],
+                            num_total_views=len(views))
+                        if data is not None:
+                            all_reinit_data.append({k: t.cpu() for k, t in data.items()})
+                        del rpkg
+                    torch.cuda.empty_cache()
+                if all_reinit_data:
+                    merged = {
+                        'xyz': torch.cat([d['xyz'] for d in all_reinit_data], dim=0).cuda(),
+                        'colors': torch.cat([d['colors'] for d in all_reinit_data], dim=0).cuda() if 'colors' in all_reinit_data[0] else None,
+                        'normals': torch.cat([d['normals'] for d in all_reinit_data], dim=0).cuda() if 'normals' in all_reinit_data[0] else None,
+                    }
+                    gaussians.reinitial_from_depth(merged)
+                    gaussians.training_setup(opt)
+
+                    # Reset INGP optimizer (stale Adam momentum from old Gaussian layout)
+                    if ingp is not None:
+                        ingp.training_setup(cfg_model.optim)
+                        tqdm.write(f"[MCMC] Reset INGP optimizer after depth reinit")
+
+                    # Save post-reinit renders
+                    with torch.no_grad():
+                        dbg_pkg = render(dbg_cam, gaussians, pipe, background, beta=beta,
+                                         iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                         record_transmittance=False, is_training=False)
+                        dbg_img = torch.clamp(dbg_pkg['render'], 0.0, 1.0)
+                        dbg_depth_mean = dbg_pkg['depth_expected']
+                        dbg_depth_median = dbg_pkg['depth_median']
+                        dbg_alpha = dbg_pkg['rend_alpha']
+                        save_img_u8(dbg_img.permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(output_path, f'{iteration}_post_reinit_rgb.png'))
+                        save_img_u8(dbg_alpha.repeat(3, 1, 1).permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(output_path, f'{iteration}_post_reinit_alpha.png'))
+                        depth_np = dbg_depth_mean.squeeze().cpu().numpy()
+                        save_img_u8(convert_gray_to_cmap(depth_np, map_mode='turbo', revert=False),
+                                    os.path.join(output_path, f'{iteration}_post_reinit_depth_mean.png'))
+                        depth_med_np = dbg_depth_median.squeeze().cpu().numpy()
+                        save_img_u8(convert_gray_to_cmap(depth_med_np, map_mode='turbo', revert=False),
+                                    os.path.join(output_path, f'{iteration}_post_reinit_depth_median.png'))
+                        del dbg_pkg
+
+                    torch.cuda.empty_cache()
+                    tqdm.write(f"[MCMC] Depth reinit at iter {iteration}: {n_before} -> {len(gaussians.get_xyz)} Gaussians")
+
+            # Densification / MCMC Relocation.
+            # When --minimc is active, the closed-loop RJ-MCMC pipeline (below) owns
+            # all relocation and birth — skip the vanilla opacity-proportional path here.
+            if iteration < opt.densify_until_iter and optim_gaussian and not args.minimc:
                 if args.mcmc or args.mcmc_deficit or args.mcmc_fps or args.mcmc_fps:
                     # MCMC mode: relocate dead Gaussians and add new ones
                     if args.cap_max <= 0:
@@ -1466,33 +1839,172 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             # No add_new_gs while in deficit - just delete
                         else:
                             # Normal MCMC (also used by mcmc_fps): relocate dead Gaussians + add new ones
-                            gaussians.relocate_gs(dead_mask=dead_mask)
-                            gaussians.add_new_gs(cap_max=args.cap_max)
+                            gaussians.relocate_gs(dead_mask=dead_mask, probs_mode=args.mcmc_sample)
+                            gaussians.add_new_gs(cap_max=args.cap_max, probs_mode=args.mcmc_sample)
                 else:
                     # Traditional densification
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                    
+
                     gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, pixels = pixels)
-                    
+
                     prune_tag = (iteration % opacity_reset_interval >= opacity_reset_protect * densification_interval)
                     # Diffuse_offset mode: pause pruning for first 3k iterations after initialize
                     if args.method == "diffuse_offset" and iteration < cfg_model.ingp_stage.initialize + 3000:
                         prune_tag = False
-                    if iteration > opt.densify_from_iter and iteration % densification_interval == 0:
+                    # Skip densification on any iter that hosts a depth reinit.
+                    # --mini (v2): only the single mini_depth_reinit_iter.
+                    # --mini1 (v1): every repeated reinit iter within the window.
+                    _is_reinit_iter = (args.mini and iteration == args.mini_depth_reinit_iter)
+                    if args.mini1:
+                        if (iteration > args.mini_depth_reinit_iter
+                                and iteration <= args.mini1_depth_reinit_until
+                                and args.mini1_depth_reinit_interval > 0
+                                and (iteration - args.mini_depth_reinit_iter) % args.mini1_depth_reinit_interval == 0):
+                            _is_reinit_iter = True
+                    # Gating rules:
+                    # --mini (v2): aggressive clone every 250 iters does the work; disable.
+                    # --mini1 (v1): enabled — the pre-reinit aggressive-clone only fires
+                    #               3x total, so standard densify_and_prune carries the
+                    #               bulk of growth between reinits.
+                    # everything else: enabled.
+                    # --minispa: use standard 3DGS densify_and_prune for growth
+                    # (aggressive cloning is disabled via mini_simp_iter1 in argparse).
+                    _disable_densify = args.mini and not args.mini1 and not args.minispa
+                    # --minispa: no densification once ADMM has started (matches GSpa).
+                    # Growth is from 500 → minispa_admm_start only.
+                    _in_admm = (args.minispa and iteration >= args.minispa_admm_start)
+
+                    # --fastgs: replaces standard densify_and_prune with VCD/VCP.
+                    # Fires every fastgs_densify_interval iters (paper: 500) until
+                    # fastgs_densify_until (paper: 15000). Uses K random views.
+                    if (args.fastgs
+                            and iteration > opt.densify_from_iter
+                            and iteration < args.fastgs_densify_until
+                            and iteration % args.fastgs_densify_interval == 0
+                            and not _is_reinit_iter):
+                        from utils.fast_utils import sampling_cameras, compute_gaussian_score_fastgs
+                        _vp_stack = scene.getTrainCameras().copy()
+                        _camlist = sampling_cameras(_vp_stack, num_cams=args.fastgs_num_views)
+                        def _fastgs_render_fn(v):
+                            return render(v, gaussians, pipe, background, beta=beta,
+                                          iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                          record_transmittance=False, is_training=False)
+                        importance_score, pruning_score = compute_gaussian_score_fastgs(
+                            _camlist, gaussians, _fastgs_render_fn,
+                            loss_thresh=args.fastgs_loss_thresh,
+                            lambda_dssim=args.fastgs_lambda_dssim,
+                            densify=True,
+                        )
+                        size_threshold = 20 if iteration > opacity_reset_interval else None
+                        _stats = gaussians.densify_and_prune_fastgs(
+                            min_opacity=opt.opacity_cull,
+                            extent=scene.cameras_extent,
+                            max_screen_size=size_threshold,
+                            importance_score=importance_score,
+                            pruning_score=pruning_score,
+                            grad_thresh=args.fastgs_grad_thresh,
+                            grad_abs_thresh=args.fastgs_grad_abs_thresh,
+                            dense=args.fastgs_dense,
+                            importance_thresh=args.fastgs_importance_thresh,
+                            prune_budget_frac=args.fastgs_prune_budget_frac,
+                        )
+                        gaussians.training_setup(opt)
+                        tqdm.write(
+                            f"[FASTGS] Densify+prune at iter {iteration}: "
+                            f"cloned={_stats['cloned']}, split_parents={_stats['split_parents']}, "
+                            f"N={len(gaussians.get_xyz)}")
+                    elif (not args.fastgs
+                            and iteration > opt.densify_from_iter
+                            and iteration % densification_interval == 0
+                            and not _is_reinit_iter
+                            and not _disable_densify
+                            and not _in_admm):
                         size_threshold = 20 if iteration > opacity_reset_interval else None
                         gaussians.densify_and_prune(densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold, \
                         appearance_update_threshold, active_levels, densify_tag = (iteration < opt.densify_until_iter), prune_tag = prune_tag)
                     
-                    if iteration % opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    if not args.mini and (iteration % opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter)):
                         if iteration <= cfg_model.training_cfg.reset_until_iter:
                             gaussians.reset_opacity()
 
+                    # FastGS post-densify aggressive pruning (paper: every 3000 iters after 15k).
+                    if (args.fastgs
+                            and iteration >= args.fastgs_densify_until
+                            and iteration < args.fastgs_final_prune_until
+                            and iteration % args.fastgs_final_prune_interval == 0):
+                        from utils.fast_utils import sampling_cameras, compute_gaussian_score_fastgs
+                        _vp_stack = scene.getTrainCameras().copy()
+                        _camlist = sampling_cameras(_vp_stack, num_cams=args.fastgs_num_views)
+                        def _fastgs_prune_render_fn(v):
+                            return render(v, gaussians, pipe, background, beta=beta,
+                                          iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                          record_transmittance=False, is_training=False)
+                        _, pruning_score = compute_gaussian_score_fastgs(
+                            _camlist, gaussians, _fastgs_prune_render_fn,
+                            loss_thresh=args.fastgs_loss_thresh,
+                            lambda_dssim=args.fastgs_lambda_dssim,
+                            densify=False,
+                        )
+                        n_before = len(gaussians.get_xyz)
+                        n_pruned = gaussians.final_prune_fastgs(
+                            min_opacity=args.fastgs_final_min_opacity,
+                            pruning_score=pruning_score,
+                            score_thresh=args.fastgs_final_score_thresh,
+                        )
+                        gaussians.training_setup(opt)
+                        tqdm.write(
+                            f"[FASTGS] Final-prune at iter {iteration}: "
+                            f"{n_before} -> {len(gaussians.get_xyz)} "
+                            f"(pruned {n_pruned})")
+
             # GaussianSpa two-phase sparsification pipeline
             if args.gspa:
-                # Phase 1: Importance-based pre-pruning at simp_iter
-                if iteration == args.gspa_simp_iter:
-                    # Phase 1 disabled for debugging
-                    print(f"[GSPA] Phase 1 SKIPPED (debugging): {len(gaussians.get_xyz)} Gaussians unchanged")
+                # Phase 1: Importance-based pre-pruning at simp_iter.
+                # Sweep all training views, accumulate per-Gaussian importance
+                # (sum of α·T blending weights), sample (1 - p1) fraction
+                # weighted by importance, reinit the survivors.
+                # Under --minispa the silhouette-aware depth reinit serves as
+                # Phase 1, so skip the importance-prune block entirely.
+                if iteration == args.gspa_simp_iter and not args.minispa:
+                    _n_before_p1 = len(gaussians.get_xyz)
+
+                    # If --gspa_target_count > 0, auto-compute p1 AND p2 so the
+                    # expected final count after BOTH phases equals the target.
+                    # Split the keep-ratio evenly across both phases:
+                    #   keep_total = target / current
+                    #   keep_per_phase = sqrt(keep_total)
+                    #   p1 = p2 = 1 - keep_per_phase
+                    if args.gspa_target_count > 0:
+                        keep_total = args.gspa_target_count / max(_n_before_p1, 1)
+                        keep_total = min(max(keep_total, 1e-6), 1.0)
+                        keep_per_phase = keep_total ** 0.5
+                        _p1 = max(0.0, min(0.99, 1.0 - keep_per_phase))
+                        _p2 = _p1
+                        args.gspa_prune_ratio1 = _p1
+                        args.gspa_ratio = _p2
+                        print(f"[GSPA] --gspa_target_count={args.gspa_target_count} → "
+                              f"auto prune_ratio1={_p1:.3f}, ratio2={_p2:.3f} "
+                              f"(current {_n_before_p1} → expected ~{args.gspa_target_count})")
+                    else:
+                        _p1 = args.gspa_prune_ratio1
+
+                    print(f"[GSPA] Phase 1: computing importance scores over all train views...")
+                    # Wrap the training `render` with the flags compute_importance_scores
+                    # expects (record_transmittance=True so transmittance_avg / cover_pixels
+                    # are populated per Gaussian).
+                    def _gspa_render_fn(view):
+                        return render(view, gaussians, pipe, background, beta=beta,
+                                      iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                      record_transmittance=True, is_training=False)
+                    imp_score = OptimizingSpa.compute_importance_scores(
+                        gaussians, scene, _gspa_render_fn, pipe, background,
+                        imp_metric=args.gspa_imp_metric,
+                    )
+                    OptimizingSpa.importance_prune(
+                        gaussians, imp_score, prune_ratio=_p1, scene=scene)
+                    gaussians.training_setup(opt)
+                    torch.cuda.empty_cache()
+                    print(f"[GSPA] Phase 1 done: {_n_before_p1} → {len(gaussians.get_xyz)} Gaussians")
 
                 # Phase 2: ADMM sparsification (start_iter to stop_iter)
                 if iteration == args.gspa_start_iter:
@@ -1507,9 +2019,605 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     optimizing_spa.handle_densification_change()
                     if iteration % args.gspa_interval == 0:
                         optimizing_spa.update_z_u()
+                        # --minispa: progressive hard prune during ADMM.
+                        # Each z/u update, delete a batch of the lowest-opacity
+                        # Gaussians so the count descends smoothly toward
+                        # --gspa_target_count by gspa_stop_iter, instead of all
+                        # landing in one big drop. ADMM has been pushing the
+                        # doomed set's opacities down, so the bottom slice is
+                        # mostly already-faded Gaussians.
+                        if args.minispa and args.gspa_target_count > 0 and iteration < args.gspa_stop_iter:
+                            n_cur = len(gaussians.get_xyz)
+                            if n_cur > args.gspa_target_count:
+                                remaining_intervals = max(1, (args.gspa_stop_iter - iteration) // max(args.gspa_interval, 1))
+                                to_prune = (n_cur - args.gspa_target_count) // remaining_intervals
+                                if to_prune > 0:
+                                    with torch.no_grad():
+                                        op = gaussians.get_opacity.squeeze(-1)
+                                        _, low_idx = torch.topk(op, k=int(to_prune), largest=False)
+                                        prune_mask = torch.zeros(n_cur, dtype=torch.bool, device=op.device)
+                                        prune_mask[low_idx] = True
+                                    gaussians.prune_points(prune_mask)
+                                    tqdm.write(f"[MINISPA] ADMM prune at iter {iteration}: "
+                                               f"{n_cur} -> {len(gaussians.get_xyz)} "
+                                               f"(target {args.gspa_target_count}, "
+                                               f"{remaining_intervals} intervals left)")
                 if iteration == args.gspa_stop_iter and optimizing_spa is not None:
-                    optimizing_spa.prune()
+                    # Final cleanup prune in case the progressive schedule
+                    # didn't exactly hit the target.
+                    if args.minispa and args.gspa_target_count > 0:
+                        n_cur = len(gaussians.get_xyz)
+                        n_extra = n_cur - args.gspa_target_count
+                        if n_extra > 0:
+                            with torch.no_grad():
+                                op = gaussians.get_opacity.squeeze(-1)
+                                _, low_idx = torch.topk(op, k=int(n_extra), largest=False)
+                                prune_mask = torch.zeros(n_cur, dtype=torch.bool, device=op.device)
+                                prune_mask[low_idx] = True
+                            gaussians.prune_points(prune_mask)
+                            tqdm.write(f"[MINISPA] ADMM final prune at iter {iteration}: "
+                                       f"{n_cur} -> {len(gaussians.get_xyz)} (target {args.gspa_target_count})")
+                    else:
+                        optimizing_spa.prune()
                     optimizing_spa = None
+
+            # Mini-Splatting v2: scheduled events (depth reinit, importance pruning)
+            if args.mini and optim_gaussian:
+                # Decide whether this iter triggers a depth reinit.
+                # --mini (v2): fires exactly at mini_depth_reinit_iter.
+                # --mini1 (v1): fires at mini_depth_reinit_iter AND repeatedly on interval
+                #               until mini1_depth_reinit_until.
+                _reinit_trigger = (iteration == args.mini_depth_reinit_iter)
+                # --minispa: pre-ADMM depth reinit at minispa_reinit_iter (default 2000).
+                # Under --minispa, mini_depth_reinit_iter is parked at 10^9 so the first
+                # line above never fires; this clause restores a real depth reinit at 2000.
+                if args.minispa and iteration == args.minispa_reinit_iter:
+                    _reinit_trigger = True
+                if args.mini1 and not _reinit_trigger:
+                    if (iteration > args.mini_depth_reinit_iter
+                            and iteration <= args.mini1_depth_reinit_until
+                            and args.mini1_depth_reinit_interval > 0
+                            and (iteration - args.mini_depth_reinit_iter) % args.mini1_depth_reinit_interval == 0):
+                        _reinit_trigger = True
+                # --minispa: periodic reinit during ADMM phase.
+                # Fires at minispa_admm_start + k·interval for k=1,2,... as long as
+                # we're strictly before minispa_admm_stop (no reinit at the final prune iter).
+                if (args.minispa and not _reinit_trigger
+                        and args.minispa_reinit_interval > 0
+                        and iteration > args.minispa_admm_start
+                        and iteration < args.minispa_admm_stop
+                        and (iteration - args.minispa_admm_start) % args.minispa_reinit_interval == 0):
+                    _reinit_trigger = True
+
+                # Depth reinitialization: intersection-preserving prune then snap to surfaces
+                if _reinit_trigger:
+                    n_before = len(gaussians.get_xyz)
+
+                    # Save pre-reinit debug renders
+                    output_path = os.path.join(scene.model_path, 'training_output')
+                    os.makedirs(output_path, exist_ok=True)
+                    with torch.no_grad():
+                        dbg_cam = scene.getTrainCameras()[0]
+                        dbg_pkg = render(dbg_cam, gaussians, pipe, background, beta=beta,
+                                         iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                         record_transmittance=False, is_training=False)
+                        dbg_img = torch.clamp(dbg_pkg['render'], 0.0, 1.0)
+                        dbg_alpha = dbg_pkg['rend_alpha']
+                        save_img_u8(dbg_img.permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(output_path, f'{iteration}_pre_reinit_rgb.png'))
+                        save_img_u8(dbg_alpha.repeat(3, 1, 1).permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(output_path, f'{iteration}_pre_reinit_alpha.png'))
+                        for dname, dkey in [('depth_mean', 'depth_expected'), ('depth_median', 'depth_median'), ('depth_maxcontrib', 'depth_max_contributor')]:
+                            d = dbg_pkg.get(dkey)
+                            if d is not None and d.numel() > 0:
+                                save_img_u8(convert_gray_to_cmap(d.squeeze().cpu().numpy(), map_mode='turbo', revert=False),
+                                            os.path.join(output_path, f'{iteration}_pre_reinit_{dname}.png'))
+                        # Max-contributor *id* colormap (per-pixel dominant Gaussian id).
+                        mci_pre = dbg_pkg.get('max_contrib_idx', None)
+                        if mci_pre is not None and mci_pre.numel() > 0:
+                            save_img_u8(_colorize_max_contrib_idx(mci_pre),
+                                        os.path.join(output_path, f'{iteration}_pre_reinit_maxcontrib_id.png'))
+                        del dbg_pkg
+
+                    # Pre-reinit: prune low-importance Gaussians (matches MSv2 interesction_preserving)
+                    tqdm.write(f"[MINI] Pre-reinit pruning: rendering all views for importance...")
+                    n_pre_pruned = gaussians.mini_intersection_preserving(
+                        scene, render, pipe, background, beta=beta,
+                        iteration=iteration, cfg=cfg_model, ingp=ingp,
+                        imp_metric=args.mini_imp_metric)
+                    if n_pre_pruned > 0:
+                        gaussians.training_setup(opt)
+                    tqdm.write(f"[MINI] Pre-reinit prune: {n_before} -> {len(gaussians.get_xyz)} Gaussians")
+                    torch.cuda.empty_cache()
+
+                    # --minispa_mesh: TSDF-fuse depth maps into a mesh, area-sample uniformly.
+                    # Bypasses the per-view pixel-sampling loop below so the reinit is not
+                    # biased toward scene regions with more camera coverage.
+                    did_mesh_reinit = False
+                    if args.minispa and args.minispa_mesh:
+                        def _mesh_render_fn(v):
+                            return render(v, gaussians, pipe, background, beta=beta,
+                                          iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                          record_transmittance=False, is_training=False)
+                        # Always sample exactly gspa_target_count points from the mesh.
+                        # Fall back to current count only if target isn't set.
+                        if args.gspa_target_count > 0:
+                            _mesh_cap = args.gspa_target_count
+                        else:
+                            _mesh_cap = len(gaussians.get_xyz)
+                        _voxel = args.minispa_mesh_voxel if args.minispa_mesh_voxel > 0 else None
+                        tqdm.write(f"[MINISPA-MESH] TSDF fusing {len(scene.getTrainCameras())} views, "
+                                   f"target {_mesh_cap} points"
+                                   + (f", voxel={_voxel:.4f}" if _voxel is not None else ", voxel=auto")
+                                   + (", poisson-disk" if args.minispa_mesh_poisson else ", uniform"))
+                        merged = tsdf_mesh_reinit(
+                            scene, _mesh_render_fn, target_count=_mesh_cap,
+                            voxel_size=_voxel,
+                            use_poisson_disk=args.minispa_mesh_poisson,
+                        )
+                        if merged is not None:
+                            merged['scale_factor'] = args.minispa_mesh_scale_factor
+                            merged['init_opacity'] = args.minispa_mesh_opacity
+                            tqdm.write(f"[MINISPA-MESH] Mesh sampled {merged['xyz'].shape[0]} points "
+                                       f"(colors + normals from TSDF, "
+                                       f"scale×{args.minispa_mesh_scale_factor}, "
+                                       f"opacity={args.minispa_mesh_opacity}).")
+                            gaussians.reinitial_from_depth(merged)
+                            gaussians.training_setup(opt)
+                            gaussians.reset_xyz_lr_schedule(iteration)
+                            torch.cuda.empty_cache()
+                            did_mesh_reinit = True
+
+                            # Post-reinit debug renders (mirror the pixel-path debug block below).
+                            output_path = os.path.join(scene.model_path, 'training_output')
+                            os.makedirs(output_path, exist_ok=True)
+                            with torch.no_grad():
+                                dbg_cam = scene.getTrainCameras()[0]
+                                dbg_pkg = render(dbg_cam, gaussians, pipe, background, beta=beta,
+                                                 iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                                 record_transmittance=False, is_training=False)
+                                dbg_img = torch.clamp(dbg_pkg['render'], 0.0, 1.0)
+                                dbg_alpha = dbg_pkg['rend_alpha']
+                                dbg_depth = dbg_pkg.get('depth_max_contributor', None)
+                                save_img_u8(dbg_img.permute(1, 2, 0).cpu().numpy(),
+                                            os.path.join(output_path, f'{iteration}_post_reinit_rgb.png'))
+                                save_img_u8(dbg_alpha.repeat(3, 1, 1).permute(1, 2, 0).cpu().numpy(),
+                                            os.path.join(output_path, f'{iteration}_post_reinit_alpha.png'))
+                                mci_post = dbg_pkg.get('max_contrib_idx', None)
+                                if mci_post is not None and mci_post.numel() > 0:
+                                    save_img_u8(_colorize_max_contrib_idx(mci_post),
+                                                os.path.join(output_path, f'{iteration}_post_reinit_maxcontrib_id.png'))
+                                if dbg_depth is not None and dbg_depth.numel() > 0:
+                                    depth_np = dbg_depth.squeeze().cpu().numpy()
+                                    save_img_u8(convert_gray_to_cmap(depth_np, map_mode='turbo', revert=False),
+                                                os.path.join(output_path, f'{iteration}_post_reinit_depth_maxcontrib.png'))
+                                del dbg_pkg
+                        else:
+                            tqdm.write("[MINISPA-MESH] TSDF fusion produced an empty mesh — falling back to pixel-sampling path.")
+
+                    if not did_mesh_reinit:
+                        views = scene.getTrainCameras()
+                        all_reinit_data = []
+                        N_total = len(gaussians.get_xyz)
+                        # Snapshot the OLD SH so we can transfer it into the new (reinit) Gaussians
+                        # by max-contributor id sampled per pixel during the per-view render below.
+                        old_features_dc = gaussians._features_dc.detach().clone()      # [N, 1, 3]
+                        old_features_rest = gaussians._features_rest.detach().clone()  # [N, K, 3]
+                        for v in views:
+                            with torch.no_grad():
+                                rpkg = render(v, gaussians, pipe, background, beta=beta,
+                                              iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                              record_transmittance=False, is_training=False)
+                                gt_img = v.original_image.cuda()
+                                # Use max-contributor depth if available, fall back to median
+                                reinit_depth = rpkg.get('depth_max_contributor', None)
+                                if reinit_depth is None or reinit_depth.numel() == 0:
+                                    reinit_depth = rpkg['depth_median']
+                                max_idx_map = rpkg.get('max_contrib_idx', None)
+                                # --minispa: cap reinit point count at gspa_target_count
+                                # (or current point count, whichever is smaller) so reinits
+                                # never produce more points than the final target.
+                                _minispa_cap = None
+                                if args.minispa and args.gspa_target_count > 0:
+                                    _minispa_cap = min(len(gaussians.get_xyz), args.gspa_target_count)
+                                data = gaussians.mini_depth_reinit(
+                                    [reinit_depth.detach()],
+                                    [rpkg['rend_alpha'].detach()],
+                                    [v],
+                                    gt_images=[gt_img],
+                                    normal_maps=[rpkg['rend_normal'].detach()],
+                                    num_total_views=len(views),
+                                    max_idx_maps=[max_idx_map.detach()] if max_idx_map is not None else None,
+                                    src_features_dc=old_features_dc,
+                                    src_features_rest=old_features_rest,
+                                    compute_safe_radius=args.minispa,
+                                    total_count_override=_minispa_cap)
+                                if data is not None:
+                                    all_reinit_data.append({k: t.cpu() for k, t in data.items()})
+                                del rpkg
+                            torch.cuda.empty_cache()
+                        del old_features_dc, old_features_rest
+                        if all_reinit_data:
+                            merged = {
+                                'xyz': torch.cat([d['xyz'] for d in all_reinit_data], dim=0).cuda(),
+                                'colors': torch.cat([d['colors'] for d in all_reinit_data], dim=0).cuda() if 'colors' in all_reinit_data[0] else None,
+                                'normals': torch.cat([d['normals'] for d in all_reinit_data], dim=0).cuda() if 'normals' in all_reinit_data[0] else None,
+                                'sh_dc': torch.cat([d['sh_dc'] for d in all_reinit_data], dim=0).cuda() if 'sh_dc' in all_reinit_data[0] else None,
+                                'sh_rest': torch.cat([d['sh_rest'] for d in all_reinit_data], dim=0).cuda() if 'sh_rest' in all_reinit_data[0] else None,
+                                'pixel_footprint': torch.cat([d['pixel_footprint'] for d in all_reinit_data], dim=0).cuda() if 'pixel_footprint' in all_reinit_data[0] else None,
+                                'safe_radius': torch.cat([d['safe_radius'] for d in all_reinit_data], dim=0).cuda() if 'safe_radius' in all_reinit_data[0] else None,
+                            }
+                            gaussians.reinitial_from_depth(merged)
+                            gaussians.training_setup(opt)
+                            # Reset the xyz exponential schedule so the fresh cohort starts
+                            # with position_lr_init instead of the decayed late-training LR.
+                            gaussians.reset_xyz_lr_schedule(iteration)
+
+                            # Save post-reinit debug renders
+                            output_path = os.path.join(scene.model_path, 'training_output')
+                            os.makedirs(output_path, exist_ok=True)
+                            with torch.no_grad():
+                                dbg_cam = scene.getTrainCameras()[0]
+                                dbg_pkg = render(dbg_cam, gaussians, pipe, background, beta=beta,
+                                                 iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                                 record_transmittance=False, is_training=False)
+                                dbg_img = torch.clamp(dbg_pkg['render'], 0.0, 1.0)
+                                dbg_alpha = dbg_pkg['rend_alpha']
+                                dbg_depth = dbg_pkg['depth_max_contributor']
+                                save_img_u8(dbg_img.permute(1, 2, 0).cpu().numpy(),
+                                            os.path.join(output_path, f'{iteration}_post_reinit_rgb.png'))
+                                save_img_u8(dbg_alpha.repeat(3, 1, 1).permute(1, 2, 0).cpu().numpy(),
+                                            os.path.join(output_path, f'{iteration}_post_reinit_alpha.png'))
+                                # Max-contributor id colormap for the NEW (post-reinit) point set.
+                                mci_post = dbg_pkg.get('max_contrib_idx', None)
+                                if mci_post is not None and mci_post.numel() > 0:
+                                    save_img_u8(_colorize_max_contrib_idx(mci_post),
+                                                os.path.join(output_path, f'{iteration}_post_reinit_maxcontrib_id.png'))
+                                depth_np = dbg_depth.squeeze().cpu().numpy()
+                                save_img_u8(convert_gray_to_cmap(depth_np, map_mode='turbo', revert=False),
+                                            os.path.join(output_path, f'{iteration}_post_reinit_depth_maxcontrib.png'))
+                                del dbg_pkg
+
+                            torch.cuda.empty_cache()
+                            tqdm.write(f"[MINI] Depth reinit at iter {iteration}: {n_before} -> {len(gaussians.get_xyz)} Gaussians")
+
+                # Aggressive cloning cadence: --mini v2 only.
+                # --mini1 (v1) does NOT use this periodic cadence — it runs
+                # aggressive clone exactly once right before each depth reinit
+                # (wired inside the reinit dispatch above).
+                # Skip on depth_reinit_iter — avoids running clone + reinit in the same step.
+                _is_mini1_reinit = False
+                if args.mini1:
+                    if (iteration > args.mini_depth_reinit_iter
+                            and iteration <= args.mini1_depth_reinit_until
+                            and args.mini1_depth_reinit_interval > 0
+                            and (iteration - args.mini_depth_reinit_iter) % args.mini1_depth_reinit_interval == 0):
+                        _is_mini1_reinit = True
+                if (not args.mini1
+                        and iteration >= 500 and iteration < args.mini_simp_iter1
+                        and iteration % args.mini_clone_interval == 0
+                        and iteration != args.mini_depth_reinit_iter
+                        and not _is_mini1_reinit):
+                    n_before = len(gaussians.get_xyz)
+                    tqdm.write(f"[MINI] Aggressive clone: rendering all views...")
+                    _n_pruned, _n_cloned = gaussians.mini_culling_with_clone(
+                        scene, render, pipe, background, beta=beta,
+                        iteration=iteration, cfg=cfg_model, ingp=ingp,
+                        imp_metric=args.mini_imp_metric)
+                    if _n_pruned > 0 or _n_cloned > 0:
+                        gaussians.training_setup(opt)
+                    tqdm.write(
+                        f"[MINI] Aggressive clone at iter {iteration}: "
+                        f"{n_before} -> {len(gaussians.get_xyz)} Gaussians "
+                        f"(pruned={_n_pruned}, cloned={_n_cloned})"
+                    )
+
+                # First simplification: importance-weighted sampling (keep ~60%)
+                # --minispa skips simp1/simp2 — GSpa ADMM handles sparsification.
+                if iteration == args.mini_simp_iter1 and not args.minispa:
+                    n_before = len(gaussians.get_xyz)
+                    tqdm.write(f"[MINI] Simp1: rendering all views for importance scores...")
+                    n_pruned = gaussians.mini_intersection_sampling(
+                        scene, render, pipe, background, beta=beta,
+                        iteration=iteration, cfg=cfg_model, ingp=ingp,
+                        imp_metric=args.mini_imp_metric,
+                        sampling_factor=args.mini_sampling_factor)
+                    if n_pruned > 0:
+                        gaussians.training_setup(opt)
+                    tqdm.write(f"[MINI] Simplification 1 at iter {iteration}: {n_before} -> {len(gaussians.get_xyz)} Gaussians")
+
+                # Second simplification: intersection-preserving (keep top 99%)
+                if iteration == args.mini_simp_iter2 and not args.minispa:
+                    n_before = len(gaussians.get_xyz)
+                    tqdm.write(f"[MINI] Simp2: rendering all views for importance scores...")
+                    n_pruned = gaussians.mini_intersection_preserving(
+                        scene, render, pipe, background, beta=beta,
+                        iteration=iteration, cfg=cfg_model, ingp=ingp,
+                        imp_metric=args.mini_imp_metric)
+                    if n_pruned > 0:
+                        gaussians.training_setup(opt)
+                    tqdm.write(f"[MINI] Simplification 2 at iter {iteration}: {n_before} -> {len(gaussians.get_xyz)} Gaussians")
+
+                # Late low-opacity prune: keep the point count honest after simp2,
+                # so opacity-driven regs (--overdraw_reg / --w_overdraw_reg) actually delete dead Gaussians.
+                if (args.mini_late_prune_interval > 0
+                        and iteration > args.mini_simp_iter2
+                        and iteration % args.mini_late_prune_interval == 0):
+                    with torch.no_grad():
+                        opacity = gaussians.get_opacity.squeeze(-1)
+                        prune_mask = opacity < args.mini_late_prune_thresh
+                        n_prune = int(prune_mask.sum().item())
+                        if n_prune > 0:
+                            n_before = len(gaussians.get_xyz)
+                            gaussians.prune_points(prune_mask)
+                            tqdm.write(f"[MINI] Late prune at iter {iteration}: {n_before} -> {len(gaussians.get_xyz)} (opacity < {args.mini_late_prune_thresh})")
+
+            # MiniMC: MCMC + importance pruning with adaptive budget reduction
+            # ============================================================
+            # --minimc: sweep-based RJ-MCMC + periodic non-contributor cull.
+            #
+            # Two events:
+            #
+            # (A) NON-CONTRIBUTOR CULL (every --minimc_reinit_interval iters):
+            #     sweep all training views, find every Gaussian that was the
+            #     max-weight contributor for ≥1 pixel anywhere ("winners"), then
+            #     despawn every OTHER alive Gaussian into the MCMC dead pool by
+            #     snapping opacity below dead_thresh. Winners are preserved
+            #     exactly (no reinit, no opacity change). Non-contributors
+            #     become dead and get re-cloned by (B) on subsequent iters.
+            #     Tensor size is invariant. Preempts (B) on coincident iters.
+            #
+            # (B) SWEEP + CLONE (every --minimc_relocate_interval iters):
+            #     importance + visibility sweep, cull by three criteria, clone
+            #     top-K alive candidates into dead slots with 50/50 split.
+            # ============================================================
+            if args.minimc and (args.mcmc or args.mcmc_fps or args.mcmc_deficit):
+                _minimc_reinit_fires = (
+                    args.minimc_reinit_interval > 0
+                    and iteration >= args.minimc_start_iter
+                    and iteration <= args.minimc_reinit_until
+                    and iteration % args.minimc_reinit_interval == 0
+                )
+                # --- (A) NON-CONTRIBUTOR CULL ---
+                if _minimc_reinit_fires:
+                    _mc_out_dir = os.path.join(scene.model_path, 'training_output')
+                    os.makedirs(_mc_out_dir, exist_ok=True)
+                    # Pre-cull debug renders (RGB + depth_maxcontrib + maxcontrib_id)
+                    with torch.no_grad():
+                        _dbg_cam_cull = scene.getTrainCameras()[0]
+                        _dbg_pre = render(_dbg_cam_cull, gaussians, pipe, background, beta=beta,
+                                          iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                          record_transmittance=False, is_training=False)
+                        save_img_u8(torch.clamp(_dbg_pre['render'], 0, 1).permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(_mc_out_dir, f'{iteration}_pre_reinit_rgb.png'))
+                        save_img_u8(_dbg_pre['rend_alpha'].repeat(3, 1, 1).permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(_mc_out_dir, f'{iteration}_pre_reinit_alpha.png'))
+                        _d_pre = _dbg_pre.get('depth_max_contributor', None)
+                        if _d_pre is not None and _d_pre.numel() > 0:
+                            save_img_u8(convert_gray_to_cmap(_d_pre.squeeze().cpu().numpy(),
+                                                             map_mode='turbo', revert=False),
+                                        os.path.join(_mc_out_dir, f'{iteration}_pre_reinit_depth_maxcontrib.png'))
+                        _mci_pre = _dbg_pre.get('max_contrib_idx', None)
+                        if _mci_pre is not None and _mci_pre.numel() > 0:
+                            save_img_u8(_colorize_max_contrib_idx(_mci_pre),
+                                        os.path.join(_mc_out_dir, f'{iteration}_pre_reinit_maxcontrib_id.png'))
+                        del _dbg_pre
+                    torch.cuda.empty_cache()
+
+                    # Non-contributor cull: union of per-pixel max contributors across
+                    # all training views is kept exactly; every OTHER alive Gaussian
+                    # is despawned into the MCMC dead pool. Tensor size unchanged.
+                    _stats = gaussians.minimc_despawn_non_contributors(
+                        scene, render, pipe, background, beta=beta,
+                        iteration=iteration, cfg=cfg_model, ingp=ingp,
+                        dead_thresh=args.minimc_dead_thresh,
+                    )
+                    tqdm.write(
+                        f"[MINIMC] Non-contributor cull at iter {iteration}: "
+                        f"alive={_stats['n_alive_before']}/{_stats['n_total']} "
+                        f"winners={_stats['n_winners']} despawned={_stats['n_despawned']} "
+                        f"(dead pool += {_stats['n_despawned']})"
+                    )
+
+                    # Post-cull debug renders
+                    with torch.no_grad():
+                        _dbg_post = render(_dbg_cam_cull, gaussians, pipe, background, beta=beta,
+                                           iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                           record_transmittance=False, is_training=False)
+                        save_img_u8(torch.clamp(_dbg_post['render'], 0, 1).permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(_mc_out_dir, f'{iteration}_post_reinit_rgb.png'))
+                        save_img_u8(_dbg_post['rend_alpha'].repeat(3, 1, 1).permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(_mc_out_dir, f'{iteration}_post_reinit_alpha.png'))
+                        _d_post = _dbg_post.get('depth_max_contributor', None)
+                        if _d_post is not None and _d_post.numel() > 0:
+                            save_img_u8(convert_gray_to_cmap(_d_post.squeeze().cpu().numpy(),
+                                                             map_mode='turbo', revert=False),
+                                        os.path.join(_mc_out_dir, f'{iteration}_post_reinit_depth_maxcontrib.png'))
+                        _mci_post = _dbg_post.get('max_contrib_idx', None)
+                        if _mci_post is not None and _mci_post.numel() > 0:
+                            save_img_u8(_colorize_max_contrib_idx(_mci_post),
+                                        os.path.join(_mc_out_dir, f'{iteration}_post_reinit_maxcontrib_id.png'))
+                        del _dbg_post
+                    torch.cuda.empty_cache()
+
+                # --- (B) SWEEP + RELOCATE ---
+                # On coincident iters, runs AFTER the reinit cull so the sweep
+                # observes the cull's new dead pool and immediately refills it.
+                if (iteration >= args.minimc_start_iter
+                        and iteration <= args.minimc_relocate_until
+                        and iteration % args.minimc_relocate_interval == 0):
+                    # Pre-relocate debug render (one fixed train view) -> training_output/.
+                    _mc_out_dir = os.path.join(scene.model_path, 'training_output')
+                    os.makedirs(_mc_out_dir, exist_ok=True)
+                    # Debug-image cadence: only save full image set on reinit cadence (cheap
+                    # every-sweep RGB pre/post otherwise).
+                    _save_full_imgs = (args.minimc_reinit_interval > 0
+                                       and iteration % args.minimc_reinit_interval == 0)
+                    with torch.no_grad():
+                        _dbg_cam = scene.getTrainCameras()[0]
+                        _dbg_pre = render(_dbg_cam, gaussians, pipe, background, beta=beta,
+                                          iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                          record_transmittance=False, is_training=False)
+                        _img_pre = torch.clamp(_dbg_pre['render'], 0.0, 1.0)
+                        save_img_u8(_img_pre.permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(_mc_out_dir, f'{iteration}_pre_minimc_rgb.png'))
+                        if _save_full_imgs:
+                            _d_pre = _dbg_pre.get('depth_max_contributor', None)
+                            if _d_pre is not None and _d_pre.numel() > 0:
+                                save_img_u8(
+                                    convert_gray_to_cmap(_d_pre.squeeze().cpu().numpy(),
+                                                         map_mode='turbo', revert=False),
+                                    os.path.join(_mc_out_dir,
+                                                 f'{iteration}_pre_minimc_depth_maxcontrib.png'))
+                            _mci_pre = _dbg_pre.get('max_contrib_idx', None)
+                            if _mci_pre is not None and _mci_pre.numel() > 0:
+                                save_img_u8(_colorize_max_contrib_idx(_mci_pre),
+                                            os.path.join(_mc_out_dir,
+                                                         f'{iteration}_pre_minimc_maxcontrib_id.png'))
+                        del _dbg_pre
+
+                    _stats = gaussians.minimc_sweep_and_relocate(
+                        scene, render, pipe, background, beta=beta,
+                        iteration=iteration, cfg=cfg_model, ingp=ingp,
+                        imp_metric="indoor",
+                        dead_thresh=args.minimc_dead_thresh,
+                        cull_single_view=(not args.minimc_no_single_view_cull),
+                        low_imp_cdf_thres=args.minimc_low_imp_cdf,
+                        growth_frac=args.minimc_growth_frac,
+                    )
+                    tqdm.write(
+                        f"[MINIMC] iter {iteration}: "
+                        f"alive={_stats['n_alive_before']}/{_stats['n_total']} | "
+                        f"cull: zero={_stats['n_culled_zero']} "
+                        f"single_view={_stats['n_culled_single_view']} "
+                        f"low_imp={_stats['n_culled_low_imp']} "
+                        f"total={_stats['n_culled_total']} | "
+                        f"dead_in={_stats['n_dead_in']} "
+                        f"candidates={_stats['n_candidates']} "
+                        f"-> clones={_stats['n_clones']} "
+                        f"natural_dead_left={_stats['n_natural_dead_left']} "
+                        f"(growth={args.minimc_growth_frac*100:.1f}%, vol-preserving split)"
+                    )
+
+                    # Post-relocate debug render (same view).
+                    with torch.no_grad():
+                        _dbg_post = render(_dbg_cam, gaussians, pipe, background, beta=beta,
+                                           iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                           record_transmittance=False, is_training=False)
+                        _img_post = torch.clamp(_dbg_post['render'], 0.0, 1.0)
+                        save_img_u8(_img_post.permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(_mc_out_dir, f'{iteration}_post_minimc_rgb.png'))
+                        if _save_full_imgs:
+                            _d_post = _dbg_post.get('depth_max_contributor', None)
+                            if _d_post is not None and _d_post.numel() > 0:
+                                save_img_u8(
+                                    convert_gray_to_cmap(_d_post.squeeze().cpu().numpy(),
+                                                         map_mode='turbo', revert=False),
+                                    os.path.join(_mc_out_dir,
+                                                 f'{iteration}_post_minimc_depth_maxcontrib.png'))
+                            _mci_post = _dbg_post.get('max_contrib_idx', None)
+                            if _mci_post is not None and _mci_post.numel() > 0:
+                                save_img_u8(_colorize_max_contrib_idx(_mci_post),
+                                            os.path.join(_mc_out_dir,
+                                                         f'{iteration}_post_minimc_maxcontrib_id.png'))
+                        del _dbg_post
+
+            # ============================================================
+            # Legacy --minimc schedule (deprecated, disabled, kept for reference).
+            # The old 3-stage code used to sit here; replaced by the new loop above.
+            # ============================================================
+            if False and args.minimc and (args.mcmc or args.mcmc_fps or args.mcmc_deficit):
+                # Depth reinitialization
+                if args.minimc_reinit_iter > 0 and iteration == args.minimc_reinit_iter:
+                    n_before = len(gaussians.get_xyz)
+                    # Save pre-reinit debug renders
+                    output_path = os.path.join(scene.model_path, 'training_output')
+                    os.makedirs(output_path, exist_ok=True)
+                    with torch.no_grad():
+                        dbg_cam = scene.getTrainCameras()[0]
+                        dbg_pkg = render(dbg_cam, gaussians, pipe, background, beta=beta,
+                                         iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                         record_transmittance=False, is_training=False)
+                        save_img_u8(torch.clamp(dbg_pkg['render'], 0, 1).permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(output_path, f'{iteration}_pre_reinit_rgb.png'))
+                        save_img_u8(dbg_pkg['rend_alpha'].repeat(3, 1, 1).permute(1, 2, 0).cpu().numpy(),
+                                    os.path.join(output_path, f'{iteration}_pre_reinit_alpha.png'))
+                        for dname, dkey in [('depth_mean', 'depth_expected'), ('depth_median', 'depth_median'), ('depth_maxcontrib', 'depth_max_contributor')]:
+                            d = dbg_pkg.get(dkey)
+                            if d is not None and d.numel() > 0:
+                                save_img_u8(convert_gray_to_cmap(d.squeeze().cpu().numpy(), map_mode='turbo', revert=False),
+                                            os.path.join(output_path, f'{iteration}_pre_reinit_{dname}.png'))
+                        del dbg_pkg
+                    torch.cuda.empty_cache()
+
+                    # Depth reinit
+                    views = scene.getTrainCameras()
+                    all_reinit_data = []
+                    for v in views:
+                        with torch.no_grad():
+                            rpkg = render(v, gaussians, pipe, background, beta=beta,
+                                          iteration=iteration, cfg=cfg_model, ingp=ingp,
+                                          record_transmittance=False, is_training=False)
+                            gt_img = v.original_image.cuda()
+                            reinit_depth = rpkg.get('depth_max_contributor', None)
+                            if reinit_depth is None or reinit_depth.numel() == 0:
+                                reinit_depth = rpkg['depth_median']
+                            data = gaussians.mini_depth_reinit(
+                                [reinit_depth.detach()], [rpkg['rend_alpha'].detach()], [v],
+                                gt_images=[gt_img], normal_maps=[rpkg['rend_normal'].detach()],
+                                num_total_views=len(views))
+                            if data is not None:
+                                all_reinit_data.append({k: t.cpu() for k, t in data.items()})
+                            del rpkg
+                        torch.cuda.empty_cache()
+                    if all_reinit_data:
+                        merged = {
+                            'xyz': torch.cat([d['xyz'] for d in all_reinit_data], dim=0).cuda(),
+                            'colors': torch.cat([d['colors'] for d in all_reinit_data], dim=0).cuda() if 'colors' in all_reinit_data[0] else None,
+                            'normals': torch.cat([d['normals'] for d in all_reinit_data], dim=0).cuda() if 'normals' in all_reinit_data[0] else None,
+                        }
+                        gaussians.reinitial_from_depth(merged)
+                        gaussians.training_setup(opt)
+                        if ingp is not None:
+                            ingp.training_setup(cfg_model.optim)
+                            tqdm.write(f"[MINIMC] Reset INGP optimizer after depth reinit")
+                        # Disable MCMC noise for 2k iterations
+                        minimc_noise_disabled_until = iteration + 2000
+                        tqdm.write(f"[MINIMC] Depth reinit at iter {iteration}: {n_before} -> {len(gaussians.get_xyz)} Gaussians")
+                        tqdm.write(f"[MINIMC] MCMC noise disabled until iter {minimc_noise_disabled_until}")
+
+                # First simplification: importance sampling, reduce budget by K/2
+                if iteration == args.minimc_simp_iter1:
+                    n_before = len(gaussians.get_xyz)
+                    tqdm.write(f"[MINIMC] Simp1: rendering all views for importance scores...")
+                    n_pruned = gaussians.mini_intersection_sampling(
+                        scene, render, pipe, background, beta=beta,
+                        iteration=iteration, cfg=cfg_model, ingp=ingp,
+                        imp_metric="indoor", sampling_factor=args.minimc_sampling_factor)
+                    if n_pruned > 0:
+                        gaussians.training_setup(opt)
+                        # Reduce budget by K/2 (half the pruned count)
+                        budget_reduction = n_pruned // 2
+                        old_cap = args.cap_max
+                        args.cap_max = max(len(gaussians.get_xyz), args.cap_max - budget_reduction)
+                        tqdm.write(f"[MINIMC] Simp1: {n_before} -> {len(gaussians.get_xyz)} Gaussians (pruned {n_pruned})")
+                        tqdm.write(f"[MINIMC] Budget: {old_cap} -> {args.cap_max} (reduced by {budget_reduction})")
+
+                # Second simplification: intersection preserving, reduce budget by L fully
+                if iteration == args.minimc_simp_iter2:
+                    n_before = len(gaussians.get_xyz)
+                    tqdm.write(f"[MINIMC] Simp2: rendering all views for importance scores...")
+                    n_pruned = gaussians.mini_intersection_preserving(
+                        scene, render, pipe, background, beta=beta,
+                        iteration=iteration, cfg=cfg_model, ingp=ingp,
+                        imp_metric="indoor")
+                    if n_pruned > 0:
+                        gaussians.training_setup(opt)
+                        # Reduce budget by full L
+                        old_cap = args.cap_max
+                        args.cap_max = max(len(gaussians.get_xyz), args.cap_max - n_pruned)
+                        tqdm.write(f"[MINIMC] Simp2: {n_before} -> {len(gaussians.get_xyz)} Gaussians (pruned {n_pruned})")
+                        tqdm.write(f"[MINIMC] Budget: {old_cap} -> {args.cap_max} (reduced by {n_pruned})")
 
             # Morton z-order sort for cache locality
             if args.morton_interval > 0 and iteration % args.morton_interval == 0 and iteration <= args.morton_end_iter:
@@ -1520,18 +2628,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Optimizer step
             if iteration < opt.iterations:
 
-                # Freeze SH gradients for first 1k iterations in 3D_SH_res (hashgrid trains first)
-                if hasattr(gaussians, '_sh_freeze_until') and iteration < gaussians._sh_freeze_until:
-                    if gaussians._features_dc.grad is not None:
-                        gaussians._features_dc.grad.zero_()
-                    if gaussians._features_rest.grad is not None:
-                        gaussians._features_rest.grad.zero_()
-
                 if iteration % 500 == 0:
                     torch.cuda.synchronize()
                     _t_opt_start = time.time()
 
-                gaussians.optimizer.step()
+                # Debug: ap_level and hashgrid stats before optimizer step
+                if (iteration % 500 == 0 or iteration == first_iter):
+                    ap = gaussians._appearance_level.data.squeeze()
+                    n_zero_ap = (ap == 0).sum().item()
+                    n_total = ap.shape[0]
+                    if n_zero_ap > 0:
+                        tqdm.write(f"[AP_LEVEL iter={iteration}] WARNING: {n_zero_ap}/{n_total} Gaussians have ap_level=0 (dead hash)")
+                    else:
+                        tqdm.write(f"[AP_LEVEL iter={iteration}] OK: all {n_total} Gaussians have ap_level>0 (mean={ap.mean().item():.1f})")
+                if (iteration % 500 == 0 or iteration == first_iter) and ingp is not None and hasattr(ingp, 'hash_encoding') and ingp.hash_encoding is not None:
+                    with torch.no_grad():
+                        for pg in ingp.current_optimizer.param_groups:
+                            name = pg.get('name', '?')
+                            p = pg['params'][0]
+                            v = p.data
+                            tqdm.write(f"[HASH_DBG iter={iteration}] {name}: shape={list(v.shape)} "
+                                       f"val(mean={v.mean().item():.6f}, std={v.std().item():.6f}, "
+                                       f"min={v.min().item():.6f}, max={v.max().item():.6f})")
+                            if p.grad is not None:
+                                g = p.grad
+                                tqdm.write(f"[HASH_DBG iter={iteration}] {name}: "
+                                           f"grad(mean={g.mean().item():.6f}, std={g.std().item():.6f}, "
+                                           f"min={g.min().item():.6f}, max={g.max().item():.6f}, "
+                                           f"norm={g.norm().item():.6f})")
+                            else:
+                                tqdm.write(f"[HASH_DBG iter={iteration}] {name}: grad=None")
+
+                if args.mini and mini_last_visibility is not None:
+                    gaussians.optimizer.step(visibility=mini_last_visibility, N=radii.shape[0])
+                else:
+                    gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
                 if optim_ngp:
@@ -1541,19 +2672,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % 500 == 0:
                     torch.cuda.synchronize()
                     _t_opt_end = time.time()
-                    # Per-pixel intersection stats
+                    # Per-pixel contributor stats
                     gs_num = render_pkg.get("gaussian_num", None)
                     gs_stats = ""
                     if gs_num is not None:
                         gs_map = gs_num.squeeze()
-                        gs_stats = (f" | isect: max={gs_map.max().item():.0f}, "
+                        gs_stats = (f" | contrib: max={gs_map.max().item():.0f}, "
                                     f"mean={gs_map.mean().item():.1f}, "
                                     f"median={gs_map.median().item():.0f}")
+                    od_stats = ""
+                    od_map = render_pkg.get("render_overdraw", None)
+                    if od_map is not None and od_map.numel() > 0:
+                        od = od_map.squeeze()
+                        if od.numel() > 0 and od.max().item() > 0:
+                            od_stats = (f" | soft_contrib: mean={od.mean().item():.1f}, "
+                                        f"median={od.median().item():.0f}")
                     tqdm.write(f"[TIMING {iteration}] fwd={(_t_fwd_end-_t_fwd_start)*1000:.1f}ms, "
                               f"bwd={(_t_bwd_end-_t_bwd_start)*1000:.1f}ms, "
                               f"opt={(_t_opt_end-_t_opt_start)*1000:.1f}ms, "
                               f"total={(_t_opt_end-_t_fwd_start)*1000:.1f}ms"
-                              f"{gs_stats}")
+                              f"{gs_stats}{od_stats}")
 
                 # Skybox optimizer step (only after switch_iter when skybox is active)
                 if skybox is not None and iteration >= cfg_model.ingp_stage.switch_iter:
@@ -1583,13 +2721,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     bg_hashgrid.optimizer.zero_grad(set_to_none=True)
 
                 # MCMC: SGLD noise injection after optimizer step
-                if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
+                # MiniMC: disable noise for 2k iters after depth reinit
+                if (args.mcmc or args.mcmc_deficit or args.mcmc_fps) and iteration >= minimc_noise_disabled_until:
                     # Get current xyz learning rate
                     xyz_lr = gaussians.optimizer.param_groups[0]['lr']
-                    
-                    # Build covariance from scale and rotation
+
+                    # Build covariance from scale and rotation. For 2DGS surfels
+                    # the third (normal) axis has no stored scale; we use
+                    # min(sx, sy) so SGLD noise can drift the Gaussian slightly
+                    # off the tangent plane without overshooting the surface.
+                    scale_xy = gaussians.get_scaling                                  # [N, 2]
+                    scale_n = scale_xy.min(dim=-1, keepdim=True).values               # [N, 1]
                     L = build_scaling_rotation(
-                        torch.cat([gaussians.get_scaling, torch.ones_like(gaussians.get_scaling[:, :1])], dim=-1),
+                        torch.cat([scale_xy, scale_n], dim=-1),
                         gaussians.get_rotation
                     )
                     actual_covariance = L @ L.transpose(1, 2)
@@ -1614,7 +2758,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             from utils.image_utils import colormap
             
             save_interval = cfg_model.settings.save_interval
-            _save_this_iter = (iteration % save_interval == 0) or (14990 <= iteration <= 15010)
+            _save_this_iter = (iteration % save_interval == 0) or iteration == first_iter
             if _save_this_iter:
 
                 output_path = os.path.join(scene.model_path, 'training_output')
@@ -1652,14 +2796,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     hash_name = os.path.join(output_path, str(iteration) + '_hash.png')
                     save_img_u8(hash_image.permute(1,2,0).detach().cpu().numpy(), hash_name)
 
+                # Save contributor heatmap every 5k iterations
+                if iteration % 5000 == 0:
+                    gs_num = render_pkg.get("gaussian_num", None)
+                    if gs_num is not None:
+                        heatmap, min_c, max_c = create_intersection_heatmap(gs_num, max_display=100)
+                        heatmap_name = os.path.join(output_path, str(iteration) + '_contributors.png')
+                        save_img_u8(heatmap, heatmap_name)
+
                 # Save decomposed renders for 3D_SH_res and 3D_SH_cat modes (SH-only and texture-only)
-                if args.method in ["3D_SH_res", "3D_SH_cat"] and ingp is not None and not getattr(ingp, 'hashgrid_disabled', False):
-                    # Fresh full render (after optimizer step) to compare with decomposition
+                # All renders done atomically with the same model state (post-optimizer-step)
+                if args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"] and ingp is not None and not getattr(ingp, 'hashgrid_disabled', False):
+                    # Full render (consistent with decomposition renders below)
                     with torch.no_grad():
-                        render_pkg_full2 = render(viewpoint_cam, gaussians, pipe, current_bg, ingp=ingp,
+                        render_pkg_full = render(viewpoint_cam, gaussians, pipe, current_bg, ingp=ingp,
                             beta=beta, iteration=iteration, cfg=cfg_model, decompose_mode=None,
                             is_training=False)
-                        full2_raw = render_pkg_full2["render"]
+                        full_raw = render_pkg_full["render"]
+
+                    # Overwrite the main image with the consistent full render
+                    full_image = torch.clamp(full_raw, 0.0, 1.0)
+                    save_img_u8(full_image.permute(1,2,0).detach().cpu().numpy(), img_name)
 
                     # SH-only render (hashgrid disabled, residual ≈ 0)
                     render_pkg_sh = render(viewpoint_cam, gaussians, pipe, current_bg, ingp=ingp,
@@ -1679,25 +2836,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tex_name = os.path.join(output_path, str(iteration) + '_tex_only.png')
                     save_img_u8(tex_image.permute(1,2,0).detach().cpu().numpy(), tex_name)
 
-                    # Save SH+residual summed image (should match full render)
+                    # True residual = full - sh_only (can be negative where hash subtracts from SH)
+                    residual_true = full_raw - sh_raw
+                    # Absolute value (magnitude of residual contribution)
+                    tex_abs = torch.clamp(residual_true.abs(), 0.0, 1.0)
+                    tex_abs_name = os.path.join(output_path, str(iteration) + '_tex_only_abs.png')
+                    save_img_u8(tex_abs.permute(1,2,0).detach().cpu().numpy(), tex_abs_name)
+                    # Signed: gray(0.5)=zero, bright=positive residual, dark=negative/subtractive
+                    tex_signed = torch.clamp(residual_true * 2.0 + 0.5, 0.0, 1.0)
+                    tex_signed_name = os.path.join(output_path, str(iteration) + '_tex_residual_signed.png')
+                    save_img_u8(tex_signed.permute(1,2,0).detach().cpu().numpy(), tex_signed_name)
+
+                    # Save SH+residual summed image (should match full render exactly)
                     sum_image = torch.clamp(sh_raw + tex_raw, 0.0, 1.0)
                     sum_name = os.path.join(output_path, str(iteration) + '_sh_plus_tex.png')
                     save_img_u8(sum_image.permute(1,2,0).detach().cpu().numpy(), sum_name)
 
                     # Debug: decomposition stats
-                    full_raw = image  # from training render (before optimizer step)
+                    if gaussians._features_dc.numel() == 0:
+                        continue
                     dc_max = gaussians._features_dc.data.abs().max().item()
-                    rest_max = gaussians._features_rest.data.abs().max().item()
+                    rest_max = gaussians._features_rest.data.abs().max().item() if gaussians._features_rest.numel() > 0 else 0.0
                     tqdm.write(f"[DECOMPOSE {iteration}] SH DC max={dc_max:.4f}, REST max={rest_max:.4f}, "
                               f"sh_degree={gaussians.active_sh_degree}")
-                    tqdm.write(f"[DECOMPOSE {iteration}] train_img: mean={full_raw.mean():.4f}, "
-                              f"fresh_full: mean={full2_raw.mean():.4f}, "
+                    tqdm.write(f"[DECOMPOSE {iteration}] full: mean={full_raw.mean():.4f}, "
                               f"sh_only: mean={sh_raw.mean():.4f}, tex_only: mean={tex_raw.mean():.4f}, "
                               f"sh+tex: mean={(sh_raw + tex_raw).mean():.4f}")
-                    tqdm.write(f"[DECOMPOSE {iteration}] train_vs_fresh diff: {(full_raw - full2_raw).abs().mean():.6f}, "
-                              f"fresh_vs_decompose diff: {(full2_raw - sh_raw - tex_raw).abs().mean():.6f}")
-                    # Compare alpha maps to check if geometry differs between renders
-                    alpha_full = render_pkg_full2.get("rend_alpha", None)
+                    tqdm.write(f"[DECOMPOSE {iteration}] full_vs_decompose diff: {(full_raw - sh_raw - tex_raw).abs().mean():.6f}")
+                    # Compare alpha maps
+                    alpha_full = render_pkg_full.get("rend_alpha", None)
                     alpha_sh = render_pkg_sh.get("rend_alpha", None)
                     alpha_tex = render_pkg_tex.get("rend_alpha", None)
                     if alpha_full is not None and alpha_sh is not None and alpha_tex is not None:
@@ -1706,7 +2873,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                   f"full_vs_sh_diff={((alpha_full - alpha_sh).abs().mean()):.6f}, "
                                   f"full_vs_tex_diff={((alpha_full - alpha_tex).abs().mean()):.6f}")
                     # Save diff image (amplified 10x for visibility)
-                    diff_raw = (full2_raw - sh_raw - tex_raw).abs() * 10
+                    diff_raw = (full_raw - sh_raw - tex_raw).abs() * 10
                     diff_image = torch.clamp(diff_raw, 0.0, 1.0)
                     diff_name = os.path.join(output_path, str(iteration) + '_decompose_diff_10x.png')
                     save_img_u8(diff_image.permute(1,2,0).detach().cpu().numpy(), diff_name)
@@ -1948,7 +3115,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration, 
         f.write("=" * 50 + "\n\n")
 
         f.write(f"Method: {args.method}\n")
-        if args.method in ["cat", "cat_dropout", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat"]:
+        if args.method in ["cat", "cat_dropout", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
             f.write(f"Hybrid Levels: {args.hybrid_levels}\n")
             if args.method == "cat_dropout":
                 f.write(f"Dropout Lambda: {args.dropout_lambda}\n")
@@ -1966,6 +3133,12 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration, 
             f.write(f"BCE Opacity Regularization: Enabled\n")
             f.write(f"  - Lambda: {args.bce_lambda}\n")
             f.write(f"  - Active for last {args.bce_iter} iterations\n")
+            if args.bce_solo_adaptive:
+                f.write(f"  - Adaptive threshold: median opacity at BCE start (solo)\n")
+            elif args.bce_adaptive:
+                f.write(f"  - Adaptive threshold: median opacity at BCE start (with reg)\n")
+            elif args.bce_solo:
+                f.write(f"  - Solo mode: opacity/scale reg disabled during BCE\n")
         f.write(f"Iterations: {iteration}\n")
         f.write(f"Resolution: {resolution}\n\n")
 
@@ -2081,7 +3254,8 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     # 3D_SH_res / 3D_SH_cat decomposition: SH-only vs texture(hash+MLP)-only
     is_3D_SH_res_mode = (ingp is not None and hasattr(ingp, 'is_3D_SH_res_mode') and ingp.is_3D_SH_res_mode)
     is_3D_SH_cat_mode = (ingp is not None and hasattr(ingp, 'is_3D_SH_cat_mode') and ingp.is_3D_SH_cat_mode)
-    do_sh_res_decomposition = (is_3D_SH_res_mode or is_3D_SH_cat_mode) and not skip_decomposition
+    is_3D_SH_32_mode = (ingp is not None and hasattr(ingp, 'is_3D_SH_32_mode') and ingp.is_3D_SH_32_mode)
+    do_sh_res_decomposition = (is_3D_SH_res_mode or is_3D_SH_cat_mode or is_3D_SH_32_mode) and not skip_decomposition
 
     # Adaptive_zero decomposition: visualize zeros-only vs hash contributors
     is_adaptive_zero_mode = (ingp is not None and hasattr(ingp, 'is_adaptive_zero_mode') and ingp.is_adaptive_zero_mode)
@@ -2773,6 +3947,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--init_ply", type=str, default=None,
+                        help="Initialize Gaussians from an external PLY file instead of dataset point cloud")
 
     parser.add_argument("--scene_name", type=str, default = None)
     parser.add_argument("--mesh_file", type=str, default = '/xxx/nerf_syn/mesh/')
@@ -2784,7 +3960,7 @@ if __name__ == "__main__":
     
     # Method argument - baseline, cat, cat_dropout, adaptive, adaptive_add, adaptive_cat, adaptive_zero, adaptive_gate, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "2dgs", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat"],
+                        choices=["baseline", "2dgs", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat", "3D_SH_32"],
                         help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'cat_dropout' (cat with hash dropout during training - use --dropout_lambda), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'adaptive_zero' (cat with weighted hash vs zeros - w=0 skips hash query), 'adaptive_gate' (VQ-AD style gating: soft→STE→hard, L1 regularization toward zeros), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual), '3D' (intersection-based SH rendering), '3D_direct' (intersection-based RGB MLP), or '3D_direct_fused' (fused in-kernel MLP, no intersection buffer)")
     parser.add_argument("--hybrid_levels", type=int, default=5,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
@@ -2803,8 +3979,15 @@ if __name__ == "__main__":
                         help="Load frozen MLP weights from this model_path (loads ngp checkpoint's mlp_fused weights)")
     parser.add_argument("--res_lr_scale", type=float, default=1.0,
                         help="Scale factor for hash encoding and MLP learning rates in 3D_SH_res mode (e.g. 0.1 = 10x lower LR)")
+    parser.add_argument("--hash_lr_scale", type=float, default=1.0,
+                        help="Scale factor for hash encoding LR only (stacks with --res_lr_scale). e.g. 100 = 100x hash LR")
     parser.add_argument("--res_warmup", type=int, default=0,
                         help="Disable hash/MLP residual for this many iterations in 3D_SH_res mode (e.g. 10000 = SH-only for first 10k iters)")
+    parser.add_argument("--sh_freeze_iter", type=int, default=0,
+                        help="Freeze SH (f_dc and f_rest) LR to 0 for the first N iterations, then unfreeze. Lets hashgrid/MLP fit first.")
+    parser.add_argument("--activation_bias", nargs=2, type=float, default=[0.5, 0.0],
+                        help="Activation biases [sh_bias, res_bias] for 3D_SH_res/cat/32. "
+                             "color = ReLU(ReLU(SH+sh_bias) + residual+res_bias). Default: [0.5, 0.0]")
     parser.add_argument("--eval_depth", action="store_true",
                         help="Render and save depth maps (expected and median) during final evaluation")
     parser.add_argument("--use_xyz_mode", action="store_true",
@@ -2891,14 +4074,25 @@ if __name__ == "__main__":
                         help="MCMC deficit mode: delete dead Gaussians until reaching cap_max, then normal MCMC. Use when init points > cap_max.")
     parser.add_argument("--mcmc_fps", action="store_true",
                         help="MCMC mode with farthest point subsampling: subsample init points to cap_max before training using FPS algorithm. Cached for standard cap_max values (40k, 100k, 400k, 1M).")
+    parser.add_argument("--mcmc_sample", type=str, default="opacity",
+                        choices=["opacity", "gradient"],
+                        help="MCMC donor-sampling distribution: 'opacity' (default, sample ∝ α) "
+                             "or 'gradient' (Nexels-style, sample ∝ accumulated xyz gradient — "
+                             "targets high-error regions).")
     parser.add_argument("--cap_max", type=int, default=-1,
                         help="Maximum number of Gaussians (required for MCMC mode)")
-    parser.add_argument("--opacity_reg", type=float, default=0.01,
-                        help="L1 regularization weight on opacity (MCMC mode)")
-    parser.add_argument("--scale_reg", type=float, default=0.01,
-                        help="L1 regularization weight on scale (MCMC mode)")
+    parser.add_argument("--opacity_reg", type=float, default=0.0,
+                        help="L1 regularization weight on opacity (0 = disabled)")
+    parser.add_argument("--scale_reg", type=float, default=0.0,
+                        help="L1 regularization weight on scale (0 = disabled)")
     parser.add_argument("--noise_lr", type=float, default=5e5,
                         help="SGLD noise learning rate multiplier (MCMC mode)")
+    parser.add_argument("--mcmc_depth_reinit", type=int, default=0,
+                        help="Iteration for first depth reinitialization in MCMC mode (0 = disabled)")
+    parser.add_argument("--reinit_interval", type=int, default=0,
+                        help="Repeat depth reinit every N iterations after mcmc_depth_reinit (0 = only once)")
+    parser.add_argument("--reinit_end", type=int, default=-1,
+                        help="Stop repeating reinit after this iteration (-1 = total_iterations - 15000)")
 
     # Learnable skybox background for outdoor scenes
     parser.add_argument("--background", type=str, default="none",
@@ -2934,27 +4128,78 @@ if __name__ == "__main__":
                         help="BCE regularization weight (default: 0.01)")
     parser.add_argument("--bce_solo", action="store_true",
                         help="Disable MCMC opacity regularization during BCE phase (avoids conflicting gradients)")
+    parser.add_argument("--bce_solo_adaptive", action="store_true",
+                        help="Like --bce_solo but sets BCE threshold to median opacity at BCE start (pushes weak down, strong up)")
+    parser.add_argument("--bce_adaptive", action="store_true",
+                        help="Sets BCE threshold to median opacity at BCE start (keeps opacity/scale reg active)")
+    parser.add_argument("--bce_adaptive_stat", type=str, default="median", choices=["median", "mean"],
+                        help="Statistic for adaptive BCE threshold (default: median)")
 
     # Beta (Gaussian sharpening) override
     parser.add_argument("--beta", type=float, default=None,
                         help="Override tg_beta from config (higher = sharper Gaussians, more opaque throughout)")
 
+    # --feature beta: view-dependent color function. Default 'sh' = spherical harmonics
+    # (current behavior). 'beta' = spherical-beta lobes as in beta-splatting paper.
+    parser.add_argument("--feature", type=str, default="sh",
+                        choices=["sh", "beta", "sg", "voronoi"],
+                        help="View-dependent color: 'sh' (spherical harmonics, default), 'beta' (spherical-beta), 'sg' (MEGS-2 spherical Gaussians), or 'voronoi' (spherical voronoi: softmax-weighted lobes, L2-dist logits)")
+    parser.add_argument("--sv_l1", type=float, default=1e-5,
+                        help="L1 regularization on _sv_colors (sphericalvoronoi default 1e-5 for NeRF-synthetic, 0 for indoor/outdoor).")
+    parser.add_argument("--sites_lr", type=float, default=5e-2,
+                        help="--feature voronoi initial LR for _sv_sites (reference scheduler init). Decays exponentially to --sites_lr_final.")
+    parser.add_argument("--sites_lr_final", type=float, default=1e-4,
+                        help="--feature voronoi final LR for _sv_sites at end of training (reference scheduler final).")
+    parser.add_argument("--sv_metric", type=str, default="l2",
+                        choices=["l2", "cosine"],
+                        help="SV logit metric: 'l2' (radiance default, -τ·||s_norm − ω||) or "
+                             "'cosine' (paper formulation, s · ω = unconstrained dot product). "
+                             "Cosine avoids L2's sqrt gradient blowup near alignment.")
+    parser.add_argument("--sv_color_lr", type=float, default=1.25e-4,
+                        help="--feature voronoi LR for _sv_colors (reference blender config: 0.000125).")
+    parser.add_argument("--sb_number", type=int, default=2,
+                        help="--feature beta: number of spherical beta primitives per Gaussian (K). Default 2")
+    parser.add_argument("--sb_params_lr", type=float, default=0.0025,
+                        help="--feature beta: LR for sb_params (per-primitive rgb/theta/phi/beta_raw). Default 0.0025")
+    parser.add_argument("--sb_beta_lr", type=float, default=0.001,
+                        help="--feature beta: LR for shared per-Gaussian sharpness. Default 0.001")
+
     # Beta kernel arguments
     parser.add_argument("--kernel", type=str, default="gaussian",
-                        choices=["gaussian", "beta", "beta_scaled", "flex", "general"],
-                        help="Kernel type: 'gaussian' (default exp(-0.5*r²)), 'beta' (pow(1-r², shape) with r∈[0,1]), 'beta_scaled' (same but r∈[0,3] to match 3σ Gaussian extent), 'flex' (Gaussian with learnable per-Gaussian beta), or 'general' (Isotropic Generalized Gaussian)")
+                        choices=["gaussian", "beta", "beta_scaled", "flex", "general", "nexel"],
+                        help="Kernel type: 'gaussian' (default exp(-0.5*r²)), 'beta' (pow(1-r², shape) with r∈[0,1]), 'beta_scaled' (same but r∈[0,3] to match 3σ Gaussian extent), 'flex' (Gaussian with learnable per-Gaussian beta), 'general' (Isotropic Generalized Gaussian), or 'nexel' (per-axis learnable gamma exponents, G=exp(-0.5*(s_x^2γx + s_y^2γy)))")
     parser.add_argument("--freeze_beta", type=float, default=None,
                         help="Freeze beta kernel shape to a fixed value (e.g., 3.0 for semisoft). Disables shape optimization.")
+    parser.add_argument("--grads", type=str, default="vanilla",
+                        choices=["vanilla", "abs"],
+                        help="Densification gradient mode: 'vanilla' (signed gradients, 2DGS default) "
+                             "or 'abs' (AbsGS cancellation-free absolute gradients)")
+    parser.add_argument("--lowpass", action="store_true",
+                        help="Enable low-pass filter gradient in backward (propagate geometry gradients "
+                             "through rho2d path to transMat). Off by default (matches reference 2DGS).")
+    parser.add_argument("--pixel_center", action="store_true",
+                        help="Use pixel-center convention (pixf = pix + 0.5, ndc2pix offset = W/2). "
+                             "Off by default = pixel-corner convention (matches reference 2DGS).")
+    parser.add_argument("--antialiasing", type=float, default=0.0,
+                        help="Nexels-style hash-grid anti-aliasing down-weight factor. "
+                             "0 disables (default). Typical value 1.0. Uses max(fx,fy) as focal.")
+    parser.add_argument("--aa_2dgs", type=float, default=0.0,
+                        help="AA-2DGS Jacobian-based anti-aliasing kernel size (σ) for 3D_SH_res. "
+                             "0 disables (default). Typical value 0.1. Replaces the "
+                             "min(rho3d, rho2d) heuristic with a mathematically continuous "
+                             "object-space mip filter (Σ'_local = I + σ·J·Jᵀ).")
     parser.add_argument("--detach_hash_grad", action="store_true",
                         help="Detach positional gradients from hashgrid in CAT mode (geometry follows per-Gaussian features only)")
-    parser.add_argument("--lambda_shape", type=float, default=0.001,
-                        help="L1 regularization weight on beta kernel shape parameter (pushes toward 0 = hard disks)")
+    parser.add_argument("--lambda_shape", type=float, default=0.0,
+                        help="L1 regularization weight on beta kernel shape parameter (pushes toward 0 = hard disks). Default 0 = shapes stay at their init.")
     parser.add_argument("--shape_iter", type=int, default=0,
                         help="Apply shape regularization for the last N iterations only (0 = always active, default: 0)")
     parser.add_argument("--lambda_flex_beta", type=float, default=0.0001,
                         help="L1 regularization weight on flex kernel beta parameter (prevents runaway sharpening)")
     parser.add_argument("--l1_hash", type=float, default=0.0,
                         help="L1 regularization on hashgrid embeddings to encourage sparsity (0.0 = disabled)")
+    parser.add_argument("--l1_sh_rest", type=float, default=0.0,
+                        help="L1 regularization on higher-order SH (features_rest) to keep SH low-frequency (0.0 = disabled)")
     parser.add_argument("--tv_hash", type=float, default=0.0,
                         help="Total variation regularization on hashgrid to penalize uniform grey while preserving edges/detail (0.0 = disabled)")
     parser.add_argument("--genreg", type=str, default="basic",
@@ -2986,6 +4231,156 @@ if __name__ == "__main__":
                         help="Phase 1: fraction of Gaussians to prune by importance (default: 0.5)")
     parser.add_argument("--gspa_imp_metric", type=str, default="indoor",
                         help="Importance metric: 'indoor' (sum weights) or 'outdoor' (weight/area)")
+    parser.add_argument("--gspa_target_count", type=int, default=0,
+                        help="Upper-limit target for final Gaussian count. When > 0, auto-splits "
+                             "the keep ratio evenly across Phase 1 and Phase 2 "
+                             "(keep_per_phase = sqrt(target/current)), overriding "
+                             "--gspa_prune_ratio1 and --gspa_ratio. 0 = use manual ratios.")
+
+    # MiniSpa: mini v2 aggressive clone + silhouette-aware depth reinit → GSpa ADMM
+    parser.add_argument("--minispa", action="store_true",
+                        help="MiniSpa: mini v2 aggressive cloning up to --minispa_reinit_iter, one "
+                             "silhouette-aware depth reinit at that iter, then GSpa ADMM from "
+                             "--minispa_admm_start to --minispa_admm_stop. Skips mini simp1/simp2 "
+                             "and GSpa Phase 1 importance-prune. Requires --method 3D_SH_res.")
+    parser.add_argument("--minispa_reinit_iter", type=int, default=2000,
+                        help="MiniSpa: depth reinit iteration (loose silhouette scale). Default 2000.")
+    parser.add_argument("--minispa_admm_start", type=int, default=3000,
+                        help="MiniSpa: GSpa ADMM start iter (after reinit settles). Default 3000.")
+    parser.add_argument("--minispa_admm_stop", type=int, default=23000,
+                        help="MiniSpa: GSpa ADMM stop iter (final hard prune). Default 23000.")
+    parser.add_argument("--minispa_reinit_interval", type=int, default=5000,
+                        help="MiniSpa: during ADMM phase, fire a fresh depth reinit every N iters. "
+                             "Skips the iter coinciding with --minispa_admm_stop (no end-of-ADMM reinit). "
+                             "Default 5000. Set 0 to disable periodic reinits.")
+    parser.add_argument("--minispa_mesh", action="store_true",
+                        help="MiniSpa: TSDF-fuse the max-contributor depth maps into a mesh and "
+                             "area-uniformly sample reinit points from it. Removes the view-coverage "
+                             "bias of per-pixel reinit. Requires Open3D.")
+    parser.add_argument("--minispa_mesh_voxel", type=float, default=0.0,
+                        help="MiniSpa mesh reinit: TSDF voxel size in world units. "
+                             "0 = scene.cameras_extent / 256 (default).")
+    parser.add_argument("--minispa_mesh_poisson", action="store_true",
+                        help="MiniSpa mesh reinit: use Poisson-disk (blue-noise) sampling instead "
+                             "of uniform area-weighted. Slower (~2x) but more even spacing.")
+    parser.add_argument("--minispa_mesh_scale_factor", type=float, default=0.5,
+                        help="MiniSpa mesh reinit: multiply per-point NN-distance by this factor "
+                             "when setting the initial surfel scale. 1.0 = neighbors overlap at 3σ "
+                             "(bloated). 0.5 = neighbors at 2σ (gap-free tiling). Default 0.5.")
+    parser.add_argument("--minispa_mesh_opacity", type=float, default=0.3,
+                        help="MiniSpa mesh reinit: initial opacity for reinit surfels. "
+                             "Default 0.3 (vs 0.8 for pixel reinit) so overlapping surfels don't "
+                             "saturate alpha and read as bloat.")
+
+    # FastGS multi-view consistency densification / pruning (Phase 1: Python proxy).
+    # Paper: arXiv 2511.04283. Phase-1 uses max_contrib_idx as a per-pixel
+    # contributor proxy (undercounts vs FastGS's all-contributor CUDA counter).
+    parser.add_argument("--fastgs", action="store_true",
+                        help="Enable FastGS multi-view consistent densification + pruning. "
+                             "Replaces standard densify_and_prune; requires --method 3D_SH_res.")
+    parser.add_argument("--fastgs_num_views", type=int, default=10,
+                        help="FastGS: K random views sampled per densify/prune call. Paper: 10.")
+    parser.add_argument("--fastgs_loss_thresh", type=float, default=0.1,
+                        help="FastGS: per-view normalized L1 threshold flagging high-error pixels.")
+    parser.add_argument("--fastgs_lambda_dssim", type=float, default=0.2,
+                        help="FastGS: SSIM weight in photometric loss (paper λ=0.2).")
+    parser.add_argument("--fastgs_importance_thresh", type=int, default=1,
+                        help="FastGS: Gaussians with floor(sum_count / K) > this are eligible "
+                             "for densification. Paper uses 5 with the all-contributor counter; "
+                             "our max-contributor proxy undercounts so default is 1.")
+    parser.add_argument("--fastgs_grad_thresh", type=float, default=0.0002,
+                        help="FastGS: gradient threshold for clone qualification.")
+    parser.add_argument("--fastgs_grad_abs_thresh", type=float, default=0.0012,
+                        help="FastGS: absolute gradient threshold for split qualification (AbsGS).")
+    parser.add_argument("--fastgs_dense", type=float, default=0.001,
+                        help="FastGS: scale/extent threshold splitting clone vs split region.")
+    parser.add_argument("--fastgs_prune_budget_frac", type=float, default=0.5,
+                        help="FastGS: fraction of opacity-pruneable Gaussians actually removed per call.")
+    parser.add_argument("--fastgs_densify_interval", type=int, default=500,
+                        help="FastGS: run VCD+VCP every N iters (paper: 500).")
+    parser.add_argument("--fastgs_densify_until", type=int, default=15000,
+                        help="FastGS: stop densification at this iter (paper: 15000).")
+    parser.add_argument("--fastgs_final_prune_interval", type=int, default=3000,
+                        help="FastGS: post-15k aggressive pruning cadence (paper: 3000).")
+    parser.add_argument("--fastgs_final_prune_until", type=int, default=30000,
+                        help="FastGS: stop the post-15k aggressive pruning at this iter.")
+    parser.add_argument("--fastgs_final_min_opacity", type=float, default=0.1,
+                        help="FastGS: post-15k opacity floor for aggressive prune (paper: 0.1).")
+    parser.add_argument("--fastgs_final_score_thresh", type=float, default=0.9,
+                        help="FastGS: post-15k pruning score threshold (paper: 0.9).")
+
+    # Mini-Splatting v2 optimization
+    parser.add_argument("--mini", action="store_true",
+                        help="Enable Mini-Splatting v2 optimization (contribution-based densification, depth reinit, importance pruning)")
+    parser.add_argument("--mini_depth_reinit_iter", type=int, default=2000,
+                        help="Iteration for depth reinitialization (default: 2000)")
+    parser.add_argument("--mini_simp_iter1", type=int, default=3000,
+                        help="First importance-based simplification iteration (default: 3000)")
+    parser.add_argument("--mini_simp_iter2", type=int, default=8000,
+                        help="Second importance-based simplification iteration (default: 8000)")
+    parser.add_argument("--mini_densify_until", type=int, default=3000,
+                        help="End densification for MSv2 (default: 10000)")
+    parser.add_argument("--mini_clone_interval", type=int, default=250,
+                        help="Aggressive clone interval (default: 250)")
+    parser.add_argument("--mini_depth_factor", type=float, default=1.0,
+                        help="Multiplier for number of depth-reinitialized points (default: 1.0)")
+    parser.add_argument("--mini_sampling_factor", type=float, default=0.6,
+                        help="Simp1: importance-weighted sampling factor (default: 0.6, keep ~60%% of non-zero importance)")
+    parser.add_argument("--mini_imp_metric", type=str, default="indoor", choices=["indoor", "outdoor"],
+                        help="Importance metric: 'indoor' (sum weights) or 'outdoor' (weight/area)")
+    parser.add_argument("--mini_late_prune_interval", type=int, default=500,
+                        help="After mini_simp_iter2, prune Gaussians below opacity threshold every N iters (0=disabled)")
+    parser.add_argument("--mini_late_prune_thresh", type=float, default=0.005,
+                        help="Opacity threshold for late prune under --mini (default: 0.005)")
+    parser.add_argument("--mini_warmup", action="store_true",
+                        help="Camera warmup: train at 0.5x resolution during densification phase (until simp1)")
+
+    # Mini-Splatting v1: repeated depth reinit + longer densification, NO aggressive clone
+    parser.add_argument("--mini1", action="store_true",
+                        help="Enable Mini-Splatting v1 schedule: repeated depth reinit on interval, longer densification window, no aggressive clone, later simplifications")
+    parser.add_argument("--mini1_depth_reinit_interval", type=int, default=5000,
+                        help="Interval (iters) between repeated depth reinits under --mini1 (default: 5000)")
+    parser.add_argument("--mini1_depth_reinit_until", type=int, default=15000,
+                        help="Stop repeated depth reinits at this iter under --mini1 (default: 15000)")
+
+    # MiniMC: Zero-Waste RJ-MCMC pipeline (error-driven relocation + pixel-ownership cull)
+    # Closed-loop: Mini cull marks non-winners dead → MCMC relocates dead onto high-error alives.
+    parser.add_argument("--minimc", action="store_true",
+                        help="Enable Zero-Waste RJ-MCMC: closed-loop error-driven relocation + pixel-ownership culling. Requires --mcmc (or --mcmc_fps/--mcmc_deficit) for SGLD noise.")
+    parser.add_argument("--minimc_start_iter", type=int, default=500,
+                        help="--minimc: do not cull/relocate before this iter (warmup). Default: 500")
+    parser.add_argument("--minimc_relocate_interval", type=int, default=100,
+                        help="--minimc: Phase-3 error-driven relocate fires every N iters. Default: 100")
+    parser.add_argument("--minimc_reinit_interval", type=int, default=0,
+                        help="--minimc: depth reinit fires every N iters (uses max-contributor depth from rasterizer, same path as --mini1). 0 = disabled. Default: 0")
+    parser.add_argument("--minimc_reinit_until", type=int, default=20000,
+                        help="--minimc: stop running depth reinit after this iter. Default: 20000")
+    # Deprecated aliases kept for back-compat. If set, they map into the reinit_interval flags.
+    parser.add_argument("--minimc_cull_interval", type=int, default=-1,
+                        help="(deprecated) Old name for --minimc_reinit_interval. Will be silently remapped.")
+    parser.add_argument("--minimc_cull_until", type=int, default=-1,
+                        help="(deprecated) Old name for --minimc_reinit_until. Will be silently remapped.")
+    parser.add_argument("--minimc_relocate_until", type=int, default=25000,
+                        help="--minimc: stop running relocate after this iter (pure SGLD drift after). Default: 25000")
+    parser.add_argument("--minimc_max_per_donor", type=int, default=1,
+                        help="--minimc: strict per-donor clone cap in a single relocate call. Default: 1 (single foggy probe per donor)")
+    parser.add_argument("--minimc_dead_thresh", type=float, default=0.005,
+                        help="--minimc: opacity <= this is considered dead. Same as vanilla MCMC. Default: 0.005")
+    parser.add_argument("--minimc_no_single_view_cull", action="store_true",
+                        help="--minimc: disable culling of single-view Gaussians (count_vis<=1). Default: cull.")
+    parser.add_argument("--minimc_low_imp_cdf", type=float, default=0.999,
+                        help="--minimc: CDF threshold for low-importance cull. Keeps top X by cumulative importance, drops the rest. Set to 1.0 to disable. Default: 0.999")
+    parser.add_argument("--minimc_growth_frac", type=float, default=0.05,
+                        help="--minimc: fraction of total tensor cloned into dead slots per sweep (matches vanilla MCMC's 5% add_new_gs growth rate). Actual n_clones = min(growth_frac * N_total, n_candidates, n_dead). Default: 0.05")
+    # Deprecated (old 3-stage minimc). Kept to avoid loud breakage if yaml configs still reference them.
+    parser.add_argument("--minimc_reinit_iter", type=int, default=0,
+                        help="(deprecated, ignored by new --minimc pipeline)")
+    parser.add_argument("--minimc_simp_iter1", type=int, default=0,
+                        help="(deprecated, ignored by new --minimc pipeline)")
+    parser.add_argument("--minimc_simp_iter2", type=int, default=0,
+                        help="(deprecated, ignored by new --minimc pipeline)")
+    parser.add_argument("--minimc_sampling_factor", type=float, default=0.6,
+                        help="(deprecated, ignored by new --minimc pipeline)")
 
     # Morton z-order sorting for cache locality
     parser.add_argument("--morton_interval", type=int, default=0,
@@ -2996,6 +4391,32 @@ if __name__ == "__main__":
     # Contribution threshold: skip hash query when effective contribution w = T*alpha is below threshold
     parser.add_argument("--contribution_thresh", type=float, default=0.0,
                         help="Skip hash query when w = T*alpha < threshold, MLP runs with zero features (0.0 = disabled, try 0.01)")
+
+    # Count threshold: skip hash after N contributing Gaussians per pixel
+    parser.add_argument("--count_thresh", type=int, default=0,
+                        help="Skip hash query after N contributing Gaussians per pixel (0 = disabled)")
+
+    # Overdraw regularization: penalize per-pixel contributor count
+    parser.add_argument("--overdraw_reg", type=float, default=0.0,
+                        help="Overdraw regularization lambda. Penalizes soft per-pixel contributor count (0 = disabled)")
+    parser.add_argument("--w_overdraw_reg", type=float, default=0.0,
+                        help="Weighted overdraw regularization lambda. Error-guided: relaxes penalty where RGB error is high (0 = disabled)")
+    parser.add_argument("--w_overdraw_gamma", type=float, default=50.0,
+                        help="Gamma for weighted overdraw: w(r) = exp(-gamma * MSE(r)). Higher = more aggressive relaxation.")
+    parser.add_argument("--weight_reg", type=float, default=0.0,
+                        help="Weight-squared regularization: penalize (1 - sum(w_i^2)) per pixel. Consolidates to single opaque surface (0 = disabled)")
+    parser.add_argument("--w_weight_reg", type=float, default=0.0,
+                        help="Error-guided weight-squared regularization. Relaxes where RGB error is high (0 = disabled)")
+    parser.add_argument("--w_weight_gamma", type=float, default=50.0,
+                        help="Gamma for weighted weight_reg: w(r) = exp(-gamma * MSE(r))")
+    parser.add_argument("--w_normal", type=float, default=0.0,
+                        help="Weighted normal consistency lambda. Error-guided: relaxes where RGB error is high (0 = use lambda_normal instead)")
+    parser.add_argument("--w_normal_gamma", type=float, default=50.0,
+                        help="Gamma for weighted normal: w(r) = exp(-gamma * MSE(r)). Higher = more aggressive relaxation.")
+
+    # Separated depth sort: pre-sort Gaussians by depth, then sort expanded list by tile_id only
+    parser.add_argument("--depth_sort", action="store_true",
+                        help="Use separated depth sort (pre-sort by depth, then tile-bin). Default: standard full radix sort")
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -3013,9 +4434,101 @@ if __name__ == "__main__":
             dest = arg.lstrip('-').replace('-', '_')
             cli_args.add(dest)
 
-    # --bce_solo implies --bce
-    if args.bce_solo:
+    # --bce_solo / --bce_solo_adaptive / --bce_adaptive implies --bce
+    if args.bce_solo or args.bce_solo_adaptive or args.bce_adaptive:
         args.bce = True
+        if args.bce_solo_adaptive:
+            args.bce_solo = True  # also disable opacity/scale reg during BCE phase
+
+    # MCMC defaults: enable opacity/scale regularization if not explicitly set
+    if (args.mcmc or args.mcmc_deficit or args.mcmc_fps):
+        if 'opacity_reg' not in cli_args and args.opacity_reg == 0.0:
+            args.opacity_reg = 0.01
+        if 'scale_reg' not in cli_args and args.scale_reg == 0.0:
+            args.scale_reg = 0.01
+
+    # Mini-Splatting v1 (--mini1) is a variant of --mini with a v1-style schedule.
+    # It reuses all --mini machinery but enables repeated depth reinit, extends
+    # densification, and skips aggressive cloning. Enable --mini automatically.
+    if args.mini1:
+        args.mini = True
+        # Override v2 defaults with v1-style schedule unless user set them explicitly.
+        if 'mini_depth_reinit_iter' not in cli_args:
+            args.mini_depth_reinit_iter = 5000
+        if 'mini_simp_iter1' not in cli_args:
+            args.mini_simp_iter1 = 15000
+        if 'mini_simp_iter2' not in cli_args:
+            args.mini_simp_iter2 = 20000
+        if 'mini_densify_until' not in cli_args:
+            args.mini_densify_until = 15000
+        if 'mini_sampling_factor' not in cli_args:
+            args.mini_sampling_factor = 0.5
+
+    # MiniSpa: mini v2 aggressive clone + silhouette reinit → GSpa ADMM.
+    # Auto-enables --mini and --gspa and wires the schedule so the two phases
+    # chain cleanly (reinit at minispa_reinit_iter, ADMM start after settle,
+    # no mini simp1/simp2, no gspa Phase 1).
+    # --minispa_mesh implies --minispa (which then implies --mini + --gspa).
+    if args.minispa_mesh and not args.minispa:
+        args.minispa = True
+        print("[MINISPA-MESH] auto-enabled --minispa (mesh reinit requires the minispa pipeline)")
+
+    if args.minispa:
+        args.mini = True
+        args.gspa = True
+        # No depth reinit under minispa — aggressive clone runs straight through
+        # until ADMM starts, then ADMM takes over. Park the mini reinit iter past
+        # the ADMM start so it never triggers, and keep aggressive clone alive
+        # until ADMM begins via mini_simp_iter1.
+        if 'mini_depth_reinit_iter' not in cli_args:
+            args.mini_depth_reinit_iter = 10**9
+        if 'mini_densify_until' not in cli_args:
+            args.mini_densify_until = args.minispa_admm_start
+        # Disable aggressive cloning: clone window is [500, mini_simp_iter1).
+        # Setting mini_simp_iter1 < 500 collapses the window — standard 3DGS
+        # densify_and_prune handles growth instead.
+        if 'mini_simp_iter1' not in cli_args:
+            args.mini_simp_iter1 = 0
+        if 'mini_simp_iter2' not in cli_args:
+            args.mini_simp_iter2 = 10**9
+        if 'gspa_start_iter' not in cli_args:
+            args.gspa_start_iter = args.minispa_admm_start
+        if 'gspa_stop_iter' not in cli_args:
+            args.gspa_stop_iter = args.minispa_admm_stop
+        # gspa_simp_iter anchors SH-degree increases. Park at ADMM start so SH
+        # begins ramping up when ADMM kicks in. Phase 1 dispatch is gated off.
+        if 'gspa_simp_iter' not in cli_args:
+            args.gspa_simp_iter = args.minispa_admm_start
+
+    # Mini-Splatting v2: mutual exclusivity check
+    if args.mini:
+        if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
+            raise ValueError("--mini is mutually exclusive with --mcmc/--mcmc_deficit/--mcmc_fps")
+        if args.gspa and not args.minispa:
+            raise ValueError("--mini is mutually exclusive with --gspa (use --minispa to combine)")
+
+    # --minimc back-compat: old --minimc_cull_interval / --minimc_cull_until flags
+    # now map into --minimc_reinit_interval / --minimc_reinit_until.
+    if args.minimc_cull_interval != -1:
+        print(f"[MINIMC] --minimc_cull_interval is deprecated; remapping to --minimc_reinit_interval={args.minimc_cull_interval}")
+        args.minimc_reinit_interval = args.minimc_cull_interval
+    if args.minimc_cull_until != -1:
+        print(f"[MINIMC] --minimc_cull_until is deprecated; remapping to --minimc_reinit_until={args.minimc_cull_until}")
+        args.minimc_reinit_until = args.minimc_cull_until
+
+    # --minimc requires one of the MCMC flags (for SGLD noise + dead-pool semantics).
+    # Auto-enable --mcmc to save the user the typing; hard-error if they actively
+    # pass --mini / --gspa alongside it.
+    if args.minimc:
+        if args.mini or args.mini1:
+            raise ValueError("--minimc is mutually exclusive with --mini/--mini1")
+        if args.gspa:
+            raise ValueError("--minimc is mutually exclusive with --gspa")
+        if not (args.mcmc or args.mcmc_deficit or args.mcmc_fps):
+            args.mcmc = True
+            print("[MINIMC] Auto-enabling --mcmc (required for SGLD noise + dead-pool semantics).")
+        if args.cap_max is None or args.cap_max <= 0:
+            raise ValueError("--minimc requires --cap_max > 0 (same as --mcmc).")
 
     print("Optimizing " + args.model_path)
     print(f"Method: {args.method.upper()}")
@@ -3045,7 +4558,8 @@ if __name__ == "__main__":
         print(f"Adaptive Add mode: weighted sum of per-Gaussian features and hashgrid features")
 
     if args.bce:
-        print(f"BCE opacity regularization: enabled for last {args.bce_iter} iterations (lambda={args.bce_lambda})")
+        mode = "adaptive (median threshold)" if args.bce_solo_adaptive else ("adaptive + reg" if args.bce_adaptive else ("solo" if args.bce_solo else "standard"))
+        print(f"BCE opacity regularization: enabled for last {args.bce_iter} iterations (lambda={args.bce_lambda}, mode={mode})")
 
     # Always print kernel info
     print(f"Kernel type: {args.kernel.upper()}")
@@ -3087,7 +4601,13 @@ if __name__ == "__main__":
 
     cfg_model = Config(args.yaml)
     merge_cfg_to_args(args, cfg_model, cli_args=cli_args)
-    
+
+    # Mini-Splatting v2: override densify_until_iter and opacity_lr AFTER yaml merge
+    if args.mini and 'densify_until_iter' not in cli_args:
+        args.densify_until_iter = args.mini_densify_until
+    if args.mini and 'opacity_lr' not in cli_args:
+        args.opacity_lr = 0.025  # MSv2 halves opacity LR for stability
+
     # Cold start mode: override config to enable hash_in_CUDA from start
     if args.cold:
         if not cfg_model.settings.if_ingp:

@@ -58,6 +58,14 @@ except ImportError:
     _sh_res_rasterizer = None
     SH_RES_RASTERIZER_AVAILABLE = False
 
+# SH+residual 32-dim library (diff_surfel_3D_sh_32) — same as sh_res but 32-dim hidden MLP
+try:
+    import diff_surfel_3D_sh_32 as _sh_32_rasterizer
+    SH_32_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _sh_32_rasterizer = None
+    SH_32_RASTERIZER_AVAILABLE = False
+
 # Import main rasterizer if lean-only mode not set
 if not _USE_LEAN_ONLY:
     try:
@@ -78,8 +86,154 @@ import time
 # from hash_encoder.FeatureBlend import FeatureBlend
 from utils.general_utils import MEM_PRINT
 
+
+# --feature beta: spherical-beta directional color function.
+# Per-Gaussian view-dependent RGB:
+#     C(v) = sum_i softplus(rgb_i) * max(0, dot(mu_i, v))^(4 * exp(beta))
+# where (theta_i, phi_i) -> mu_i is one of K lobe directions and `beta` is a shared
+# per-Gaussian sharpness. Returns [N, 3] in natural RGB space (NOT SH-scaled).
+# See beta-splatting reference: submodules/gsplat/cuda/csrc/spherical_beta.cuh.
+_SH_C0 = 0.28209479177387814
+
+
+def eval_sb(sb_params: torch.Tensor, view_dirs: torch.Tensor) -> torch.Tensor:
+    """Spherical beta directional color evaluation. Matches beta-splatting reference:
+       contrib = sum_k softplus_steep(rgb_k) · dot^(4·exp(beta_k))
+    with per-primitive beta at index 5 and dot clamped via `dot > 0`.
+
+    Args:
+        sb_params:  [N, K, 6]  per-primitive (r, g, b, theta, phi, beta_per_primitive).
+        view_dirs:  [N, 3]     unit view direction per Gaussian (camera→Gaussian center).
+
+    Returns:
+        [N, 3] RGB contribution from the K primitive lobes.
+    """
+    import math
+    # Steep softplus: beta=10*ln(2)≈6.93, matches reference
+    rgb   = torch.nn.functional.softplus(sb_params[..., 0:3], beta=10.0 * math.log(2.0))  # [N, K, 3]
+    theta = sb_params[..., 3]                                             # [N, K]
+    phi   = sb_params[..., 4]                                             # [N, K]
+    beta_per_primitive = sb_params[..., 5]                                # [N, K]
+
+    sin_t = torch.sin(theta)
+    mu = torch.stack([
+        sin_t * torch.cos(phi),
+        sin_t * torch.sin(phi),
+        torch.cos(theta),
+    ], dim=-1)                                                            # [N, K, 3]
+
+    # Reference CUDA: betaTerm = dot > 0 ? dot^(4·exp(β)) : 0
+    dot = (mu * view_dirs.unsqueeze(1)).sum(dim=-1)                        # [N, K]
+    expo = 4.0 * torch.exp(beta_per_primitive)                             # [N, K] per-primitive
+    term = torch.where(dot > 0, dot.clamp_min(1e-12).pow(expo), torch.zeros_like(dot))
+    contrib = (term.unsqueeze(-1) * rgb).sum(dim=1)                        # [N, 3]
+    return contrib
+
+
+def eval_sg(sg_directions: torch.Tensor, sg_sharpness: torch.Tensor,
+            sg_rgb: torch.Tensor, view_dirs: torch.Tensor) -> torch.Tensor:
+    """MEGS-2 Spherical Gaussian directional color evaluation.
+
+    color = Σ_k softplus(sg_rgb[k]) · exp(|λ_k| · (cos θ_k − 1))
+
+    `softplus` on rgb keeps per-lobe contributions non-negative so the downstream
+    SH clamp (`max(color, 0)` in the rasterizer) never zeros real SG output.
+
+    Args:
+        sg_directions: [N, K, 3] raw direction vectors (will be normalized).
+        sg_sharpness:  [N, K, 1] raw sharpness (|·| activation).
+        sg_rgb:        [N, K, 3] raw per-axis RGB (softplus'd at eval).
+        view_dirs:     [N, 3]    unit view direction per Gaussian.
+
+    Returns:
+        [N, 3] additive RGB contribution, always >= 0.
+    """
+    d = sg_directions / (sg_directions.norm(dim=-1, keepdim=True) + 1e-8)  # [N, K, 3]
+    cos_theta = (d * view_dirs.unsqueeze(1)).sum(dim=-1)                    # [N, K]
+    lam = torch.abs(sg_sharpness.squeeze(-1))                               # [N, K]
+    scale = torch.exp(lam * (cos_theta - 1.0))                              # [N, K]
+    rgb_pos = torch.nn.functional.softplus(sg_rgb)                          # [N, K, 3] > 0
+    contrib = (scale.unsqueeze(-1) * rgb_pos).sum(dim=1)                    # [N, 3]
+    return contrib
+
+
+def eval_voronoi(sv_sites: torch.Tensor, sv_colors: torch.Tensor,
+                 view_dirs: torch.Tensor, metric: str = "l2") -> torch.Tensor:
+    """Spherical Voronoi (radiance) directional color evaluation.
+
+    Two metrics supported (both match sphericalvoronoi/radiance):
+      - 'l2'     : logits = -τ_k · ||site_k_unit − ω||    (L2 distance, default)
+      - 'cosine' : logits = s_k · ω                       (paper formulation,
+                   unconstrained dot product; τ is implicit in ||s_k||).
+
+    Args:
+        sv_sites:   [N, K, 3] raw direction vectors (magnitude = τ).
+        sv_colors:  [N, K, 3] per-site RGB.
+        view_dirs:  [N, 3]    unit view direction per Gaussian.
+        metric:     'l2' or 'cosine'.
+    """
+    if metric == "cosine":
+        # Paper-clean: logits_k = s_k · ω  (no normalization, no sqrt).
+        logits = (sv_sites * view_dirs.unsqueeze(1)).sum(dim=-1)            # [N, K]
+    else:
+        tau = torch.norm(sv_sites, dim=-1)                                  # [N, K]
+        site_dirs = sv_sites / (tau.unsqueeze(-1) + 1e-8)                   # [N, K, 3]
+        diff = site_dirs - view_dirs.unsqueeze(1)                           # [N, K, 3]
+        dist = torch.norm(diff, dim=-1)                                     # [N, K]
+        logits = -tau * dist                                                # [N, K]
+    W = torch.softmax(logits, dim=-1).unsqueeze(-1)                         # [N, K, 1]
+    V = (W * sv_colors).sum(dim=1)                                          # [N, 3]
+    return torch.clamp_min(V, 0.0)
+
+
+def _build_fake_shs_from_voronoi(pc, view_dirs, max_sh_degree, sh_bias: float = 0.5,
+                                  metric: str = "l2"):
+    """Hybrid SH-DC + SV. SH degree-0 (DC) carries the view-independent base color;
+    SV adds a view-dependent refinement on top. Higher-order SH stays zero.
+
+    Rasterizer computes `color = clamp(SH_C0 * fake_dc + sh_bias, 0)` + (any
+    higher-order SH, but fake_rest=0 so none). To inject SV additively:
+       fake_dc = real_dc + SV / SH_C0
+    so final = SH_C0 * real_dc + sh_bias + SV = pcd_RGB_baseline + view-dep SV."""
+    sv_rgb = eval_voronoi(pc._sv_sites, pc._sv_colors, view_dirs, metric=metric)
+    real_shs = pc.get_features  # [N, M, 3]
+    fake = real_shs.new_zeros(real_shs.shape)
+    fake[:, 0, :] = real_shs[:, 0, :] + sv_rgb / _SH_C0  # DC + SV/SH_C0
+    # fake[:, 1:, :] stays zero — higher-order SH disabled
+    return fake
+
+
+def _build_fake_shs_from_sg(pc, view_dirs, max_sh_degree, sh_bias: float = 0.5):
+    """Add the SG contribution on top of the real SH, matching MEGS-2:
+    `color = clamp(SH_eval + sh_bias + SG_sum, 0)`.
+    """
+    sg_rgb_out = eval_sg(pc._sg_directions, pc._sg_sharpness_sg, pc._sg_rgb, view_dirs)
+    real_shs = pc.get_features
+    fake = real_shs.clone()
+    fake[:, 0, :] = real_shs[:, 0, :] + sg_rgb_out / _SH_C0
+    return fake
+
+
+def _build_fake_shs_from_sb(pc, view_dirs, max_sh_degree, sh_bias: float = 0.5):
+    """Add the spherical-beta contribution on top of the real SH, matching
+    beta-splatting's: `color = clamp(SH_eval + sh_bias + SB_sum, 0)`.
+
+    Rasterizer computes `SH_C0 * fake_dc + sh_bias + higher_SH + ...`.
+    Real SH computes: `SH_C0 * dc + sh_bias + higher_SH`.
+    To add SB contribution: fake_dc = dc + SB_sum / SH_C0.
+    The higher-order SH terms carry through unchanged.
+    """
+    beta_rgb = eval_sb(pc._sb_params, view_dirs)                           # [N, 3]
+    real_shs = pc.get_features                                              # [N, M, 3]
+    fake = real_shs.clone()
+    # real_shs[:,0,:] is the DC coefficient; the rasterizer multiplies it by SH_C0.
+    # Adding beta_rgb / SH_C0 to DC injects beta_rgb into the final color additively.
+    fake[:, 0, :] = real_shs[:, 0, :] + beta_rgb / _SH_C0
+    return fake
+
 # One-time verification flags for render modes
 _3D_DIRECT_FUSED_VERIFIED = False
+_ACTIVATION_BIAS = [0.5, 0.0]  # [sh_bias, res_bias] — set from train.py via set_default_activation_bias()
 
 
 class IntersectionOpacityGrad(torch.autograd.Function):
@@ -459,7 +613,7 @@ class RenderCache:
 
     def get_screenspace_points(self, num_gaussians, device='cuda'):
         if self.screenspace_points is None or self.screenspace_points.shape[0] != num_gaussians:
-            self.screenspace_points = torch.zeros(num_gaussians, 3, dtype=torch.float32, device=device)
+            self.screenspace_points = torch.zeros(num_gaussians, 4, dtype=torch.float32, device=device)
             self._num_gaussians = num_gaussians
         return self.screenspace_points
 
@@ -483,11 +637,16 @@ class RenderCache:
         return self.homotrans
 
 
+def set_default_activation_bias(sh_bias, res_bias):
+    """Set the default activation biases used for decompose restore."""
+    global _ACTIVATION_BIAS
+    _ACTIVATION_BIAS = [sh_bias, res_bias]
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
     beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False, decompose_mode = None, max_intersections = 0,
     skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2, no_gumbel = False, dropout_lambda = 0.0, is_training = True,
     aabb_mode = "2dgs", aa = 0.0, aa_threshold = 0.01, skybox = None, background_mode = "none", bg_hashgrid = None, detach_hash_grad = False,
-    return_raw_features = False, fast_inference = False, cache = None, max_intersections_per_pixel = 32):
+    return_raw_features = False, fast_inference = False, cache = None, max_intersections_per_pixel = 32, lowpass = False, pixel_center = False, antialiasing = 0.0, sv_metric = "l2"):
     """
     Render the scene.
 
@@ -516,7 +675,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         screenspace_points.zero_()  # Reset to zeros
     else:
         # Training mode: need gradients
-        screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+        screenspace_points = torch.zeros(pc.get_xyz.shape[0], 4, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
         try:
             screenspace_points.retain_grad()
         except:
@@ -529,6 +688,43 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+
+    # --feature beta / --feature sg: compute fake SH tensor from the directional
+    # lobes once per render. Stashed on pc._beta_fake_shs so dispatch blocks below
+    # can read it back in place of pc.get_features.
+    pc._beta_fake_shs = None
+    _fm = getattr(pc, 'feature_mode', 'sh')
+    if _fm == "beta" and pc._sb_params.numel() > 0:
+        with torch.no_grad():
+            _cam_center = viewpoint_camera.camera_center.to(means3D.device)
+        _dirs = means3D - _cam_center.unsqueeze(0)
+        _dirs = _dirs / (_dirs.norm(dim=-1, keepdim=True) + 1e-8)
+        _sh_bias_local = _ACTIVATION_BIAS[0]
+        pc._beta_fake_shs = _build_fake_shs_from_sb(pc, _dirs, pc.max_sh_degree,
+                                                    sh_bias=_sh_bias_local)
+    elif _fm == "sg" and pc._sg_directions.numel() > 0:
+        with torch.no_grad():
+            _cam_center = viewpoint_camera.camera_center.to(means3D.device)
+        _dirs = means3D - _cam_center.unsqueeze(0)
+        _dirs = _dirs / (_dirs.norm(dim=-1, keepdim=True) + 1e-8)
+        _sh_bias_local = _ACTIVATION_BIAS[0]
+        pc._beta_fake_shs = _build_fake_shs_from_sg(pc, _dirs, pc.max_sh_degree,
+                                                     sh_bias=_sh_bias_local)
+    elif _fm == "voronoi" and pc._sv_sites.numel() > 0:
+        with torch.no_grad():
+            _cam_center = viewpoint_camera.camera_center.to(means3D.device)
+        _dirs = means3D - _cam_center.unsqueeze(0)
+        _dirs = _dirs / (_dirs.norm(dim=-1, keepdim=True) + 1e-8)
+        _sh_bias_local = _ACTIVATION_BIAS[0]
+        pc._beta_fake_shs = _build_fake_shs_from_voronoi(pc, _dirs, pc.max_sh_degree,
+                                                          sh_bias=_sh_bias_local,
+                                                          metric=sv_metric)
+
+    def _effective_shs():
+        """Return directional-lobe-derived fake SH if --feature beta/sg, else real SH."""
+        if pc._beta_fake_shs is not None:
+            return pc._beta_fake_shs
+        return pc.get_features
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -584,8 +780,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_3D_SH_res_mode = ingp is not None and hasattr(ingp, 'is_3D_SH_res_mode') and ingp.is_3D_SH_res_mode
     # 3D_SH_cat mode: per-Gaussian SH + hash+DC MLP residual (diff_surfel_3D_sh_res)
     is_3D_SH_cat_mode = ingp is not None and hasattr(ingp, 'is_3D_SH_cat_mode') and ingp.is_3D_SH_cat_mode
-    # Treat lean/fp16/tc/sh_tc/sh_res/sh_cat mode same as fused mode for rendering logic
-    if is_3D_direct_lean_mode or is_3D_direct_fp16_mode or is_3D_direct_tc_mode or is_3D_direct_sh_tc_mode or is_3D_SH_res_mode or is_3D_SH_cat_mode:
+    # 3D_SH_32 mode: per-Gaussian SH + 32-dim hash MLP residual (diff_surfel_3D_sh_32)
+    is_3D_SH_32_mode = ingp is not None and hasattr(ingp, 'is_3D_SH_32_mode') and ingp.is_3D_SH_32_mode
+    # Treat lean/fp16/tc/sh_tc/sh_res/sh_cat/sh_32 mode same as fused mode for rendering logic
+    if is_3D_direct_lean_mode or is_3D_direct_fp16_mode or is_3D_direct_tc_mode or is_3D_direct_sh_tc_mode or is_3D_SH_res_mode or is_3D_SH_cat_mode or is_3D_SH_32_mode:
         is_3D_direct_fused_mode = True
 
     hash_in_CUDA = True
@@ -622,13 +820,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     if override_color is None:
         if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            _feat_src = _effective_shs()
+            shs_view = _feat_src.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(_feat_src.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
-            shs = pc.get_features
+            shs = _effective_shs()
     else:
         colors_precomp = override_color
 
@@ -752,31 +951,33 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             from diff_surfel_3D_sh_res import set_mlp_weights
 
             # Full SH for view-dependent base color (evaluated in CUDA preprocessing)
-            shs = pc.get_features
+            shs = _effective_shs()
 
             # DC SH for MLP input: raw SH_C0 * coeff + 0.5 (same as computeColorFromSH DC term)
             SH_C0 = 0.28209479177387814
-            dc_sh = SH_C0 * pc.get_features[:, 0, :] + 0.5  # [N, 3]
+            dc_sh = SH_C0 * _effective_shs()[:, 0, :] + 0.5  # [N, 3]
             colors_precomp = dc_sh.contiguous()
 
             # Decompose mode for 3D_SH_cat:
-            #   'sh_only': zero MLP weights → residual = 0, only SH contributes
-            #   'tex_only': zero SH via rgb_override → sh_color = 0, only MLP residual contributes
+            #   'sh_only': zero MLP weights, set res_bias=-999 → ReLU(0-999)=0
+            #   'tex_only': set sh_bias=-999 → ReLU(SH-999)=0
             _zero_mlp_weights = False
             if decompose_mode == 'sh_only':
                 _zero_mlp_weights = True
+                _restore_bias = True
+                from diff_surfel_3D_sh_res import set_activation_bias
+                set_activation_bias(sh_bias=_ACTIVATION_BIAS[0], res_bias=0.0)  # sh_only: zero MLP weights handle it
             elif decompose_mode == 'tex_only':
-                # For mode 6: SH eval goes into geomState.rgb which becomes rgb_override
-                # Zero out shs so computeColorFromSH produces 0.5, then we need true zeros...
-                # Actually for mode 6, rgb_override = geomState.rgb, so zero out shs
-                # But clamp(0 + 0.5, 0) = 0.5, not 0. Instead, set shs to produce -0.5:
-                shs = torch.zeros_like(shs)
-                # Set DC to -0.5/SH_C0 so that SH_C0 * dc + 0.5 = 0
-                shs[:, 0, :] = -0.5 / SH_C0
+                _restore_bias = True
+                from diff_surfel_3D_sh_res import set_activation_bias
+                set_activation_bias(sh_bias=-999.0, res_bias=_ACTIVATION_BIAS[1])  # tex_only: kill SH
 
-            # Hash grid setup (all levels are hash, no hybrid)
-            total_levels = ingp.levels
-            active_hashgrid_levels = ingp.hashgrid_levels if not ingp.hashgrid_disabled else 0
+            # Hash grid setup: use actual hashgrid_levels (not config total),
+            # since hybrid_levels may have reduced the hash grid size.
+            total_levels = ingp.hashgrid_levels
+            active_hashgrid_levels = min(
+                ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0,
+                total_levels)
 
             # Encode levels: (total << 16) | (active_hashgrid << 8) | hybrid=0
             levels = (total_levels << 16) | (active_hashgrid_levels << 8) | 0
@@ -820,6 +1021,77 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             output_dim = 3  # RGB output
             shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
 
+        # 3D_SH_32 mode: per-Gaussian SH + 32-dim hash MLP residual (diff_surfel_3D_sh_32)
+        # Same as 3D_SH_res but with 32-dim hidden MLP
+        elif is_3D_SH_32_mode:
+            from diff_surfel_3D_sh_32 import set_mlp_weights
+
+            # Use standard SH coefficients (NOT per-Gaussian features)
+            shs = _effective_shs()
+            colors_precomp = None
+
+            # Decompose mode for 3D_SH_32:
+            #   'sh_only': zero MLP weights, set res_bias=-999 → ReLU(0-999)=0
+            #   'tex_only': set sh_bias=-999 → ReLU(SH-999)=0 for any normal SH values
+            _zero_mlp_weights = False
+            _restore_bias = False
+            if decompose_mode == 'sh_only':
+                _zero_mlp_weights = True
+                _restore_bias = True
+                from diff_surfel_3D_sh_32 import set_activation_bias
+                set_activation_bias(sh_bias=_ACTIVATION_BIAS[0], res_bias=0.0)  # sh_only: zero MLP weights handle it
+            elif decompose_mode == 'tex_only':
+                _restore_bias = True
+                from diff_surfel_3D_sh_32 import set_activation_bias
+                set_activation_bias(sh_bias=-999.0, res_bias=_ACTIVATION_BIAS[1])  # tex_only: kill SH
+
+            # Hash grid setup: use actual hashgrid_levels (not config total),
+            # since hybrid_levels may have reduced the hash grid size.
+            total_levels = ingp.hashgrid_levels
+            active_hashgrid_levels = min(
+                ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0,
+                total_levels)
+
+            # Encode levels: (total << 16) | (active_hashgrid << 8) | hybrid=0
+            levels = (total_levels << 16) | (active_hashgrid_levels << 8) | 0
+
+            # Pad offsets
+            if offsets.shape[0] < 17:
+                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
+                padded_offsets[:offsets.shape[0]] = offsets
+                offsets = padded_offsets
+
+            # Upload MLP weights (zero for sh_only decomposition)
+            if _zero_mlp_weights:
+                mlp_weights = ingp.get_fused_mlp_weights()
+                if mlp_weights is not None:
+                    W1, W2, W3 = mlp_weights
+                    set_mlp_weights(torch.zeros_like(W1), torch.zeros_like(W2), torch.zeros_like(W3))
+            else:
+                mlp_weights = ingp.get_fused_mlp_weights()
+                if mlp_weights is not None:
+                    W1, W2, W3 = mlp_weights
+                    set_mlp_weights(W1, W2, W3)
+
+            render_mode = 5  # Fused in-kernel MLP
+            if ingp.freeze_mlp:
+                render_mode |= 0x200  # bit 9: skip MLP weight gradients in CUDA backward
+
+            # One-time verification
+            if not _3D_DIRECT_FUSED_VERIFIED:
+                hash_dim = active_hashgrid_levels * ingp.level_dim
+                print(f"[3D_SH_32] render_mode={render_mode}, "
+                      f"SH=degree-3 (48 params), "
+                      f"hash={active_hashgrid_levels}×{ingp.level_dim}={hash_dim}D, "
+                      f"MLP=32→32→32→3 residual")
+                _3D_DIRECT_FUSED_VERIFIED = True
+
+            # Dimensions: no per-Gaussian features, hash only
+            gaussian_dim = 0
+            hash_dim = active_hashgrid_levels * ingp.level_dim
+            output_dim = 3  # RGB output
+            shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
+
         # 3D_SH_res mode: per-Gaussian SH + tiny hash MLP residual
         # SH handles per-Gaussian view-dependent appearance (evaluated in CUDA preprocessing)
         # Hash MLP adds view-independent spatial correction per-intersection
@@ -828,23 +1100,30 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             from diff_surfel_3D_sh_res import set_mlp_weights
 
             # Use standard SH coefficients (NOT per-Gaussian features)
-            shs = pc.get_features
+            shs = _effective_shs()
             colors_precomp = None
 
             # Decompose mode for 3D_SH_res:
-            #   'sh_only': zero MLP weights → residual = 0, only SH contributes
-            #   'tex_only': colors_precomp = zeros → sh_color = 0, only MLP residual contributes
+            #   'sh_only': zero MLP weights, set res_bias=-999 → ReLU(0-999)=0
+            #   'tex_only': set sh_bias=-999 → ReLU(SH-999)=0 for any normal SH values
             _zero_mlp_weights = False
+            _restore_bias = False
             if decompose_mode == 'sh_only':
                 _zero_mlp_weights = True
+                _restore_bias = True
+                from diff_surfel_3D_sh_res import set_activation_bias
+                set_activation_bias(sh_bias=_ACTIVATION_BIAS[0], res_bias=0.0)  # sh_only: zero MLP weights handle it
             elif decompose_mode == 'tex_only':
-                # Pass zeros as colors_precomp and drop SH; CUDA uses colors_precomp as rgb
-                shs = None
-                colors_precomp = torch.zeros(means3D.shape[0], 3, device="cuda")
+                _restore_bias = True
+                from diff_surfel_3D_sh_res import set_activation_bias
+                set_activation_bias(sh_bias=-999.0, res_bias=_ACTIVATION_BIAS[1])  # tex_only: kill SH
 
-            # Hash grid setup (all levels are hash, no hybrid)
-            total_levels = ingp.levels
-            active_hashgrid_levels = ingp.hashgrid_levels if not ingp.hashgrid_disabled else 0
+            # Hash grid setup: use actual hashgrid_levels (not config total),
+            # since hybrid_levels may have reduced the hash grid size.
+            total_levels = ingp.hashgrid_levels
+            active_hashgrid_levels = min(
+                ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0,
+                total_levels)
 
             # Encode levels: (total << 16) | (active_hashgrid << 8) | hybrid=0
             levels = (total_levels << 16) | (active_hashgrid_levels << 8) | 0
@@ -879,6 +1158,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                       f"hash={active_hashgrid_levels}×{ingp.level_dim}={hash_dim}D, "
                       f"MLP=16→16→16→3 residual")
                 _3D_DIRECT_FUSED_VERIFIED = True
+
+            # Set Nexels-style anti-aliasing (hash-grid down-weighting per level).
+            # Only call when enabled — skip entirely if off so rasterizer builds without
+            # the symbol still work.
+            if antialiasing > 0.0:
+                try:
+                    from diff_surfel_3D_sh_res import set_anti_alias as _set_aa
+                    _focal = max(viewpoint_camera.image_width / (2.0 * math.tan(viewpoint_camera.FoVx / 2.0)),
+                                 viewpoint_camera.image_height / (2.0 * math.tan(viewpoint_camera.FoVy / 2.0)))
+                    _set_aa(antialiasing, _focal)
+                except (ImportError, AttributeError):
+                    pass  # AA not compiled in this build — fall back to no AA
 
             # Dimensions: no per-Gaussian features, hash only
             gaussian_dim = 0
@@ -1276,7 +1567,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
 
     # Use SH_RES, SH_TC, TC, FP16, or lean rasterizer for fused modes
-    if (is_3D_SH_res_mode or is_3D_SH_cat_mode) and SH_RES_RASTERIZER_AVAILABLE:
+    if is_3D_SH_32_mode and SH_32_RASTERIZER_AVAILABLE:
+        rasterizer = _sh_32_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
+    elif (is_3D_SH_res_mode or is_3D_SH_cat_mode) and SH_RES_RASTERIZER_AVAILABLE:
         rasterizer = _sh_res_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
     elif is_3D_direct_sh_tc_mode and SH_TC_RASTERIZER_AVAILABLE:
         rasterizer = _sh_tc_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
@@ -1310,6 +1603,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # Beta in range [2.0, 8.0]: 2.0=standard Gaussian, 8.0=super-Gaussian (box)
         shapes = pc.get_shape
         kernel_type = 3
+    elif hasattr(pc, 'kernel_type') and pc.kernel_type == "nexel" and hasattr(pc, '_shape') and pc._shape.numel() > 0:
+        # Nexel kernel: per-axis gamma exponents [N, 2] (gamma_x, gamma_y).
+        # G = exp(-0.5 * (pow(s_x²+eps, gamma_x) + pow(s_y²+eps, gamma_y)))
+        # gamma = exp(raw) + 1, range [1, inf). gamma=1 is standard Gaussian.
+        shapes = pc.get_shape  # [N, 2] activated gamma values
+        kernel_type = 5
 
     # Convert aabb_mode string to int:
     # 0 = square AABB, fixed 4σ cutoff (2DGS default)
@@ -1331,6 +1630,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         aabb_mode_int = 4  # Beta kernel: fixed r=1 cutoff
     else:
         aabb_mode_int = 0  # "2dgs" or default
+
+    # Bit 10: enable low-pass filter backward gradient (rho2d → transMat)
+    if lowpass:
+        render_mode |= 0x400
+    # Bit 11: pixel-center convention (pixf = pix + 0.5, ndc2pix offset = W/2)
+    if pixel_center:
+        render_mode |= 0x800
 
     # Build rasterizer kwargs
     rasterizer_kwargs = dict(
@@ -1356,9 +1662,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if viewdirs_enc is not None and not isinstance(rasterizer, GaussianRasterizer):
         rasterizer_kwargs['viewdirs_enc'] = viewdirs_enc
     rasterizer_output = rasterizer(**rasterizer_kwargs)
-    # Main rasterizer returns 5 values; other rasterizers (lean, fp16, etc.) return 8 (with intersection_buffer, intersection_count, geomBuffer)
-    if len(rasterizer_output) == 8:
+    # Main rasterizer returns 7 values (with max_weight, accum_weights); other rasterizers (lean, fp16, etc.) return 8 (with intersection_buffer, intersection_count, geomBuffer)
+    # diff_surfel_3D_sh_res additionally appends out_index (per-pixel max-contributor id) → 9 values
+    max_weight_buf = None
+    accum_weights_buf = None
+    max_contrib_idx = None
+    if len(rasterizer_output) == 9:
+        rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer, max_contrib_idx = rasterizer_output
+    elif len(rasterizer_output) == 8:
         rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer = rasterizer_output
+    elif len(rasterizer_output) == 7:
+        rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, max_weight_buf, accum_weights_buf = rasterizer_output
+        intersection_buffer = None
+        intersection_count = None
+        geomBuffer = None
     elif len(rasterizer_output) == 6:
         rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, geomBuffer = rasterizer_output
         intersection_buffer = None
@@ -1718,6 +2035,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # get contributed gaussians per pixel
     render_gs_nums = allmap[7:8]
 
+    # get overdraw map (soft contributor count from sigmoid relaxation)
+    render_overdraw = allmap[14:15]
+
+    # get max-contributor depth (intersection depth of Gaussian with highest alpha*T per pixel)
+    render_depth_max_contributor = allmap[15:16]
+
+    # get w² sum (sum of squared weights per pixel, for weight_reg loss)
+    render_w_square = allmap[16:17]
+
     # Diffuse_ngp mode: unproject median depth, query hashgrid, add to diffuse RGB
     gaussian_rgb_diffuse_ngp = None
     ngp_rgb_diffuse_ngp = None
@@ -1966,6 +2292,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         elif bg_color.sum() > 0:
             rendered_image = rendered_image + (1.0 - render_alpha) * bg_color.unsqueeze(-1).unsqueeze(-1)
 
+    # Restore activation biases after decomposition render
+    if '_restore_bias' in dir() and _restore_bias:
+        if is_3D_SH_32_mode:
+            from diff_surfel_3D_sh_32 import set_activation_bias as _restore_set_activation_bias
+        else:
+            from diff_surfel_3D_sh_res import set_activation_bias as _restore_set_activation_bias
+        _restore_set_activation_bias(sh_bias=_ACTIVATION_BIAS[0], res_bias=_ACTIVATION_BIAS[1])
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     rets =  {"render": rendered_image,
@@ -1979,6 +2313,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'transmittance_avg': transmittance_avg,
             'cover_pixels': num_covered_pixels,
         })
+        if max_weight_buf is not None:
+            rets['max_weight'] = max_weight_buf
+        if accum_weights_buf is not None:
+            rets['accum_weights'] = accum_weights_buf
 
     rets.update({
             'rend_alpha': render_alpha,
@@ -1989,6 +2327,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'gaussian_num' : render_gs_nums,
             'depth_expected': render_depth_expected,
             'depth_median': render_depth_median,
+            'depth_max_contributor': render_depth_max_contributor,
+            'render_w_square': render_w_square,
+            'render_overdraw': render_overdraw,
+            # int32 [H, W] per-pixel id of the max-weight Gaussian (-1 if none).
+            # Used by the mini depth-reinit SH-transfer path. Only populated by
+            # rasterizers that thread out_index through (currently diff_surfel_3D_sh_res).
+            'max_contrib_idx': max_contrib_idx,
     })
     
     # Add diffuse_ngp mode separate RGB outputs

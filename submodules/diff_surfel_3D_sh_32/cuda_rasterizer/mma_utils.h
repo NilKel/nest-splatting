@@ -21,15 +21,15 @@ constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 
 // ============================================================================
-// Padded MLP dimensions for WMMA alignment (all 16)
+// Padded MLP dimensions — 32-dim hidden layers for increased capacity
 // ============================================================================
-constexpr int TC_INPUT_DIM  = 16;   // [hash(hash_dim) | pad(16-hash_dim)]
-constexpr int TC_HIDDEN_DIM = 16;   // single WMMA tile width
-constexpr int TC_OUTPUT_DIM = 16;   // only first 3 = RGB residual
+constexpr int TC_INPUT_DIM  = 32;   // [hash(hash_dim) | bias(1) | pad] — up to 31D hash features
+constexpr int TC_HIDDEN_DIM = 32;   // 32-dim hidden layers (2x wider than 16-dim variant)
+constexpr int TC_OUTPUT_DIM = 32;   // only first 3 = RGB residual
 constexpr int TC_BATCH      = 256;  // pixels per tile (16x16 block)
 
 // Original (unpadded) dimensions for masking/trimming
-constexpr int ORIG_INPUT_DIM  = 5;  // [hash(4) | bias(1)]
+constexpr int ORIG_INPUT_DIM  = 5;  // [hash(4) | bias(1)] — adjusts at runtime
 constexpr int ORIG_OUTPUT_DIM = 3;  // RGB residual
 
 // ============================================================================

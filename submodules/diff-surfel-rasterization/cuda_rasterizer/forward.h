@@ -83,6 +83,8 @@ namespace FORWARD
 		int* out_index,
 		float* cover_pixels,
 		float* trans_avg,
+		float* max_weight,
+		float* accum_weights,
 		const uint32_t D_diffuse = 0,
 		const float* hash_features_diffuse = nullptr,
 		const int* level_offsets_diffuse = nullptr,

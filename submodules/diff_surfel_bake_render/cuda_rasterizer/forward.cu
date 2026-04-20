@@ -510,10 +510,10 @@ renderBakedCUDA(
 				int au1 = min(au0 + 1, (int)(u0_px + u_span - 1));
 				int av1 = min(av0 + 1, (int)(v0_px + v_span - 1));
 
-				int idx00 = (av0 * atlas_width + au0) * 3;
-				int idx10 = (av0 * atlas_width + au1) * 3;
-				int idx01 = (av1 * atlas_width + au0) * 3;
-				int idx11 = (av1 * atlas_width + au1) * 3;
+				long long idx00 = ((long long)av0 * atlas_width + au0) * 3;
+				long long idx10 = ((long long)av0 * atlas_width + au1) * 3;
+				long long idx01 = ((long long)av1 * atlas_width + au0) * 3;
+				long long idx11 = ((long long)av1 * atlas_width + au1) * 3;
 				for (int ch = 0; ch < 3; ch++) {
 					float c00 = __half2float(atlas_texture[idx00 + ch]);
 					float c10 = __half2float(atlas_texture[idx10 + ch]);

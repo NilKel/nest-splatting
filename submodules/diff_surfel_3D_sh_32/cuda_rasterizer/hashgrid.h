@@ -51,26 +51,12 @@ __device__ inline T smoothstep_derivative(T val) {
 }
 // hash_features, level, l_scale, Base, align_corners, interp);
 
-// Nexels-style anti-aliasing down-weight: Δ_ℓ = 1 - exp(-1/(2π) * (f/(s_ℓ·t*))²)
-// Per-TU device globals — each TU that includes this header defines its own copy.
-// Setters in forward.cu / backward.cu update the per-TU copy.
-static __device__ float d_aa_factor = 0.0f;
-static __device__ float d_aa_focal = 1.0f;
-__device__ __forceinline__ float hashgrid_aa_downweight(float depth, float level_scale) {
-    if (d_aa_factor <= 0.0f) return 1.0f;
-    float ts = d_aa_factor * depth * level_scale / fmaxf(d_aa_focal, 1e-6f);
-    if (ts <= 0.0f) return 1.0f;
-    float x_sq = 0.5f / (ts * ts);
-    return 1.0f - expf(-4.0f * x_sq * 0.3183098862f);  // 1/π
-}
-
 template <bool BW, uint32_t C, uint32_t LD>
 __device__ void query_feature(float* feat, float3 xyz, float vmin, float vmax,
 int* offsets, const uint32_t appearance_level, const __half* __restrict__ hash_features,
 uint32_t L, float S, uint32_t H, bool align_corners, uint32_t interp, bool contract, bool debug,
 float* __restrict__ grad_feat = nullptr,
-float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = nullptr,
-float aa_depth = 0.0f)
+float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = nullptr)
 {
     if(debug){
         printf("BW tag: %d \n", BW);
@@ -168,9 +154,6 @@ float aa_depth = 0.0f)
 
 		float results[LD] = {0};
 
-		// Nexels anti-aliasing downweight for this level.
-		const float level_downweight = hashgrid_aa_downweight(aa_depth, scale);
-
 		#pragma unroll
 		for (uint32_t idx = 0; idx < (1 << D); idx++) {
 			float w = 1;
@@ -186,7 +169,6 @@ float aa_depth = 0.0f)
 					pos_grid_local[d] = pos_grid[d] + 1;
 				}
 			}
-			w *= level_downweight;
 
             uint32_t index = get_grid_index<D, LD>(align_corners, 0, hashmap_size, resolution, pos_grid_local);
 
@@ -257,18 +239,15 @@ float aa_depth = 0.0f)
                 printf("\n");
             }
 
-            // Nexels AA downweight — applies uniformly to this level's dL/dxyz.
-            const float bw_level_downweight = hashgrid_aa_downweight(aa_depth, scale);
-
             #pragma unroll
-            for (uint32_t gd = 0; gd < D; gd++) {
+            for (uint32_t gd = 0; gd < D; gd++) { 
 
                 float results_grad[LD] = {0};
 
                 #pragma unroll
                 for (uint32_t idx = 0; idx < (1 << (D - 1)); idx++) {
                     // float w = scale;
-                    float w = scale * grad_scale * bw_level_downweight;
+                    float w = scale * grad_scale;
                     uint32_t pos_grid_local[D];
 
                     #pragma unroll
@@ -328,8 +307,7 @@ __device__ void query_compact_feature(float* feat, float3 xyz, float vmin, float
 int* offsets, const uint32_t appearance_level, const __half* __restrict__ hash_features,
 uint32_t L, float S, uint32_t H, bool align_corners, uint32_t interp, bool contract, bool debug,
 float* __restrict__ grad_feat = nullptr,
-float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = nullptr,
-float aa_depth = 0.0f)
+float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = nullptr)
 {
     if(debug){
         printf("BW tag: %d \n", BW);
@@ -427,9 +405,6 @@ float aa_depth = 0.0f)
 
 		float results[LD] = {0};
 
-		// Nexels anti-aliasing downweight for this level.
-		const float level_downweight = hashgrid_aa_downweight(aa_depth, scale);
-
 		#pragma unroll
 		for (uint32_t idx = 0; idx < (1 << D); idx++) {
 			float w = 1;
@@ -445,7 +420,6 @@ float aa_depth = 0.0f)
 					pos_grid_local[d] = pos_grid[d] + 1;
 				}
 			}
-			w *= level_downweight;
 
             uint32_t index = get_grid_index<D, LD>(align_corners, 0, hashmap_size, resolution, pos_grid_local);
 
@@ -516,18 +490,15 @@ float aa_depth = 0.0f)
                 printf("\n");
             }
 
-            // Nexels AA downweight — applies uniformly to this level's dL/dxyz.
-            const float bw_level_downweight = hashgrid_aa_downweight(aa_depth, scale);
-
             #pragma unroll
-            for (uint32_t gd = 0; gd < D; gd++) {
+            for (uint32_t gd = 0; gd < D; gd++) { 
 
                 float results_grad[LD] = {0};
 
                 #pragma unroll
                 for (uint32_t idx = 0; idx < (1 << (D - 1)); idx++) {
                     // float w = scale;
-                    float w = scale * grad_scale * bw_level_downweight;
+                    float w = scale * grad_scale;
                     uint32_t pos_grid_local[D];
 
                     #pragma unroll

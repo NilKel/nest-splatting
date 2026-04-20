@@ -25,9 +25,7 @@ namespace cg = cooperative_groups;
 __device__ float d_contrib_thresh_bw = 0.0f;
 __device__ int d_count_thresh_bw = 0;
 __device__ float d_overdraw_lambda_bw = 0.0f;
-__device__ float d_weight_reg_lambda_bw = 0.0f;  // Weight-squared reg: -lambda * 2 * w * T per Gaussian
 __device__ float d_res_bias = 0.5f;  // Residual activation bias: ReLU(residual + d_res_bias)
-__device__ float d_aa_kernel_size = 0.0f;  // AA-2DGS Jacobian mip filter σ (0 = off)
 
 // ============================================================================
 // BACKWARD KERNEL PROFILING (clock64 instrumentation)
@@ -374,7 +372,7 @@ renderCUDA(
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_depths,
 	float * __restrict__ dL_dtransMat,
-	float4* __restrict__ dL_dmean2D,
+	float3* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors)
@@ -697,7 +695,7 @@ renderCUDAsurfelBackward(
 	float * __restrict__ dL_dfeatures,
 	float * __restrict__ dL_dtransMat,
 	float * __restrict__ dL_dhomoMat,
-	float4* __restrict__ dL_dmean2D,
+	float3* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
@@ -738,8 +736,7 @@ renderCUDAsurfelBackward(
 	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
 	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	const uint32_t pix_id = W * pix.y + pix.x;
-	const float pix_off = (render_mode & 0x800) ? 0.5f : 0.0f;
-	const float2 pixf = {(float)pix.x + pix_off, (float)pix.y + pix_off};
+	const float2 pixf = {(float)pix.x, (float)pix.y};
 
 	const bool inside = pix.x < W&& pix.y < H;
 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
@@ -764,7 +761,7 @@ renderCUDAsurfelBackward(
 	__shared__ float3 collected_SvTv[BLOCK_SIZE];
 	__shared__ float3 collected_pk[BLOCK_SIZE];
 	__shared__ uint32_t collected_ap_level[BLOCK_SIZE];
-	__shared__ float2 collected_shapes[BLOCK_SIZE];  // Kernel shape: .x = primary, .y = nexel gamma_y
+	__shared__ float collected_shapes[BLOCK_SIZE];  // Beta kernel shape parameter
 
 	// Per-tile MLP gradient accumulators for 3D_SH_res mode (render_mode=5, bias-free)
 	// All [16×16] = 256 floats each. Accumulate to shared memory first, flush to global once per tile
@@ -905,13 +902,6 @@ renderCUDAsurfelBackward(
 	// dL/d(overdraw) = lambda / (H * W) for mean reduction
 	const float dL_doverdraw = (od_lambda > 0.0f) ? od_lambda / (float)(H * W) : 0.0f;
 
-	// Weight-squared regularization: d(sum w²)/d(alpha_i) has direct + indirect terms
-	// Direct: 2*w_i*T_i  (changing alpha_i changes w_i directly)
-	// Indirect: -sum_{j>i}(2*w_j²) / (1-alpha_i)  (changing alpha_i changes T_j for all j>i)
-	const float wr_lambda = d_weight_reg_lambda_bw;
-	const float dL_dwr = (wr_lambda > 0.0f) ? -wr_lambda / (float)(H * W) : 0.0f;
-	float wr_accum = 0.0f;  // Running sum of w_j² for j > i (back-to-front traversal)
-
 	// Gradient of pixel coordinate w.r.t. normalized
 	// screen-space viewport corrdinates (-1 to 1)
 	const float ddelx_dx = 0.5 * W;
@@ -979,11 +969,7 @@ renderCUDAsurfelBackward(
 			}
 			// Collect shape for beta kernel (only when using beta kernel)
 			if(shapes != nullptr){
-				if (kernel_type == 5) {
-				collected_shapes[block.thread_rank()] = {shapes[coll_id * 2], shapes[coll_id * 2 + 1]};
-			} else {
-				collected_shapes[block.thread_rank()] = {shapes[coll_id], 0.0f};
-			}
+				collected_shapes[block.thread_rank()] = shapes[coll_id];
 			}
 
 		// NOTE: Per-Gaussian feature caching disabled due to shared memory limits
@@ -1072,7 +1058,7 @@ renderCUDAsurfelBackward(
 							bool valid_alpha = false;
 							if (kernel_type == 1 || kernel_type == 4) {
 								if (rho3d < k_sq + 1e-6f) {
-									shape_val = collected_shapes[j].x;
+									shape_val = collected_shapes[j];
 									base = fmaxf(0.0f, 1.0f - rho3d / k_sq);
 									alpha_beta = powf(base, shape_val);
 									alpha_lp = expf(-rho2d / 2.0f);
@@ -1085,7 +1071,7 @@ renderCUDAsurfelBackward(
 								float power = -0.5f * rho;
 								if (power <= 0.0f) {
 									G_raw = expf(power);
-									per_gaussian_beta_val = collected_shapes[j].x;
+									per_gaussian_beta_val = collected_shapes[j];
 									G = G_raw; demon_val = 1.0f;
 									if (per_gaussian_beta_val > 0.0f) {
 										demon_val = 1.0f + per_gaussian_beta_val * G_raw;
@@ -1095,7 +1081,7 @@ renderCUDAsurfelBackward(
 									valid_alpha = true;
 								}
 							} else if (kernel_type == 3) {
-								general_beta_val = collected_shapes[j].x;
+								general_beta_val = collected_shapes[j];
 								general_rho_safe_val = fmaxf(rho, 1e-8f);
 								general_pow_term_val = powf(general_rho_safe_val, 0.5f * general_beta_val);
 								float power = -0.5f * general_pow_term_val;
@@ -1151,7 +1137,7 @@ renderCUDAsurfelBackward(
 					// 1. Query hash features — skip for tail pixels (matches forward)
 					const int hash_dim_collab = active_hashgrid_levels * l_dim;
 					if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
-						float hash_feat[16] = {0};
+						float hash_feat[12] = {0};
 						uint32_t appearance_level = collected_ap_level[j];
 						if (hash_dim_collab == 4)
 							query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
@@ -1163,10 +1149,6 @@ renderCUDAsurfelBackward(
 							                           l_scale, Base, align_corners, interp, if_contract, false);
 						else if (hash_dim_collab == 12)
 							query_feature<false, 12, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							                           appearance_level, hash_features, active_hashgrid_levels,
-							                           l_scale, Base, align_corners, interp, if_contract, false);
-						else if (hash_dim_collab == 16)
-							query_feature<false, 16, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 							                           appearance_level, hash_features, active_hashgrid_levels,
 							                           l_scale, Base, align_corners, interp, if_contract, false);
 						for (int i = 0; i < hash_dim_collab && i < TC_INPUT_DIM; i++) my_input[i] = hash_feat[i];
@@ -1182,10 +1164,8 @@ renderCUDAsurfelBackward(
 					for (int ch = 0; ch < 3; ch++)
 						sh_color[ch] = colors[global_id * 3 + ch];
 
-					// Combo #6: feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias )
-					// Outer ReLU gate: both SH and residual paths share the same
-					// (sh_color + residual + res_bias > 0) gate. SH's own inner
-					// ReLU is handled upstream in preprocessCUDA (clamped[]).
+					// 6. Combo #6: feat = ReLU(SH + residual + res_bias)
+					// Outer ReLU gate: if (SH + residual + res_bias > 0), gradient flows to BOTH SH and residual
 					#pragma unroll
 					for (int o = 0; o < ORIG_OUTPUT_DIM; o++) {
 						float relu_grad = (sh_color[o] + my_residual[o] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
@@ -1193,7 +1173,7 @@ renderCUDAsurfelBackward(
 					}
 					// Positions 3-15 of dL_dz3 stay zero (WMMA padding)
 
-					// SH gradient: same outer ReLU gate as residual.
+					// SH gradient: same outer ReLU gate (shared with residual)
 					for (int ch = 0; ch < 3; ch++) {
 						float relu_grad = (sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
 						atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_dpixel[ch] * w * relu_grad);
@@ -1258,9 +1238,9 @@ renderCUDAsurfelBackward(
 					// Backprop to hash features - dL_dxyz flows to geometry
 					float dL_dxyz[3] = {0, 0, 0};
 					if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
-						float dL_dhash[16];
+						float dL_dhash[12];
 						for (int i = 0; i < hash_dim; i++) dL_dhash[i] = my_dL_dinput[i];
-						float hash_feat_dummy[16];
+						float hash_feat_dummy[12];
 						uint32_t appearance_level = collected_ap_level[j];
 						if (hash_dim == 4) {
 							query_feature<true, 4, 4>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
@@ -1277,18 +1257,13 @@ renderCUDAsurfelBackward(
 							                          appearance_level, hash_features, active_hashgrid_levels,
 							                          l_scale, Base, align_corners, interp, if_contract, false,
 							                          dL_dhash, dL_dfeatures, dL_dxyz);
-						} else if (hash_dim == 16) {
-							query_feature<true, 16, 4>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-							                          appearance_level, hash_features, active_hashgrid_levels,
-							                          l_scale, Base, align_corners, interp, if_contract, false,
-							                          dL_dhash, dL_dfeatures, dL_dxyz);
 						}
 						if (detach_hash_grad) { dL_dxyz[0] = 0; dL_dxyz[1] = 0; dL_dxyz[2] = 0; }
 					}
 
 					// ======== GEOMETRY GRADIENTS ========
 					float dL_dalpha = 0.0f;
-					// feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias ) recompute for alpha gradient
+					// feat = ReLU(SH + residual + res_bias) (recompute for alpha gradient)
 					float feat[C];
 					float sh_color_recomp[3];
 					for (int ch = 0; ch < 3; ch++) {
@@ -1338,32 +1313,19 @@ renderCUDAsurfelBackward(
 
 					dL_dalpha *= T;
 
-					// Regularization gradients: only affect opacity, NOT geometry
-					float dL_dalpha_reg = 0.0f;
-
 					// Overdraw regularization gradient
 					if (dL_doverdraw > 0.0f) {
 						float sig_od = 1.0f / (1.0f + expf(-OD_K * (w - OD_THRESH)));
 						float dsig_od = OD_K * sig_od * (1.0f - sig_od);
 						// Direct: dsig * T. Indirect: -overdraw_accum / (1 - alpha)
 						float safe_denom = fmaxf(1.0f - alpha, 1e-7f);
-						dL_dalpha_reg += dL_doverdraw * (dsig_od * T - overdraw_accum / safe_denom);
+						dL_dalpha += dL_doverdraw * (dsig_od * T - overdraw_accum / safe_denom);
 						overdraw_accum += dsig_od * w;
-					}
-
-					// Weight-squared regularization gradient (direct + indirect)
-					if (dL_dwr != 0.0f) {
-						float safe_denom_wr = fmaxf(1.0f - alpha, 1e-7f);
-						dL_dalpha_reg += dL_dwr * (2.0f * w * T - 2.0f * wr_accum / safe_denom_wr);
-						wr_accum += w * w;
 					}
 
 					last_alpha = alpha;
 
-					// Geometry gradient: only from RGB loss (no reg)
 					float dL_dG = opa * dL_dalpha;
-					// Opacity gradient: RGB + reg
-					dL_dalpha += dL_dalpha_reg;
 
 					// Kernel-specific shape gradients and dL_dG adjustments
 					if (kernel_type == 1 || kernel_type == 4) {
@@ -1417,44 +1379,23 @@ renderCUDAsurfelBackward(
 
 					// Geometry gradients based on whether rho3d or rho2d was used
 					if (rho3d <= rho2d) {
-						float2 dL_ds;
-						if (kernel_type == 5) {
-							// Nexel kernel: anisotropic gamma exponents
-							// G = exp(-0.5 * (pow(comp_x, gamma_x) + pow(comp_y, gamma_y)))
-							// dG/ds_x = -G * gamma_x * pow(comp_x, gamma_x - 1) * s_x
-							float gamma_x = collected_shapes[j].x;
-							float gamma_y = collected_shapes[j].y;
-							const float GAMMA_EPS = 1e-6f;
-							float comp_x = fminf(s.x * s.x + GAMMA_EPS, powf(1000.0f, 1.0f / gamma_x));
-							float comp_y = fminf(s.y * s.y + GAMMA_EPS, powf(1000.0f, 1.0f / gamma_y));
-							dL_ds = {
-								dL_dG * (-G) * gamma_x * powf(comp_x, gamma_x - 1.0f) * s.x + dL_dz * Tw.x,
-								dL_dG * (-G) * gamma_y * powf(comp_y, gamma_y - 1.0f) * s.y + dL_dz * Tw.y
-							};
-							// dL_dgamma: -0.5 * dL_dG * G * log(comp) * pow(comp, gamma)
-							float dL_dgamma_x = -0.5f * dL_dG * G * logf(comp_x) * powf(comp_x, gamma_x);
-							float dL_dgamma_y = -0.5f * dL_dG * G * logf(comp_y) * powf(comp_y, gamma_y);
-							atomicAdd(&dL_dshapes[global_id * 2 + 0], dL_dgamma_x);
-							atomicAdd(&dL_dshapes[global_id * 2 + 1], dL_dgamma_y);
-						} else {
-							// Compute dG_factor based on kernel type
-							float dG_factor;
-							if (kernel_type == 1 || kernel_type == 4) {
-								if (beta_wins && base > 1e-7f) {
-									dG_factor = -shape_val * alpha_beta / (base * k_sq);
-								} else {
-									dG_factor = 0.0f;
-								}
-							} else if (kernel_type == 3) {
-								dG_factor = -0.5f * general_beta_val * G * general_pow_term_val / general_rho_safe_val;
+						// Compute dG_factor based on kernel type
+						float dG_factor;
+						if (kernel_type == 1 || kernel_type == 4) {
+							if (beta_wins && base > 1e-7f) {
+								dG_factor = -shape_val * alpha_beta / (base * k_sq);
 							} else {
-								dG_factor = -G;  // Gaussian (and flex with adjusted dL_dG)
+								dG_factor = 0.0f;
 							}
-							dL_ds = {
-								dL_dG * dG_factor * s.x + dL_dz * Tw.x,
-								dL_dG * dG_factor * s.y + dL_dz * Tw.y
-							};
+						} else if (kernel_type == 3) {
+							dG_factor = -0.5f * general_beta_val * G * general_pow_term_val / general_rho_safe_val;
+						} else {
+							dG_factor = -G;  // Gaussian (and flex with adjusted dL_dG)
 						}
+						float2 dL_ds = {
+							dL_dG * dG_factor * s.x + dL_dz * Tw.x,
+							dL_dG * dG_factor * s.y + dL_dz * Tw.y
+						};
 						dL_ds.x += dL_duv.x;
 						dL_ds.y += dL_duv.y;
 
@@ -1481,9 +1422,6 @@ renderCUDAsurfelBackward(
 						atomicAdd(&dL_dtransMat[global_id * 9 + 6],  dL_dTw.x);
 						atomicAdd(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
 						atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
-						// AbsGS: accumulate absolute Tu.z / Tv.z for cancellation-free densification
-						atomicAdd(&dL_dmean2D[global_id].z, fabsf(dL_dTu.z));
-						atomicAdd(&dL_dmean2D[global_id].w, fabsf(dL_dTv.z));
 					} else {
 						// 2D fallback: gradient w.r.t. screen-space position
 						float dG_factor_2d;
@@ -1502,39 +1440,7 @@ renderCUDAsurfelBackward(
 						const float dG_ddely = dG_factor_2d * (xy.y - pixf.y);
 						atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx);
 						atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely);
-						// AbsGS: abs gradient from low-pass filter path
-						atomicAdd(&dL_dmean2D[global_id].z, fabsf(dL_dG * dG_ddelx));
-						atomicAdd(&dL_dmean2D[global_id].w, fabsf(dL_dG * dG_ddely));
-						if (render_mode & 0x400) {
-							// --lowpass: propagate low-pass filter + depth gradient to transMat
-							const float dL_dxy_x = dL_dG * dG_ddelx;
-							const float dL_dxy_y = dL_dG * dG_ddely;
-							const float inv_Tw_z = 1.0f / (Tw.z + 1e-7f);
-							const float2 dL_ds_lp = {dL_dz * Tw.x, dL_dz * Tw.y};
-							const float3 dz_dTw_lp = {s.x, s.y, 1.0f};
-							const float dsx_pz_lp = dL_ds_lp.x / p_stored.z;
-							const float dsy_pz_lp = dL_ds_lp.y / p_stored.z;
-							const float3 dL_dp_lp = {dsx_pz_lp, dsy_pz_lp, -(dsx_pz_lp * s.x + dsy_pz_lp * s.y)};
-							const float3 dL_dk_lp = cross(l_stored, dL_dp_lp);
-							const float3 dL_dl_lp = cross(dL_dp_lp, k_stored);
-							const float3 dL_dTu_lp = {-dL_dk_lp.x, -dL_dk_lp.y, -dL_dk_lp.z};
-							const float3 dL_dTv_lp = {-dL_dl_lp.x, -dL_dl_lp.y, -dL_dl_lp.z};
-							const float3 dL_dTw_lp = {
-								pixf.x * dL_dk_lp.x + pixf.y * dL_dl_lp.x + dL_dz * dz_dTw_lp.x + dL_dxy_x * inv_Tw_z,
-								pixf.x * dL_dk_lp.y + pixf.y * dL_dl_lp.y + dL_dz * dz_dTw_lp.y + dL_dxy_y * inv_Tw_z,
-								pixf.x * dL_dk_lp.z + pixf.y * dL_dl_lp.z + dL_dz * dz_dTw_lp.z - (dL_dxy_x * xy.x + dL_dxy_y * xy.y) * inv_Tw_z};
-							atomicAdd(&dL_dtransMat[global_id * 9 + 0], dL_dTu_lp.x);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 1], dL_dTu_lp.y);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 2], dL_dTu_lp.z);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 3], dL_dTv_lp.x);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 4], dL_dTv_lp.y);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 5], dL_dTv_lp.z);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 6], dL_dTw_lp.x);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 7], dL_dTw_lp.y);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 8], dL_dTw_lp.z);
-						} else {
-							atomicAdd(&dL_dtransMat[global_id * 9 + 8], dL_dz);
-						}
+						atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz);
 					}
 
 					atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
@@ -1621,10 +1527,6 @@ renderCUDAsurfelBackward(
 		// For beta_scaled kernel (type 4), we need k_sq for gradient computation
 		float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
 
-		// AA-2DGS mip-filter state (populated when d_aa_kernel_size > 0 and standard Gaussian kernel)
-		bool is_aa = false;
-		float aa_coef = 1.0f;
-
 		if (kernel_type == 1 || kernel_type == 4) {
 			// Beta kernel with separate G_obj (Beta) and G_screen (Gaussian low-pass)
 			// kernel_type 1: k²=1 (unit circle cutoff)
@@ -1634,7 +1536,7 @@ renderCUDAsurfelBackward(
 			if (rho3d >= k_sq + 1e-6f)
 				continue;  // Outside compact support - skip entirely
 
-			shape_val = collected_shapes[j].x;
+			shape_val = collected_shapes[j];
 
 			// 2. Object-space Beta kernel
 			base = fmaxf(0.0f, 1.0f - rho3d / k_sq);
@@ -1656,7 +1558,7 @@ renderCUDAsurfelBackward(
 				continue;
 
 			G_raw = exp(power);
-			per_gaussian_beta = collected_shapes[j].x;  // shapes array holds per-Gaussian beta
+			per_gaussian_beta = collected_shapes[j];  // shapes array holds per-Gaussian beta
 			if (per_gaussian_beta > 0.0f) {
 				demon = 1.0f + per_gaussian_beta * G_raw;
 				G = (1.0f + per_gaussian_beta) * G_raw / demon;
@@ -1667,7 +1569,7 @@ renderCUDAsurfelBackward(
 		} else if (kernel_type == 3) {
 			// General kernel: Isotropic Generalized Gaussian
 			// Formula: G = exp(-0.5 * (r²)^(β/2))
-			general_beta = collected_shapes[j].x;  // beta in range [2.0, 8.0]
+			general_beta = collected_shapes[j];  // beta in range [2.0, 8.0]
 			float exponent = 0.5f * general_beta;  // β/2
 
 			general_rho_safe = fmaxf(rho, 1e-8f);
@@ -1679,33 +1581,6 @@ renderCUDAsurfelBackward(
 
 			G = expf(power);
 			alpha = min(0.99f, opa * G);
-		} else if (d_aa_kernel_size > 0.0f) {
-			// AA-2DGS Jacobian-based mip filter (forward replay).
-			is_aa = true;
-			const float ks = d_aa_kernel_size;
-			const float k_sq_aa = ks * ks;
-			const float pz_inv_aa = 1.0f / p.z;
-			const float pz_sq_inv_aa = pz_inv_aa * pz_inv_aa;
-			const float3 dp_dx_aa = cross(Tv, Tw);
-			const float3 dp_dy_aa = cross(Tw, Tu);
-			const float J_a = (dp_dx_aa.x * p.z - p.x * dp_dx_aa.z) * pz_sq_inv_aa;
-			const float J_b = (dp_dx_aa.y * p.z - p.y * dp_dx_aa.z) * pz_sq_inv_aa;
-			const float J_c = (dp_dy_aa.x * p.z - p.x * dp_dy_aa.z) * pz_sq_inv_aa;
-			const float J_d = (dp_dy_aa.y * p.z - p.y * dp_dy_aa.z) * pz_sq_inv_aa;
-			const float det_J = J_a * J_d - J_b * J_c;
-			const float trace_JJT = J_a*J_a + J_b*J_b + J_c*J_c + J_d*J_d;
-			const float det_V = k_sq_aa * det_J * det_J + ks * trace_JJT + 1.0f;
-			if (fabsf(det_V) < 1e-8f) continue;
-			const float det_V_inv = 1.0f / det_V;
-			aa_coef = sqrtf(det_V_inv + 1e-8f);
-			const float term1 = J_d * s.x - J_c * s.y;
-			const float term2 = J_a * s.y - J_b * s.x;
-			const float rho_aa_num = (s.x*s.x + s.y*s.y) + ks * (term1*term1 + term2*term2);
-			const float rho_aa = rho_aa_num * det_V_inv;
-			const float power_aa = -0.5f * rho_aa;
-			if (power_aa > 0.0f) continue;
-			G = expf(power_aa);
-			alpha = fminf(0.99f, aa_coef * opa * G);
 		} else {
 			// Standard Gaussian kernel
 			float power = -0.5f * rho;
@@ -1810,7 +1685,7 @@ renderCUDAsurfelBackward(
 				bool skip_hash = (d_contrib_thresh_bw > 0.0f && w < d_contrib_thresh_bw)
 				                 || (d_count_thresh_bw > 0 && contributor >= (uint32_t)d_count_thresh_bw);
 				const int hash_dim_px = active_hashgrid_levels * l_dim;
-				float hash_feat[16] = {0};
+				float hash_feat[12] = {0};
 				if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
 					if (hash_dim_px == 4)
 						query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
@@ -1822,10 +1697,6 @@ renderCUDAsurfelBackward(
 						                           l_scale, Base, align_corners, interp, contract, false);
 					else if (hash_dim_px == 12)
 						query_feature<false, 12, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false);
-					else if (hash_dim_px == 16)
-						query_feature<false, 16, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 						                           appearance_level, hash_features, active_hashgrid_levels,
 						                           l_scale, Base, align_corners, interp, contract, false);
 				}
@@ -1841,9 +1712,8 @@ renderCUDAsurfelBackward(
 				MlpWeights smem_mlp2 = {smem_mlp_W1, smem_mlp_W2, smem_mlp_W3};
 				mlp_forward_inline(mlp_input, residual, h1_post, h2_post, false, smem_mlp2);
 
-				// Combo #6: feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias )
-				// Outer ReLU gates both SH and residual paths identically.
-				// SH's own inner ReLU is handled upstream in preprocessCUDA (clamped[]).
+				// 6. Combo #6: feat = ReLU(SH + residual + res_bias)
+				// Outer ReLU gate shared by both SH and residual
 				float sh_color_bw[3];
 				for (int c = 0; c < 3; c++)
 					sh_color_bw[c] = colors[global_id * 3 + c];
@@ -1854,7 +1724,7 @@ renderCUDAsurfelBackward(
 					dL_drgb[c] = dL_dchannels[c] * w * relu_grad;
 				}
 
-				// SH gradient: same outer ReLU gate.
+				// SH gradient: same outer ReLU gate
 				for (int ch = 0; ch < 3; ch++)
 					atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_drgb[ch]);
 
@@ -1886,11 +1756,11 @@ renderCUDAsurfelBackward(
 				// 7. Backprop to hash features (first hash_dim elements of dL_dinput)
 				const int hash_dim = active_hashgrid_levels * l_dim;
 				if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
-					float dL_dhash[16];
+					float dL_dhash[12];
 					for (int i = 0; i < hash_dim; i++)
 						dL_dhash[i] = dL_dinput_full[i];
 
-					float hash_feat_dummy[16];
+					float hash_feat_dummy[12];
 					if (hash_dim == 4) {
 						query_feature<true, 4, 4>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
 						                           appearance_level, hash_features, active_hashgrid_levels,
@@ -1906,16 +1776,11 @@ renderCUDAsurfelBackward(
 						                           appearance_level, hash_features, active_hashgrid_levels,
 						                           l_scale, Base, align_corners, interp, contract, false,
 						                           dL_dhash, dL_dfeatures, dL_dxyz);
-					} else if (hash_dim == 16) {
-						query_feature<true, 16, 4>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false,
-						                           dL_dhash, dL_dfeatures, dL_dxyz);
 					}
 					if (detach_hash_grad) { dL_dxyz[0] = 0; dL_dxyz[1] = 0; dL_dxyz[2] = 0; }
 				}
 
-				// 8. Set feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias ) for alpha gradient.
+				// 8. Set feat = ReLU(SH + residual + res_bias) for alpha gradient computation below
 				for (int ch = 0; ch < C; ch++) {
 					feat[ch] = fmaxf(0.0f, colors[global_id * 3 + ch] + residual[ch] + d_res_bias);
 				}
@@ -1982,10 +1847,7 @@ renderCUDAsurfelBackward(
 				MlpWeights smem_mlp_6 = {smem_mlp_W1, smem_mlp_W2, smem_mlp_W3};
 				mlp_forward_inline(mlp_input_6, residual_6, h1_post_6, h2_post_6, false, smem_mlp_6);
 
-				// Combo #6 (same as case 5): outer ReLU gates both paths.
-				// NOTE: for case 6, colors[] holds DC_SH (MLP input), not the SH-
-				// evaluated sh_color. We use DC_SH as a stand-in in the gate test —
-				// this matches the pre-decoupling approximation in this kernel.
+				// 5. Outer ReLU gate (same as case 5)
 				float sh_color_bw_6[3];
 				for (int c = 0; c < 3; c++)
 					sh_color_bw_6[c] = colors[global_id * 3 + c];
@@ -1996,7 +1858,7 @@ renderCUDAsurfelBackward(
 					dL_drgb_6[c] = dL_dchannels[c] * w * relu_grad;
 				}
 
-				// SH gradient: same outer ReLU gate.
+				// SH gradient
 				for (int ch = 0; ch < 3; ch++)
 					atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_drgb_6[ch]);
 
@@ -2019,11 +1881,11 @@ renderCUDAsurfelBackward(
 
 				// 7. Backprop to hash features
 				if (!skip_hash_6 && active_hashgrid_levels_6 > 0 && l_dim == 4) {
-					float dL_dhash_6[16];
+					float dL_dhash_6[12];
 					for (int i = 0; i < hash_dim_6; i++)
 						dL_dhash_6[i] = dL_dinput_full_6[i];
 
-					float hash_feat_dummy_6[16];
+					float hash_feat_dummy_6[12];
 					if (hash_dim_6 == 4)
 						query_feature<true, 4, 4>(hash_feat_dummy_6, xyz6, voxel_min, voxel_max, collec_offsets,
 						    appearance_level, hash_features, active_hashgrid_levels_6,
@@ -2039,17 +1901,10 @@ renderCUDAsurfelBackward(
 						    appearance_level, hash_features, active_hashgrid_levels_6,
 						    l_scale, Base, align_corners, interp, contract, false,
 						    dL_dhash_6, dL_dfeatures, dL_dxyz);
-					else if (hash_dim_6 == 16)
-						query_feature<true, 16, 4>(hash_feat_dummy_6, xyz6, voxel_min, voxel_max, collec_offsets,
-						    appearance_level, hash_features, active_hashgrid_levels_6,
-						    l_scale, Base, align_corners, interp, contract, false,
-						    dL_dhash_6, dL_dfeatures, dL_dxyz);
 					if (detach_hash_grad) { dL_dxyz[0] = 0; dL_dxyz[1] = 0; dL_dxyz[2] = 0; }
 				}
 
-				// 8. Set feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias ) for alpha gradient.
-				// NOTE: for case 6, colors[] holds DC_SH (MLP input), not the SH-evaluated
-				// sh_color. We use DC_SH as a stand-in — matches prior approximation.
+				// 8. Set feat for alpha gradient
 				for (int ch = 0; ch < C; ch++)
 					feat[ch] = fmaxf(0.0f, colors[global_id * 3 + ch] + residual_6[ch] + d_res_bias);
 
@@ -2116,35 +1971,23 @@ renderCUDAsurfelBackward(
 
 			dL_dalpha *= T;
 
-			// Regularization gradients: only affect opacity, NOT geometry
-			float dL_dalpha_reg = 0.0f;
-
 			// Overdraw regularization gradient (non-GEMM path)
 			if (dL_doverdraw > 0.0f) {
 				float sig_od = 1.0f / (1.0f + expf(-OD_K * (w - OD_THRESH)));
 				float dsig_od = OD_K * sig_od * (1.0f - sig_od);
 				float safe_denom = fmaxf(1.0f - alpha, 1e-7f);
-				dL_dalpha_reg += dL_doverdraw * (dsig_od * T - overdraw_accum / safe_denom);
+				dL_dalpha += dL_doverdraw * (dsig_od * T - overdraw_accum / safe_denom);
 				overdraw_accum += dsig_od * w;
-			}
-
-			// Weight-squared regularization gradient (direct + indirect)
-			if (dL_dwr != 0.0f) {
-				float safe_denom_wr = fmaxf(1.0f - alpha, 1e-7f);
-				dL_dalpha_reg += dL_dwr * (2.0f * w * T - 2.0f * wr_accum / safe_denom_wr);
-				wr_accum += w * w;
 			}
 
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
 
-			// Geometry gradient: only from RGB loss (no reg)
-			// AA: alpha = coef * opa * G  →  dL/dG = coef * opa * dL_dalpha
-			float dL_dG = (is_aa ? aa_coef : 1.0f) * nor_o.w * dL_dalpha;
-			// AA: dL/dcoef = opa * G * dL_dalpha (used only in AA backward block below)
-			float dL_dcoef_aa = is_aa ? (nor_o.w * G * dL_dalpha) : 0.0f;
-			// Opacity gradient: RGB + reg
-			dL_dalpha += dL_dalpha_reg;
+			// Account for fact that alpha also influences how much of
+			// the background color is added if nothing left to blend
+
+			// Helpful reusable temporary variables
+			float dL_dG = nor_o.w * dL_dalpha;
 
 			if (kernel_type == 1 || kernel_type == 4) {
 				// Beta kernel with max-pool: gradient only flows through winning branch
@@ -2211,7 +2054,7 @@ renderCUDAsurfelBackward(
 				const float dL_dpy = dL_dxyz[1];
 				const float dL_dpz = dL_dxyz[2];
 				
-				if(rho3d <= rho2d || is_aa){
+				if(rho3d <= rho2d){
 					const float3 sutu = collected_SuTu[j];
 					const float3 svtv = collected_SvTv[j];
 					const float3 pk = collected_pk[j];
@@ -2237,173 +2080,43 @@ renderCUDAsurfelBackward(
 			}
 
 
-			if (is_aa) {
-				// AA-2DGS Jacobian-based mip filter backward.
-				// Recompute forward-replay variables for the gradient chain.
-				const float ks = d_aa_kernel_size;
-				const float k_sq_aa = ks * ks;
-				const float pz_inv_aa = 1.0f / p.z;
-				const float pz_sq_inv_aa = pz_inv_aa * pz_inv_aa;
-				const float3 dp_dx_aa = cross(Tv, Tw);
-				const float3 dp_dy_aa = cross(Tw, Tu);
-				const float J_a = (dp_dx_aa.x * p.z - p.x * dp_dx_aa.z) * pz_sq_inv_aa;
-				const float J_b = (dp_dx_aa.y * p.z - p.y * dp_dx_aa.z) * pz_sq_inv_aa;
-				const float J_c = (dp_dy_aa.x * p.z - p.x * dp_dy_aa.z) * pz_sq_inv_aa;
-				const float J_d = (dp_dy_aa.y * p.z - p.y * dp_dy_aa.z) * pz_sq_inv_aa;
-				const float det_J = J_a * J_d - J_b * J_c;
-				const float trace_JJT = J_a*J_a + J_b*J_b + J_c*J_c + J_d*J_d;
-				const float det_V = k_sq_aa * det_J * det_J + ks * trace_JJT + 1.0f;
-				const float det_V_inv = 1.0f / det_V;
-				const float coef = aa_coef;  // = sqrtf(det_V_inv + 1e-8f) from forward replay
-				const float term1 = J_d * s.x - J_c * s.y;
-				const float term2 = J_a * s.y - J_b * s.x;
-				const float rho_numerator = (s.x*s.x + s.y*s.y) + ks * (term1*term1 + term2*term2);
-
-				// 1. Through G = exp(power), power = -0.5 * rho
-				float dL_drho = dL_dG * G * (-0.5f);
-				// 2. Through coef = sqrt(det_V_inv)
-				float dL_ddet_V_inv = 0.0f;
-				if (coef > 1e-9f) dL_ddet_V_inv = dL_dcoef_aa * (0.5f / coef);
-				// 3. Through rho = rho_numerator * det_V_inv
-				float dL_drho_numerator = dL_drho * det_V_inv;
-				dL_ddet_V_inv += dL_drho * rho_numerator;
-				// 4. Through det_V_inv = 1 / det_V
-				float dL_ddet_V = dL_ddet_V_inv * (-det_V_inv * det_V_inv);
-				// 5. dL/ds from s² part + hashgrid feature gradient via xyz = s·SuTu + s·SvTv + pk
-				float2 dL_ds = { dL_drho_numerator * 2.0f * s.x + dL_duv.x,
-				                 dL_drho_numerator * 2.0f * s.y + dL_duv.y };
-				// 6. dL/dterm1, dL/dterm2
-				float dL_dterm1 = dL_drho_numerator * ks * 2.0f * term1;
-				float dL_dterm2 = dL_drho_numerator * ks * 2.0f * term2;
-				// term1 = J_d * s.x - J_c * s.y
-				float dL_dJ_d = dL_dterm1 * s.x;
-				float dL_dJ_c = dL_dterm1 * (-s.y);
-				dL_ds.x += dL_dterm1 * J_d;
-				dL_ds.y += dL_dterm1 * (-J_c);
-				// term2 = J_a * s.y - J_b * s.x
-				float dL_dJ_a = dL_dterm2 * s.y;
-				float dL_dJ_b = dL_dterm2 * (-s.x);
-				dL_ds.y += dL_dterm2 * J_a;
-				dL_ds.x += dL_dterm2 * (-J_b);
-				// 7. Through det_V: k²·det_J² + k·trace + 1
-				float dL_ddet_J = dL_ddet_V * k_sq_aa * 2.0f * det_J;
-				float dL_dtrace = dL_ddet_V * ks;
-				// trace_JJT = J_a² + J_b² + J_c² + J_d²
-				float trace_coef = dL_dtrace * 2.0f;
-				dL_dJ_a += trace_coef * J_a;
-				dL_dJ_b += trace_coef * J_b;
-				dL_dJ_c += trace_coef * J_c;
-				dL_dJ_d += trace_coef * J_d;
-				// det_J = J_a*J_d - J_b*J_c
-				dL_dJ_a += dL_ddet_J * J_d;
-				dL_dJ_d += dL_ddet_J * J_a;
-				dL_dJ_b += dL_ddet_J * (-J_c);
-				dL_dJ_c += dL_ddet_J * (-J_b);
-				// 8. Depth gradient contribution to dL/ds and dL/dTw
-				dL_ds.x += dL_dz * Tw.x;
-				dL_ds.y += dL_dz * Tw.y;
-				float3 dL_dTu = {0.f, 0.f, 0.f};
-				float3 dL_dTv = {0.f, 0.f, 0.f};
-				float3 dL_dTw = {dL_dz * s.x, dL_dz * s.y, dL_dz};
-				// 9. Backprop J quotient rule → dp_dx, dp_dy, p
-				float3 dL_ddp_dx = {0.f, 0.f, 0.f};
-				float3 dL_ddp_dy = {0.f, 0.f, 0.f};
-				float3 dL_dp_aa = {0.f, 0.f, 0.f};
-				// val = (vec.comp * p.z - p.comp * vec.z) * pz_squared_inv
-				#define ACCUM_QG(dL_dval, val, vec_comp, vec_z, p_comp, dL_dvec_comp, dL_dvec_z, dL_dp_comp) \
-				    { \
-				        float term_qg = (dL_dval) * pz_sq_inv_aa; \
-				        dL_dvec_comp += term_qg * p.z; \
-				        dL_dvec_z    -= term_qg * p_comp; \
-				        dL_dp_comp   -= term_qg * vec_z; \
-				        dL_dp_aa.z   += term_qg * vec_comp - 2.0f * (dL_dval) * (val) * pz_inv_aa; \
-				    }
-				ACCUM_QG(dL_dJ_a, J_a, dp_dx_aa.x, dp_dx_aa.z, p.x, dL_ddp_dx.x, dL_ddp_dx.z, dL_dp_aa.x);
-				ACCUM_QG(dL_dJ_b, J_b, dp_dx_aa.y, dp_dx_aa.z, p.y, dL_ddp_dx.y, dL_ddp_dx.z, dL_dp_aa.y);
-				ACCUM_QG(dL_dJ_c, J_c, dp_dy_aa.x, dp_dy_aa.z, p.x, dL_ddp_dy.x, dL_ddp_dy.z, dL_dp_aa.x);
-				ACCUM_QG(dL_dJ_d, J_d, dp_dy_aa.y, dp_dy_aa.z, p.y, dL_ddp_dy.y, dL_ddp_dy.z, dL_dp_aa.y);
-				#undef ACCUM_QG
-				// 10. Perspective division s = p/p.z
-				float dL_dsx_pz = dL_ds.x * pz_inv_aa;
-				float dL_dsy_pz = dL_ds.y * pz_inv_aa;
-				dL_dp_aa.x += dL_dsx_pz;
-				dL_dp_aa.y += dL_dsy_pz;
-				dL_dp_aa.z -= (dL_dsx_pz * s.x + dL_dsy_pz * s.y);
-				// 11. Through cross products
-				// dp_dx = cross(Tv, Tw) → dL/dTv += cross(Tw, dL_ddp_dx); dL/dTw += cross(dL_ddp_dx, Tv)
-				{
-					float3 a1 = cross(Tw, dL_ddp_dx);
-					float3 a2 = cross(dL_ddp_dx, Tv);
-					dL_dTv.x += a1.x; dL_dTv.y += a1.y; dL_dTv.z += a1.z;
-					dL_dTw.x += a2.x; dL_dTw.y += a2.y; dL_dTw.z += a2.z;
-				}
-				// dp_dy = cross(Tw, Tu) → dL/dTw += cross(Tu, dL_ddp_dy); dL/dTu += cross(dL_ddp_dy, Tw)
-				{
-					float3 b1 = cross(Tu, dL_ddp_dy);
-					float3 b2 = cross(dL_ddp_dy, Tw);
-					dL_dTw.x += b1.x; dL_dTw.y += b1.y; dL_dTw.z += b1.z;
-					dL_dTu.x += b2.x; dL_dTu.y += b2.y; dL_dTu.z += b2.z;
-				}
-				// p = cross(k, l) → dL/dk = cross(l, dL_dp); dL/dl = cross(dL_dp, k)
-				const float3 dL_dk_aa = cross(l, dL_dp_aa);
-				const float3 dL_dl_aa = cross(dL_dp_aa, k);
-				// k = pixf.x * Tw - Tu ; l = pixf.y * Tw - Tv
-				dL_dTu.x -= dL_dk_aa.x; dL_dTu.y -= dL_dk_aa.y; dL_dTu.z -= dL_dk_aa.z;
-				dL_dTv.x -= dL_dl_aa.x; dL_dTv.y -= dL_dl_aa.y; dL_dTv.z -= dL_dl_aa.z;
-				dL_dTw.x += pixf.x * dL_dk_aa.x + pixf.y * dL_dl_aa.x;
-				dL_dTw.y += pixf.x * dL_dk_aa.y + pixf.y * dL_dl_aa.y;
-				dL_dTw.z += pixf.x * dL_dk_aa.z + pixf.y * dL_dl_aa.z;
-				// Atomic updates
-				atomicAdd(&dL_dtransMat[global_id * 9 + 0], dL_dTu.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 1], dL_dTu.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 2], dL_dTu.z);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 3], dL_dTv.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 4], dL_dTv.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 5], dL_dTv.z);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 6], dL_dTw.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 7], dL_dTw.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 8], dL_dTw.z);
-				// AbsGS: abs of Tu.z/Tv.z for densification signal
-				atomicAdd(&dL_dmean2D[global_id].z, fabsf(dL_dTu.z));
-				atomicAdd(&dL_dmean2D[global_id].w, fabsf(dL_dTv.z));
-			} else if (rho3d <= rho2d) {
-				float2 dL_ds;
-				if (kernel_type == 5) {
-					// Nexel kernel: anisotropic gamma exponents
-					float gamma_x = collected_shapes[j].x;
-					float gamma_y = collected_shapes[j].y;
-					const float GAMMA_EPS = 1e-6f;
-					float comp_x = fminf(s.x * s.x + GAMMA_EPS, powf(1000.0f, 1.0f / gamma_x));
-					float comp_y = fminf(s.y * s.y + GAMMA_EPS, powf(1000.0f, 1.0f / gamma_y));
-					dL_ds = {
-						dL_dG * (-G) * gamma_x * powf(comp_x, gamma_x - 1.0f) * s.x + dL_dz * Tw.x,
-						dL_dG * (-G) * gamma_y * powf(comp_y, gamma_y - 1.0f) * s.y + dL_dz * Tw.y
-					};
-					// dL_dgamma
-					float dL_dgamma_x = -0.5f * dL_dG * G * logf(comp_x) * powf(comp_x, gamma_x);
-					float dL_dgamma_y = -0.5f * dL_dG * G * logf(comp_y) * powf(comp_y, gamma_y);
-					atomicAdd(&dL_dshapes[global_id * 2 + 0], dL_dgamma_x);
-					atomicAdd(&dL_dshapes[global_id * 2 + 1], dL_dgamma_y);
-				} else {
-					float dG_factor;
-					if (kernel_type == 1 || kernel_type == 4) {
-						if (beta_wins && base > 1e-7f) {
-							dG_factor = -shape_val * alpha_beta / (base * k_sq);
-						} else {
-							dG_factor = 0.0f;
-						}
-					} else if (kernel_type == 2) {
-						dG_factor = -G_raw;
-					} else if (kernel_type == 3) {
-						dG_factor = -0.5f * general_beta * G * general_pow_term / general_rho_safe;
+			if (rho3d <= rho2d) {
+				// Update gradients w.r.t. covariance of Gaussian 3x3 (T)
+				// For Gaussian kernel: dG/ds.x = -G * s.x (from exp(-0.5*(s.x²+s.y²)))
+				// For Beta kernel: dG/ds.x = -shape * G / base * s.x (from pow(1-rho, shape))
+				// For Flex kernel: same as Gaussian but use G_raw (already accounted for in dL_dG)
+				// For General kernel: dG/drho = -0.25 * β * G * pow_term / rho
+				float dG_factor;
+				if (kernel_type == 1 || kernel_type == 4) {
+					// Beta kernel with max-pool: gradient depends on which branch won
+					if (beta_wins && base > 1e-7f) {
+						// Beta branch: dG/drho3d = -shape * alpha_beta / (base * k_sq)
+						dG_factor = -shape_val * alpha_beta / (base * k_sq);
 					} else {
-						dG_factor = -G;
+						// Gaussian low-pass won, but we're in rho3d branch
+						// alpha_lp depends on rho2d, not rho3d, so gradient is 0
+						dG_factor = 0.0f;
 					}
-					dL_ds = {
-						dL_dG * dG_factor * s.x + dL_dz * Tw.x,
-						dL_dG * dG_factor * s.y + dL_dz * Tw.y
-					};
+				} else if (kernel_type == 2) {
+					// Flex kernel: same as Gaussian, use G_raw for position gradient
+					// dL_dG has already been adjusted in the gradient section above
+					dG_factor = -G_raw;
+				} else if (kernel_type == 3) {
+					// General kernel: dG/ds.x = dG/drho * drho/ds.x
+					// dG/drho = -0.5 * G * (β/2) * pow_term / rho = -0.25 * β * G * pow_term / rho
+					// drho/ds.x = 2 * s.x, so dG/ds.x = dG/drho * 2 * s.x
+					// dG_factor should satisfy: dG_factor * s.x = dG/ds.x
+					// Therefore: dG_factor = dG/drho * 2 = -0.5 * β * G * pow_term / rho
+					dG_factor = -0.5f * general_beta * G * general_pow_term / general_rho_safe;
+				} else {
+					// Gaussian kernel: dG/drho = -0.5 * G, drho/ds.x = 2*s.x
+					// Combined: dG/ds.x = -G * s.x
+					dG_factor = -G;
 				}
+				float2 dL_ds = {
+					dL_dG * dG_factor * s.x + dL_dz * Tw.x,
+					dL_dG * dG_factor * s.y + dL_dz * Tw.y
+				};
 
 				dL_ds.x += dL_duv.x;
 				dL_ds.y += dL_duv.y;
@@ -2433,11 +2146,13 @@ renderCUDAsurfelBackward(
 				atomicAdd(&dL_dtransMat[global_id * 9 + 6],  dL_dTw.x);
 				atomicAdd(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
 				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
-				// AbsGS: accumulate absolute Tu.z / Tv.z for cancellation-free densification
-				atomicAdd(&dL_dmean2D[global_id].z, fabsf(dL_dTu.z));
-				atomicAdd(&dL_dmean2D[global_id].w, fabsf(dL_dTv.z));
 			} else {
 				// Update gradients w.r.t. center of Gaussian 2D mean position
+				// For rho2d case: rho2d = FilterInvSquare * (d.x² + d.y²)
+				// For Gaussian kernel: dG/dd.x = -G * FilterInvSquare * d.x
+				// For Beta kernel: dG/dd.x = -shape * G / base * FilterInvSquare * d.x
+				// For Flex kernel: same as Gaussian but use G_raw
+				// For General kernel: dG/dd.x = dG/drho * FilterInvSquare * d.x
 				float dG_factor_2d;
 				if (kernel_type == 1 || kernel_type == 4) {
 					// Beta kernel with max-pool: gradient depends on which branch won
@@ -2467,44 +2182,11 @@ renderCUDAsurfelBackward(
 				const float dG_ddely = dG_factor_2d * d.y;
 				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
 				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
-				// AbsGS: abs gradient from low-pass filter path
-				atomicAdd(&dL_dmean2D[global_id].z, fabsf(dL_dG * dG_ddelx));
-				atomicAdd(&dL_dmean2D[global_id].w, fabsf(dL_dG * dG_ddely));
-				if (render_mode & 0x400) {
-					// --lowpass: propagate low-pass filter + depth gradient to transMat
-					const float dL_dxy_x = dL_dG * dG_ddelx;
-					const float dL_dxy_y = dL_dG * dG_ddely;
-					const float inv_Tw_z = 1.0f / (Tw.z + 1e-7f);
-					const float2 dL_ds_lp = {dL_dz * Tw.x, dL_dz * Tw.y};
-					const float3 dz_dTw_lp = {s.x, s.y, 1.0f};
-					const float dsx_pz_lp = dL_ds_lp.x / p.z;
-					const float dsy_pz_lp = dL_ds_lp.y / p.z;
-					const float3 dL_dp_lp = {dsx_pz_lp, dsy_pz_lp, -(dsx_pz_lp * s.x + dsy_pz_lp * s.y)};
-					const float3 dL_dk_lp = cross(l, dL_dp_lp);
-					const float3 dL_dl_lp = cross(dL_dp_lp, k);
-					const float3 dL_dTu_lp = {-dL_dk_lp.x, -dL_dk_lp.y, -dL_dk_lp.z};
-					const float3 dL_dTv_lp = {-dL_dl_lp.x, -dL_dl_lp.y, -dL_dl_lp.z};
-					const float3 dL_dTw_lp = {
-						pixf.x * dL_dk_lp.x + pixf.y * dL_dl_lp.x + dL_dz * dz_dTw_lp.x + dL_dxy_x * inv_Tw_z,
-						pixf.x * dL_dk_lp.y + pixf.y * dL_dl_lp.y + dL_dz * dz_dTw_lp.y + dL_dxy_y * inv_Tw_z,
-						pixf.x * dL_dk_lp.z + pixf.y * dL_dl_lp.z + dL_dz * dz_dTw_lp.z - (dL_dxy_x * xy.x + dL_dxy_y * xy.y) * inv_Tw_z};
-					atomicAdd(&dL_dtransMat[global_id * 9 + 0], dL_dTu_lp.x);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 1], dL_dTu_lp.y);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 2], dL_dTu_lp.z);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 3], dL_dTv_lp.x);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 4], dL_dTv_lp.y);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 5], dL_dTv_lp.z);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 6], dL_dTw_lp.x);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 7], dL_dTw_lp.y);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 8], dL_dTw_lp.z);
-				} else {
-					atomicAdd(&dL_dtransMat[global_id * 9 + 8], dL_dz);
-				}
+				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz); // propagate depth loss
 			}
 
 			// Update gradients w.r.t. opacity of the Gaussian
-			// AA: alpha = coef * opa * G → dL/dopa = coef * G * dL_dalpha
-			atomicAdd(&(dL_dopacity[global_id]), (is_aa ? aa_coef : 1.0f) * G * dL_dalpha);
+			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
 		}
 	}
 
@@ -2538,7 +2220,7 @@ __device__ void compute_transmat_aabb(
 	const float* viewmatrix, 
 	const int W, const int H, 
 	const float3* dL_dnormals,
-	const float4* dL_dmean2Ds,
+	const float3* dL_dmean2Ds, 
 	float* dL_dTs, 
 	float* dL_dhomoMat,
 	glm::vec3* dL_dmeans, 
@@ -2600,7 +2282,7 @@ __device__ void compute_transmat_aabb(
 		dL_dTs[idx*9+3], dL_dTs[idx*9+4], dL_dTs[idx*9+5],
 		dL_dTs[idx*9+6], dL_dTs[idx*9+7], dL_dTs[idx*9+8]
 	);
-	float4 dL_dmean2D = dL_dmean2Ds[idx];
+	float3 dL_dmean2D = dL_dmean2Ds[idx];
 	if(dL_dmean2D.x != 0 || dL_dmean2D.y != 0)
 	{
 		glm::vec3 t_vec = glm::vec3(9.0f, 9.0f, -1.0f);
@@ -2712,11 +2394,10 @@ __global__ void preprocessCUDA(
 	const float* dL_dnormal3Ds,
 	float* dL_dcolors,
 	float* dL_dshs,
-	float4* dL_dmean2Ds,
+	float3* dL_dmean2Ds,
 	glm::vec3* dL_dmean3Ds,
 	glm::vec2* dL_dscales,
-	glm::vec4* dL_drots,
-	const bool pixel_center = false)
+	glm::vec4* dL_drots)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
@@ -2744,14 +2425,8 @@ __global__ void preprocessCUDA(
 	
 	// hack the gradient here for densitification
 	float depth = transMats[idx * 9 + 8];
-	dL_dmean2Ds[idx].x = dL_dtransMats[idx * 9 + 2] * depth * 0.5 * float(W); // to ndc
+	dL_dmean2Ds[idx].x = dL_dtransMats[idx * 9 + 2] * depth * 0.5 * float(W); // to ndc 
 	dL_dmean2Ds[idx].y = dL_dtransMats[idx * 9 + 5] * depth * 0.5 * float(H); // to ndc
-
-	// AbsGS: scale the abs signal accumulated during the render backward
-	// (per-pixel fabs(dL_dTu.z) / fabs(dL_dG * dG_ddelx)) to match the
-	// densification coordinate system (same depth * 0.5 * W/H factor as x/y).
-	dL_dmean2Ds[idx].z *= depth * 0.5f * float(W);
-	dL_dmean2Ds[idx].w *= depth * 0.5f * float(H);
 }
 
 
@@ -2772,19 +2447,9 @@ void BACKWARD::setOverdrawLambda(float val) {
 	setOverdrawLambdaBwKernel<<<1, 1>>>(val);
 }
 
-__global__ void setWeightRegLambdaBwKernel(float val) { d_weight_reg_lambda_bw = val; }
-void BACKWARD::setWeightRegLambda(float val) {
-	setWeightRegLambdaBwKernel<<<1, 1>>>(val);
-}
-
 __global__ void setResBiasBwKernel(float val) { d_res_bias = val; }
 void BACKWARD::setResBias(float val) {
 	setResBiasBwKernel<<<1, 1>>>(val);
-}
-
-__global__ void setAaKernelSizeBwKernel(float val) { d_aa_kernel_size = val; }
-void BACKWARD::setAaKernelSize(float val) {
-	setAaKernelSizeBwKernel<<<1, 1>>>(val);
 }
 
 void BACKWARD::preprocess(
@@ -2801,8 +2466,8 @@ void BACKWARD::preprocess(
 	const float* projmatrix,
 	const float focal_x, const float focal_y,
 	const float tan_fovx, const float tan_fovy,
-	const glm::vec3* campos,
-	float4* dL_dmean2Ds,
+	const glm::vec3* campos, 
+	float3* dL_dmean2Ds,
 	const float* dL_dnormal3Ds,
 	float* dL_dtransMats,
 	float* dL_dhomoMat,
@@ -2810,8 +2475,7 @@ void BACKWARD::preprocess(
 	float* dL_dshs,
 	glm::vec3* dL_dmean3Ds,
 	glm::vec2* dL_dscales,
-	glm::vec4* dL_drots,
-	const bool pixel_center)
+	glm::vec4* dL_drots)
 {	
 	preprocessCUDA<NUM_CHANNELS><< <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -2838,8 +2502,7 @@ void BACKWARD::preprocess(
 		dL_dmean2Ds,
 		dL_dmean3Ds,
 		dL_dscales,
-		dL_drots,
-		pixel_center
+		dL_drots
 	);
 }
 
@@ -2874,7 +2537,7 @@ void BACKWARD::render(
 	float* dL_dfeatures,
 	float * dL_dtransMat,
 	float * dL_dhomoMat,
-	float4* dL_dmean2D,
+	float3* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
 	float* dL_dcolors,
@@ -3174,6 +2837,7 @@ __global__ void backward_from_weight_grad_kernel(
     // IMPORTANT: pix_id is just an index into unique pixels, NOT the actual pixel coordinate!
     int actual_pixel_id = pixel_ids[start];
     // NOTE: Native CUDA kernel uses integer pixel coordinates WITHOUT +0.5 offset!
+    // This must match forward.cu line 589: float2 pixf = { (float)pix.x, (float)pix.y};
     float pixf_x = (float)(actual_pixel_id % W);
     float pixf_y = (float)(actual_pixel_id / W);
 
@@ -3388,8 +3052,7 @@ __global__ void transMat_to_scale_rot_grad_kernel(
     const float* __restrict__ viewmatrix,      // [16] - 4x4 view matrix (for normal gradient transform)
     float* __restrict__ dL_dscales,            // [N, 2] output
     float* __restrict__ dL_drots,              // [N, 4] output
-    float* __restrict__ dL_dmeans,             // [N, 3] output
-    const bool pixel_center = false)
+    float* __restrict__ dL_dmeans)             // [N, 3] output
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
@@ -3416,11 +3079,10 @@ __global__ void transMat_to_scale_rot_grad_kernel(
     );
 
     // Build ndc2pix transformation (matches forward.cu and native backward)
-    const float ndc_off_x = pixel_center ? float(W) / 2.0f : float(W-1) / 2.0f;
-    const float ndc_off_y = pixel_center ? float(H) / 2.0f : float(H-1) / 2.0f;
+    // This converts from NDC [-1,1] to pixel coordinates [0,W-1] x [0,H-1]
     glm::mat3x4 ndc2pix = glm::mat3x4(
-        glm::vec4(float(W) / 2.0f, 0.0f, 0.0f, ndc_off_x),
-        glm::vec4(0.0f, float(H) / 2.0f, 0.0f, ndc_off_y),
+        glm::vec4(float(W) / 2.0f, 0.0f, 0.0f, float(W-1) / 2.0f),
+        glm::vec4(0.0f, float(H) / 2.0f, 0.0f, float(H-1) / 2.0f),
         glm::vec4(0.0f, 0.0f, 0.0f, 1.0f)
     );
 

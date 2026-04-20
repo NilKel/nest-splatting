@@ -806,6 +806,8 @@ renderCUDAsurfelForward(
 	int* __restrict__ out_index,
 	float* __restrict__ cover_pixel,
 	float* __restrict__ trans_avg,
+	float* __restrict__ max_weight_buf,
+	float* __restrict__ accum_weights_buf,
 	const float* __restrict__ hash_features_diffuse = nullptr,
 	const int* __restrict__ level_offsets_diffuse = nullptr,
 	const float* __restrict__ gridrange_diffuse = nullptr,
@@ -1297,6 +1299,17 @@ renderCUDAsurfelForward(
 			if(record_transmittance){
 				atomicAdd(&(cover_pixel[collected_id[j]]), 1.0f);
 				atomicAdd(&(trans_avg[collected_id[j]]), T);
+				atomicAdd(&(accum_weights_buf[collected_id[j]]), w);
+				// Float atomicMax via CAS
+				{
+					int* addr = (int*)&(max_weight_buf[collected_id[j]]);
+					int old_val = *addr, assumed;
+					do {
+						assumed = old_val;
+						old_val = atomicCAS(addr, assumed,
+							__float_as_int(fmaxf(__int_as_float(assumed), w)));
+					} while (assumed != old_val);
+				}
 			}
 			
 			T = test_T;
@@ -1376,6 +1389,8 @@ void FORWARD::render(
 	int* out_index,
 	float* cover_pixels,
 	float* trans_avg,
+	float* max_weight,
+	float* accum_weights,
 	const uint32_t D_diffuse,
 	const float* hash_features_diffuse,
 	const int* level_offsets_diffuse,
@@ -1387,66 +1402,27 @@ void FORWARD::render(
 	const float aa,
 	const float aa_threshold)
 {
-	switch (C) {
+	#define LAUNCH_KERNEL(CH) \
+		renderCUDAsurfelForward<CH, 0> <<<grid, block>>>( \
+			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, \
+			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg, max_weight, accum_weights, \
+			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold);
 
-		case 3:
-			renderCUDAsurfelForward<3, 0> <<<grid, block>>>(
-				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
-				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold);
-			break;
-		case 8:
-			renderCUDAsurfelForward<8, 0> <<<grid, block>>>(
-				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
-				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold);
-			break;
-		case 16:
-			renderCUDAsurfelForward<16, 0> <<<grid, block>>>(
-				ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
-				depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-				hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold);
-			break;
-	case 24:
-		renderCUDAsurfelForward<24, 0> <<<grid, block>>>(
-			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
-			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold);
-		break;
-	case 32:
-		renderCUDAsurfelForward<32, 0> <<<grid, block>>>(
-			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
-			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold);
-		break;
-	case 42:
-		renderCUDAsurfelForward<42, 0> <<<grid, block>>>(
-			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
-			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold);
-		break;
-	case 48:
-		renderCUDAsurfelForward<48, 0> <<<grid, block>>>(
-			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
-			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold);
-		break;
-	case 72:
-		renderCUDAsurfelForward<72, 0> <<<grid, block>>>(
-			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
-			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold);
-		break;
-	case 90:
-		renderCUDAsurfelForward<90, 0> <<<grid, block>>>(
-			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
-			depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg,
-			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, colors, max_intersections, shapes, kernel_type, aa, aa_threshold);
-		break;
-	default:
-		printf("Unsupported channel count: %d\n", C);
+	switch (C) {
+		case 3:  LAUNCH_KERNEL(3);  break;
+		case 8:  LAUNCH_KERNEL(8);  break;
+		case 16: LAUNCH_KERNEL(16); break;
+		case 24: LAUNCH_KERNEL(24); break;
+		case 32: LAUNCH_KERNEL(32); break;
+		case 42: LAUNCH_KERNEL(42); break;
+		case 48: LAUNCH_KERNEL(48); break;
+		case 72: LAUNCH_KERNEL(72); break;
+		case 90: LAUNCH_KERNEL(90); break;
+		default:
+			printf("Unsupported channel count: %d\n", C);
 	}
 
+	#undef LAUNCH_KERNEL
 }
 
 void FORWARD::preprocess(int P, int D, int M,

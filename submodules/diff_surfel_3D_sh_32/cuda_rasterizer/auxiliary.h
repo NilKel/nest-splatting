@@ -31,8 +31,7 @@
 #define VIS_OFFSET 11
 #define OVERDRAW_OFFSET 14
 #define MAXDEPTH_OFFSET 15  // Depth of max-contributing Gaussian per pixel
-#define WSQUARE_OFFSET 16   // Sum of squared weights: sum(w_i^2) for weight_reg
-#define DIFFUSE_RGB_OFFSET 17
+#define DIFFUSE_RGB_OFFSET 16
 // #define MEDIAN_WEIGHT_OFFSET 7
 
 // distortion helper macros

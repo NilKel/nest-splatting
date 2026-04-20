@@ -13,7 +13,7 @@ training_cfg:
   ingp_opacity_reset_interval: 3000
   opacity_reset_protect: 10
 
-  densify_grad_threshold: 0.0002
+  densify_grad_threshold: 0.0008
   ingp_densify_threshold: 0.0004
 
   opacity_cull: 0.05

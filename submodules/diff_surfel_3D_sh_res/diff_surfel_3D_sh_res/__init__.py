@@ -185,11 +185,14 @@ class _RasterizeGaussians(torch.autograd.Function):
             depth, out_index, radii, sh, geomBuffer, binningBuffer, imgBuffer, shapes)
 
         # if raster_settings.record_transmittance :
-        # Return geomBuffer for use by 3D mode backward (transMat access)
-        return color, radii, depth, transmittance_avg, pixels, intersection_buffer, intersection_count, geomBuffer
+        # Return geomBuffer for use by 3D mode backward (transMat access).
+        # Also surface out_index ([H, W] int32, per-pixel id of the max-weight contributor)
+        # for the mini depth-reinit SH-transfer path. New element appended at the END to
+        # avoid disturbing existing positional unpacks elsewhere.
+        return color, radii, depth, transmittance_avg, pixels, intersection_buffer, intersection_count, geomBuffer, out_index
 
     @staticmethod
-    def backward(ctx, grad_out_color, grad_radii, grad_depth, grad_0, grad_1, grad_intersection_buffer, grad_intersection_count, grad_geomBuffer):
+    def backward(ctx, grad_out_color, grad_radii, grad_depth, grad_0, grad_1, grad_intersection_buffer, grad_intersection_count, grad_geomBuffer, grad_out_index):
 
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -272,32 +275,24 @@ class _RasterizeGaussians(torch.autograd.Function):
              grad_mlp_W1, grad_mlp_W2, grad_mlp_W3
             ) = _C.rasterize_gaussians_backward(*args)
 
-        # Store MLP gradients for fused MLP modes (render_mode=5 or 6)
+        # Debug: print grad_features stats to diagnose hash gradient flow
+        if grad_features is not None and grad_features.numel() > 0:
+            if not hasattr(_RasterizeGaussians, '_bw_dbg_count'):
+                _RasterizeGaussians._bw_dbg_count = 0
+            _RasterizeGaussians._bw_dbg_count += 1
+            if _RasterizeGaussians._bw_dbg_count % 500 == 1:
+                print(f"[BW_DBG iter~{_RasterizeGaussians._bw_dbg_count}] grad_features: shape={list(grad_features.shape)}, "
+                      f"norm={grad_features.norm().item():.8f}, "
+                      f"abs_max={grad_features.abs().max().item():.8f}, "
+                      f"nonzero={grad_features.count_nonzero().item()}/{grad_features.numel()}")
+
+        # Store MLP gradients for fused MLP modes (render_mode=5)
         # These need to be retrieved by the caller and applied to MLP parameters
         # Use mask to handle bit flags (collaborative GEMM, freeze_mlp)
-        if (render_mode & 0xFF) in (5, 6):
+        if (render_mode & 0xFF) == 5:
             _RasterizeGaussians._last_mlp_grads = (
                 grad_mlp_W1, grad_mlp_W2, grad_mlp_W3
             )
-
-        # For 3D mode (render_mode == 3):
-        # - CUDA color output is NOT used (Python MLP processes intersection buffer instead)
-        # - So grad_out_color = 0, meaning native backward only has gradients from auxiliary losses
-        #   (mask_loss via dL_daccum, depth_loss, normal_loss, etc.)
-        # - IntersectionOpacityGrad computes gradients from RGB/feature loss only
-        # - These are ADDITIVE, not overlapping - no double-counting!
-        #
-        # Keep ALL gradients from native backward (they contain mask_loss contributions).
-        # IMPORTANT: Do NOT zero grad_means2D - it's needed for densification!
-        # - Native backward's grad_means2D comes from mask_loss (dL_daccum -> dL_dalpha -> dL_dmean2D)
-        # - IntersectionOpacityGrad's grad_screenspace comes from RGB loss
-        # - These are additive since they come from different loss sources
-        # - grad_means2D is critical for add_densification_stats() to work correctly!
-        if render_mode == 3:
-            # Keep ALL gradients including grad_means2D for densification
-            # Keep: grad_means3D, grad_means2D, grad_opacities, grad_scales, grad_rotations
-            # These contain auxiliary loss (mask_loss, etc.) gradients
-            pass
 
         grad_homotrans = None
 
@@ -385,9 +380,12 @@ class GaussianRasterizer(nn.Module):
         raster_settings = self.raster_settings
         hashgrid_settings = self.hashgrid_settings
 
-        # render_mode 6 (3D_SH_cat) needs BOTH: shs for full SH eval, colors_precomp for DC SH
-        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None and (render_mode & 0xFF) != 6):
-            raise Exception('Please provide excatly one of either SHs or precomputed colors!')
+        # render_mode 6 (3D_SH_cat) legitimately needs BOTH shs (for computeColorFromSH
+        # in preprocess → rgb buffer) AND colors_precomp (= DC_SH used as MLP input
+        # at line ~1889 of forward.cu, threaded through the kernel's `features` arg).
+        # So we only error when neither is provided.
+        if shs is None and colors_precomp is None:
+            raise Exception('Please provide either SHs or precomputed colors!')
 
         if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
             raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
@@ -648,6 +646,39 @@ def set_mlp_weights(W1, W2, W3):
 def set_contrib_thresh(val):
     """Set contribution threshold. Skip hash query when w = T*alpha < val (0 = disabled)."""
     _C.set_contrib_thresh(val)
+
+def set_count_thresh(val):
+    """Set count threshold. Skip hash after N contributing Gaussians per pixel (0 = disabled)."""
+    _C.set_count_thresh(val)
+
+def set_overdraw_lambda(val):
+    """Set overdraw regularization lambda. Penalizes per-pixel contributor count with sigmoid relaxation (0 = disabled)."""
+    _C.set_overdraw_lambda(val)
+
+def set_weight_reg_lambda(val):
+    """Set weight-squared regularization lambda. CUDA backward adds dL_dalpha = -lambda * 2*w*T per Gaussian (0 = disabled)."""
+    _C.set_weight_reg_lambda(val)
+
+def set_activation_bias(sh_bias=0.5, res_bias=0.5):
+    """Set activation biases: color = ReLU(SH + sh_bias) + ReLU(residual + res_bias).
+    Default: 0.5/0.5. For decomposition: sh_only uses res_bias=-999, tex_only uses sh_bias=-999."""
+    _C.set_activation_bias(sh_bias, res_bias)
+
+def set_anti_alias(factor=0.0, focal=1.0):
+    """Set Nexels-style hash-grid anti-aliasing down-weighting.
+    factor=0 disables AA. factor=1.0 and focal=max(fx,fy) matches Nexels default.
+    Downweight per level: Δ = 1 - exp(-1/(2π) * (focal/(s_ℓ·factor·depth))²)."""
+    _C.set_anti_alias(float(factor), float(focal))
+
+def set_aa_kernel_size(val=0.0):
+    """Set AA-2DGS Jacobian-based mip filter kernel size σ (0 = off, typical 0.1).
+    When > 0, replaces the min(rho3d, rho2d) heuristic in the scalar mode 5/6
+    standard-Gaussian path with Σ'_local = I + σ·J·Jᵀ, alpha = coef·opa·exp(-0.5·rho)."""
+    _C.set_aa_kernel_size(float(val))
+
+def set_depth_sort(val):
+    """Set depth sort toggle. True = separated depth sort, False = standard sort (default)."""
+    _C.set_depth_sort(val)
 
 def get_mlp_grads():
     """

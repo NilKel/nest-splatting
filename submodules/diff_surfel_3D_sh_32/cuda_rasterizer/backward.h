@@ -52,7 +52,7 @@ namespace BACKWARD
 		float* dL_dfeatures,
 		float* dL_dtransMat,
 		float* dL_dhomoMat,
-		float4* dL_dmean2D,
+		float3* dL_dmean2D,
 		float* dL_dnormal3D,
 		float* dL_dopacity,
 		float* dL_dcolors,
@@ -79,9 +79,7 @@ namespace BACKWARD
 	void setContribThresh(float val);
 	void setCountThresh(int val);
 	void setOverdrawLambda(float val);
-	void setWeightRegLambda(float val);
 	void setResBias(float val);
-	void setAaKernelSize(float val);
 
 	void preprocess(
 		int P, int D, int M,
@@ -98,7 +96,7 @@ namespace BACKWARD
 		const float focal_x, const float focal_y,
 		const float tan_fovx, const float tan_fovy,
 		const glm::vec3* campos,
-		float4* dL_dmean2D,
+		float3* dL_dmean2D,
 		const float* dL_dnormal3D,
 		float* dL_dtransMat,
 		float* dL_dhomoMat,
@@ -106,8 +104,7 @@ namespace BACKWARD
 		float* dL_dsh,
 		glm::vec3* dL_dmeans,
 		glm::vec2* dL_dscale,
-		glm::vec4* dL_drot,
-		const bool pixel_center = false);
+		glm::vec4* dL_drot);
 }
 
 // Unified backward kernel for 3D mode that reads transMat from geomBuffer

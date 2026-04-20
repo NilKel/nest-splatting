@@ -39,18 +39,10 @@ __device__ int d_count_thresh = 0;
 // backward adds dL_dalpha contribution to reduce per-pixel contributor count.
 __device__ float d_overdraw_lambda = 0.0f;
 
-// Weight-squared regularization: penalize (1 - sum(w_i^2)) per pixel
-// When lambda > 0, backward adds dL_dalpha = -lambda * 2 * w * T per Gaussian
-__device__ float d_weight_reg_lambda = 0.0f;
-
 // Activation biases for SH and MLP residual: color = ReLU(ReLU(SH + sh_bias) + residual + res_bias)
 // Default: sh_bias=0.5, res_bias=0.5 (standard 3DGS gray init + residual offset)
 // For decomposition: sh_only sets res_bias=-999 (ReLU clamps to 0), tex_only sets sh_bias=-999
 __device__ float d_sh_bias = 0.5f;
-// Nexels-style anti-aliasing d_aa_factor / d_aa_focal are now declared in hashgrid.h
-// (per-TU static __device__). Setters below update this TU's copy.
-// AA-2DGS mip filter kernel size σ. 0 disables (use standard rho3d/rho2d).
-__device__ float d_aa_kernel_size = 0.0f;
 __device__ float d_res_bias = 0.5f;
 
 // Host-side pointers for memory management
@@ -797,7 +789,7 @@ renderCUDA(
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
-	float2 pixf = { (float)pix.x, (float)pix.y };
+	float2 pixf = { (float)pix.x, (float)pix.y};
 
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;
@@ -1052,8 +1044,7 @@ renderCUDAsurfelForward(
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
-	const float pix_off = (render_mode & 0x800) ? 0.5f : 0.0f;
-	float2 pixf = { (float)pix.x + pix_off, (float)pix.y + pix_off};
+	float2 pixf = { (float)pix.x, (float)pix.y};
 
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;
@@ -1078,7 +1069,7 @@ renderCUDAsurfelForward(
 	__shared__ float3 collected_SvTv[BLOCK_SIZE];
 	__shared__ float3 collected_pk[BLOCK_SIZE];
 	__shared__ uint32_t collected_ap_level[BLOCK_SIZE];
-	__shared__ float2 collected_shapes[BLOCK_SIZE];  // Kernel shape: .x = primary (beta/general/flex), .y = nexel gamma_y
+	__shared__ float collected_shapes[BLOCK_SIZE];  // Beta kernel shape parameter
 
 	// Shared memory for per-Gaussian baseline features (dual hashgrid mode)
 	// NOTE: Disabled for baseline_double/baseline_blend_double due to shared memory limits
@@ -1117,7 +1108,6 @@ renderCUDAsurfelForward(
 	uint32_t render_number = 0;
 	float vis_appearance[3] = {0};
 	float overdraw_sum = 0.0f;  // Soft contributor count: sum of sigmoid(k*(w-t))
-	float w_square_sum = 0.0f;  // Sum of squared weights: sum(w_i^2) for weight_reg loss
 
 #if RENDER_AXUTILITY
 	// render axutility ouput
@@ -1133,7 +1123,6 @@ renderCUDAsurfelForward(
 	// Max contributor tracking for depth reinit
 	float max_w = 0.0f;
 	float max_depth = 0.0f;
-	int max_idx = -1;  // global Gaussian id of the max-weight contributor (or -1 if none)
 
 	int collec_offsets[16] = {0};
 	// float feat[CHANNELS] = { 0 };
@@ -1211,15 +1200,9 @@ renderCUDAsurfelForward(
 		if(ap_level != nullptr){
 			collected_ap_level[block.thread_rank()] = floorf(ap_level[coll_id]);
 		}
-		// Collect shape for kernel (beta/general/flex: 1 float; nexel: 2 floats)
+		// Collect shape for beta kernel (only when using beta kernel)
 		if(shapes != nullptr){
-			if (kernel_type == 5) {
-				// Nexel: load [gamma_x, gamma_y] from [N, 2] tensor
-				collected_shapes[block.thread_rank()] = {shapes[coll_id * 2], shapes[coll_id * 2 + 1]};
-			} else {
-				// Other kernels: single float per Gaussian
-				collected_shapes[block.thread_rank()] = {shapes[coll_id], 0.0f};
-			}
+			collected_shapes[block.thread_rank()] = shapes[coll_id];
 		}
 
 		// NOTE: Per-Gaussian feature caching disabled due to shared memory limits
@@ -1283,7 +1266,7 @@ renderCUDAsurfelForward(
 
 				if (kernel_type == 1 || kernel_type == 4) {
 					float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
-					float shape = collected_shapes[j].x;
+					float shape = collected_shapes[j];
 					if (my_rho3d >= k_sq + 1e-6f) { active = false; break; }
 					float base = fmaxf(0.0f, 1.0f - my_rho3d / k_sq);
 					float alpha_beta = powf(base, shape);
@@ -1293,25 +1276,15 @@ renderCUDAsurfelForward(
 					float power = -0.5f * rho;
 					if (power > 0.0f) { active = false; break; }
 					float G = exp(power);
-					float per_gaussian_beta = collected_shapes[j].x;
+					float per_gaussian_beta = collected_shapes[j];
 					if (per_gaussian_beta > 0.0f)
 						G = (1.0f + per_gaussian_beta) * G / (1.0f + per_gaussian_beta * G);
 					my_alpha = min(0.99f, opa * G);
 				} else if (kernel_type == 3) {
-					float beta_param = collected_shapes[j].x;
+					float beta_param = collected_shapes[j];
 					float rho_safe = fmaxf(rho, 1e-8f);
 					float pow_term = powf(rho_safe, 0.5f * beta_param);
 					float power = -0.5f * pow_term;
-					if (power > 0.0f) { active = false; break; }
-					my_alpha = min(0.99f, opa * expf(power));
-				} else if (kernel_type == 5) {
-					// Nexel kernel (WMMA path)
-					float gamma_x = collected_shapes[j].x;
-					float gamma_y = collected_shapes[j].y;
-					const float GAMMA_EPS = 1e-6f;
-					float comp_x = fminf(my_s.x * my_s.x + GAMMA_EPS, powf(1000.0f, 1.0f / gamma_x));
-					float comp_y = fminf(my_s.y * my_s.y + GAMMA_EPS, powf(1000.0f, 1.0f / gamma_y));
-					float power = -0.5f * (powf(comp_x, gamma_x) + powf(comp_y, gamma_y));
 					if (power > 0.0f) { active = false; break; }
 					my_alpha = min(0.99f, opa * expf(power));
 				} else {
@@ -1333,11 +1306,10 @@ renderCUDAsurfelForward(
 				render_number++;
 
 #if RENDER_AXUTILITY
-				// Track max contributor per pixel (id used by mini depth-reinit SH transfer)
+				// Track max contributor per pixel
 				if (my_w > max_w) {
 					max_w = my_w;
 					max_depth = my_depth;
-					max_idx = collected_id[j];
 				}
 
 				float A = 1-T;
@@ -1374,43 +1346,33 @@ renderCUDAsurfelForward(
 				for (int ch = 0; ch < 3; ch++)
 					my_sh_color[ch] = rgb[gauss_id * 3 + ch];
 
-				// Query hashgrid (up to 16D for 4 levels × 4D)
+				// Query hashgrid (up to 12D for 3 levels × 4D)
 				const int active_hashgrid_levels = (level >> 8) & 0xFF;
 				const int hash_dim_batched = active_hashgrid_levels * l_dim;
 				uint32_t my_ap_level = collected_ap_level[j];
-				float hash_feat[16] = {0};
+				float hash_feat[12] = {0};
 				if (active_hashgrid_levels > 0 && l_dim == 4) {
 					if (hash_dim_batched == 4)
 						query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
+							l_scale, Base, align_corners, interp, if_contract, false);
 					else if (hash_dim_batched == 8)
 						query_feature<false, 8, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
+							l_scale, Base, align_corners, interp, if_contract, false);
 					else if (hash_dim_batched == 12)
 						query_feature<false, 12, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
-					else if (hash_dim_batched == 16)
-						query_feature<false, 16, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
+							l_scale, Base, align_corners, interp, if_contract, false);
 				} else if (active_hashgrid_levels > 0 && l_dim == 2) {
 					if (hash_dim_batched == 2)
 						query_feature<false, 2, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
+							l_scale, Base, align_corners, interp, if_contract, false);
 					else if (hash_dim_batched == 4)
 						query_feature<false, 4, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
+							l_scale, Base, align_corners, interp, if_contract, false);
 				}
 
 				// Write MLP input: [hash(hash_dim) | pad(16-hash_dim)] = 16D
@@ -1430,7 +1392,6 @@ renderCUDAsurfelForward(
 				smem_mlp_W1, smem_mlp_W2, smem_mlp_W3);
 
 			// Phase 4: Read MLP result, combine with SH, accumulate
-			// Combo #6: feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias )
 			if (active) {
 				for (int ch = 0; ch < ORIG_OUTPUT_DIM; ch++) {
 					float residual = smem_fw_float[tid * TC_OUTPUT_DIM + ch];
@@ -1491,7 +1452,7 @@ renderCUDAsurfelForward(
 			// kernel_type 1: k²=1 (unit circle cutoff)
 			// kernel_type 4: k²=9 (3σ scaled, matches Gaussian extent)
 			float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
-			float shape = collected_shapes[j].x;
+			float shape = collected_shapes[j];
 
 			// 1. Hard support check on object-space distance (with epsilon for numerical safety)
 			if (rho3d >= k_sq + 1e-6f)
@@ -1518,7 +1479,7 @@ renderCUDAsurfelForward(
 				continue;
 
 			float G = exp(power);
-			float per_gaussian_beta = collected_shapes[j].x;  // shapes array holds per-Gaussian beta
+			float per_gaussian_beta = collected_shapes[j];  // shapes array holds per-Gaussian beta
 			if (per_gaussian_beta > 0.0f)
 				G = (1.0f + per_gaussian_beta) * G / (1.0f + per_gaussian_beta * G);
 
@@ -1527,7 +1488,7 @@ renderCUDAsurfelForward(
 			// General kernel: Isotropic Generalized Gaussian
 			// Formula: G = exp(-0.5 * (r²)^(β/2))
 			// β = 2.0: standard Gaussian, β = 8.0: super-Gaussian (box-like)
-			float beta_param = collected_shapes[j].x;  // shapes array holds beta in range [2.0, 8.0]
+			float beta_param = collected_shapes[j];  // shapes array holds beta in range [2.0, 8.0]
 
 #ifdef FAST_POW_TEST
 			// PERFORMANCE TEST: Bypass expensive powf
@@ -1549,48 +1510,6 @@ renderCUDAsurfelForward(
 
 			float G = expf(power);
 			alpha = min(0.99f, opa * G);
-		} else if (kernel_type == 5) {
-			// Nexel kernel: per-axis gamma exponents (anisotropic generalized Gaussian)
-			// G = exp(-0.5 * (pow(s_x² + eps, gamma_x) + pow(s_y² + eps, gamma_y)))
-			// gamma=1: standard Gaussian. gamma>1: softer. gamma<1: sharper (but activation prevents <1).
-			float gamma_x = collected_shapes[j].x;
-			float gamma_y = collected_shapes[j].y;
-			float sx2 = s.x * s.x;
-			float sy2 = s.y * s.y;
-			const float GAMMA_EPS = 1e-6f;
-			float comp_x = fminf(sx2 + GAMMA_EPS, powf(1000.0f, 1.0f / gamma_x));
-			float comp_y = fminf(sy2 + GAMMA_EPS, powf(1000.0f, 1.0f / gamma_y));
-			float power = -0.5f * (powf(comp_x, gamma_x) + powf(comp_y, gamma_y));
-			if (power > 0.0f)
-				continue;
-			float G = expf(power);
-			alpha = min(0.99f, opa * G);
-		} else if (d_aa_kernel_size > 0.0f) {
-			// AA-2DGS Jacobian-based mip filter (replaces rho3d/rho2d heuristic).
-			// Σ'_local = I + ks·J·Jᵀ, alpha = coef·opa·exp(-0.5·rho_new)
-			const float ks = d_aa_kernel_size;
-			const float k_sq_aa = ks * ks;
-			const float pz_inv = 1.0f / p.z;
-			const float pz_sq_inv = pz_inv * pz_inv;
-			const float3 dp_dx = cross(Tv, Tw);
-			const float3 dp_dy = cross(Tw, Tu);
-			const float J_a = (dp_dx.x * p.z - p.x * dp_dx.z) * pz_sq_inv;
-			const float J_b = (dp_dx.y * p.z - p.y * dp_dx.z) * pz_sq_inv;
-			const float J_c = (dp_dy.x * p.z - p.x * dp_dy.z) * pz_sq_inv;
-			const float J_d = (dp_dy.y * p.z - p.y * dp_dy.z) * pz_sq_inv;
-			const float det_J = J_a * J_d - J_b * J_c;
-			const float trace_JJT = J_a * J_a + J_b * J_b + J_c * J_c + J_d * J_d;
-			const float det_V = k_sq_aa * det_J * det_J + ks * trace_JJT + 1.0f;
-			if (fabsf(det_V) < 1e-8f) continue;
-			const float det_V_inv = 1.0f / det_V;
-			const float coef = sqrtf(det_V_inv + 1e-8f);
-			const float term1 = J_d * s.x - J_c * s.y;
-			const float term2 = J_a * s.y - J_b * s.x;
-			const float rho_aa_num = (s.x * s.x + s.y * s.y) + ks * (term1 * term1 + term2 * term2);
-			const float rho_aa = rho_aa_num * det_V_inv;
-			const float power_aa = -0.5f * rho_aa;
-			if (power_aa > 0.0f) continue;
-			alpha = fminf(0.99f, coef * opa * expf(power_aa));
 		} else {
 			// Standard Gaussian kernel
 			float power = -0.5f * rho;
@@ -1631,19 +1550,15 @@ renderCUDAsurfelForward(
 			float sig = 1.0f / (1.0f + expf(-OD_K * (w - OD_THRESH)));
 			overdraw_sum += sig;
 		}
-		// Weight squared accumulation for weight_reg loss: sum(w_i^2)
-		// Ideal surface: one Gaussian with w=1 → sum=1. Overdraw: multiple w<1 → sum<1.
-		w_square_sum += w * w;
 
 		// NOTE: max_intersections check moved earlier (before kernel computation)
 		// to cap total evaluations for benchmarking, not just valid intersections
 
 #if RENDER_AXUTILITY
-			// Track max contributor per pixel (id used by mini depth-reinit SH transfer)
+			// Track max contributor per pixel
 			if (w > max_w) {
 				max_w = w;
 				max_depth = depth;
-				max_idx = collected_id[j];
 			}
 
 			// Render depth distortion map
@@ -1875,41 +1790,31 @@ renderCUDAsurfelForward(
 			// 2. Query hashgrid for fine features at xyz
 			// hash_dim = active_hashgrid_levels * l_dim (up to 12D for 3 levels × 4D)
 			const int hash_dim = active_hashgrid_levels * l_dim;
-			float hash_feat[16];  // Max 4 levels × 4D = 16D (= TC_INPUT_DIM)
-			for (int i = 0; i < 16; i++) hash_feat[i] = 0.0f;
+			float hash_feat[12];  // Max 3 levels × 4D = 12D (fits in TC_INPUT_DIM=16 with bias)
+			for (int i = 0; i < 12; i++) hash_feat[i] = 0.0f;
 			if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
 				if (hash_dim == 4) {
 					query_feature<false, 4, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
+					                           l_scale, Base, align_corners, interp, contract, debug);
 				} else if (hash_dim == 8) {
 					query_feature<false, 8, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
+					                           l_scale, Base, align_corners, interp, contract, debug);
 				} else if (hash_dim == 12) {
 					query_feature<false, 12, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
-				} else if (hash_dim == 16) {
-					query_feature<false, 16, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
+					                           l_scale, Base, align_corners, interp, contract, debug);
 				}
 			} else if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 2) {
 				if (hash_dim == 2) {
 					query_feature<false, 2, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
+					                           l_scale, Base, align_corners, interp, contract, debug);
 				} else if (hash_dim == 4) {
 					query_feature<false, 4, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
+					                           l_scale, Base, align_corners, interp, contract, debug);
 				}
 			}
 
@@ -1925,10 +1830,8 @@ renderCUDAsurfelForward(
 				mlp_input, residual, h1, h2, false,  // false = identity (no sigmoid)
 				smem_mlp_W1, smem_mlp_W2, smem_mlp_W3);
 
-			// Combo #6: feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias )
-			// sh_color is already ReLU(SH+sh_bias) from computeColorFromSH (inner ReLU).
-			// Residual is unbounded — can push the sum down. Outer ReLU clamps the
-			// whole sum so final color can't go negative.
+			// 6. feat = ReLU(ReLU(SH_color + sh_bias) + residual + res_bias)
+			// Residual CAN be subtractive (cancel SH), outer ReLU clamps to 0
 			for (int ch = 0; ch < 3; ch++)
 				feat[ch] = fmaxf(0.0f, sh_color[ch] + residual[ch] + d_res_bias);
 
@@ -1989,7 +1892,7 @@ renderCUDAsurfelForward(
 				mlp_input_6, residual_6, h1_6, h2_6, false,
 				smem_mlp_W1, smem_mlp_W2, smem_mlp_W3);
 
-			// Combo #6 (same as case 5): feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias )
+			// 6. feat = ReLU(ReLU(SH_color + sh_bias) + residual + res_bias)
 			for (int ch = 0; ch < 3; ch++)
 				feat[ch] = fmaxf(0.0f, sh_color_6[ch] + residual_6[ch] + d_res_bias);
 
@@ -2076,10 +1979,6 @@ renderCUDAsurfelForward(
 		out_others[pix_id + (VIS_OFFSET + 2) * H * W] = vis_appearance[2];
 		out_others[pix_id + OVERDRAW_OFFSET * H * W] = overdraw_sum;
 		out_others[pix_id + MAXDEPTH_OFFSET * H * W] = max_depth;
-		out_others[pix_id + WSQUARE_OFFSET * H * W] = w_square_sum;
-		// Per-pixel id of the max-weight Gaussian (for mini depth-reinit SH transfer).
-		// out_index is a separate int32 [H, W] buffer plumbed all the way to Python.
-		if (out_index != nullptr) out_index[pix_id] = max_idx;
 
 		// out_others[pix_id + MEDIAN_WEIGHT_OFFSET * H * W] = median_weight;
 #endif
@@ -2150,28 +2049,10 @@ void FORWARD::setOverdrawLambda(float val) {
 	setOverdrawLambdaKernel<<<1, 1>>>(val);
 }
 
-// Set weight-squared regularization lambda
-__global__ void setWeightRegLambdaKernel(float val) { d_weight_reg_lambda = val; }
-void FORWARD::setWeightRegLambda(float val) {
-	setWeightRegLambdaKernel<<<1, 1>>>(val);
-}
-
 // Set activation biases for SH and MLP residual
 __global__ void setActivationBiasKernel(float sh, float res) { d_sh_bias = sh; d_res_bias = res; }
 void FORWARD::setActivationBias(float sh_bias, float res_bias) {
 	setActivationBiasKernel<<<1, 1>>>(sh_bias, res_bias);
-}
-
-// Set anti-aliasing params (Nexels-style hash-grid down-weighting)
-__global__ void setAntiAliasKernel(float factor, float focal) { d_aa_factor = factor; d_aa_focal = focal; }
-void FORWARD::setAntiAlias(float factor, float focal) {
-	setAntiAliasKernel<<<1, 1>>>(factor, focal);
-}
-
-// Set AA-2DGS mip filter kernel size σ (0 disables; matches AA-2DGS's kernel_size, default 0.1)
-__global__ void setAaKernelSizeKernel(float val) { d_aa_kernel_size = val; }
-void FORWARD::setAaKernelSize(float val) {
-	setAaKernelSizeKernel<<<1, 1>>>(val);
 }
 
 // Get MLP weight device pointers for passing to kernels (bias-free, FP16)

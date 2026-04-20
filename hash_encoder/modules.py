@@ -92,9 +92,11 @@ class INGP(nn.Module):
         self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_res"
         # Store args for 3D_SH_cat mode (per-Gaussian SH + hash+DC MLP residual, diff_surfel_3D_sh_res)
         self.is_3D_SH_cat_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_cat"
+        # Store args for 3D_SH_32 mode (per-Gaussian SH + 32-dim hash MLP residual, diff_surfel_3D_sh_32)
+        self.is_3D_SH_32_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_32"
         self.freeze_mlp = args is not None and hasattr(args, 'freeze_mlp') and args.freeze_mlp
         # Treat lean/fp16/tc/sh_tc/sh_res/sh_cat mode same as fused mode for MLP/rendering logic
-        if self.is_3D_direct_lean_mode or self.is_3D_direct_fp16_mode or self.is_3D_direct_tc_mode or self.is_3D_direct_sh_tc_mode or self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode:
+        if self.is_3D_direct_lean_mode or self.is_3D_direct_fp16_mode or self.is_3D_direct_tc_mode or self.is_3D_direct_sh_tc_mode or self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode or self.is_3D_SH_32_mode:
             self.is_3D_direct_fused_mode = True
 
         # hybrid_levels is used by cat, cat_dropout, adaptive_cat, adaptive_zero, adaptive_gate, 3D, 3D_direct, and 3D_direct_fused modes
@@ -237,9 +239,10 @@ class INGP(nn.Module):
             hash_dim = (total_levels - self.hybrid_levels) * level_dim  # All non-hybrid levels
             dc_dim = 3  # DC SH (3 RGB channels)
             mlp_input_dim = hash_dim + dc_dim  # e.g., 4 + 3 = 7D
-            # Pad to 16D for WMMA alignment: [hash(4) | dc(3) | bias(1) | pad(8)] = 16
-            mlp_input_padded = ((mlp_input_dim + 1 + 15) // 16) * 16  # +1 for bias, round up to 16
-            hidden_dim = mlp_input_padded  # 16
+            # CUDA kernel uses TC_INPUT_DIM=16 fixed. MLP must match.
+            assert hash_dim + dc_dim + 1 <= 16, f"hash_dim={hash_dim} + dc_dim={dc_dim} + bias(1) exceeds TC_INPUT_DIM=16"
+            mlp_input_padded = 16  # Must match TC_INPUT_DIM
+            hidden_dim = 16  # Must match TC_HIDDEN_DIM
 
             print(f'[3D_SH_CAT MODE] Building bias-free residual MLP for CUDA:')
             print(f'  Hash features: {hash_dim}D ({total_levels - self.hybrid_levels} levels × {level_dim}D)')
@@ -281,6 +284,38 @@ class INGP(nn.Module):
                 for p in self.mlp_fused.parameters():
                     p.requires_grad_(False)
 
+        elif self.is_3D_SH_32_mode:
+            # 3D_SH_32: Same as 3D_SH_res but with 32-dim hidden MLP
+            # Per-Gaussian SH handles view-dependent base color (evaluated in CUDA preprocessing)
+            # MLP adds spatial correction from hash grid with larger capacity
+            total_levels = cfg_model.encoding.levels
+            level_dim = cfg_model.encoding.hashgrid.dim
+            hash_dim = (total_levels - self.hybrid_levels) * level_dim  # All non-hybrid levels
+            mlp_input_dim = hash_dim  # e.g., 4D for 1 hash level, 8D for 2, etc.
+            # CUDA kernel uses TC_INPUT_DIM=32 fixed. MLP must match.
+            # Input layout: [hash(hash_dim) | bias(1) | pad(32-hash_dim-1)] = 32D always
+            assert hash_dim + 1 <= 32, f"hash_dim={hash_dim} + bias(1) exceeds TC_INPUT_DIM=32. Max hash_dim=31."
+            mlp_input_padded = 32  # Must match TC_INPUT_DIM in diff_surfel_3D_sh_32
+            hidden_dim = 32  # Must match TC_HIDDEN_DIM
+
+            print(f'[3D_SH_32 MODE] Building bias-free residual MLP for CUDA:')
+            print(f'  Hash features: {hash_dim}D ({total_levels - self.hybrid_levels} levels × {level_dim}D)')
+            print(f'  MLP input: {mlp_input_dim}D hash + 1D bias + {mlp_input_padded - mlp_input_dim - 1}D pad = {mlp_input_padded}D')
+            print(f'  Architecture: {mlp_input_padded}D → {hidden_dim}D (ReLU) → {hidden_dim}D (ReLU) → {hidden_dim}D (identity, first 3 = RGB residual)')
+            print(f'  Bias-free: L1 uses input padding (col {mlp_input_dim} acts as bias), L2/L3 no bias')
+            print(f'  Per-Gaussian SH: standard degree-3 (16 coefficients × 3 channels)')
+            self.mlp_fused = nn.Sequential(
+                nn.Linear(mlp_input_padded, hidden_dim, bias=False),  # W1: [32, 32]
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim, bias=False),         # W2: [32, 32]
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim, bias=False),         # W3: [32, 32] (only first 3 = RGB residual)
+            ).cuda()
+
+            self.mlp_fused_input_dim = mlp_input_dim
+            self.mlp_fused_hash_dim = hash_dim
+            self.mlp_fused_gauss_dim = 0  # No per-Gaussian features (SH handles it)
+
         elif self.is_3D_SH_res_mode:
             # 3D_SH_res: Tiny view-independent residual MLP (hash features → RGB residual)
             # Per-Gaussian SH handles view-dependent base color (evaluated in CUDA preprocessing)
@@ -288,18 +323,19 @@ class INGP(nn.Module):
             total_levels = cfg_model.encoding.levels
             level_dim = cfg_model.encoding.hashgrid.dim
             hash_dim = (total_levels - self.hybrid_levels) * level_dim  # All non-hybrid levels
-            mlp_input_dim = hash_dim  # e.g., 4D for 1 hash level
-            # Pad to 16D for WMMA alignment: [hash(4) | bias(1) | pad(11)] = 16
-            mlp_input_padded = ((mlp_input_dim + 1 + 15) // 16) * 16  # +1 for bias, round up to 16
-            hidden_dim = mlp_input_padded  # 16
+            mlp_input_dim = hash_dim  # e.g., 4D for 1 hash level, 8D for 2, 12D for 3
+            # CUDA kernel uses TC_INPUT_DIM=16 fixed. MLP must match.
+            # Input layout: [hash(hash_dim) | pad(16-hash_dim)] = 16D always, no bias
+            assert hash_dim <= 16, f"hash_dim={hash_dim} exceeds TC_INPUT_DIM=16. Max 4 hash levels with 4D features."
+            mlp_input_padded = 16  # Must match TC_INPUT_DIM in mma_utils.h
+            hidden_dim = 16  # Must match TC_HIDDEN_DIM
 
-            print(f'[3D_SH_RES MODE] Building bias-free residual MLP for CUDA:')
+            print(f'[3D_SH_RES MODE] Building no-bias residual MLP for CUDA:')
             print(f'  Hash features: {hash_dim}D ({total_levels - self.hybrid_levels} levels × {level_dim}D)')
-            print(f'  MLP input: {mlp_input_dim}D hash + 1D bias + {mlp_input_padded - mlp_input_dim - 1}D pad = {mlp_input_padded}D')
+            print(f'  MLP input: {mlp_input_dim}D hash + {mlp_input_padded - mlp_input_dim}D pad = {mlp_input_padded}D (no bias)')
             print(f'  Architecture: {mlp_input_padded}D → {hidden_dim}D (ReLU) → {hidden_dim}D (ReLU) → {hidden_dim}D (identity, first 3 = RGB residual)')
-            print(f'  Bias-free: L1 uses input padding (col {mlp_input_dim} acts as bias), L2/L3 no bias')
+            print(f'  No bias: all layers bias=False, no implicit bias in input')
             print(f'  Per-Gaussian SH: standard degree-3 (16 coefficients × 3 channels)')
-
             self.mlp_fused = nn.Sequential(
                 nn.Linear(mlp_input_padded, hidden_dim, bias=False),  # W1: [16, 16]
                 nn.ReLU(),
@@ -386,10 +422,14 @@ class INGP(nn.Module):
 
         # Apply LR scaling for 3D_SH_res mode
         if self.args is not None and hasattr(self.args, 'res_lr_scale') and self.args.res_lr_scale != 1.0:
-            if self.args.method in ["3D_SH_res", "3D_SH_cat"]:
+            if self.args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
                 print(f"[3D_SH_RES] Scaling hash/MLP LR by {self.args.res_lr_scale}: encoding {lr_encoding} -> {lr_encoding * self.args.res_lr_scale}, mlp {lr_mlp_rgb} -> {lr_mlp_rgb * self.args.res_lr_scale}")
                 lr_encoding *= self.args.res_lr_scale
                 lr_mlp_rgb *= self.args.res_lr_scale
+        # Separate hash-only LR multiplier (stacks with res_lr_scale)
+        if self.args is not None and hasattr(self.args, 'hash_lr_scale') and self.args.hash_lr_scale != 1.0:
+            print(f"[HASH_LR] Scaling hash encoding LR by {self.args.hash_lr_scale}: {lr_encoding} -> {lr_encoding * self.args.hash_lr_scale}")
+            lr_encoding *= self.args.hash_lr_scale
 
         l = []
         # Only add hash_encoding if it exists (not disabled in cat mode or diffuse mode)
@@ -759,12 +799,28 @@ class INGP(nn.Module):
                 self.resolutions = []
                 self.active_hashgrid_levels = 0
             else:
-                # Normal 3D mode: use finest levels for hashgrid
-                hashgrid_resolutions = all_resolutions[-self.hashgrid_levels:]
+                # Build a reference 4-level progression spanning the full
+                # r_min→r_max range (4 = max hash levels for TC_INPUT_DIM=16
+                # with dim=4). Then take the FINEST hashgrid_levels from it.
+                # This means adding per-Gaussian levels peels off from the
+                # coarsest hash levels while always retaining the finest:
+                #   hybrid=2 → 4 hash: [128, 203, 322, 512]
+                #   hybrid=3 → 3 hash: [203, 322, 512]
+                #   hybrid=4 → 2 hash: [322, 512]
+                #   hybrid=5 → 1 hash: [512]
+                max_hash_levels = 16 // cfg_encoding.hashgrid.dim  # 4 for dim=4
+                if max_hash_levels > 1:
+                    ref_growth_rate = np.exp((np.log(r_max) - np.log(r_min)) / (max_hash_levels - 1))
+                else:
+                    ref_growth_rate = 1.0
+                ref_resolutions = []
+                for lv in range(max_hash_levels):
+                    size = int(np.floor(r_min * ref_growth_rate ** lv)) + 1
+                    ref_resolutions.append(size)
+
+                hashgrid_resolutions = ref_resolutions[-self.hashgrid_levels:]
                 base_resolution = hashgrid_resolutions[0]
                 finest_resolution = hashgrid_resolutions[-1]
-
-                # Calculate growth rate for the hashgrid
                 if self.hashgrid_levels > 1:
                     hash_growth_rate = np.exp((np.log(finest_resolution) - np.log(base_resolution)) / (self.hashgrid_levels - 1))
                 else:
@@ -784,16 +840,15 @@ class INGP(nn.Module):
                 )
 
                 mode_name = "3D_DIRECT_FUSED" if self.is_3D_direct_fused_mode else ("3D_DIRECT" if self.is_3D_direct_mode else "3D")
-                print(f'[{mode_name} MODE] Cat-style hashgrid configuration:')
-                print(f'  Total levels: {num_levels_total}')
+                print(f'[{mode_name} MODE] Hashgrid configuration (finest-first):')
+                print(f'  Reference 4-level progression: {ref_resolutions}')
                 print(f'  Hybrid (per-Gaussian) levels: {self.hybrid_levels}')
-                print(f'  Hashgrid levels: {self.hashgrid_levels}')
-                print(f'  Resolutions: {base_resolution} -> {finest_resolution}')
+                print(f'  Hashgrid levels: {self.hashgrid_levels} (finest {self.hashgrid_levels} of {max_hash_levels})')
+                print(f'  Active resolutions: {hashgrid_resolutions}')
                 print(f'  Features per level: {cfg_encoding.hashgrid.dim}D')
                 print(f'  Hashgrid size: 2^{cfg_encoding.hashgrid.dict_size}')
                 print(f'  Per-Gaussian features: {self.hybrid_levels}×{cfg_encoding.hashgrid.dim} = {self.hybrid_levels * cfg_encoding.hashgrid.dim}D')
                 print(f'  Hash features: {self.hashgrid_levels}×{cfg_encoding.hashgrid.dim} = {self.hashgrid_levels * cfg_encoding.hashgrid.dim}D')
-                print(f'  MLP input: {num_levels_total * cfg_encoding.hashgrid.dim}D (cat-style concat)')
 
                 self.hash_encoding = register_GridEncoder(config)
                 self.resolutions = hashgrid_resolutions
@@ -954,10 +1009,17 @@ class INGP(nn.Module):
             self.active_hashgrid_levels = self.hashgrid_levels  # All hashgrid levels active
             self.optim_gaussian = True  # Train Gaussians throughout
         elif self.is_3D_direct_fused_mode:
-            # 3D_direct_fused mode: Fused in-kernel MLP, all hashgrid levels active (no C2F)
-            # MLP is built expecting fixed input dimensions, can't use C2F
+            # 3D_SH_res / 3D_SH_cat: C2F for multi-level hash grids.
+            # Coarsest hash level always on, add one finer level every 2k iters.
+            # Other fused modes (3D_direct_lean, 3D_direct_tc, etc.): all levels active.
+            if (self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode) and self.hashgrid_levels > 1:
+                c2f_step = 2000
+                self.active_hashgrid_levels = min(
+                    self.hashgrid_levels,
+                    1 + (current_iter // c2f_step))
+            else:
+                self.active_hashgrid_levels = self.hashgrid_levels
             self.active_levels = self.levels  # Total levels (for MLP input size)
-            self.active_hashgrid_levels = self.hashgrid_levels  # All hashgrid levels active
             self.optim_gaussian = True  # Train Gaussians throughout
         elif self.is_residual_hybrid_mode:
             # Residual_hybrid mode: No C2F, all hashgrid levels active from start
@@ -1080,7 +1142,22 @@ class INGP(nn.Module):
         # which matches CUDA's W[h * in_dim + i] access pattern
 
         # Pad weights for WMMA alignment (Tensor Core modes)
-        if self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode:
+        if self.is_3D_SH_32_mode:
+            # 3D_SH_32: All weights are [32, 32] — already WMMA-aligned
+            # But W3 output: [32, 32] — only first 3 rows used as RGB residual
+            import torch
+            actual_input_cols = W1.shape[1]
+            if actual_input_cols < 32:
+                W1_padded = torch.zeros(32, 32, device=W1.device, dtype=W1.dtype)
+                W1_padded[:W1.shape[0], :W1.shape[1]] = W1
+                W1 = W1_padded
+            actual_output_rows = W3.shape[0]
+            if actual_output_rows < 32:
+                W3_padded = torch.zeros(32, 32, device=W3.device, dtype=W3.dtype)
+                W3_padded[:W3.shape[0], :W3.shape[1]] = W3
+                W3 = W3_padded
+            return W1.contiguous(), W2.contiguous(), W3.contiguous()
+        elif self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode:
             # 3D_SH_res / 3D_SH_cat: All weights are [16, 16] — already WMMA-aligned
             # But W1 might be smaller if input_dim+1 < 16, so pad
             import torch

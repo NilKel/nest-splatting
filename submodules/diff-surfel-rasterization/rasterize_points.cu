@@ -37,7 +37,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
 	return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -157,6 +157,8 @@ RasterizeGaussiansCUDA(
   if(record_transmittance == false) record_P = 0;
   torch::Tensor cover_pixels = torch::full({record_P, 1}, 0, float_opts);
   torch::Tensor trans_avg = torch::full({record_P, 1}, 0, float_opts);
+  torch::Tensor max_weight = torch::full({record_P, 1}, 0, float_opts);
+  torch::Tensor accum_weights = torch::full({record_P, 1}, 0, float_opts);
 
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -214,6 +216,8 @@ RasterizeGaussiansCUDA(
 		radii.contiguous().data<int>(),
 		cover_pixels.contiguous().data<float>(),
 		trans_avg.contiguous().data<float>(),
+		max_weight.contiguous().data<float>(),
+		accum_weights.contiguous().data<float>(),
 		debug,
 		beta,
 		D_diffuse,
@@ -229,7 +233,7 @@ RasterizeGaussiansCUDA(
 		aa_threshold);
   }
 
-  return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg);
+  return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg, max_weight, accum_weights);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

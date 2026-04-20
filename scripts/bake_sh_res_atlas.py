@@ -313,7 +313,7 @@ def main():
                     mlp_input[:, dc_start:dc_start+3] = dc_expanded
 
                 mlp_out = mlp(mlp_input)
-                rgb_residual = mlp_out[:, :3].clamp(min=0.0)  # ReLU to match training kernel
+                rgb_residual = mlp_out[:, :3]  # Raw residual; render kernel applies ReLU
 
             residual = rgb_residual.reshape(n_batch, bake_res, bake_res, 3)
 
@@ -346,7 +346,7 @@ def main():
 
     # Atlas texture [H, W, 3] FP16
     atlas_path = os.path.join(output_dir, "atlas_texture.pt")
-    torch.save(atlas.half().cpu(), atlas_path)
+    torch.save(atlas.cpu().half(), atlas_path)
     print(f"[BAKE] Saved atlas_texture.pt → {atlas_path} ({atlas_mb:.1f} MB)")
 
     # Atlas rects [N, 4] float32

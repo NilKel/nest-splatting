@@ -116,20 +116,8 @@ namespace FORWARD
 	// Set overdraw regularization lambda (0 = disabled)
 	void setOverdrawLambda(float val);
 
-	// Set weight-squared regularization lambda (0 = disabled)
-	void setWeightRegLambda(float val);
-
 	// Set activation biases: color = ReLU(SH + sh_bias) + ReLU(residual + res_bias)
 	void setActivationBias(float sh_bias, float res_bias);
-
-	// Set Nexels-style anti-aliasing params for hash-grid down-weighting.
-	// factor=0 disables AA. Typical factor=1.0, focal=max(fx,fy).
-	void setAntiAlias(float factor, float focal);
-
-	// Set AA-2DGS mip-filter kernel size σ (0 disables, typical 0.1).
-	// When >0, replaces the rho3d/rho2d heuristic with the Jacobian-based
-	// object-space mip filter in the scalar mode 5/6 Gaussian path.
-	void setAaKernelSize(float val);
 
 	// Copy MLP weights to global device memory (bias-free, all [16×16])
 	void setMlpWeights(
