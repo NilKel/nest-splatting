@@ -1,17 +1,17 @@
-"""FastGS multi-view consistency scoring (Phase 1 — Python-only).
+"""FastGS multi-view consistency scoring.
 
 Reference: FastGS (arXiv 2511.04283). Paper says K=10 views, λ=0.2 dssim weight,
 densification every 500 iters until 15k, pruning every 500 before 15k and every
 3000 after 15k.
 
-Phase-1 proxy: FastGS's real CUDA kernel atomicAdd's per-Gaussian for every
-contributor at a high-error pixel (all Gaussians with alpha > 1/255). We
-approximate it with our existing ``max_contrib_idx`` map, which records only
-the single dominant Gaussian per pixel. This strictly undercounts, so the
-FastGS threshold ``importance_score > 5`` does not carry over — we expose a
-knob ``fastgs_importance_thresh`` that defaults to ``1`` (any high-error pixel
-at which this Gaussian dominates). Phase 2 would add a CUDA counter to get
-exact FastGS semantics.
+With the Phase-2 CUDA rebuild of ``diff_surfel_3D_sh_res``, the rasterizer now
+populates ``metric_counts`` directly — atomicAdd'd per-Gaussian for every
+contributor at a high-error pixel. Exact FastGS semantics. A single render per
+view with ``metric_map`` passed in is all that's needed.
+
+If ``metric_counts`` is unavailable (older rasterizer or missing rebuild), we
+fall back to the proxy using ``max_contrib_idx`` (undercounts — counts only the
+dominant Gaussian per pixel).
 """
 import random
 
@@ -69,34 +69,40 @@ def compute_gaussian_score_fastgs(camlist, gaussians, render_fn,
     full_metric_score = torch.zeros(N, dtype=torch.float32, device="cuda")
 
     for cam in camlist:
+        # 1. First render — no metric_map — to compute per-pixel L1 + mask.
         with torch.no_grad():
-            pkg = render_fn(cam)
-        rendered = pkg["render"].clamp(0.0, 1.0)
+            pkg_loss = render_fn(cam)
+        rendered = pkg_loss["render"].clamp(0.0, 1.0)
         gt = cam.original_image.cuda()
 
-        # Per-pixel L1, normalized per-view; threshold into a binary mask.
         l1_norm = _per_pixel_l1_normalized(rendered, gt)         # [H, W]
-        metric_map = (l1_norm > loss_thresh)                      # [H, W] bool
-
+        metric_map = (l1_norm > loss_thresh).to(torch.int32)     # [H, W] int32
         photometric_loss = _photometric_loss(rendered, gt, lambda_dssim)
 
-        # Proxy: count high-error pixels where THIS Gaussian is the max
-        # contributor. FastGS counts all contributors; we only count winners.
-        max_idx = pkg.get("max_contrib_idx", None)
-        if max_idx is None or max_idx.numel() == 0:
-            raise RuntimeError(
-                "--fastgs requires a rasterizer that exposes max_contrib_idx "
-                "(currently only diff_surfel_3D_sh_res / --method 3D_SH_res)."
-            )
-        flat_idx = max_idx.long().reshape(-1)
-        flat_mask = metric_map.reshape(-1)
-        valid = (flat_idx >= 0) & flat_mask
-        winners = flat_idx[valid]
-        counts_view = torch.zeros(N, dtype=torch.float32, device="cuda")
-        if winners.numel() > 0:
-            counts_view.scatter_add_(
-                0, winners,
-                torch.ones_like(winners, dtype=torch.float32))
+        counts_view = None
+        # 2. Second render — metric_map supplied — populates metric_counts in CUDA.
+        with torch.no_grad():
+            pkg_count = render_fn(cam, metric_map=metric_map.reshape(-1).contiguous())
+        metric_counts = pkg_count.get("metric_counts", None)
+        if metric_counts is not None and metric_counts.numel() == N:
+            counts_view = metric_counts.to(torch.float32)
+        else:
+            # Fallback: proxy via max_contrib_idx.
+            max_idx = pkg_loss.get("max_contrib_idx", None)
+            if max_idx is None or max_idx.numel() == 0:
+                raise RuntimeError(
+                    "--fastgs requires a rasterizer that exposes metric_counts "
+                    "(rebuild diff_surfel_3D_sh_res) or max_contrib_idx as fallback."
+                )
+            flat_idx = max_idx.long().reshape(-1)
+            flat_mask = metric_map.to(torch.bool).reshape(-1)
+            valid = (flat_idx >= 0) & flat_mask
+            winners = flat_idx[valid]
+            counts_view = torch.zeros(N, dtype=torch.float32, device="cuda")
+            if winners.numel() > 0:
+                counts_view.scatter_add_(
+                    0, winners,
+                    torch.ones_like(winners, dtype=torch.float32))
 
         if densify:
             full_metric_counts += counts_view

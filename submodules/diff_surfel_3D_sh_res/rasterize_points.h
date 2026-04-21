@@ -15,7 +15,7 @@
 #include <tuple>
 #include <string>
 	
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -60,7 +60,8 @@ RasterizeGaussiansCUDA(
 	const int aabb_mode,
 	const float aa,
 	const float aa_threshold,
-	const int max_intersections_per_pixel);
+	const int max_intersections_per_pixel,
+	const torch::Tensor& metric_map);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor>
@@ -214,6 +215,10 @@ void SetActivationBiasCUDA(float sh_bias, float res_bias);
 
 // Set Nexels-style anti-aliasing params (hash-grid down-weighting)
 void SetAntiAliasCUDA(float factor, float focal);
+
+// FastGS Compact Box Mahalanobis² scale factor for AdR cutoff.
+// val=1.0 = our current AdR; val=0.5 = FastGS paper default (tighter AABB, faster rasterization).
+void SetCompactMultCUDA(float val);
 
 // Set AA-2DGS mip filter kernel size σ (0 disables, typical 0.1).
 void SetAaKernelSizeCUDA(float val);

@@ -18,7 +18,8 @@ import os
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid, rays = None, depth_path = None, HWK = None,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
+                 image_path = None,
                  ):
         super(Camera, self).__init__()
 
@@ -29,6 +30,11 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        # Source image path (full). Used by --decomp to key its guided-filter cache.
+        self.image_path = image_path
+        # Populated by utils.image_decomp.load_gt_low_for_cameras when --decomp is set.
+        # [3, H, W] float32 on data_device, matching original_image. None otherwise.
+        self.gt_low = None
 
         self.depth_path = depth_path
         self.depth_map = None

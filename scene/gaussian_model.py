@@ -1023,12 +1023,18 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if group["name"] == name:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
-
-                del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
+                if stored_state is None:
+                    # No Adam state yet (e.g. param was freshly recreated by
+                    # cat_tensors_to_optimizer/_prune_optimizer on a cold
+                    # optimizer). Just swap the param; Adam will initialize
+                    # fresh zero moments on the next step.
+                    group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                else:
+                    stored_state["exp_avg"] = torch.zeros_like(tensor)
+                    stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                    del self.optimizer.state[group['params'][0]]
+                    group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                    self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
@@ -1678,6 +1684,54 @@ class GaussianModel:
         if importance_score is not None and importance_score.numel() == N:
             metric_mask = importance_score > importance_thresh
 
+        # Diagnostics: report the funnel at every call so starved densification is obvious.
+        _n_grad = int(grad_qualifiers.sum().item())
+        _n_grad_abs = int(grad_qualifiers_abs.sum().item())
+        _n_small = int(clone_qualifiers.sum().item())
+        _n_big = int(split_qualifiers.sum().item())
+        _n_metric = int(metric_mask.sum().item())
+        if importance_score is not None and importance_score.numel() == N:
+            _imp_max = float(importance_score.max().item())
+            _imp_mean = float(importance_score.float().mean().item())
+            _imp_nonzero = int((importance_score > 0).sum().item())
+        else:
+            _imp_max = _imp_mean = 0.0
+            _imp_nonzero = 0
+        print(f"[FASTGS/funnel] N={N}, grad>={grad_thresh}:{_n_grad}, "
+              f"grad_abs>={grad_abs_thresh}:{_n_grad_abs}, "
+              f"small(<={dense}*ext):{_n_small}, big:{_n_big}, "
+              f"metric>{importance_thresh}:{_n_metric} (imp max={_imp_max:.1f}, mean={_imp_mean:.2f}, nonzero={_imp_nonzero})")
+
+        # Percentile dump — pick thresholds empirically. "What percentile does
+        # my current threshold cut at?" tells you whether densification catches
+        # the right slice of Gaussians.
+        def _qdump(tensor, name, current_thresh=None, nonzero_only=False):
+            if tensor.numel() == 0:
+                return
+            t = tensor.detach().flatten()
+            if nonzero_only:
+                t = t[t > 0]
+                if t.numel() == 0:
+                    print(f"[FASTGS/dist] {name}: all zeros")
+                    return
+            qs = torch.tensor([0.50, 0.75, 0.90, 0.95, 0.99], device=t.device)
+            vals = torch.quantile(t.float(), qs).tolist()
+            extra = ""
+            if current_thresh is not None:
+                pct_above = float((t > current_thresh).float().mean().item() * 100.0)
+                extra = f"  | >{current_thresh:g}: {pct_above:.2f}% pass"
+            print(f"[FASTGS/dist] {name:<14} "
+                  f"q50={vals[0]:.6g}  q75={vals[1]:.6g}  q90={vals[2]:.6g}  "
+                  f"q95={vals[3]:.6g}  q99={vals[4]:.6g}{extra}")
+
+        _grad_norm = torch.norm(grad_vars, dim=-1)
+        _grad_abs_norm = torch.norm(grads_abs, dim=-1)
+        _qdump(_grad_norm,     "grad_norm",     grad_thresh,     nonzero_only=True)
+        _qdump(_grad_abs_norm, "grad_abs_norm", grad_abs_thresh, nonzero_only=True)
+        _qdump(max_scale,      f"max_scale (dense·ext={dense * extent:.5f})", dense * extent)
+        if importance_score is not None and importance_score.numel() == N:
+            _qdump(importance_score, "importance_sc", importance_thresh, nonzero_only=True)
+
         n_cloned = self._clone_by_mask_fastgs(metric_mask & all_clones)
         # After clone, tensor grew → keep masks of original length only for split.
         split_mask = metric_mask & all_splits
@@ -1696,6 +1750,7 @@ class GaussianModel:
 
         to_remove = int(prune_mask.sum().item())
         remove_budget = int(prune_budget_frac * to_remove)
+        n_pruned = 0
         if remove_budget > 0 and pruning_score is not None:
             n_cur = self.get_xyz.shape[0]
             scores = 1.0 - pruning_score
@@ -1705,10 +1760,17 @@ class GaussianModel:
             sampled_mask = torch.zeros(n_cur, dtype=torch.bool, device="cuda")
             sampled_mask[sampled] = True
             final_prune = prune_mask & sampled_mask
+            n_pruned = int(final_prune.sum().item())
             self.prune_points(final_prune)
 
+        n_split_children = 2 * n_split_parents  # N=2 in _split_by_mask_fastgs
+        n_net = n_cloned + n_split_children - n_split_parents - n_pruned
+        print(f"[FASTGS/action] cloned={n_cloned}, split_parents={n_split_parents} "
+              f"(→{n_split_children} children), opacity_pruneable={to_remove} "
+              f"(budget={remove_budget}), actually_pruned={n_pruned}, "
+              f"ΔN={n_net:+d} -> N={self.get_xyz.shape[0]}")
         torch.cuda.empty_cache()
-        return {"cloned": n_cloned, "split_parents": n_split_parents}
+        return {"cloned": n_cloned, "split_parents": n_split_parents, "pruned": n_pruned}
 
     def final_prune_fastgs(self, min_opacity, pruning_score, score_thresh=0.9):
         """FastGS final-stage prune: remove by opacity OR high pruning_score.
@@ -2173,6 +2235,163 @@ class GaussianModel:
         self._reset_optimizer_state_for_indices(add_idx.unique())
         
         return num_gs
+
+    @torch.no_grad()
+    def consolidate_primitives(self,
+                               tau_dist=None,
+                               tau_normal=0.95,
+                               tau_planar=None,
+                               tau_feat=0.01,
+                               verbose=True):
+        """Mode-agnostic geometric consolidation: merge redundant primitives
+        that pass the 4-gate test (normal alignment, coplanarity, spatial
+        overlap, feature similarity). Works for 2DGS surfels; 3DGS ellipsoids
+        would pick the smallest-scale axis as normal (not our case).
+
+        Pipeline:
+          1. scipy.spatial.cKDTree.query_pairs(τ_dist) gives all within-radius pairs.
+          2. Vectorized 4-gate check (gate 3 is implicit via cKDTree radius).
+          3. Greedy pairing (each primitive in at most one merge this cycle),
+             preferring pairs with lowest feature MSE.
+          4. For each pair (i, j): update i in-place with opacity-weighted
+             averages (alpha-composition opacity), reset Adam momentum on i,
+             and mark j for pruning.
+          5. prune_points(j_mask) drops the absorbed primitives and shrinks
+             every per-Gaussian tensor + Adam state via _prune_optimizer.
+
+        Returns number of pairs merged.
+        """
+        N = self._xyz.shape[0]
+        if N < 2:
+            return 0
+
+        # Extract current state (GPU).
+        xyz_t = self._xyz.detach()
+        rot_t = self._rotation.detach()
+        scaling_t = self.get_scaling.detach()              # [N, 2] (2DGS) or [N, 3] (3DGS)
+        opacity_t = self.get_opacity.squeeze(-1).detach()   # [N], sigmoid-activated
+
+        max_scale = scaling_t.max(dim=1).values  # [N]
+        if tau_dist is None or tau_dist <= 0.0:
+            tau_dist = float(max_scale.median().item() * 0.5)
+        if tau_planar is None or tau_planar <= 0.0:
+            tau_planar = 0.5 * tau_dist
+
+        # Normal: for 2DGS surfels the rotation's z-axis (column 2). For 3DGS
+        # ellipsoids we'd pick the smallest-scale axis; our code path is 2DGS.
+        R = build_rotation(rot_t)    # [N, 3, 3]
+        normals = R[:, :, 2]         # [N, 3]
+
+        xyz_np = xyz_t.cpu().numpy()
+        normals_np = normals.cpu().numpy()
+        opacity_np = opacity_t.cpu().numpy()
+        features_dc_flat = self._features_dc.detach().reshape(N, -1).cpu().numpy()
+
+        from scipy.spatial import cKDTree
+        tree = cKDTree(xyz_np)
+        pairs = tree.query_pairs(tau_dist, output_type="ndarray")
+        P = int(len(pairs))
+        if P == 0:
+            if verbose:
+                print(f"[MERGE] No pairs within τ_dist={tau_dist:.5g}")
+            return 0
+
+        i_idx, j_idx = pairs[:, 0], pairs[:, 1]
+        ni, nj = normals_np[i_idx], normals_np[j_idx]
+        pi, pj = xyz_np[i_idx], xyz_np[j_idx]
+
+        # Gate 1: normal alignment.
+        dot = np.sum(ni * nj, axis=1)
+        gate1 = dot > tau_normal
+        # Gate 2: coplanarity (projection of (pi - pj) onto avg normal).
+        navg = ni + nj
+        navg /= np.maximum(np.linalg.norm(navg, axis=1, keepdims=True), 1e-8)
+        gate2 = np.abs(np.sum((pi - pj) * navg, axis=1)) < tau_planar
+        # Gate 4: feature (SH DC) similarity.
+        feat_mse = np.mean((features_dc_flat[i_idx] - features_dc_flat[j_idx]) ** 2, axis=1)
+        gate4 = feat_mse < tau_feat
+        passes = gate1 & gate2 & gate4
+        n_pass = int(passes.sum())
+
+        if n_pass == 0:
+            if verbose:
+                print(f"[MERGE] {P} candidate pairs, 0 pass 4 gates "
+                      f"(~normal:{int((~gate1).sum())}, "
+                      f"~planar:{int((~gate2).sum())}, "
+                      f"~feat:{int((~gate4).sum())})")
+            return 0
+
+        # Greedy: prefer lowest feature MSE first; each primitive paired at most once.
+        ordered_idx = np.argsort(feat_mse[passes])
+        merge_pairs = pairs[passes][ordered_idx]
+        used = np.zeros(N, dtype=bool)
+        absorb_i, absorb_j = [], []
+        for (i, j) in merge_pairs:
+            if used[i] or used[j]:
+                continue
+            used[i] = True
+            used[j] = True
+            absorb_i.append(int(i))
+            absorb_j.append(int(j))
+        if len(absorb_i) == 0:
+            return 0
+
+        i_t = torch.tensor(absorb_i, dtype=torch.long, device="cuda")
+        j_t = torch.tensor(absorb_j, dtype=torch.long, device="cuda")
+        a_i = opacity_t[i_t]
+        a_j = opacity_t[j_t]
+        w_i = a_i / (a_i + a_j + 1e-8)  # [M]
+
+        def _bcast(tensor, w):
+            return w.view([-1] + [1] * (tensor.dim() - 1))
+
+        # Opacity (alpha-composition, correct optical-thickness rule).
+        a_new = (1.0 - (1.0 - a_i) * (1.0 - a_j)).clamp(1e-6, 1.0 - 1e-6)
+        self._opacity.data[i_t, 0] = self.inverse_opacity_activation(a_new)
+
+        # Position: opacity-weighted average.
+        w = _bcast(self._xyz, w_i)
+        self._xyz.data[i_t] = w * self._xyz.data[i_t] + (1.0 - w) * self._xyz.data[j_t]
+
+        # Scaling: weighted average in raw (log) space.
+        w = _bcast(self._scaling, w_i)
+        self._scaling.data[i_t] = w * self._scaling.data[i_t] + (1.0 - w) * self._scaling.data[j_t]
+
+        # Rotation: can't average quaternions; keep the higher-opacity partner's quat.
+        flip = (a_j > a_i)
+        if flip.any():
+            self._rotation.data[i_t[flip]] = self._rotation.data[j_t[flip]]
+
+        # All additional per-Gaussian tensors: opacity-weighted average in raw space.
+        _feat_tensors = [
+            "_features_dc", "_features_rest",
+            "_gaussian_features", "_gamma",
+            "_adaptive_features", "_adaptive_cat_weight", "_adaptive_zero_weight",
+            "_gate_logits", "_shape", "_flex_beta",
+            "_sb_params",
+            "_sg_directions", "_sg_sharpness_sg", "_sg_rgb",
+            "_sv_sites", "_sv_colors",
+        ]
+        for attr_name in _feat_tensors:
+            t = getattr(self, attr_name, None)
+            if t is None or t.numel() == 0 or t.shape[0] != N:
+                continue
+            w = _bcast(t, w_i)
+            t.data[i_t] = w * t.data[i_t] + (1.0 - w) * t.data[j_t]
+
+        # Reset Adam momentum on updated primitives; old momentum is stale.
+        self._reset_optimizer_state_for_indices(i_t.unique())
+
+        # Prune absorbed primitives (prune_points handles optimizer state).
+        prune_mask = torch.zeros(N, dtype=torch.bool, device="cuda")
+        prune_mask[j_t] = True
+        self.prune_points(prune_mask)
+
+        if verbose:
+            print(f"[MERGE] {P} pairs (τ_dist={tau_dist:.5g}), {n_pass} pass 4 gates → "
+                  f"{len(absorb_i)} merged after greedy pairing. "
+                  f"N: {N} → {self._xyz.shape[0]}.")
+        return len(absorb_i)
 
     def _reset_optimizer_state_for_indices(self, inds):
         """

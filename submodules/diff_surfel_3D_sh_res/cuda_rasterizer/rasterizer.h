@@ -80,7 +80,10 @@ namespace CudaRasterizer
 			// 3D mode intersection buffer outputs
 			float* intersection_buffer = nullptr,
 			uint32_t* intersection_count = nullptr,
-			uint32_t max_intersections_per_pixel = 0);
+			uint32_t max_intersections_per_pixel = 0,
+			// FastGS VCD/VCP counter (see forward.h)
+			const int* metric_map = nullptr,
+			int* metric_counts = nullptr);
 
 		static void backward(
 			const int P, int D, int M, int R,

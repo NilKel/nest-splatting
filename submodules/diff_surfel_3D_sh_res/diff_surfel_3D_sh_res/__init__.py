@@ -41,6 +41,7 @@ def rasterize_gaussians(
     shapes,
     kernel_type,
     aabb_mode=0,
+    metric_map=None,
 ):
     return _RasterizeGaussians.apply(
         means3D,
@@ -65,6 +66,7 @@ def rasterize_gaussians(
         shapes,
         kernel_type,
         aabb_mode,
+        metric_map,
     )
 
 class _RasterizeGaussians(torch.autograd.Function):
@@ -103,6 +105,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         shapes,
         kernel_type,
         aabb_mode=0,
+        metric_map=None,
     ):
 
         start_event = torch.cuda.Event(enable_timing=True)
@@ -113,6 +116,11 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Handle empty shapes tensor
         if shapes is None:
             shapes = torch.Tensor([]).cuda()
+
+        # FastGS metric_map: optional per-pixel int32 [H*W] mask of high-error pixels.
+        # Empty tensor when disabled.
+        if metric_map is None:
+            metric_map = torch.empty(0, dtype=torch.int32, device="cuda")
 
         # Restructure arguments the way that the C++ lib expects them
         args = (
@@ -160,19 +168,20 @@ class _RasterizeGaussians(torch.autograd.Function):
             hashgrid_settings.aa,
             hashgrid_settings.aa_threshold,
             raster_settings.max_intersections_per_pixel,
+            metric_map,
         )
 
         # Invoke C++/CUDA rasterizer
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
-                num_rendered, color, depth, out_index, radii, geomBuffer, binningBuffer, imgBuffer, pixels, transmittance_avg, intersection_buffer, intersection_count = _C.rasterize_gaussians(*args)
+                num_rendered, color, depth, out_index, radii, geomBuffer, binningBuffer, imgBuffer, pixels, transmittance_avg, intersection_buffer, intersection_count, metric_counts = _C.rasterize_gaussians(*args)
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
-            num_rendered, color, depth, out_index, radii, geomBuffer, binningBuffer, imgBuffer, pixels, transmittance_avg, intersection_buffer, intersection_count = _C.rasterize_gaussians(*args)
+            num_rendered, color, depth, out_index, radii, geomBuffer, binningBuffer, imgBuffer, pixels, transmittance_avg, intersection_buffer, intersection_count, metric_counts = _C.rasterize_gaussians(*args)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
@@ -189,10 +198,12 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Also surface out_index ([H, W] int32, per-pixel id of the max-weight contributor)
         # for the mini depth-reinit SH-transfer path. New element appended at the END to
         # avoid disturbing existing positional unpacks elsewhere.
-        return color, radii, depth, transmittance_avg, pixels, intersection_buffer, intersection_count, geomBuffer, out_index
+        # metric_counts (FastGS VCD/VCP) also appended at the end; [P] int32, zeros
+        # when metric_map wasn't provided.
+        return color, radii, depth, transmittance_avg, pixels, intersection_buffer, intersection_count, geomBuffer, out_index, metric_counts
 
     @staticmethod
-    def backward(ctx, grad_out_color, grad_radii, grad_depth, grad_0, grad_1, grad_intersection_buffer, grad_intersection_count, grad_geomBuffer, grad_out_index):
+    def backward(ctx, grad_out_color, grad_radii, grad_depth, grad_0, grad_1, grad_intersection_buffer, grad_intersection_count, grad_geomBuffer, grad_out_index, grad_metric_counts):
 
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -319,6 +330,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_shapes,  # shapes
             None,  # kernel_type
             None,  # aabb_mode
+            None,  # metric_map (int32; no gradient)
         )
 
         return grads
@@ -375,7 +387,8 @@ class GaussianRasterizer(nn.Module):
         homotrans = None, ap_level = None, \
         features = None, offsets = None, gridrange = None, \
         features_diffuse = None, offsets_diffuse = None, gridrange_diffuse = None, \
-        render_mode = 0, shapes = None, kernel_type = 0, aabb_mode = 0):
+        render_mode = 0, shapes = None, kernel_type = 0, aabb_mode = 0,
+        metric_map = None):
 
         raster_settings = self.raster_settings
         hashgrid_settings = self.hashgrid_settings
@@ -450,6 +463,7 @@ class GaussianRasterizer(nn.Module):
             shapes,
             kernel_type,
             aabb_mode,
+            metric_map,
         )
 
 def compute_relocation(opacity_old, scale_old, N, binoms, n_max):
@@ -669,6 +683,18 @@ def set_anti_alias(factor=0.0, focal=1.0):
     factor=0 disables AA. factor=1.0 and focal=max(fx,fy) matches Nexels default.
     Downweight per level: Δ = 1 - exp(-1/(2π) * (focal/(s_ℓ·factor·depth))²)."""
     _C.set_anti_alias(float(factor), float(focal))
+
+def set_compact_mult(val=1.0):
+    """Set FastGS Compact Box Mahalanobis² multiplier for AdR cutoff.
+
+    AdR cutoff formula: cutoff = sqrt(2 * log(opacity * 255) * val).
+    - val=1.0 (default): matches our existing AdR cutoff, no change.
+    - val=0.5 (FastGS paper): tighter tile AABB → fewer Gaussian–tile pairs,
+      faster rasterization. May cause visible alpha discontinuities at tile edges
+      for near-threshold Gaussians; FastGS accepts this for speed.
+    Only effective when --aabb is one of {adr, adrrect} (aabb_mode in {1, 3}).
+    """
+    _C.set_compact_mult(float(val))
 
 def set_aa_kernel_size(val=0.0):
     """Set AA-2DGS Jacobian-based mip filter kernel size σ (0 = off, typical 0.1).

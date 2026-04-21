@@ -40,7 +40,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
 	return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -85,7 +85,8 @@ RasterizeGaussiansCUDA(
 	const int aabb_mode,
 	const float aa,
 	const float aa_threshold,
-	const int max_intersections_per_pixel)
+	const int max_intersections_per_pixel,
+	const torch::Tensor& metric_map)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 	AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -177,6 +178,15 @@ RasterizeGaussiansCUDA(
   if(record_transmittance == false) record_P = 0;
   torch::Tensor cover_pixels = torch::full({record_P, 1}, 0, float_opts);
   torch::Tensor trans_avg = torch::full({record_P, 1}, 0, float_opts);
+
+  // FastGS VCD/VCP per-Gaussian counter. Always allocated (shape [P]) so the Python
+  // tuple layout is stable; only written when metric_map is provided.
+  const bool fastgs_enabled = metric_map.numel() > 0;
+  torch::Tensor metric_counts = torch::zeros({P}, int_opts);
+  if (fastgs_enabled) {
+    TORCH_CHECK(metric_map.numel() == H * W, "metric_map must have H*W entries");
+    CHECK_INPUT(metric_map);
+  }
 
   // 3D mode intersection buffer allocation (render_mode == 3)
   torch::Tensor intersection_buffer;
@@ -273,10 +283,12 @@ RasterizeGaussiansCUDA(
 		aa_threshold,
 		(render_mode == 3) ? intersection_buffer.contiguous().data<float>() : nullptr,
 		(render_mode == 3) ? (uint32_t*)intersection_count.contiguous().data<int>() : nullptr,
-		max_intersections_alloc);
+		max_intersections_alloc,
+		fastgs_enabled ? metric_map.contiguous().data<int>() : nullptr,
+		fastgs_enabled ? metric_counts.contiguous().data<int>() : nullptr);
   }
 
-  return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg, intersection_buffer, intersection_count);
+  return std::make_tuple(rendered, out_color, out_others, out_index, radii, geomBuffer, binningBuffer, imgBuffer, cover_pixels, trans_avg, intersection_buffer, intersection_count, metric_counts);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -863,6 +875,10 @@ void SetActivationBiasCUDA(float sh_bias, float res_bias) {
 
 void SetAntiAliasCUDA(float factor, float focal) {
     FORWARD::setAntiAlias(factor, focal);
+}
+
+void SetCompactMultCUDA(float val) {
+    FORWARD::setCompactMult(val);
 }
 
 void SetAaKernelSizeCUDA(float val) {

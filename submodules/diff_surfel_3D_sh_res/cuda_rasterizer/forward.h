@@ -105,7 +105,11 @@ namespace FORWARD
 		// Pre-encoded view directions for 3D_direct_fused (H*W, 16)
 		const float* viewdirs_enc = nullptr,
 		// Separate SH RGB pointer for 3D_SH_cat (render_mode=6)
-		const float* rgb_override = nullptr);
+		const float* rgb_override = nullptr,
+		// FastGS VCD/VCP: per-pixel high-error mask [H*W] int32, per-Gaussian
+		// counter [P] int32. Both nullptr => feature disabled.
+		const int* metric_map = nullptr,
+		int* metric_counts = nullptr);
 
 	// Set contribution threshold for hash query skip: w = T*alpha (0 = disabled)
 	void setContribThresh(float val);
@@ -125,6 +129,10 @@ namespace FORWARD
 	// Set Nexels-style anti-aliasing params for hash-grid down-weighting.
 	// factor=0 disables AA. Typical factor=1.0, focal=max(fx,fy).
 	void setAntiAlias(float factor, float focal);
+
+	// FastGS Compact Box: Mahalanobis² scale factor for AdR cutoff.
+	// val=1.0 → matches existing AdR (our current default). val=0.5 → FastGS paper default (tighter tile AABB).
+	void setCompactMult(float val);
 
 	// Set AA-2DGS mip-filter kernel size σ (0 disables, typical 0.1).
 	// When >0, replaces the rho3d/rho2d heuristic with the Jacobian-based

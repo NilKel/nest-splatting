@@ -387,7 +387,9 @@ int CudaRasterizer::Rasterizer::forward(
 	const float aa_threshold,
 	float* intersection_buffer,
 	uint32_t* intersection_count,
-	uint32_t max_intersections_per_pixel)
+	uint32_t max_intersections_per_pixel,
+	const int* metric_map,
+	int* metric_counts)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -594,7 +596,9 @@ int CudaRasterizer::Rasterizer::forward(
 		intersection_count,
 		max_intersections_per_pixel,
 		nullptr,  // viewdirs_enc
-		((render_mode & 0xFF) == 6) ? geomState.rgb : nullptr   // rgb_override: mode 6 needs SH colors separately from features (which has DC SH)
+		((render_mode & 0xFF) == 6) ? geomState.rgb : nullptr,  // rgb_override: mode 6 needs SH colors separately from features (which has DC SH)
+		metric_map,
+		metric_counts
 		), debug)
 
 	return num_rendered;

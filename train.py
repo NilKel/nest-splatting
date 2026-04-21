@@ -116,6 +116,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     training_start_time = time.time()
 
+    # --decomp: only the diff_surfel_3D_sh_res rasterizer exposes the sh_only /
+    # tex_only decompose_mode paths needed to split the supervision.
+    if getattr(args, 'decomp', False) and args.method != "3D_SH_res":
+        raise RuntimeError(
+            f"--decomp requires --method 3D_SH_res; got --method {args.method}. "
+            f"Other rasterizers don't expose the sh_only/tex_only decompose path."
+        )
+    # --blurprog: uses the same gt_low cache as --decomp but only needs main-loop
+    # render — no decompose_mode dependency. Gated to 3D_SH_res here only because
+    # the cache plumbing (Scene.__init__) is tied to the same code path. Could be
+    # relaxed if needed.
+    if getattr(args, 'blurprog', False) and args.method != "3D_SH_res":
+        raise RuntimeError(
+            f"--blurprog requires --method 3D_SH_res; got --method {args.method}."
+        )
+
     # Pass mini flag to OptimizationParams so training_setup can pick SparseGaussianAdam
     opt.mini = getattr(args, 'mini', False)
 
@@ -755,11 +771,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"\n[INFO] No warmup checkpoint found at {warmup_checkpoint_path}")
             print(f"[INFO] Will train 2DGS for {cfg_model.ingp_stage.initialize} iterations, then save checkpoint.\n")
 
-    # mcmc_fps: auto-set cap_max to current number of Gaussians
+    # mcmc_fps: auto-set cap_max ONLY if the user didn't specify one.
+    # Previously this also clamped cap_max down to num_init when num_init < cap_max,
+    # which conflicted with the new FPS-halving path where cap_max is intentionally
+    # larger than the subsampled init count (MCMC grows back to cap_max).
     if args.mcmc_fps:
         n_current = len(gaussians.get_xyz)
-        if args.cap_max <= 0 or n_current < args.cap_max:
-            print(f"[mcmc_fps] Setting cap_max to current Gaussian count: {n_current}")
+        if args.cap_max <= 0:
+            print(f"[mcmc_fps] --cap_max unset; auto-setting to current Gaussian count: {n_current}")
             args.cap_max = n_current
 
     surfel_cfg = cfg_model.surfel
@@ -811,6 +830,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ingp_model = None
     if cfg_model.settings.if_ingp and args.method != "2dgs":
         ingp_model = INGP(cfg_model, args=args).to('cuda')
+
+    # FastGS Compact Box: set the Mahalanobis² multiplier + auto-enable AdR+rect AABB.
+    if args.fastgs and args.method == "3D_SH_res":
+        from diff_surfel_3D_sh_res import set_compact_mult
+        set_compact_mult(args.fastgs_mult)
+        if args.aabb == "2dgs":
+            # Caller didn't pick an AABB mode — switch to adrrect so the compact-box
+            # cutoff math actually runs in preprocessCUDA.
+            args.aabb = "adrrect"
+            print("[FASTGS] Auto-enabled --aabb adrrect for Compact Box.")
+        print(f"[FASTGS] Compact Box: mult={args.fastgs_mult} (cutoff = sqrt(2·log(opacity·255)·mult), paper default 0.5)")
 
     # Set hash query transmittance threshold (skip hash+MLP when T < threshold)
     if args.contribution_thresh > 0.0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
@@ -942,6 +972,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     if args.sh_freeze_iter > 0:
         print(f"[SH_FREEZE] SH parameters (f_dc, f_rest) frozen for first {args.sh_freeze_iter} iterations")
+    if args.freeze_prim > 0:
+        print(f"[FREEZE_PRIM] Per-Gaussian appearance (SH/SB/SG/SV) frozen for first "
+              f"{args.freeze_prim} iterations. Geometry, opacity, shape, hashgrid + MLP "
+              f"all train normally during the warmup.")
 
     for iteration in range(first_iter, opt.iterations + 1):
 
@@ -968,6 +1002,65 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if param_group["name"] in ["f_dc", "f_rest"] and "_saved_lr" in param_group:
                         param_group["lr"] = param_group["_saved_lr"]
                         print(f"\n[SH_UNFREEZE] Unfreezing {param_group['name']} at iter {iteration}, lr={param_group['lr']:.6f}")
+
+        # --freeze_prim: freeze the per-Gaussian directional appearance groups
+        # (SH + SB + SG + SV) for the first N iters. Geometry (xyz, scale,
+        # rotation), opacity, kernel shape, and the hash/MLP path all keep
+        # training normally, so the hashgrid residual has a chance to fit the
+        # scene's appearance alone before the primitive color lobes engage.
+        # sv_sites is scheduled — unfreeze lets update_learning_rate take over.
+        # Also drops the SH activation bias (clamp(SH + sh_bias) term) to 0
+        # during the freeze window so SH's color contribution is a true zero,
+        # then restores it to the --activation_bias configured value afterward.
+        if args.freeze_prim > 0:
+            _FP_APPEARANCE = {
+                "f_dc", "f_rest",                                 # SH
+                "sb_params",                                      # Spherical Beta
+                "sg_directions", "sg_sharpness", "sg_rgb",        # Spherical Gaussian
+                "sv_sites", "sv_colors",                          # Spherical Voronoi
+            }
+            _FP_SCHEDULED = {"sv_sites"}
+            _FP_HAS_BIAS = args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]
+            if iteration <= args.freeze_prim:
+                for pg in gaussians.optimizer.param_groups:
+                    name = pg.get("name")
+                    if name not in _FP_APPEARANCE:
+                        continue
+                    if iteration == 1 and name not in _FP_SCHEDULED:
+                        pg["_saved_lr_prim"] = pg["lr"]
+                    pg["lr"] = 0.0
+                if iteration == 1 and _FP_HAS_BIAS:
+                    # Override the startup-time bias setter: zero SH bias so SH
+                    # contribution = ReLU(SH + 0) — effectively nothing while SH
+                    # weights are frozen (SH DC typically inits to ~0 anyway).
+                    if args.method == "3D_SH_32":
+                        from diff_surfel_3D_sh_32 import set_activation_bias as _sab
+                    else:
+                        from diff_surfel_3D_sh_res import set_activation_bias as _sab
+                    from gaussian_renderer import set_default_activation_bias as _sdab
+                    _cfg_sh, _cfg_res = args.activation_bias
+                    _sab(sh_bias=0.0, res_bias=_cfg_res)
+                    _sdab(0.0, _cfg_res)
+                    tqdm.write(f"[FREEZE_PRIM] SH bias 0.0 during freeze window "
+                               f"(configured={_cfg_sh}, restored at iter {args.freeze_prim + 1})")
+            elif iteration == args.freeze_prim + 1:
+                for pg in gaussians.optimizer.param_groups:
+                    name = pg.get("name")
+                    if name not in _FP_APPEARANCE or name in _FP_SCHEDULED:
+                        continue
+                    if "_saved_lr_prim" in pg:
+                        pg["lr"] = pg["_saved_lr_prim"]
+                if _FP_HAS_BIAS:
+                    if args.method == "3D_SH_32":
+                        from diff_surfel_3D_sh_32 import set_activation_bias as _sab
+                    else:
+                        from diff_surfel_3D_sh_res import set_activation_bias as _sab
+                    from gaussian_renderer import set_default_activation_bias as _sdab
+                    _cfg_sh, _cfg_res = args.activation_bias
+                    _sab(sh_bias=_cfg_sh, res_bias=_cfg_res)
+                    _sdab(_cfg_sh, _cfg_res)
+                    print(f"[FREEZE_PRIM] SH bias restored to {_cfg_sh}")
+                print(f"\n[FREEZE_PRIM] Unfrozen SH/SB/SG/SV appearance groups at iter {iteration}")
 
         opacity_reset_interval = opt.opacity_reset_interval
         densification_interval = opt.densification_interval
@@ -1035,7 +1128,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # When GSPA is active, delay SH increases until after Phase 1 (importance pruning)
         # When sh_freeze_iter is set, delay SH increases until after unfreeze
         # When --mini is active, lock SH at degree 0 until simp1 (matches MSv2 paper)
-        sh_base_iter = max(args.sh_freeze_iter, args.gspa_simp_iter if args.gspa else 0)
+        sh_base_iter = max(args.sh_freeze_iter, args.freeze_prim, args.gspa_simp_iter if args.gspa else 0)
         if iteration > sh_base_iter and (iteration - sh_base_iter) % 1000 == 0:
             gaussians.oneupSHdegree()
 
@@ -1176,9 +1269,83 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         rend_alpha = render_pkg['rend_alpha']
         
+        # --blurprog: curriculum — interpolate target from gt_low (heavy structure)
+        # to gt (fully sharp) across the first `blurprog_until` iters. After that,
+        # target is pure gt (same as no curriculum).
+        if args.blurprog:
+            gt_low_cam = getattr(viewpoint_cam, 'gt_low', None)
+            if gt_low_cam is None:
+                raise RuntimeError(
+                    f"--blurprog: camera {viewpoint_cam.image_name} has no gt_low. "
+                    f"Scene loader should have populated it.")
+            t_prog = min(1.0, float(iteration) / max(1, args.blurprog_until))
+            if args.blurprog_schedule == "cosine":
+                _alpha = 0.5 * (1.0 - np.cos(np.pi * t_prog))
+            else:
+                _alpha = t_prog  # linear
+            gt_image = (1.0 - _alpha) * gt_low_cam + _alpha * gt_image
+            if iteration % 500 == 0:
+                tqdm.write(f"[BLURPROG iter={iteration}] t={t_prog:.3f}, α={_alpha:.3f} "
+                           f"(α=0 → gt_low, α=1 → gt)")
+
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        
+
+        # --decomp: supervise the structure branch against the guided-filter low-freq
+        # image, and the hashgrid-MLP residual against the high-freq residual.
+        #   default (--decomp):       L1(sh_only,  gt_low) + L1(tex_only, gt_high)
+        #                             → 2 extra renders per iter (sh_only, tex_only)
+        #   --decomp_comb:            L1(full,     gt_low) + L1(tex_only, gt_high)
+        #                             → 1 extra render per iter (tex_only); reuses the
+        #                               main-loop `image`. SH and hashgrid jointly fit
+        #                               the blur; residual pulls hashgrid toward detail.
+        decomp_sh_loss = torch.tensor(0.0, device="cuda")
+        decomp_tex_loss = torch.tensor(0.0, device="cuda")
+        if args.decomp and (iteration % max(1, args.decomp_interval) == 0):
+            gt_low_cam = getattr(viewpoint_cam, 'gt_low', None)
+            if gt_low_cam is None:
+                raise RuntimeError(
+                    f"--decomp: camera {viewpoint_cam.image_name} has no gt_low. "
+                    f"Scene loader should have populated it.")
+            gt_low_t = gt_low_cam
+            gt_high_t = (gt_image - gt_low_t).clamp(-1.0, 1.0)
+
+            _decomp_render_kwargs = dict(
+                ingp=ingp, beta=beta, iteration=iteration, cfg=cfg_model,
+                record_transmittance=record_transmittance,
+                use_xyz_mode=args.use_xyz_mode,
+                temperature=temperature, force_ratio=args.force_ratio,
+                no_gumbel=args.no_gumbel, dropout_lambda=args.dropout_lambda,
+                is_training=True, aabb_mode=args.aabb,
+                aa=args.aa, aa_threshold=args.aa_threshold,
+                skybox=active_skybox, background_mode=background_mode,
+                bg_hashgrid=active_bg_hashgrid,
+                detach_hash_grad=args.detach_hash_grad,
+                max_intersections_per_pixel=args.max_intersections_per_pixel,
+                lowpass=args.lowpass, pixel_center=args.pixel_center,
+                antialiasing=args.antialiasing, sv_metric=args.sv_metric)
+
+            # Structure target: either the sh_only render (default) or the full
+            # render already computed above (--decomp_comb).
+            if args.decomp_comb:
+                structure_render = image
+            else:
+                sh_pkg = render(viewpoint_cam, gaussians, pipe, current_bg,
+                                decompose_mode='sh_only', **_decomp_render_kwargs)
+                structure_render = sh_pkg['render']
+
+            tex_pkg = render(viewpoint_cam, gaussians, pipe, current_bg,
+                             decompose_mode='tex_only', **_decomp_render_kwargs)
+            tex_only = tex_pkg['render']
+
+            decomp_sh_loss = args.decomp_lambda_sh * l1_loss(structure_render, gt_low_t)
+            decomp_tex_loss = args.decomp_lambda_tex * l1_loss(tex_only, gt_high_t)
+
+            if iteration % 500 == 0:
+                _tag = "full_vs_low" if args.decomp_comb else "sh_vs_low"
+                tqdm.write(f"[DECOMP iter={iteration}] {_tag}={decomp_sh_loss.item():.6f}, "
+                           f"tex_vs_high={decomp_tex_loss.item():.6f}, main_l1={Ll1.item():.6f}")
+
         # regularization
         lambda_normal = opt.lambda_normal if iteration > cfg_model.loss.normal_iter else 0.0
         lambda_dist = opt.lambda_dist if iteration > cfg_model.loss.dist_iter else 0.0
@@ -1423,7 +1590,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             set_weight_reg_lambda(effective_lambda)
 
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss + l1_sh_rest_loss + gspa_loss + w_overdraw_loss + sv_l1_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss + l1_sh_rest_loss + gspa_loss + w_overdraw_loss + sv_l1_loss + decomp_sh_loss + decomp_tex_loss
 
         # --minimc per-step error accumulation: BENCHED.
         # Replaced by the full-view sweep inside `minimc_sweep_and_relocate`,
@@ -1885,10 +2052,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         from utils.fast_utils import sampling_cameras, compute_gaussian_score_fastgs
                         _vp_stack = scene.getTrainCameras().copy()
                         _camlist = sampling_cameras(_vp_stack, num_cams=args.fastgs_num_views)
-                        def _fastgs_render_fn(v):
+                        def _fastgs_render_fn(v, metric_map=None):
                             return render(v, gaussians, pipe, background, beta=beta,
                                           iteration=iteration, cfg=cfg_model, ingp=ingp,
-                                          record_transmittance=False, is_training=False)
+                                          record_transmittance=False, is_training=False,
+                                          metric_map=metric_map)
                         importance_score, pruning_score = compute_gaussian_score_fastgs(
                             _camlist, gaussians, _fastgs_render_fn,
                             loss_thresh=args.fastgs_loss_thresh,
@@ -1908,7 +2076,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             importance_thresh=args.fastgs_importance_thresh,
                             prune_budget_frac=args.fastgs_prune_budget_frac,
                         )
-                        gaussians.training_setup(opt)
+                        # NOTE: no training_setup() — densification_postfix +
+                        # prune_points already preserve Adam state via
+                        # cat_tensors_to_optimizer / _prune_optimizer.
                         tqdm.write(
                             f"[FASTGS] Densify+prune at iter {iteration}: "
                             f"cloned={_stats['cloned']}, split_parents={_stats['split_parents']}, "
@@ -1923,7 +2093,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.densify_and_prune(densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold, \
                         appearance_update_threshold, active_levels, densify_tag = (iteration < opt.densify_until_iter), prune_tag = prune_tag)
                     
-                    if not args.mini and (iteration % opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter)):
+                    if not args.mini and not args.fastgs and (iteration % opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter)):
                         if iteration <= cfg_model.training_cfg.reset_until_iter:
                             gaussians.reset_opacity()
 
@@ -1935,10 +2105,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         from utils.fast_utils import sampling_cameras, compute_gaussian_score_fastgs
                         _vp_stack = scene.getTrainCameras().copy()
                         _camlist = sampling_cameras(_vp_stack, num_cams=args.fastgs_num_views)
-                        def _fastgs_prune_render_fn(v):
+                        def _fastgs_prune_render_fn(v, metric_map=None):
                             return render(v, gaussians, pipe, background, beta=beta,
                                           iteration=iteration, cfg=cfg_model, ingp=ingp,
-                                          record_transmittance=False, is_training=False)
+                                          record_transmittance=False, is_training=False,
+                                          metric_map=metric_map)
                         _, pruning_score = compute_gaussian_score_fastgs(
                             _camlist, gaussians, _fastgs_prune_render_fn,
                             loss_thresh=args.fastgs_loss_thresh,
@@ -1951,11 +2122,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             pruning_score=pruning_score,
                             score_thresh=args.fastgs_final_score_thresh,
                         )
-                        gaussians.training_setup(opt)
+                        # NOTE: no training_setup() — prune_points preserves
+                        # Adam state via _prune_optimizer.
                         tqdm.write(
                             f"[FASTGS] Final-prune at iter {iteration}: "
                             f"{n_before} -> {len(gaussians.get_xyz)} "
                             f"(pruned {n_pruned})")
+
+            # --merge: mode-agnostic geometric consolidation. Placed at the top
+            # scope so it runs regardless of --mcmc / --mini / traditional path.
+            # Fires AFTER any density changes above, BEFORE mini/gspa blocks below.
+            if (args.merge
+                    and iteration > 0
+                    and iteration % args.merge_interval == 0
+                    and iteration <= args.merge_until):
+                _n_before_merge = len(gaussians.get_xyz)
+                _n_merged = gaussians.consolidate_primitives(
+                    tau_dist=(args.merge_tau_dist if args.merge_tau_dist > 0 else None),
+                    tau_normal=args.merge_tau_normal,
+                    tau_planar=(args.merge_tau_planar if args.merge_tau_planar > 0 else None),
+                    tau_feat=args.merge_tau_feat,
+                    verbose=False,  # we print via tqdm.write below
+                )
+                tqdm.write(
+                    f"[MERGE] iter {iteration}: {_n_before_merge} -> "
+                    f"{len(gaussians.get_xyz)} Gaussians "
+                    f"(merged {_n_merged} pairs)"
+                )
 
             # GaussianSpa two-phase sparsification pipeline
             if args.gspa:
@@ -3947,6 +4140,12 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--random_init", type=int, default=0,
+                        help="If >0, bypass the dataset's points3d.ply / COLMAP sparse cloud and "
+                             "initialize with N random points uniformly distributed in a sphere. "
+                             "Radius auto-sized from cameras_extent unless --random_init_radius is set.")
+    parser.add_argument("--random_init_radius", type=float, default=0.0,
+                        help="--random_init: sphere radius in world units. 0 = auto = 1.3 × cameras_extent.")
     parser.add_argument("--init_ply", type=str, default=None,
                         help="Initialize Gaussians from an external PLY file instead of dataset point cloud")
 
@@ -3985,6 +4184,13 @@ if __name__ == "__main__":
                         help="Disable hash/MLP residual for this many iterations in 3D_SH_res mode (e.g. 10000 = SH-only for first 10k iters)")
     parser.add_argument("--sh_freeze_iter", type=int, default=0,
                         help="Freeze SH (f_dc and f_rest) LR to 0 for the first N iterations, then unfreeze. Lets hashgrid/MLP fit first.")
+    parser.add_argument("--freeze_prim", type=int, default=0,
+                        help="Freeze per-Gaussian APPEARANCE parameters only (SH f_dc/f_rest, SB sb_params, "
+                             "SG sg_directions/sg_sharpness/sg_rgb, SV sv_sites/sv_colors) for the first N iters. "
+                             "Geometry (xyz, scale, rotation), opacity, kernel shape, per-Gaussian hashgrid "
+                             "features, and the hash+MLP path all keep training. Lets the hashgrid residual "
+                             "fit the scene alone before directional color lobes engage. Also delays the SH "
+                             "degree progression by N. Stacks with --sh_freeze_iter.")
     parser.add_argument("--activation_bias", nargs=2, type=float, default=[0.5, 0.0],
                         help="Activation biases [sh_bias, res_bias] for 3D_SH_res/cat/32. "
                              "color = ReLU(ReLU(SH+sh_bias) + residual+res_bias). Default: [0.5, 0.0]")
@@ -4296,8 +4502,8 @@ if __name__ == "__main__":
                         help="FastGS: scale/extent threshold splitting clone vs split region.")
     parser.add_argument("--fastgs_prune_budget_frac", type=float, default=0.5,
                         help="FastGS: fraction of opacity-pruneable Gaussians actually removed per call.")
-    parser.add_argument("--fastgs_densify_interval", type=int, default=500,
-                        help="FastGS: run VCD+VCP every N iters (paper: 500).")
+    parser.add_argument("--fastgs_densify_interval", type=int, default=100,
+                        help="FastGS: run VCD+VCP every N iters (paper: 500; default here 100).")
     parser.add_argument("--fastgs_densify_until", type=int, default=15000,
                         help="FastGS: stop densification at this iter (paper: 15000).")
     parser.add_argument("--fastgs_final_prune_interval", type=int, default=3000,
@@ -4308,6 +4514,12 @@ if __name__ == "__main__":
                         help="FastGS: post-15k opacity floor for aggressive prune (paper: 0.1).")
     parser.add_argument("--fastgs_final_score_thresh", type=float, default=0.9,
                         help="FastGS: post-15k pruning score threshold (paper: 0.9).")
+    parser.add_argument("--fastgs_mult", type=float, default=0.5,
+                        help="FastGS Compact Box Mahalanobis² scale factor. "
+                             "Tightens per-Gaussian tile AABB to ellipse contour where "
+                             "opacity·exp(-0.5·maha²·mult) = 1/255. "
+                             "1.0 = existing AdR cutoff (no change). 0.5 = paper default "
+                             "(tighter, faster). Auto-enables --aabb adrrect when --fastgs set.")
 
     # Mini-Splatting v2 optimization
     parser.add_argument("--mini", action="store_true",
@@ -4417,6 +4629,71 @@ if __name__ == "__main__":
     # Separated depth sort: pre-sort Gaussians by depth, then sort expanded list by tile_id only
     parser.add_argument("--depth_sort", action="store_true",
                         help="Use separated depth sort (pre-sort by depth, then tile-bin). Default: standard full radix sort")
+
+    # Structure-texture decomposition training (--decomp).
+    # Pre-computes a guided-filter low-frequency image per train view (cached to
+    # {dataset}/decomp_r{R}_eps{EPS}/) and supervises sh_only vs low-freq,
+    # tex_only vs high-freq residual, on top of the main photometric loss.
+    # Only works with --method 3D_SH_res (the only rasterizer exposing the
+    # sh_only/tex_only decompose_mode path).
+    parser.add_argument("--decomp", action="store_true",
+                        help="Enable structure-texture decomposition training. Requires --method 3D_SH_res.")
+    parser.add_argument("--decomp_r", type=int, default=8,
+                        help="Guided-filter radius. Larger = more aggressive structure extraction. Default 8.")
+    parser.add_argument("--decomp_eps", type=float, default=0.01,
+                        help="Guided-filter ε² edge-preservation. Smaller = sharper edges, less detail in residual. Default 0.01.")
+    parser.add_argument("--decomp_lambda_sh", type=float, default=1.0,
+                        help="Weight on L1(sh_only, gt_low) auxiliary loss. Default 1.0.")
+    parser.add_argument("--decomp_lambda_tex", type=float, default=1.0,
+                        help="Weight on L1(tex_only, gt_high) auxiliary loss. Default 1.0.")
+    parser.add_argument("--decomp_interval", type=int, default=1,
+                        help="Apply --decomp losses every N iters. 1 = every step, higher amortizes the 2 extra renders.")
+    parser.add_argument("--decomp_comb", action="store_true",
+                        help="Change the --decomp structure target from sh_only to the FULL render: "
+                             "supervise L1(full, gt_low) instead of L1(sh_only, gt_low). SH and hashgrid "
+                             "jointly fit the blur; hashgrid is additionally pulled toward the residual via "
+                             "L1(tex_only, gt_high). Saves one render per iter (no sh_only pass). "
+                             "Equilibrium (with main L(full, gt) still active): SH ≈ gt_low, tex_only ≈ gt_high.")
+    # --blurprog: curriculum alternative to --decomp. No extra renders — just
+    # interpolate the target image from gt_low (structure) toward gt (full) over
+    # the first N iters. Whole model (SH + hashgrid) fits increasingly sharp images.
+    parser.add_argument("--blurprog", action="store_true",
+                        help="Progressive-blur curriculum: start training against gt_low and linearly "
+                             "ramp to full gt by --blurprog_until. Uses --decomp_r / --decomp_eps for "
+                             "the guided-filter cache (pre-computed once, shared with --decomp). "
+                             "Same iter cost as normal training.")
+    parser.add_argument("--blurprog_until", type=int, default=10000,
+                        help="--blurprog: iter at which the target is fully sharp (α=1, pure gt). Default 10000.")
+    parser.add_argument("--blurprog_schedule", type=str, default="linear",
+                        choices=["linear", "cosine"],
+                        help="--blurprog: α(t) interpolation shape from 0 (blur) to 1 (sharp). Default 'linear'.")
+
+    # --merge: mode-agnostic geometric primitive consolidation. Every --merge_interval
+    # iters (up to --merge_until), pair primitives within τ_dist via a scipy KDTree,
+    # run a 4-gate test (normal alignment, coplanarity, spatial overlap, feature
+    # similarity), and merge pairs that pass. Designed to stop SH/residual
+    # overfitting by collapsing onion-skin layers into a single surface.
+    parser.add_argument("--merge", action="store_true",
+                        help="Enable geometric primitive consolidation (4-gate merge). Runs "
+                             "before opacity reset at each --merge_interval up to --merge_until.")
+    parser.add_argument("--merge_interval", type=int, default=3000,
+                        help="--merge: run consolidation every N iters. Default 3000 (lines up with "
+                             "opacity_reset_interval).")
+    parser.add_argument("--merge_until", type=int, default=0,
+                        help="--merge: stop running consolidation after this iter. "
+                             "0 = auto = densify_until_iter − merge_interval (last merge lands "
+                             "one cycle before densification ends).")
+    parser.add_argument("--merge_tau_dist", type=float, default=0.0,
+                        help="--merge: spatial-overlap radius (Gate 3). 0 = auto = "
+                             "0.5 × median(max_scale).")
+    parser.add_argument("--merge_tau_normal", type=float, default=0.95,
+                        help="--merge: min n_i · n_j for alignment (Gate 1). Default 0.95 "
+                             "(~18° cone).")
+    parser.add_argument("--merge_tau_planar", type=float, default=0.0,
+                        help="--merge: coplanarity threshold (Gate 2). 0 = auto = 0.5 × τ_dist.")
+    parser.add_argument("--merge_tau_feat", type=float, default=0.01,
+                        help="--merge: max MSE(f_dc_i, f_dc_j) for feature-similarity (Gate 4). "
+                             "Default 0.01 (SH DC is small-magnitude; tune per-scene).")
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -4607,6 +4884,19 @@ if __name__ == "__main__":
         args.densify_until_iter = args.mini_densify_until
     if args.mini and 'opacity_lr' not in cli_args:
         args.opacity_lr = 0.025  # MSv2 halves opacity LR for stability
+
+    # --merge: auto-resolve merge_until to land one cycle before densification ends.
+    # Picks the right "densify end" per mode (fastgs / minispa / traditional).
+    if args.merge and args.merge_until <= 0:
+        if args.fastgs:
+            _dend = int(args.fastgs_densify_until)
+        elif args.minispa:
+            _dend = int(args.minispa_admm_start)  # densify stops when ADMM starts
+        else:
+            _dend = int(args.densify_until_iter)
+        args.merge_until = max(args.merge_interval, _dend - args.merge_interval)
+        print(f"[MERGE] Auto merge_until={args.merge_until} "
+              f"(densify_end={_dend} − merge_interval={args.merge_interval})")
 
     # Cold start mode: override config to enable hash_in_CUDA from start
     if args.cold:

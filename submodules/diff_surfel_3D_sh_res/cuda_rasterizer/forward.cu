@@ -52,6 +52,10 @@ __device__ float d_sh_bias = 0.5f;
 // AA-2DGS mip filter kernel size σ. 0 disables (use standard rho3d/rho2d).
 __device__ float d_aa_kernel_size = 0.0f;
 __device__ float d_res_bias = 0.5f;
+// FastGS Compact Box multiplier. Scales the Mahalanobis² threshold used by the
+// AdR cutoff in preprocessCUDA:  cutoff = sqrt(2·log(opacity·255)·mult).
+// Default 1.0 = unchanged (matches our existing AdR cutoff). FastGS paper uses 0.5.
+__device__ float d_compact_mult = 1.0f;
 
 // Host-side pointers for memory management
 static __half* h_mlp_W1 = nullptr;
@@ -679,7 +683,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 		float log_term = logf(255.0f * opacity_val);
 		if (log_term > 0.0f) {
-			cutoff = sqrtf(2.0f * log_term);
+			// FastGS Compact Box: scale Mahalanobis² by d_compact_mult (paper: 0.5).
+			// d_compact_mult=1.0 reproduces our existing AdR cutoff.
+			cutoff = sqrtf(2.0f * log_term * d_compact_mult);
 		} else {
 			cutoff = 0.1f;
 		}
@@ -1043,7 +1049,12 @@ renderCUDAsurfelForward(
 	uint32_t* __restrict__ intersection_count = nullptr,
 	const uint32_t max_intersections_per_pixel = 0,
 	// Pre-encoded view directions for 3D_direct_fused (H*W, 16) - one 16D vector per pixel
-	const float* __restrict__ viewdirs_enc = nullptr)
+	const float* __restrict__ viewdirs_enc = nullptr,
+	// FastGS VCD/VCP counters. When metric_map[pix_id]==1, every Gaussian that
+	// passes the alpha > 1/255 gate at this pixel atomic-adds to metric_counts[id].
+	// No effect when either pointer is null.
+	const int* __restrict__ metric_map = nullptr,
+	int* __restrict__ metric_counts = nullptr)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -1054,6 +1065,7 @@ renderCUDAsurfelForward(
 	uint32_t pix_id = W * pix.y + pix.x;
 	const float pix_off = (render_mode & 0x800) ? 0.5f : 0.0f;
 	float2 pixf = { (float)pix.x + pix_off, (float)pix.y + pix_off};
+	const bool fastgs_count = (metric_counts != nullptr && metric_map != nullptr);
 
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;
@@ -1324,6 +1336,11 @@ renderCUDAsurfelForward(
 				}
 
 				if (my_alpha < 1.0f / 255.0f) { active = false; break; }
+
+				// FastGS VCD/VCP: count high-error-pixel hits per Gaussian.
+				if (fastgs_count && inside && metric_map[pix_id] == 1) {
+					atomicAdd(&metric_counts[collected_id[j]], 1);
+				}
 
 				float test_T = T * (1 - my_alpha);
 				if (test_T < 0.0001f) { done = true; active = false; break; }
@@ -1611,6 +1628,11 @@ renderCUDAsurfelForward(
 
 		if (alpha < 1.0f / 255.0f)
 			continue;
+
+		// FastGS VCD/VCP: count high-error-pixel hits per Gaussian.
+		if (fastgs_count && inside && metric_map[pix_id] == 1) {
+			atomicAdd(&metric_counts[collected_id[j]], 1);
+		}
 
 		float test_T = T * (1 - alpha);
 		if (test_T < 0.0001f)
@@ -2168,6 +2190,12 @@ void FORWARD::setAntiAlias(float factor, float focal) {
 	setAntiAliasKernel<<<1, 1>>>(factor, focal);
 }
 
+// Set FastGS Compact Box Mahalanobis² multiplier (scales AdR cutoff).
+__global__ void setCompactMultKernel(float val) { d_compact_mult = val; }
+void FORWARD::setCompactMult(float val) {
+	setCompactMultKernel<<<1, 1>>>(val);
+}
+
 // Set AA-2DGS mip filter kernel size σ (0 disables; matches AA-2DGS's kernel_size, default 0.1)
 __global__ void setAaKernelSizeKernel(float val) { d_aa_kernel_size = val; }
 void FORWARD::setAaKernelSize(float val) {
@@ -2231,7 +2259,9 @@ void FORWARD::render(
 	uint32_t* intersection_count,
 	uint32_t max_intersections_per_pixel,
 	const float* viewdirs_enc,
-	const float* rgb_override)
+	const float* rgb_override,
+	const int* metric_map,
+	int* metric_counts)
 {
 	const uint32_t D_DIFFUSE_TEMPLATE = D_diffuse;
 
@@ -2251,7 +2281,8 @@ void FORWARD::render(
 		ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, record_transmittance, scales, focal_x, focal_y, means3D, means2D, colors, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange,
 		depths, normal_opacity, final_T, n_contrib, bg_color, out_color, out_others, out_index, cover_pixels, trans_avg, cam_pos,
 		hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, render_mode, rgb_ptr, max_intersections, shapes, kernel_type, aa, aa_threshold,
-		intersection_buffer, intersection_count, max_intersections_per_pixel, viewdirs_enc);
+		intersection_buffer, intersection_count, max_intersections_per_pixel, viewdirs_enc,
+		metric_map, metric_counts);
 
 }
 

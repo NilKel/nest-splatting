@@ -646,7 +646,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False, decompose_mode = None, max_intersections = 0,
     skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2, no_gumbel = False, dropout_lambda = 0.0, is_training = True,
     aabb_mode = "2dgs", aa = 0.0, aa_threshold = 0.01, skybox = None, background_mode = "none", bg_hashgrid = None, detach_hash_grad = False,
-    return_raw_features = False, fast_inference = False, cache = None, max_intersections_per_pixel = 32, lowpass = False, pixel_center = False, antialiasing = 0.0, sv_metric = "l2"):
+    return_raw_features = False, fast_inference = False, cache = None, max_intersections_per_pixel = 32, lowpass = False, pixel_center = False, antialiasing = 0.0, sv_metric = "l2",
+    metric_map = None):
     """
     Render the scene.
 
@@ -1661,13 +1662,21 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Other rasterizers (lean, fp16, etc.) still accept viewdirs_enc
     if viewdirs_enc is not None and not isinstance(rasterizer, GaussianRasterizer):
         rasterizer_kwargs['viewdirs_enc'] = viewdirs_enc
+    # FastGS: only diff_surfel_3D_sh_res accepts metric_map today. Detect by module.
+    _rasterizer_mod = getattr(type(rasterizer), '__module__', '') or ''
+    if metric_map is not None and 'diff_surfel_3D_sh_res' in _rasterizer_mod:
+        rasterizer_kwargs['metric_map'] = metric_map
     rasterizer_output = rasterizer(**rasterizer_kwargs)
     # Main rasterizer returns 7 values (with max_weight, accum_weights); other rasterizers (lean, fp16, etc.) return 8 (with intersection_buffer, intersection_count, geomBuffer)
-    # diff_surfel_3D_sh_res additionally appends out_index (per-pixel max-contributor id) → 9 values
+    # diff_surfel_3D_sh_res additionally appends out_index (max-contrib id) and
+    # metric_counts (FastGS per-Gaussian counter) → 10 values.
     max_weight_buf = None
     accum_weights_buf = None
     max_contrib_idx = None
-    if len(rasterizer_output) == 9:
+    metric_counts = None
+    if len(rasterizer_output) == 10:
+        rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer, max_contrib_idx, metric_counts = rasterizer_output
+    elif len(rasterizer_output) == 9:
         rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer, max_contrib_idx = rasterizer_output
     elif len(rasterizer_output) == 8:
         rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer = rasterizer_output
@@ -2334,6 +2343,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             # Used by the mini depth-reinit SH-transfer path. Only populated by
             # rasterizers that thread out_index through (currently diff_surfel_3D_sh_res).
             'max_contrib_idx': max_contrib_idx,
+            # int32 [P] FastGS VCD/VCP per-Gaussian counter: number of high-error
+            # pixels (metric_map==1) this Gaussian contributed to above alpha=1/255.
+            # Only populated by diff_surfel_3D_sh_res when metric_map was provided.
+            'metric_counts': metric_counts,
     })
     
     # Add diffuse_ngp mode separate RGB outputs
