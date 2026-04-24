@@ -48,7 +48,8 @@ def load_training_config(model_path):
 def render_baked(viewpoint_camera, gaussians, pipe, background,
                  residual_textures=None, beta=0.0, kernel_type=0,
                  atlas_texture=None, atlas_rects=None, atlas_width=0,
-                 aabb_mode=3):
+                 aabb_mode=3,
+                 sb_params=None, sb_number=0):
     """Render using diff_surfel_bake_render submodule (SH + residual textures)."""
     from diff_surfel_bake_render import GaussianRasterizationSettings, GaussianRasterizer
 
@@ -99,6 +100,8 @@ def render_baked(viewpoint_camera, gaussians, pipe, background,
         atlas_texture=atlas_texture,
         atlas_rects=atlas_rects,
         atlas_width=atlas_width,
+        sb_params=sb_params,
+        sb_number=sb_number,
     )
 
     return {"render": color}
@@ -107,7 +110,8 @@ def render_baked(viewpoint_camera, gaussians, pipe, background,
 def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                   residual_textures, save_dir, num_warmup, num_benchmark,
                   atlas_texture=None, atlas_rects=None, atlas_width=0,
-                  aabb_mode=3):
+                  aabb_mode=3,
+                  sb_params=None, sb_number=0):
     """Render all test views, compute metrics, benchmark FPS. Save images to save_dir."""
     os.makedirs(save_dir, exist_ok=True)
 
@@ -120,7 +124,9 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                                  atlas_texture=atlas_texture,
                                  atlas_rects=atlas_rects,
                                  atlas_width=atlas_width,
-                                 aabb_mode=aabb_mode)
+                                 aabb_mode=aabb_mode,
+                                 sb_params=sb_params,
+                                 sb_number=sb_number)
             rendered = result["render"]
             gt = cam.original_image[:3].cuda()
 
@@ -140,7 +146,10 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                             beta=beta, kernel_type=kernel_type,
                             atlas_texture=atlas_texture,
                             atlas_rects=atlas_rects,
-                            atlas_width=atlas_width)
+                            atlas_width=atlas_width,
+                            aabb_mode=aabb_mode,
+                            sb_params=sb_params,
+                            sb_number=sb_number)
         torch.cuda.synchronize()
 
         times = []
@@ -153,7 +162,10 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                             beta=beta, kernel_type=kernel_type,
                             atlas_texture=atlas_texture,
                             atlas_rects=atlas_rects,
-                            atlas_width=atlas_width)
+                            atlas_width=atlas_width,
+                            aabb_mode=aabb_mode,
+                            sb_params=sb_params,
+                            sb_number=sb_number)
             torch.cuda.synchronize()
             times.append(time.time() - t0)
 
@@ -220,16 +232,29 @@ def main():
     N = len(gaussians.get_xyz)
     print(f"[RENDER] Loaded {N:,} Gaussians from {baked_ply}")
 
-    # Auto-detect texture mode from metadata
+    # Auto-detect texture mode from metadata, also pull activation biases,
+    # Compact Box mult, feature mode, and SB lobe count.
     meta_path = os.path.join(baked_dir, "bake_meta.json")
+    bake_meta = {}
     texture_mode = render_args.texture
-    if texture_mode == "auto" and os.path.exists(meta_path):
+    if os.path.exists(meta_path):
         with open(meta_path) as f:
             bake_meta = json.load(f)
-        texture_mode = bake_meta.get("texture_mode", "shared")
-        print(f"[RENDER] Auto-detected texture mode: {texture_mode}")
+        if texture_mode == "auto":
+            texture_mode = bake_meta.get("texture_mode", "shared")
+            print(f"[RENDER] Auto-detected texture mode: {texture_mode}")
     elif texture_mode == "auto":
         texture_mode = "shared"
+
+    # Call the CUDA device-global setters so the baked kernel matches training.
+    from diff_surfel_bake_render import set_activation_bias, set_compact_mult
+    _sh_bias = float(bake_meta.get("sh_bias", getattr(args, 'activation_bias', [0.5, 0.0])[0]))
+    _res_bias = float(bake_meta.get("res_bias", getattr(args, 'activation_bias', [0.5, 0.0])[1]))
+    _compact_mult = float(bake_meta.get("compact_mult", 1.0))
+    set_activation_bias(_sh_bias, _res_bias)
+    set_compact_mult(_compact_mult)
+    print(f"[RENDER] set_activation_bias(sh={_sh_bias}, res={_res_bias})  "
+          f"set_compact_mult({_compact_mult})")
 
     # Load textures based on mode
     residual_textures = None
@@ -241,7 +266,21 @@ def main():
         atlas_tex_path = os.path.join(baked_dir, "atlas_texture.pt")
         atlas_rects_path = os.path.join(baked_dir, "atlas_rects.pt")
         if os.path.exists(atlas_tex_path) and os.path.exists(atlas_rects_path):
-            atlas_tex = torch.load(atlas_tex_path).cuda()  # [H, W, 3] half
+            atlas_tex = torch.load(atlas_tex_path).cuda()
+            # uint8 RGBA on disk (new default) → dequantize back to FP16 RGB for
+            # the CUDA kernel, which still expects Half. scale/offset come from
+            # bake_meta.json and must survive the round-trip intact.
+            if atlas_tex.dtype == torch.uint8:
+                atlas_scale_meta  = float(bake_meta.get("atlas_scale",  1.0))
+                atlas_offset_meta = float(bake_meta.get("atlas_offset", 0.0))
+                if atlas_tex.shape[-1] == 4:
+                    atlas_rgb = atlas_tex[..., :3]
+                else:
+                    atlas_rgb = atlas_tex
+                atlas_tex = (atlas_rgb.to(torch.float32) / 255.0 * atlas_scale_meta
+                             + atlas_offset_meta).to(torch.float16).contiguous()
+                print(f"[RENDER] Dequantized uint8 atlas → FP16 "
+                      f"(scale={atlas_scale_meta:.4f}, offset={atlas_offset_meta:.4f})")
             atlas_width = atlas_tex.shape[1]
             atlas_texture = atlas_tex.reshape(-1).contiguous()  # [H*W*3] half flat
             atlas_rects = torch.load(atlas_rects_path).cuda().contiguous()  # [N, 4] float
@@ -263,6 +302,21 @@ def main():
                   f"residual_dim={residual_dim}, total per Gaussian={residual_textures.shape[1]}")
         else:
             print(f"[RENDER] No residual_textures.pt found, SH-only mode")
+
+    # Spherical-Beta params (loaded if the training feature_mode was 'beta').
+    sb_params = None
+    sb_number = int(bake_meta.get("sb_number", 0))
+    sb_file = bake_meta.get("sb_params_file", None)
+    if sb_number > 0 and sb_file is not None:
+        sb_path = os.path.join(baked_dir, sb_file)
+        if os.path.exists(sb_path):
+            sb_tensor = torch.load(sb_path).float().cuda().contiguous()
+            sb_params = sb_tensor.reshape(-1).contiguous()  # [N * K * 6] flat
+            print(f"[RENDER] Loaded SB params: shape={list(sb_tensor.shape)}, "
+                  f"K={sb_number} lobes, feature=beta")
+        else:
+            print(f"[RENDER] bake_meta referenced {sb_file} but file missing; SB disabled.")
+            sb_number = 0
 
     # Load test cameras (Scene overwrites gaussians' PLY, so we reload baked PLY after)
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -298,6 +352,8 @@ def main():
         num_warmup=render_args.num_warmup,
         num_benchmark=render_args.num_benchmark,
         aabb_mode=aabb_mode,
+        sb_params=sb_params,
+        sb_number=sb_number,
     )
     all_metrics["sh_only"] = sh_metrics
     print(f"  PSNR: {sh_metrics['psnr']:.2f} dB  |  SSIM: {sh_metrics['ssim']:.4f}  |  "
@@ -319,6 +375,8 @@ def main():
             atlas_rects=atlas_rects,
             atlas_width=atlas_width,
             aabb_mode=aabb_mode,
+            sb_params=sb_params,
+            sb_number=sb_number,
         )
         all_metrics[mode_name] = res_metrics
         print(f"  PSNR: {res_metrics['psnr']:.2f} dB  |  SSIM: {res_metrics['ssim']:.4f}  |  "

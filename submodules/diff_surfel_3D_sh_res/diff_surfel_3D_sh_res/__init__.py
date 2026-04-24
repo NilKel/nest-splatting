@@ -702,6 +702,7 @@ def set_aa_kernel_size(val=0.0):
     standard-Gaussian path with Σ'_local = I + σ·J·Jᵀ, alpha = coef·opa·exp(-0.5·rho)."""
     _C.set_aa_kernel_size(float(val))
 
+
 def set_depth_sort(val):
     """Set depth sort toggle. True = separated depth sort, False = standard sort (default)."""
     _C.set_depth_sort(val)

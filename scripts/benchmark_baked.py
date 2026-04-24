@@ -92,52 +92,72 @@ def quat_to_rotcols(quats):
 # Adaptive resolution
 # ---------------------------------------------------------------------------
 def compute_adaptive_resolution(scales, cell_size, uv_extent=4.0, max_res=64, min_res=4):
-    max_scale = scales.max(dim=1).values
-    n_cells = 2.0 * uv_extent * max_scale / cell_size
-    nyquist_samples = 2.0 * n_cells
+    """Per-axis Nyquist resolution: each surfel gets (res_x, res_y) where each
+    axis is sized by its own scale (not the larger axis). Saves atlas texels on
+    anisotropic surfels (edges, hair) without losing fidelity.
+    Returns [N, 2] int tensor of (res_x, res_y) powers of two in [min_res, max_res].
+    """
+    # scales is [N, 2] for 2DGS surfels — column 0 = sx, column 1 = sy.
+    n_cells = 2.0 * uv_extent * scales / cell_size           # [N, 2]
+    nyquist_samples = 2.0 * n_cells                          # [N, 2]
     log2_res = torch.ceil(torch.log2(nyquist_samples.clamp(min=1.0)))
     resolutions = (2.0 ** log2_res).int()
-    return resolutions.clamp(min=min_res, max=max_res)
+    return resolutions.clamp(min=min_res, max=max_res)       # [N, 2]
 
 
 # ---------------------------------------------------------------------------
 # Atlas packing (shelf-first-fit-decreasing)
 # ---------------------------------------------------------------------------
 def shelf_pack_atlas(resolutions, atlas_width=4096):
-    N = len(resolutions)
-    res_cpu = resolutions.cpu().numpy()
+    """Shelf-first-fit-decreasing on arbitrary rectangles.
+    `resolutions` is [N, 2] = (res_x, res_y). Shelves are indexed by shelf_height
+    (largest res_y dominates shelf height). Items ordered by res_y descending.
+    Returns rects as [N, 4] = (u0, v0, w, h) in atlas pixels.
+    """
+    res_cpu = resolutions.cpu().numpy().astype(np.int64)   # [N, 2]
+    N = res_cpu.shape[0]
+    rx = res_cpu[:, 0]
+    ry = res_cpu[:, 1]
 
+    # Estimate atlas height by shelves of distinct ry values.
     height = 0
-    for sz in sorted(set(int(x) for x in res_cpu), reverse=True):
-        count = int((res_cpu == sz).sum())
-        per_row = atlas_width // sz
-        rows = (count + per_row - 1) // per_row
-        height += rows * sz
+    for sz in sorted(set(int(y) for y in ry), reverse=True):
+        sel = (ry == sz)
+        # Widths of items that will go on shelves of this height.
+        rxs = rx[sel]
+        # Greedy linear tally: sum widths, divide by atlas_width, round up.
+        total_w = int(rxs.sum())
+        rows_for_sz = (total_w + atlas_width - 1) // atlas_width
+        height += rows_for_sz * sz
     atlas_height = max(((height + 63) // 64) * 64, 64)
 
-    order = np.argsort(-res_cpu)
+    # Order items by res_y desc (taller first), break ties by res_x desc.
+    order = np.lexsort((-rx, -ry))
+
+    # Each shelf: [y_start, shelf_height, next_x]
     shelves = []
     rects = np.zeros((N, 4), dtype=np.float32)
 
     for idx in order:
-        sz = int(res_cpu[idx])
+        ix = int(rx[idx])
+        iy = int(ry[idx])
         placed = False
         for shelf in shelves:
-            if shelf[1] >= sz and shelf[2] + sz <= atlas_width:
-                rects[idx] = [shelf[2], shelf[0], sz, sz]
-                shelf[2] += sz
+            if shelf[1] >= iy and shelf[2] + ix <= atlas_width:
+                rects[idx] = [shelf[2], shelf[0], ix, iy]
+                shelf[2] += ix
                 placed = True
                 break
         if not placed:
             y_start = max((s[0] + s[1] for s in shelves), default=0)
-            if y_start + sz > atlas_height:
-                rects[idx] = [0, 0, 2, 2]
+            if y_start + iy > atlas_height:
+                rects[idx] = [0, 0, 2, 2]  # fallback: tiny placeholder
                 continue
-            shelves.append([y_start, sz, sz])
-            rects[idx] = [0, y_start, sz, sz]
+            shelves.append([y_start, iy, ix])
+            rects[idx] = [0, y_start, ix, iy]
 
     used_rows = max((s[0] + s[1] for s in shelves), default=0)
-    total_area = float(np.sum(res_cpu.astype(np.int64) ** 2))
+    total_area = float((rx * ry).sum())
     utilization = total_area / (atlas_width * atlas_height) * 100
 
     return torch.from_numpy(rects).float(), atlas_height, used_rows, utilization
@@ -160,16 +180,18 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
     print(f"[BAKE] Hash grid: {num_levels} levels, finest_res={finest_resolution:.0f}, "
           f"cell_size={cell_size:.6f}")
 
-    # Compute ideal resolutions, then shrink to fit atlas budget
+    # Compute ideal per-axis resolutions, then shrink to fit atlas budget.
+    # resolutions is [N, 2] = (res_x, res_y).
     resolutions = compute_adaptive_resolution(
         gaussians.get_scaling, cell_size, uv_extent=uv_extent,
         max_res=max_res, min_res=min_res)
 
-    # Budget-constrain: iteratively halve max_res until atlas fits (0 = unlimited)
+    # Budget-constrain: iteratively halve max_res until atlas fits (0 = unlimited).
+    # Texel cost per Gaussian is res_x * res_y, so anisotropic surfels stay cheap.
     effective_max = max_res
     while atlas_budget_mb > 0 and effective_max > min_res:
         clamped = resolutions.clamp(max=effective_max)
-        total_texels = (clamped.long() ** 2).sum().item()
+        total_texels = (clamped[:, 0].long() * clamped[:, 1].long()).sum().item()
         atlas_size_mb = total_texels * 3 * 2 / (1024 * 1024)  # FP16, 3 channels
         if atlas_size_mb <= atlas_budget_mb:
             break
@@ -179,11 +201,20 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
         print(f"[BAKE] Budget {atlas_budget_mb} MB: clamped max_res {max_res} -> {effective_max}")
         resolutions = resolutions.clamp(min=min_res, max=effective_max)
 
-    print(f"[BAKE] Adaptive resolution distribution:")
-    unique_res = resolutions.unique().sort().values
-    for res_val in unique_res:
-        count = (resolutions == res_val.item()).sum().item()
-        print(f"  {res_val.item():>4}x{res_val.item():<4}: {count:>7,} Gaussians")
+    # Print distribution grouped by (res_x, res_y) pair.
+    print(f"[BAKE] Adaptive resolution distribution (res_x × res_y):")
+    # Unique pair keys = res_x * 10000 + res_y (both fit in 4 digits since <= 128).
+    res_cpu = resolutions.cpu()
+    pair_keys = (res_cpu[:, 0].long() * 10000 + res_cpu[:, 1].long())
+    unique_keys, counts = torch.unique(pair_keys, return_counts=True)
+    # Sort by resolution area desc.
+    areas = (unique_keys // 10000) * (unique_keys % 10000)
+    sort_idx = torch.argsort(-areas)
+    for k_idx in sort_idx:
+        key = unique_keys[k_idx].item()
+        cnt = counts[k_idx].item()
+        rx_v, ry_v = key // 10000, key % 10000
+        print(f"  {rx_v:>4}x{ry_v:<4}: {cnt:>7,} Gaussians")
 
     atlas_rects, atlas_height, used_rows, utilization = shelf_pack_atlas(
         resolutions, atlas_width=atlas_width)
@@ -200,28 +231,38 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
     scales = gaussians.get_scaling
     R0, R1 = quat_to_rotcols(quats)
 
-    mlp = ingp.mlp_fused
-    mlp.eval()
+    # Cast the training MLP to FP16 to match the in-kernel __half2 math the
+    # training-time forward uses (float2half_kernel uploads + FP16 GEMM).
+    # Without this, Python evaluates in FP32 and the residual numerically drifts
+    # from what the training render kernel produced.
+    mlp = ingp.mlp_fused.half().eval()
     hash_dim = ingp.mlp_fused_hash_dim
     mlp_input_padded = mlp[0].weight.shape[1]
     bias_col = hash_dim
 
-    for res_val in unique_res:
-        res = res_val.item()
-        bake_res = res * ss
-        mask = (resolutions == res)
+    # Iterate per unique (res_x, res_y) pair; Gaussians within the same pair
+    # share the UV lattice shape, so the MLP eval can be batched together.
+    unique_pairs = set(
+        (int(resolutions[i, 0].item()), int(resolutions[i, 1].item()))
+        for i in range(resolutions.shape[0])
+    )
+    for (res_x, res_y) in sorted(unique_pairs, key=lambda p: -(p[0] * p[1])):
+        bake_res_x = res_x * ss
+        bake_res_y = res_y * ss
+        mask = (resolutions[:, 0] == res_x) & (resolutions[:, 1] == res_y)
         indices = mask.nonzero(as_tuple=True)[0]
         n_group = len(indices)
 
-        print(f"[BAKE] {res}x{res} (ss={ss}x -> {bake_res}x{bake_res}): {n_group:,} Gaussians")
+        print(f"[BAKE] {res_x}x{res_y} (ss={ss}x -> {bake_res_x}x{bake_res_y}): {n_group:,} Gaussians")
 
-        step = 2.0 * uv_extent / bake_res
-        coords = torch.arange(bake_res, dtype=torch.float32, device='cuda')
-        uv_1d = (coords + 0.5) * step - uv_extent
-        uu, vv = torch.meshgrid(uv_1d, uv_1d, indexing='ij')
+        step_x = 2.0 * uv_extent / bake_res_x
+        step_y = 2.0 * uv_extent / bake_res_y
+        u_coords = (torch.arange(bake_res_x, dtype=torch.float32, device='cuda') + 0.5) * step_x - uv_extent
+        v_coords = (torch.arange(bake_res_y, dtype=torch.float32, device='cuda') + 0.5) * step_y - uv_extent
+        uu, vv = torch.meshgrid(u_coords, v_coords, indexing='ij')
         u_flat = uu.reshape(-1)
         v_flat = vv.reshape(-1)
-        n_pts = bake_res * bake_res
+        n_pts = bake_res_x * bake_res_y
 
         # Chunk to limit GPU memory (~4 GB budget)
         # Per Gaussian: xyz(12) + hash(16) + mlp_in(64) + mlp_out(64) + residual(12) ≈ 168 bytes per texel
@@ -248,15 +289,19 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
 
             with torch.no_grad():
                 hash_feat = ingp._encode_3D(xyz_flat)
-                mlp_input = torch.zeros(xyz_flat.shape[0], mlp_input_padded, device='cuda')
-                mlp_input[:, :hash_dim] = hash_feat[:, :hash_dim]
+                # MLP and input are FP16 to match training's in-kernel
+                # __half2 math (training uploads FP16 weights via
+                # float2half_kernel; any FP32 Python path diverges numerically).
+                mlp_input = torch.zeros(xyz_flat.shape[0], mlp_input_padded,
+                                        device='cuda', dtype=torch.float16)
+                mlp_input[:, :hash_dim] = hash_feat[:, :hash_dim].to(torch.float16)
                 mlp_input[:, bias_col] = 1.0
-                mlp_out = mlp(mlp_input)
-                rgb_residual = mlp_out[:, :3]
+                mlp_out = mlp(mlp_input)  # FP16 in, FP16 out
+                rgb_residual = mlp_out[:, :3].to(torch.float32)
 
-            residual = rgb_residual.reshape(n_batch, bake_res, bake_res, 3)
+            residual = rgb_residual.reshape(n_batch, bake_res_x, bake_res_y, 3)
             if ss > 1:
-                residual = residual.view(n_batch, res, ss, res, ss, 3).mean(dim=(2, 4))
+                residual = residual.view(n_batch, res_x, ss, res_y, ss, 3).mean(dim=(2, 4))
 
             # Write to CPU atlas (convert to FP16 to match atlas dtype)
             residual_cpu = residual.half().cpu()
@@ -264,7 +309,9 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
             for b in range(n_batch):
                 u0 = int(rects[b, 0].item())
                 v0 = int(rects[b, 1].item())
-                atlas_cpu[v0:v0+res, u0:u0+res, :] = residual_cpu[b].permute(1, 0, 2)
+                # UV lattice is (res_x, res_y); atlas stores as [row=v, col=u],
+                # so transpose the (u, v) axes when copying.
+                atlas_cpu[v0:v0+res_y, u0:u0+res_x, :] = residual_cpu[b].permute(1, 0, 2)
 
             del xyz, xyz_flat, hash_feat, mlp_input, mlp_out, rgb_residual, residual
             torch.cuda.empty_cache()
@@ -272,7 +319,10 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
     print(f"[BAKE] Atlas residual stats: mean={atlas_cpu.mean():.6f}, "
           f"std={atlas_cpu.std():.6f}, min={atlas_cpu.min():.6f}, max={atlas_cpu.max():.6f}")
 
-    res_dist = {str(r.item()): int((resolutions == r).sum().item()) for r in unique_res}
+    res_dist = {}
+    for (rx_v, ry_v) in unique_pairs:
+        cnt = int(((resolutions[:, 0] == rx_v) & (resolutions[:, 1] == ry_v)).sum().item())
+        res_dist[f"{rx_v}x{ry_v}"] = cnt
     meta = {
         "texture_mode": "atlas",
         "residual_dim": 3,
@@ -298,7 +348,8 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
 def render_baked(viewpoint_camera, gaussians, background,
                  residual_textures=None, beta=0.0, kernel_type=0,
                  atlas_texture=None, atlas_rects=None, atlas_width=0,
-                 aabb_mode=3):
+                 aabb_mode=3,
+                 sb_params=None, sb_number=0):
     from diff_surfel_bake_render import GaussianRasterizationSettings, GaussianRasterizer
 
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -335,6 +386,8 @@ def render_baked(viewpoint_camera, gaussians, background,
         atlas_texture=atlas_texture,
         atlas_rects=atlas_rects,
         atlas_width=atlas_width,
+        sb_params=sb_params,
+        sb_number=sb_number,
     )
     return color
 
@@ -342,12 +395,14 @@ def render_baked(viewpoint_camera, gaussians, background,
 def evaluate_baked(test_cameras, gaussians, bg_color, beta, kernel_type,
                    residual_textures=None, atlas_texture=None, atlas_rects=None,
                    atlas_width=0, num_warmup=10, num_benchmark=100, save_dir=None,
-                   aabb_mode=3):
+                   aabb_mode=3,
+                   sb_params=None, sb_number=0):
     """Render all test views, compute metrics, benchmark FPS. Optionally save images."""
     psnrs, l1s, ssims_list = [], [], []
     kwargs = dict(residual_textures=residual_textures,
                   atlas_texture=atlas_texture, atlas_rects=atlas_rects,
-                  atlas_width=atlas_width, aabb_mode=aabb_mode)
+                  atlas_width=atlas_width, aabb_mode=aabb_mode,
+                  sb_params=sb_params, sb_number=sb_number)
 
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
@@ -412,6 +467,12 @@ def main():
     parser.add_argument("--skip_bake", action="store_true", help="Skip baking, use existing atlas")
     parser.add_argument("--aabb_mode", type=int, default=3,
                         help="AABB mode: 0=square, 1=square+AdR, 2=rect, 3=rect+AdR (default: 3)")
+    parser.add_argument("--atlas_quant", type=str, default="uint8",
+                        choices=["uint8", "half4", "software"],
+                        help="Atlas texture encoding. uint8 (default) = quantized ±6σ, ¼ memory, "
+                             "hw bilinear. half4 = lossless vs training FP16 storage (slower, larger). "
+                             "software = legacy pre-texture path (raw FP16 global reads, manual "
+                             "bilinear in kernel — slowest, but no hw-texture dependency).")
     bargs = parser.parse_args()
 
     model_path = bargs.model_path
@@ -473,17 +534,26 @@ def main():
         if hasattr(args, 'kernel'):
             gaussians.kernel_type = args.kernel
 
-        # Prune dead Gaussians
+        # Prune dead Gaussians — must prune EVERY per-Gaussian tensor so save_ply
+        # doesn't see a size mismatch. Optional banks (SB/SG/SV/flex_beta/etc.)
+        # are only pruned when actually populated.
         dead_mask = (gaussians.get_opacity <= 0.005).squeeze(-1)
         n_dead = dead_mask.sum().item()
         if n_dead > 0:
             valid_mask = ~dead_mask
             for attr in ['_xyz', '_features_dc', '_features_rest', '_opacity',
-                         '_scaling', '_rotation', '_appearance_level']:
-                tensor = getattr(gaussians, attr)
-                setattr(gaussians, attr, tensor[valid_mask])
-            if hasattr(gaussians, '_shape') and gaussians._shape is not None and gaussians._shape.numel() > 0:
-                gaussians._shape = gaussians._shape[valid_mask.to(gaussians._shape.device)]
+                         '_scaling', '_rotation', '_appearance_level',
+                         '_gaussian_features',
+                         '_shape', '_flex_beta',
+                         '_sb_params',
+                         '_sg_directions', '_sg_sharpness_sg', '_sg_rgb',
+                         '_sv_sites', '_sv_colors',
+                         '_gamma', '_adaptive_features',
+                         '_adaptive_cat_weight', '_adaptive_zero_weight',
+                         '_gate_logits']:
+                tensor = getattr(gaussians, attr, None)
+                if tensor is not None and tensor.numel() > 0 and tensor.shape[0] == valid_mask.shape[0]:
+                    setattr(gaussians, attr, tensor[valid_mask.to(tensor.device)])
 
         N = len(gaussians.get_xyz)
         print(f"[BAKE] {N:,} Gaussians after pruning ({n_dead:,} pruned)")
@@ -496,6 +566,19 @@ def main():
         bake_meta["kernel"] = getattr(args, 'kernel', 'gaussian')
         bake_meta["sh_degree"] = 3
 
+        # --- Training-time config snapshot: activation biases + Compact Box ---
+        _ab = getattr(args, 'activation_bias', [0.5, 0.0])
+        _sh_bias_train = float(_ab[0]) if isinstance(_ab, (list, tuple)) else 0.5
+        _res_bias_train = float(_ab[1]) if isinstance(_ab, (list, tuple)) else 0.0
+        _fastgs_mult_train = float(getattr(args, 'fastgs_mult', 1.0)) if getattr(args, 'fastgs', False) else 1.0
+        _feature_mode_train = getattr(args, 'feature', 'sh')
+        bake_meta["sh_bias"] = _sh_bias_train
+        bake_meta["res_bias"] = _res_bias_train
+        bake_meta["compact_mult"] = _fastgs_mult_train
+        bake_meta["feature_mode"] = _feature_mode_train
+        bake_meta["sb_number"] = 0
+        bake_meta["sb_params_file"] = None
+
         # Save
         os.makedirs(output_dir, exist_ok=True)
 
@@ -507,6 +590,15 @@ def main():
 
         rects_path = os.path.join(output_dir, "atlas_rects.pt")
         torch.save(atlas_rects.cpu(), rects_path)
+
+        # If trained with --feature beta, snapshot SB params for the baked renderer.
+        if _feature_mode_train == "beta" and hasattr(gaussians, '_sb_params') and gaussians._sb_params.numel() > 0:
+            sb_tensor = gaussians._sb_params.detach().cpu().float()
+            bake_meta["sb_number"] = int(sb_tensor.shape[1])
+            bake_meta["sb_params_file"] = "sb_params.pt"
+            torch.save(sb_tensor, os.path.join(output_dir, "sb_params.pt"))
+            print(f"[BAKE] Saved sb_params.pt  shape={list(sb_tensor.shape)}  "
+                  f"(K={bake_meta['sb_number']} lobes)")
 
         meta_path = os.path.join(output_dir, "bake_meta.json")
         with open(meta_path, 'w') as f:
@@ -542,12 +634,67 @@ def main():
     kernel_map = {'gaussian': 0, 'beta': 1, 'flex': 2, 'general': 3, 'beta_scaled': 4}
     kernel_type = kernel_map.get(getattr(args, 'kernel', 'gaussian'), 0)
 
-    # Load atlas onto GPU for rendering
+    # Atlas encoding: uint8 quantized (default), lossless half4, or the
+    # pre-texture software path (raw FP16 global reads + manual bilinear).
+    from diff_surfel_bake_render import (
+        set_atlas_use_uint8, set_use_atlas_tex_object, clear_atlas_cache)
+    if bargs.atlas_quant == "software":
+        set_use_atlas_tex_object(False)  # kernel falls through to software bilinear
+    else:
+        set_use_atlas_tex_object(True)
+        set_atlas_use_uint8(bargs.atlas_quant == "uint8")
+    clear_atlas_cache()
+    print(f"[RENDER] atlas_quant={bargs.atlas_quant}")
+
+    # Load atlas onto GPU for rendering.
     atlas_tex = torch.load(os.path.join(output_dir, "atlas_texture.pt")).cuda()
+
+    # Pull bake_meta early — uint8 dequant below needs atlas_scale/offset.
+    meta_path = os.path.join(output_dir, "bake_meta.json")
+    bake_meta_render = {}
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            bake_meta_render = json.load(f)
+
+    # uint8 atlas on disk (new default) → dequantize to FP16 RGB for the CUDA
+    # kernel (which expects at::Half). The CUDA runtime may then re-quantize to
+    # uint8 internally for the hw-texture path (round-trip is numerically stable
+    # with matched scale/offset).
+    if atlas_tex.dtype == torch.uint8:
+        atlas_scale_meta  = float(bake_meta_render.get("atlas_scale",  1.0))
+        atlas_offset_meta = float(bake_meta_render.get("atlas_offset", 0.0))
+        atlas_rgb = atlas_tex[..., :3] if atlas_tex.shape[-1] == 4 else atlas_tex
+        atlas_tex = (atlas_rgb.to(torch.float32) / 255.0 * atlas_scale_meta
+                     + atlas_offset_meta).to(torch.float16).contiguous()
+        print(f"[RENDER] Dequantized uint8 atlas → FP16 "
+              f"(scale={atlas_scale_meta:.4f}, offset={atlas_offset_meta:.4f})")
+
     atlas_width = atlas_tex.shape[1]
     atlas_texture = atlas_tex.reshape(-1).contiguous()
     atlas_rects_gpu = torch.load(os.path.join(output_dir, "atlas_rects.pt")).cuda().contiguous()
     N = len(gaussians.get_xyz)
+    _sh_bias = float(bake_meta_render.get("sh_bias", getattr(args, 'activation_bias', [0.5, 0.0])[0]))
+    _res_bias = float(bake_meta_render.get("res_bias", getattr(args, 'activation_bias', [0.5, 0.0])[1]))
+    _compact_mult = float(bake_meta_render.get("compact_mult", 1.0))
+    from diff_surfel_bake_render import set_activation_bias, set_compact_mult
+    set_activation_bias(_sh_bias, _res_bias)
+    set_compact_mult(_compact_mult)
+    print(f"[RENDER] set_activation_bias(sh={_sh_bias}, res={_res_bias})  "
+          f"set_compact_mult({_compact_mult})")
+
+    # SB params (only present if training used --feature beta).
+    sb_params = None
+    sb_number = int(bake_meta_render.get("sb_number", 0))
+    sb_file = bake_meta_render.get("sb_params_file")
+    if sb_number > 0 and sb_file is not None:
+        sb_path = os.path.join(output_dir, sb_file)
+        if os.path.exists(sb_path):
+            sb_t = torch.load(sb_path).float().cuda().contiguous()
+            sb_params = sb_t.reshape(-1).contiguous()  # [N*K*6]
+            print(f"[RENDER] Loaded SB params: shape={list(sb_t.shape)} (K={sb_number} lobes)")
+        else:
+            print(f"[RENDER] bake_meta referenced {sb_file} but file missing; SB disabled.")
+            sb_number = 0
 
     atlas_mb = atlas_tex.nelement() * 2 / 1024 / 1024
     print(f"[RENDER] {N:,} Gaussians, atlas {atlas_tex.shape[0]}x{atlas_tex.shape[1]} ({atlas_mb:.1f} MB)")
@@ -571,7 +718,8 @@ def main():
     sh_metrics = evaluate_baked(
         test_cameras, gaussians, bg_color, beta, kernel_type,
         num_warmup=bargs.num_warmup, num_benchmark=bargs.num_benchmark,
-        save_dir=sh_save_dir, aabb_mode=bargs.aabb_mode)
+        save_dir=sh_save_dir, aabb_mode=bargs.aabb_mode,
+        sb_params=sb_params, sb_number=sb_number)
 
     # --- SH + Atlas residual ---
     atlas_save_dir = os.path.join(render_dir, "sh_atlas")
@@ -581,7 +729,8 @@ def main():
         atlas_texture=atlas_texture, atlas_rects=atlas_rects_gpu,
         atlas_width=atlas_width,
         num_warmup=bargs.num_warmup, num_benchmark=bargs.num_benchmark,
-        save_dir=atlas_save_dir, aabb_mode=bargs.aabb_mode)
+        save_dir=atlas_save_dir, aabb_mode=bargs.aabb_mode,
+        sb_params=sb_params, sb_number=sb_number)
 
     # =====================================================================
     # 4. Summary

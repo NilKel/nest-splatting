@@ -1107,6 +1107,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 active_levels = ingp.set_active_levels(iteration)
                 optim_ngp = True
                 optim_gaussian = ingp.optim_gaussian
+
             if iteration % surfel_cfg.update_interval == 0 and optim_gaussian \
                 and beta < surfel_cfg.tg_beta and active_levels == cfg_model.encoding.levels:
                 
@@ -1425,10 +1426,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if args.scale_reg > 0:
                 mcmc_scale_reg = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
 
-        # --feature voronoi: L1 loss on SV colors (sparsification) to match sphericalvoronoi reference
+        # --feature voronoi / SV: L1 loss on SV colors (sparsification) to match
+        # sphericalvoronoi/radiance. Reference applies it ONLY inside the
+        # densification window: `densify_from_iter < iter < densify_until_iter`
+        # (radiance/train.py:134-139). Outside that window the L1 is silent so
+        # colors can grow back if needed.
+        # NB: in the reference, l_l1 is 1e-5 for blender/db/tandt and 0 for
+        # indoor/outdoor — pass --sv_l1 0 when training on indoor/outdoor scenes.
         sv_l1_loss = torch.tensor(0.0, device="cuda")
-        if args.feature == "voronoi" and args.sv_l1 > 0 and gaussians._sv_colors.numel() > 0:
-            sv_l1_loss = args.sv_l1 * gaussians._sv_colors.abs().sum(dim=-1).mean()
+        if args.feature in ("voronoi", "SV") and args.sv_l1 > 0 and gaussians._sv_colors.numel() > 0:
+            in_densify_window = opt.densify_from_iter < iteration < opt.densify_until_iter
+            if in_densify_window:
+                sv_l1_loss = args.sv_l1 * gaussians._sv_colors.abs().sum(dim=-1).mean()
 
         # Adaptive_cat entropy regularization - encourage binary blend weights (0 or 1)
         adaptive_cat_reg_loss = torch.tensor(0.0, device="cuda")
@@ -1515,7 +1524,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Applied only in the last shape_iter iterations (or always if shape_iter == 0)
         shape_reg_loss = torch.tensor(0.0, device="cuda")
         shape_phase_active = args.shape_iter == 0 or iteration > (opt.iterations - args.shape_iter)
-        if args.kernel in ["beta", "beta_scaled"] and args.lambda_shape > 0 and shape_phase_active and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+        # --w_lambda: error-guided version of lambda_shape. Mirrors --w_normal's logic.
+        # Weight = exp(-γ · mean_per_pixel_MSE): low loss → full penalty (push flat),
+        # high loss → relax (let the kernel stay soft where detail needs it).
+        # Overrides the static lambda_shape path when active.
+        _w_lambda_active = (args.w_lambda > 0.0 and shape_phase_active
+                            and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0
+                            and args.kernel in ["beta", "beta_scaled", "general"])
+        if _w_lambda_active:
+            mse_per_pixel_s = ((image - gt_image) ** 2).mean(dim=0, keepdim=True).detach()
+            w_s = torch.exp(-args.w_lambda_gamma * mse_per_pixel_s).mean()
+            if args.kernel in ["beta", "beta_scaled"]:
+                # Push β toward 0 (flat disks), same direction as lambda_shape.
+                shape_reg_loss = args.w_lambda * w_s * gaussians.get_shape.mean()
+            else:  # general kernel: push β toward 8 (flat/super-Gaussian box).
+                shape_reg_loss = args.w_lambda * w_s * (8.0 - gaussians.get_shape).mean()
+        elif args.kernel in ["beta", "beta_scaled"] and args.lambda_shape > 0 and shape_phase_active and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
             # L1 penalty on shape values - pushes toward 0 (hard disks)
             shape_reg_loss = args.lambda_shape * gaussians.get_shape.mean()
 
@@ -1533,7 +1557,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Modes: basic (constant), decay (linear decay), scaled (by RGB loss), scaled_decay (both)
         # Applied only in the last shape_iter iterations (or always if shape_iter == 0)
         general_beta_reg_loss = torch.tensor(0.0, device="cuda")
-        if args.kernel == "general" and args.lambda_shape != 0 and shape_phase_active and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+        # Skip static general-beta reg when --w_lambda is driving the penalty (above).
+        if args.kernel == "general" and args.lambda_shape != 0 and shape_phase_active and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0 and not _w_lambda_active:
             effective_lambda = args.lambda_shape
 
             # Apply decay if requested
@@ -1745,6 +1770,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # Add general kernel beta stats to progress bar
                 if args.w_normal > 0.0 and normal_loss.item() > 0:
                     loss_dict["wN"] = f"{normal_loss.item():.5f}"
+                if args.w_lambda > 0.0 and shape_reg_loss.item() != 0.0:
+                    loss_dict["wλ"] = f"{shape_reg_loss.item():.5f}"
                 if args.overdraw_reg > 0.0:
                     od_map = render_pkg.get('render_overdraw')
                     if od_map is not None:
@@ -2092,6 +2119,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         size_threshold = 20 if iteration > opacity_reset_interval else None
                         gaussians.densify_and_prune(densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold, \
                         appearance_update_threshold, active_levels, densify_tag = (iteration < opt.densify_until_iter), prune_tag = prune_tag)
+
+                        # --feature SV: refresh per-site eval mask after densify
+                        # (matches reference's `update_sites_mask()` cadence — called
+                        # inside the densify cycle of radiance/train.py:181).
+                        if args.feature == "SV":
+                            gaussians.update_sites_mask()
                     
                     if not args.mini and not args.fastgs and (iteration % opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter)):
                         if iteration <= cfg_model.training_cfg.reset_until_iter:
@@ -4348,8 +4381,8 @@ if __name__ == "__main__":
     # --feature beta: view-dependent color function. Default 'sh' = spherical harmonics
     # (current behavior). 'beta' = spherical-beta lobes as in beta-splatting paper.
     parser.add_argument("--feature", type=str, default="sh",
-                        choices=["sh", "beta", "sg", "voronoi"],
-                        help="View-dependent color: 'sh' (spherical harmonics, default), 'beta' (spherical-beta), 'sg' (MEGS-2 spherical Gaussians), or 'voronoi' (spherical voronoi: softmax-weighted lobes, L2-dist logits)")
+                        choices=["sh", "beta", "sg", "voronoi", "SV"],
+                        help="View-dependent color: 'sh' (spherical harmonics, default), 'beta' (spherical-beta), 'sg' (MEGS-2 spherical Gaussians), 'voronoi' (legacy hybrid SH+SV, additive on top of SH-DC), or 'SV' (reference-faithful Spherical Voronoi: SV-only color, pcd-RGB init, no SH-DC, no bias — matches sphericalvoronoi/radiance).")
     parser.add_argument("--sv_l1", type=float, default=1e-5,
                         help="L1 regularization on _sv_colors (sphericalvoronoi default 1e-5 for NeRF-synthetic, 0 for indoor/outdoor).")
     parser.add_argument("--sites_lr", type=float, default=5e-2,
@@ -4363,6 +4396,15 @@ if __name__ == "__main__":
                              "Cosine avoids L2's sqrt gradient blowup near alignment.")
     parser.add_argument("--sv_color_lr", type=float, default=1.25e-4,
                         help="--feature voronoi LR for _sv_colors (reference blender config: 0.000125).")
+    parser.add_argument("--sv_dc", action="store_true",
+                        help="--feature SV: add an explicit per-Gaussian view-independent "
+                             "DC channel [N, 3]. SV becomes a directional residual on top. "
+                             "Inits _sv_dc to pcd RGB and _sv_colors to zeros so the Gaussian "
+                             "starts at its pcd color. Diverges from the strict reference "
+                             "(which has no DC term) — opt-in.")
+    parser.add_argument("--sv_dc_lr", type=float, default=2.5e-3,
+                        help="--feature SV + --sv_dc: LR for _sv_dc. Default matches the "
+                             "reference's sh_lr (0.0025).")
     parser.add_argument("--sb_number", type=int, default=2,
                         help="--feature beta: number of spherical beta primitives per Gaussian (K). Default 2")
     parser.add_argument("--sb_params_lr", type=float, default=0.0025,
@@ -4625,6 +4667,14 @@ if __name__ == "__main__":
                         help="Weighted normal consistency lambda. Error-guided: relaxes where RGB error is high (0 = use lambda_normal instead)")
     parser.add_argument("--w_normal_gamma", type=float, default=50.0,
                         help="Gamma for weighted normal: w(r) = exp(-gamma * MSE(r)). Higher = more aggressive relaxation.")
+    parser.add_argument("--w_lambda", type=float, default=0.0,
+                        help="Weighted shape regularization lambda (error-guided lambda_shape). "
+                             "Effective penalty = lambda · exp(-gamma · mean_MSE) · shape_direction. "
+                             "Pushes β toward 0 (flat disk) for beta/beta_scaled, toward 8 (flat box) "
+                             "for general. Relaxes where photometric error is high so detail regions "
+                             "can keep their soft kernels. 0 = disabled (fall back to static lambda_shape).")
+    parser.add_argument("--w_lambda_gamma", type=float, default=50.0,
+                        help="Gamma for weighted shape: w = exp(-gamma · MSE). Higher = sharper relaxation.")
 
     # Separated depth sort: pre-sort Gaussians by depth, then sort expanded list by tile_id only
     parser.add_argument("--depth_sort", action="store_true",

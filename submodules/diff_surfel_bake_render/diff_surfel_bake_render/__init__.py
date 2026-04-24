@@ -40,12 +40,14 @@ def rasterize_gaussians(
     scales, rotations, settings,
     shapes=None, kernel_type=0, residual_textures=None,
     atlas_texture=None, atlas_rects=None, atlas_width=0,
+    sb_params=None, sb_number=0,
 ):
     return _RasterizeGaussians.apply(
         means3D, means2D, sh, colors_precomp, opacities,
         scales, rotations, settings,
         shapes, kernel_type, residual_textures,
         atlas_texture, atlas_rects, atlas_width,
+        sb_params, sb_number,
     )
 
 
@@ -56,6 +58,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         scales, rotations, settings,
         shapes, kernel_type, residual_textures,
         atlas_texture, atlas_rects, atlas_width,
+        sb_params, sb_number,
     ):
         if shapes is None:
             shapes = torch.Tensor([]).cuda()
@@ -65,6 +68,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             atlas_texture = torch.Tensor([]).half().cuda()
         if atlas_rects is None:
             atlas_rects = torch.Tensor([]).float().cuda()
+        if sb_params is None:
+            sb_params = torch.Tensor([]).float().cuda()
 
         buffers = _get_buffers(means3D.device)
 
@@ -95,6 +100,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             atlas_rects,
             atlas_width,
             settings.aabb_mode,
+            sb_params,
+            sb_number,
             buffers['geom'],
             buffers['binning'],
             buffers['img'],
@@ -134,7 +141,8 @@ class GaussianRasterizer(nn.Module):
     def forward(self, means3D, means2D, opacities, shs=None, colors_precomp=None,
                 scales=None, rotations=None, shapes=None, kernel_type=0,
                 residual_textures=None,
-                atlas_texture=None, atlas_rects=None, atlas_width=0):
+                atlas_texture=None, atlas_rects=None, atlas_width=0,
+                sb_params=None, sb_number=0):
 
         settings = self.raster_settings
 
@@ -155,4 +163,46 @@ class GaussianRasterizer(nn.Module):
             scales, rotations, settings,
             shapes, kernel_type, residual_textures,
             atlas_texture, atlas_rects, atlas_width,
+            sb_params, sb_number,
         )
+
+
+def set_activation_bias(sh_bias=0.5, res_bias=0.0):
+    """Mirror diff_surfel_3D_sh_res.set_activation_bias on the baked renderer."""
+    _C.set_activation_bias(float(sh_bias), float(res_bias))
+
+
+def set_compact_mult(val=1.0):
+    """FastGS Compact Box multiplier on the baked AdR cutoff. val=1.0 disables the shrink."""
+    _C.set_compact_mult(float(val))
+
+
+def clear_atlas_cache():
+    """Release all cached uint8 atlases and their cudaTextureObject_t handles.
+
+    Call this if you load a new/different atlas between renders, or at shutdown.
+    Safe to call repeatedly.
+    """
+    _C.clear_atlas_cache()
+
+
+def set_atlas_use_uint8(val=True):
+    """Switch atlas hardware-texture encoding.
+
+    True (default)  → uint8-quantized (~±6σ), ¼ memory, hw bilinear.
+    False           → half4 (lossless vs training FP16 storage), larger memory.
+
+    Flushes the atlas cache so the next render rebuilds with the chosen format.
+    """
+    _C.set_atlas_use_uint8(bool(val))
+
+
+def set_use_atlas_tex_object(val=True):
+    """Switch between hardware texture object path (default) and the pre-texture
+    software path (raw FP16 global-memory reads + manual bilinear math in the
+    render kernel).
+
+    True  → hw texture (fast, uses texture cache + hw bilinear).
+    False → software bilinear (legacy path; useful for A/B benchmarking).
+    """
+    _C.set_use_atlas_tex_object(bool(val))

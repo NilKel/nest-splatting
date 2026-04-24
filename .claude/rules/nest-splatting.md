@@ -544,3 +544,48 @@ Standard 2DGS accumulates `dL_dmean2D.xy` for densification decisions, but per-p
 
 ### `--detach_hash_grad` Semantics
 Zeros `dL_dxyz` from the hash backward in CUDA. Effect: hash spatial derivatives can't push Gaussian xyz/scale/rotation. Hash table features and MLP weights still update normally. Hash `dL_dxyz` does NOT flow to opacity (opacity gradient comes from `dL_dalpha * G(u,v)` which is independent of the hash backward).
+
+## Warp-Reduced Per-Gaussian Atomics + Tile-Level Early-Out (2026-04, mode 5/6 GEMM path)
+
+Atomic-contention optimization for the backward pass in `diff_surfel_3D_sh_res`. Only touches the collaborative-GEMM path (`render_mode & 0x100`); the non-GEMM fallback in the same kernel is unchanged. Motivated by the FastGS / Taming-3DGS per-splat refactor, but applied *without* flipping the parallelization scheme — it stays pixel-parallel so the existing tile-level MLP weight GEMM (sub-tile matmul in shared memory, one atomic flush per tile per W element) keeps its locality advantage.
+
+### What we had before
+- Kernel is pixel-parallel (1 thread = 1 pixel, 256 threads/tile) — confirmed per-pixel in `renderCUDAsurfelBackward` ([backward.cu:669](submodules/diff_surfel_3D_sh_res/cuda_rasterizer/backward.cu#L669)).
+- GEMM path iterates synchronously over Gaussians in a tile batch ([backward.cu:1024](submodules/diff_surfel_3D_sh_res/cuda_rasterizer/backward.cu#L1024)). All 256 threads process the same Gaussian `j` together.
+- Each participating pixel fired `atomicAdd(&dL_d*[global_id…], val)` on every per-Gaussian field. With up to 256 participating threads all hitting the same address, this was the dominant contention path. Fields hit per Gaussian per tile: `dL_dopacity` (1), `dL_dcolors` (3), `dL_dnormal3D` (3), `dL_dtransMat` (9), `dL_dmean2D` (4 incl. AbsGS abs), `dL_dhomoMat` (9 when homotrans), `dL_dshapes` (1–2 depending on kernel). ~30 reducible atomic slots × 256 threads = ~7.5K atomics per Gaussian per tile.
+- Ballot-based per-Gaussian skip existed (`__syncthreads_count(participates)`, [backward.cu:1036](submodules/diff_surfel_3D_sh_res/cuda_rasterizer/backward.cu#L1036)) to avoid entering the inner loop body when no pixel contributed, but SMEM loads happened regardless of whether the whole *batch* was relevant.
+
+### What changed
+1. **Warp-reduced per-Gaussian atomics** ([backward.cu:~1583-1655](submodules/diff_surfel_3D_sh_res/cuda_rasterizer/backward.cu#L1583)). Inside the synchronized j-loop body, every per-Gaussian `atomicAdd` now writes to a register-local `acc_*` accumulator (initialized to 0 at the top of the j iteration). After `if (participates)` closes, all 32 lanes of each warp call `cg::reduce(warp, acc_*, cg::plus<float>())` to sum across the warp, and only lane 0 fires `atomicAdd` to global memory. BLOCK_SIZE=256 → NUM_WARPS=8 → **256 atomics per field per Gaussian drops to 8**. Non-participating threads contribute 0 to the reduction (branch-free). All lanes reach the reduction site because the ballot `continue` happens at the top of the j iteration, not inside.
+
+2. **Tile-level `last_contributor` max early-out** ([backward.cu:~955-985](submodules/diff_surfel_3D_sh_res/cuda_rasterizer/backward.cu#L955)). Once at kernel start, compute `tile_max_last_contrib = max over pixels of last_contributor` via shared-memory `atomicMax` (256 SMEM atomics, one-time). In the main rounds loop, before the SMEM prefetch, check whether the *lowest* Gaussian-contributor-index in the upcoming batch (`contributor - effective_toDo`) is already ≥ `tile_max_last_contrib`; if so, **skip the entire batch**: no SMEM load, no j-loop body, no profiling noise. Equivalent to FastGS's `max_contrib[tile_id]` bucket-skip, scoped to our tile/batch layout.
+
+### What is NOT changed
+- **MLP weight gradients** (`dL_dmlp_W1/W2/W3`): still routed through the collaborative WMMA GEMMs (`wmma_gemm_layer1/2/3`) accumulating into shared `tile_dL_dW*`, flushed once per tile via `flush_tile_mlp_grads` at [backward.cu:~2623](submodules/diff_surfel_3D_sh_res/cuda_rasterizer/backward.cu#L2623). This produces one atomic per W element per tile — strictly better than per-splat would, since there are many more splats than tiles. **Do not move these into the warp reduction.**
+- **Hash-table gradients** (`dL_dfeatures`, the 2^19 × 4D table scattered inside `query_feature<true>`): different pixels hit different hash cells, so warp-reduction doesn't apply. Left as pixel-level atomicAdds.
+- **Non-GEMM path** in the same kernel (`render_mode & 0x100 == 0`): untouched. Old per-pixel atomicAdds preserved.
+- **Preprocess kernels** (`transMat_to_scale_rot_grad_kernel`, etc.): already per-Gaussian, no contention.
+
+### Atomic count math (per Gaussian per tile, GEMM path, 256-pixel tile, rho3d branch representative)
+| Field | Slots | Before (atomics) | After (atomics) |
+|---|---|---|---|
+| dL_dopacity | 1 | 256 | 8 |
+| dL_dcolors | 3 | 768 | 24 |
+| dL_dnormal3D | 3 | 768 | 24 |
+| dL_dtransMat | 9 | 2304 | 72 |
+| dL_dmean2D (abs channels) | 2 | 512 | 16 |
+| dL_dhomoMat | 9 | 2304 | 72 |
+| dL_dshapes | 1 | 256 | 8 |
+| **Total** |  | **~7.2K** | **~224** |
+
+~32× reduction, and collisions on each address drop from "up to 32 lanes in the same warp step" to "one lane per warp" (8 warps spread across SM schedules).
+
+### Correctness notes
+- `cg::reduce` is a warp-level collective — requires all 32 lanes in the warp to arrive. The j-loop body is entered by all 256 threads (the ballot `continue` happens *before* the body), so this is safe. Divergent branches inside (`rho3d <= rho2d`, `render_mode & 0x400` lowpass, `kernel_type == 5`) write to *different slots* of the same accumulator array; unwritten slots stay 0 and contribute 0 to their reduction — no duplication or loss.
+- `dL_dhomoMat` and `dL_dshapes` can be nullptr for some kernel configs; reduction code guards on those pointers before issuing the atomic (only lane 0 does the guarded atomic, to avoid warp divergence during the reduce call itself — the reduce happens unconditionally).
+- `dL_dmean2D` is `float4` (AbsGS); .x/.y come from rho2d branch only, .z/.w are the abs accumulators written by both branches. Same accumulator array handles both.
+- Numerical differences from reordered float addition are ~1e-6 relative (float-associativity).
+
+### Files touched
+- [backward.cu](submodules/diff_surfel_3D_sh_res/cuda_rasterizer/backward.cu) — `renderCUDAsurfelBackward` only. `auto warp = cg::tiled_partition<32>(block)` at kernel top; `s_tile_max_last_contrib` SMEM + compute just before the rounds loop; batch early-out inside the rounds loop before SMEM prefetch; accumulator decls at the top of the j-body; atomicAdds → `acc_*` writes throughout the j-body; warp-reduce + lane-0 atomicAdd block just after the `if (participates)` closes, before the profiling sync.
+- No header / signature changes. No new kernel launch params. No Python-side changes.

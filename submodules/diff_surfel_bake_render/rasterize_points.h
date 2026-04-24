@@ -36,10 +36,28 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& atlas_rects,        // [N, 4] float atlas UV rects (empty if not atlas mode)
 	const int atlas_width,                   // atlas dimension (0 if not atlas mode)
 	const int aabb_mode,                     // 0=square, 1=square+AdR, 2=rect, 3=rect+AdR
+	// Optional Spherical-Beta params [N, K, 6], K=sb_number (empty if SB disabled)
+	const torch::Tensor& sb_params,
+	const int sb_number,
 	// Persistent buffers — pass empty on first call, reused on subsequent calls
 	torch::Tensor geomBuffer,
 	torch::Tensor binningBuffer,
 	torch::Tensor imgBuffer);
+
+// Device-global setters mirroring training-time setters.
+void SetActivationBiasBakeCUDA(float sh_bias, float res_bias);
+void SetCompactMultBakeCUDA(float val);
+
+// Frees the cached cudaArrays + cudaTextureObjects for all atlases seen so far.
+void ClearAtlasCacheCUDA();
+
+// Switch atlas encoding: true = uint8 quantized (smaller, hw bilinear), false = half4 (lossless).
+// Flushes the cache so next render rebuilds with the chosen format.
+void SetAtlasUseUint8CUDA(bool val);
+
+// Runtime toggle: hardware texture object (true, default) vs pre-texture
+// software path (false — raw FP16 global reads + manual bilinear in kernel).
+void SetUseAtlasTexObjectCUDA(bool val);
 
 torch::Tensor markVisible(
 	torch::Tensor& means3D,

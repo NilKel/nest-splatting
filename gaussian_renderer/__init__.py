@@ -186,6 +186,46 @@ def eval_voronoi(sv_sites: torch.Tensor, sv_colors: torch.Tensor,
     return torch.clamp_min(V, 0.0)
 
 
+def eval_voronoi_sv(sv_sites: torch.Tensor, sv_colors: torch.Tensor,
+                    view_dirs: torch.Tensor,
+                    sites_mask: torch.Tensor = None,
+                    sv_dc: torch.Tensor = None) -> torch.Tensor:
+    """Reference-faithful Spherical Voronoi evaluation (sphericalvoronoi/radiance).
+
+    Returns SV color per Gaussian. Caller passes the output as `colors_precomp`
+    to the rasterizer (vanilla) or into the SH-DC slot via `_build_fake_shs_from_SV`.
+
+    Args:
+        sv_sites:   [N, K, 3] raw direction vectors (magnitude = τ).
+        sv_colors:  [N, K, 3] per-site RGB.
+        view_dirs:  [N, 3]    unit view direction per Gaussian.
+        sites_mask: [N, K] bool — sites where False are pushed to a far direction
+                    so their softmax weight ≈ 0. Mirrors the reference's eval-time
+                    `_nn_sites[~mask] = 1e8` trick.
+        sv_dc:      [N, 3] (optional) per-Gaussian view-independent RGB added on
+                    top of the softmax-mixed SV. Turns SV into a *directional
+                    residual* on top of an explicit diffuse channel. Init
+                    convention: `sv_dc = pcd RGB`, `sv_colors = 0`, so the
+                    Gaussian starts at its pcd color and SV learns the delta.
+                    Diverges from the strict reference (which has no DC) — see
+                    --sv_dc flag.
+    """
+    tau = torch.norm(sv_sites, dim=-1)                                      # [N, K]
+    site_dirs = sv_sites / (tau.unsqueeze(-1) + 1e-12)                      # [N, K, 3]
+    if sites_mask is not None:
+        # Push masked-out sites to a far point so distance → ∞ → softmax weight ≈ 0.
+        far = torch.full_like(site_dirs, 1e8)
+        site_dirs = torch.where(sites_mask.unsqueeze(-1), site_dirs, far)
+    diff = site_dirs - view_dirs.unsqueeze(1)                               # [N, K, 3]
+    dist = torch.norm(diff, dim=-1)                                         # [N, K]
+    logits = -tau * dist                                                    # [N, K]
+    W = torch.softmax(logits, dim=-1).unsqueeze(-1)                         # [N, K, 1]
+    V = (W * sv_colors).sum(dim=1)                                          # [N, 3]
+    if sv_dc is not None:
+        V = V + sv_dc
+    return torch.clamp_min(V, 0.0)
+
+
 def _build_fake_shs_from_voronoi(pc, view_dirs, max_sh_degree, sh_bias: float = 0.5,
                                   metric: str = "l2"):
     """Hybrid SH-DC + SV. SH degree-0 (DC) carries the view-independent base color;
@@ -201,6 +241,46 @@ def _build_fake_shs_from_voronoi(pc, view_dirs, max_sh_degree, sh_bias: float = 
     fake[:, 0, :] = real_shs[:, 0, :] + sv_rgb / _SH_C0  # DC + SV/SH_C0
     # fake[:, 1:, :] stays zero — higher-order SH disabled
     return fake
+
+
+def _build_fake_shs_from_SV(pc, view_dirs):
+    """Reference-faithful SV via fake-SH injection.
+
+    Plumbs the SV color into the SH-DC channel so any rasterizer that reads
+    `_effective_shs()` (3D_SH_res, 3D_SH_cat, baseline SH, ...) renders SV as
+    if it were the diffuse component:
+
+        SH_eval(view)  = SH_C0 * fake_dc + sum(higher-order)
+                       = SH_C0 * (sv_rgb / SH_C0) + 0
+                       = sv_rgb
+
+    Real `_features_dc` is intentionally ignored — this is the SV-only path
+    (vs. `_build_fake_shs_from_voronoi` which adds SV on top of real DC). The
+    rasterizer adds its sh_bias and any hash MLP residual on top; for the
+    closest match to sphericalvoronoi/radiance, set --activation_bias 0.0 0.0
+    and run with the hash MLP cold (or via vanilla 2DGS where colors_precomp
+    bypasses the SH path entirely).
+    """
+    _sv_mask = getattr(pc, '_sv_mask', None)
+    apply_mask = (
+        _sv_mask is not None
+        and (not getattr(pc, '_sv_training_flag', True))
+        and _sv_mask.shape[0] == pc._sv_sites.shape[0]
+    )
+    # --sv_dc (optional): per-Gaussian diffuse RGB added on top of SV. See
+    # eval_voronoi_sv docstring for init convention.
+    _sv_dc = getattr(pc, '_sv_dc', None)
+    if _sv_dc is not None and _sv_dc.numel() == 0:
+        _sv_dc = None
+    sv_rgb = eval_voronoi_sv(
+        pc._sv_sites, pc._sv_colors, view_dirs,
+        sites_mask=(_sv_mask if apply_mask else None),
+        sv_dc=_sv_dc,
+    )
+    real_shs = pc.get_features                                              # [N, M, 3]
+    fake = real_shs.new_zeros(real_shs.shape)
+    fake[:, 0, :] = sv_rgb / _SH_C0  # DC slot only — higher-order SH stays 0
+    return fake, sv_rgb
 
 
 def _build_fake_shs_from_sg(pc, view_dirs, max_sh_degree, sh_bias: float = 0.5):
@@ -721,6 +801,26 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                                                           sh_bias=_sh_bias_local,
                                                           metric=sv_metric)
 
+    # --feature SV: reference-faithful Spherical Voronoi (sphericalvoronoi/radiance).
+    # Wires SV into both rasterizer color paths so it works regardless of method:
+    #   • SH path (3D_SH_res / 3D_SH_cat / baseline-with-SH / ...): bake SV into
+    #     fake_shs DC slot via `_build_fake_shs_from_SV` so SH_eval(view) outputs
+    #     sv_rgb. Real `_features_dc` is ignored. Visible in `sh_only` decompose.
+    #   • Vanilla colors_precomp path (no ingp): set `override_color = sv_rgb`
+    #     so the rasterizer uses RGB directly (no bias, no SH). This is the
+    #     closest reference match.
+    # The `_sites_mask` (if populated) is applied at eval only, mirroring the
+    # reference's `_nn_sites[~mask] = 1e8`. NB: under 3D_SH_* the rasterizer
+    # still adds sh_bias and hash MLP residual on top of SV — pass
+    # `--activation_bias 0.0 0.0` for the cleanest match.
+    if _fm == "SV" and pc._sv_sites.numel() > 0:
+        with torch.no_grad():
+            _cam_center = viewpoint_camera.camera_center.to(means3D.device)
+        _dirs_sv = means3D - _cam_center.unsqueeze(0)
+        _dirs_sv = _dirs_sv / (_dirs_sv.norm(dim=-1, keepdim=True) + 1e-8)
+        pc._beta_fake_shs, _sv_rgb = _build_fake_shs_from_SV(pc, _dirs_sv)
+        override_color = _sv_rgb
+
     def _effective_shs():
         """Return directional-lobe-derived fake SH if --feature beta/sg, else real SH."""
         if pc._beta_fake_shs is not None:
@@ -811,7 +911,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if not is_3D_mode and not is_3D_direct_mode:
         max_intersections_per_pixel = 0  # Disabled for non-3D modes
 
-    if ingp is not None and hash_in_CUDA == False and not is_diffuse_mode and not is_specular_mode and not is_diffuse_ngp_mode and not is_diffuse_offset_mode and not is_3D_mode and not is_3D_direct_mode and not is_3D_direct_fused_mode:
+    if ingp is not None and hash_in_CUDA == False and not is_diffuse_mode and not is_specular_mode and not is_diffuse_ngp_mode and not is_diffuse_offset_mode and not is_3D_mode and not is_3D_direct_mode and not is_3D_direct_fused_mode and _fm != "SV":
         ### warm-up
         override_color = ingp(points_3D = means3D, with_xyz = False).float()
         feat_dim = ingp.active_levels * ingp.level_dim

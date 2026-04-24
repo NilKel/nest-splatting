@@ -10,6 +10,14 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+// Mirrors the training-time activation constants in diff_surfel_3D_sh_res.
+// Set via FORWARD::setActivationBias / FORWARD::setCompactMult from Python.
+// Defaults match the training defaults (sh_bias=0.5, res_bias=0.0 under 3D_SH_res;
+// we use 0.5 here because the legacy bake pipeline always applied +0.5 to SH).
+__device__ float d_sh_bias = 0.5f;
+__device__ float d_res_bias = 0.0f;
+__device__ float d_compact_mult = 1.0f;
+
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.
 __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
@@ -52,12 +60,42 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 			}
 		}
 	}
-	result += 0.5f;
+	result += d_sh_bias;
 
 	clamped[3 * idx + 0] = (result.x < 0);
 	clamped[3 * idx + 1] = (result.y < 0);
 	clamped[3 * idx + 2] = (result.z < 0);
 	return glm::max(result, 0.0f);
+}
+
+// Spherical-Beta (SB) evaluation — matches eval_sb in Python (gaussian_renderer/__init__.py).
+// sb_params: [K, 6] per-Gaussian block: (r, g, b, theta, phi, beta_raw).
+// Returns summed RGB lobe contribution for one Gaussian under view_dir.
+__device__ glm::vec3 eval_sb(const float* sb_params, int K, const glm::vec3 view_dir)
+{
+	const float softplus_scale = 10.0f * 0.693147f;  // 10 * ln(2) — matches Python.
+	glm::vec3 rgb_sum = glm::vec3(0.0f);
+	for (int k = 0; k < K; ++k) {
+		const float* p = sb_params + k * 6;
+		float r = p[0], g = p[1], b = p[2];
+		float theta = p[3], phi = p[4], beta_raw = p[5];
+		// Per-primitive beta = 4 * exp(beta_raw). Matches reference.
+		float beta = 4.0f * __expf(beta_raw);
+		// Steep softplus activation on RGB.
+		float sr = __logf(1.0f + __expf(softplus_scale * r)) / softplus_scale;
+		float sg = __logf(1.0f + __expf(softplus_scale * g)) / softplus_scale;
+		float sb_ = __logf(1.0f + __expf(softplus_scale * b)) / softplus_scale;
+		// Direction from (theta, phi).
+		float st = __sinf(theta), ct = __cosf(theta);
+		float sp = __sinf(phi),   cp = __cosf(phi);
+		glm::vec3 mu = glm::vec3(st * cp, st * sp, ct);
+		float dot = glm::dot(mu, view_dir);
+		if (dot > 0.0f) {
+			float w = __powf(dot, beta);
+			rgb_sum += glm::vec3(sr * w, sg * w, sb_ * w);
+		}
+	}
+	return rgb_sum;
 }
 
 // Compute a 2D-to-2D mapping matrix from a tangent plane into an image plane
@@ -224,37 +262,52 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float cutoff;
 	bool is_beta_kernel = (kernel_type >= 1 && kernel_type <= 4);
 
+	// Cutoff selection mirrors diff_surfel_3D_sh_res/forward.cu ~L600 branches.
+	// Matching training exactly is critical: even subtle cutoff differences cause
+	// multiplicative dimming (we've observed ~16% at mode=2 + beta_scaled).
+	bool use_beta_fixed = (aabb_mode == 4);  // aabb=beta: deliberate tight support
 	if (use_adr && is_beta_kernel && shapes != nullptr) {
-		// AdR: per-Gaussian adaptive cutoff from opacity and shape
-		float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
+		// Mode 1/3 + beta: AdR for beta kernel with Gaussian-low-pass max-pool.
 		float k = (kernel_type == 4) ? 3.0f : 1.0f;
 
 		float opacity_val = opacities[idx];
 		float shape = shapes[idx];
 
-		if (opacity_val < (1.0f / 255.0f)) {
-			return;
-		}
+		if (opacity_val < (1.0f / 255.0f)) return;
 
 		float ratio = 1.0f / (255.0f * opacity_val);
 		float r_beta = 0.0f;
 		float threshold = powf(ratio, 1.0f / shape);
-		if (threshold < 1.0f) {
-			r_beta = k * sqrtf(1.0f - threshold);
-		}
+		if (threshold < 1.0f) r_beta = k * sqrtf(1.0f - threshold);
+
+		// IMPORTANT: training's beta-AdR branch leaves r_lp unmodified.
+		// d_compact_mult is only applied to the pure-Gaussian branch below.
 		float r_lp = 0.0f;
 		float log_term = logf(255.0f * opacity_val);
-		if (log_term > 0.0f) {
-			r_lp = sqrtf(2.0f * log_term);
-		}
+		if (log_term > 0.0f) r_lp = sqrtf(2.0f * log_term);
+
 		cutoff = fmaxf(r_beta, r_lp);
 		cutoff = fminf(cutoff, k + 2.0f);
-	} else if (is_beta_kernel) {
-		// Fixed conservative cutoff for beta kernels (no AdR)
+	} else if (use_adr) {
+		// Mode 1/3 + Gaussian (no shapes): FastGS Compact Box — only branch
+		// that uses d_compact_mult.
+		float opacity_val = opacities[idx];
+		if (opacity_val < (1.0f / 255.0f)) return;
+
+		float log_term = logf(255.0f * opacity_val);
+		cutoff = (log_term > 0.0f)
+			? sqrtf(2.0f * log_term * d_compact_mult)
+			: 0.1f;
+		cutoff = fminf(cutoff, 4.0f);
+	} else if (use_beta_fixed) {
+		// Mode 4 (aabb=beta) only: deliberate tight cutoff for max-pool compact support.
 		float k = (kernel_type == 4) ? 3.0f : 1.0f;
 		float r_lp_typical = sqrtf(2.0f * logf(127.5f));
 		cutoff = fmaxf(k * 1.1f, r_lp_typical);
 	} else {
+		// Mode 0 (square) / mode 2 (rect) with ANY kernel: fixed 4σ (2DGS default).
+		// The prior "is_beta_kernel → 3.3" fallback was wrong here — training uses 4.0
+		// for these modes regardless of kernel.
 		cutoff = 4.0f;
 	}
 
@@ -330,9 +383,14 @@ renderBakedCUDA(
 	const int residual_dim,                        // 3 (DC) or 48 (full SH)
 	const float* __restrict__ means3D,             // [N, 3] Gaussian centers (for viewdir, nullable)
 	const float* __restrict__ cam_pos,             // [3] camera position (for viewdir, nullable)
-	const __half* __restrict__ atlas_texture,      // [atlas_W * atlas_W * 3] FP16 (nullable)
+	const __half* __restrict__ atlas_texture,      // [atlas_W * atlas_W * 3] FP16 (nullable; kept for back-compat)
 	const float* __restrict__ atlas_rects,         // [N, 4] (u0_px, v0_px, w_px, h_px) (nullable)
-	const int atlas_width)                         // atlas dimension (e.g. 4096)
+	const int atlas_width,                         // atlas dimension (e.g. 4096)
+	const float* __restrict__ sb_params,           // [N, K, 6] SB params (nullable)
+	const int sb_number,                           // K lobes per Gaussian (0 = SB disabled)
+	cudaTextureObject_t atlas_tex_obj,             // hardware texture object for atlas (0 = software path)
+	float atlas_offset,                            // dequantization offset (uint8 atlas)
+	float atlas_scale)                             // dequantization scale  (uint8 atlas)
 {
 	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -497,7 +555,7 @@ renderBakedCUDA(
 				float u_span = atlas_rects[gauss_id * 4 + 2];
 				float v_span = atlas_rects[gauss_id * 4 + 3];
 
-				// Surfel s → atlas pixel coords (texel-center convention)
+				// Surfel s → atlas pixel coords (texel-center convention).
 				// Bake kernel places sample i at s = (i+0.5)*step - E
 				// Inverse: tex_coord = (s+E)/(2E) * G - 0.5
 				float au = u0_px + (s.x + UV_EXTENT) / (2.0f * UV_EXTENT) * u_span - 0.5f;
@@ -505,23 +563,33 @@ renderBakedCUDA(
 				au = fmaxf(u0_px, fminf(u0_px + u_span - 1.001f, au));
 				av = fmaxf(v0_px, fminf(v0_px + v_span - 1.001f, av));
 
-				int au0 = (int)au, av0 = (int)av;
-				float fu = au - au0, fv = av - av0;
-				int au1 = min(au0 + 1, (int)(u0_px + u_span - 1));
-				int av1 = min(av0 + 1, (int)(v0_px + v_span - 1));
-
-				long long idx00 = ((long long)av0 * atlas_width + au0) * 3;
-				long long idx10 = ((long long)av0 * atlas_width + au1) * 3;
-				long long idx01 = ((long long)av1 * atlas_width + au0) * 3;
-				long long idx11 = ((long long)av1 * atlas_width + au1) * 3;
-				for (int ch = 0; ch < 3; ch++) {
-					float c00 = __half2float(atlas_texture[idx00 + ch]);
-					float c10 = __half2float(atlas_texture[idx10 + ch]);
-					float c01 = __half2float(atlas_texture[idx01 + ch]);
-					float c11 = __half2float(atlas_texture[idx11 + ch]);
-					float res = (1-fu)*(1-fv)*c00 + fu*(1-fv)*c10
-					          + (1-fu)*fv*c01 + fu*fv*c11;
-					feat[ch] += fmaxf(0.0f, res);  // ReLU to match training kernel
+				if (atlas_tex_obj != 0) {
+					// Hardware bilinear via texture unit. cudaReadModeNormalizedFloat
+					// returns uint8 as [0, 1]; dequantize via `*scale + offset`.
+					// +0.5 is the pixel-center offset for cudaFilterModeLinear.
+					float4 rgba = tex2D<float4>(atlas_tex_obj, au + 0.5f, av + 0.5f);
+					feat[0] += rgba.x * atlas_scale + atlas_offset;
+					feat[1] += rgba.y * atlas_scale + atlas_offset;
+					feat[2] += rgba.z * atlas_scale + atlas_offset;
+				} else {
+					// Software bilinear fallback (no hardware texture bound).
+					int au0 = (int)au, av0 = (int)av;
+					float fu = au - au0, fv = av - av0;
+					int au1 = min(au0 + 1, (int)(u0_px + u_span - 1));
+					int av1 = min(av0 + 1, (int)(v0_px + v_span - 1));
+					long long idx00 = ((long long)av0 * atlas_width + au0) * 3;
+					long long idx10 = ((long long)av0 * atlas_width + au1) * 3;
+					long long idx01 = ((long long)av1 * atlas_width + au0) * 3;
+					long long idx11 = ((long long)av1 * atlas_width + au1) * 3;
+					for (int ch = 0; ch < 3; ch++) {
+						float c00 = __half2float(atlas_texture[idx00 + ch]);
+						float c10 = __half2float(atlas_texture[idx10 + ch]);
+						float c01 = __half2float(atlas_texture[idx01 + ch]);
+						float c11 = __half2float(atlas_texture[idx11 + ch]);
+						float res = (1-fu)*(1-fv)*c00 + fu*(1-fv)*c10
+						          + (1-fu)*fv*c01 + fu*fv*c11;
+						feat[ch] += res;
+					}
 				}
 			}
 			// Shared mode: fixed 8×8 per-Gaussian texture
@@ -597,10 +665,33 @@ renderBakedCUDA(
 						float c01 = __half2float(residual_textures[base + (v1*8+u0)*3 + ch]);
 						float c11 = __half2float(residual_textures[base + (v1*8+u1)*3 + ch]);
 						float res = w00*c00 + w10*c10 + w01*c01 + w11*c11;
-						feat[ch] += fmaxf(0.0f, res);  // ReLU to match training kernel
+						feat[ch] += res;  // final ReLU + d_res_bias applied once after all residual sources
 					}
 				}
 			}
+
+			// Spherical-Beta (SB) additive contribution if provided.
+			if (sb_params != nullptr && sb_number > 0 && means3D != nullptr && cam_pos != nullptr) {
+				const float* sbp = sb_params + gauss_id * sb_number * 6;
+				// View dir: (cam_pos → Gaussian center). matches training's eval_sb.
+				glm::vec3 gc = glm::vec3(means3D[gauss_id * 3 + 0],
+				                         means3D[gauss_id * 3 + 1],
+				                         means3D[gauss_id * 3 + 2]);
+				glm::vec3 cp = glm::vec3(cam_pos[0], cam_pos[1], cam_pos[2]);
+				glm::vec3 vd = gc - cp;
+				vd = vd / (glm::length(vd) + 1e-8f);
+				glm::vec3 sb_rgb = eval_sb(sbp, sb_number, vd);
+				feat[0] += sb_rgb.x;
+				feat[1] += sb_rgb.y;
+				feat[2] += sb_rgb.z;
+			}
+
+			// Final activation matches training's line 1455:
+			//   color = ReLU(SH_clamped + residual + d_res_bias)
+			// SH_clamped is already in feat[] (precomputed via computeColorFromSH
+			// which uses d_sh_bias). We apply res_bias + final ReLU once here.
+			for (int ch = 0; ch < 3; ch++)
+				feat[ch] = fmaxf(0.0f, feat[ch] + d_res_bias);
 
 			// Alpha compositing
 			for (int ch = 0; ch < 3; ch++)
@@ -659,7 +750,12 @@ void FORWARD::render(
 	const float* cam_pos,
 	const __half* atlas_texture,
 	const float* atlas_rects,
-	const int atlas_width)
+	const int atlas_width,
+	const float* sb_params,
+	const int sb_number,
+	cudaTextureObject_t atlas_tex_obj,
+	float atlas_offset,
+	float atlas_scale)
 {
 	renderBakedCUDA<<<grid, block>>>(
 		ranges, point_list, beta, W, H,
@@ -667,7 +763,23 @@ void FORWARD::render(
 		final_T, n_contrib, bg_color, out_color, out_others,
 		shapes, kernel_type, residual_textures,
 		residual_dim, means3D, cam_pos,
-		atlas_texture, atlas_rects, atlas_width);
+		atlas_texture, atlas_rects, atlas_width,
+		sb_params, sb_number, atlas_tex_obj,
+		atlas_offset, atlas_scale);
+}
+
+// Device-global setters (mirror training-time setters in diff_surfel_3D_sh_res).
+__global__ void setBakeActivationBiasKernel(float sh, float res) {
+	d_sh_bias = sh;
+	d_res_bias = res;
+}
+void FORWARD::setActivationBias(float sh_bias, float res_bias) {
+	setBakeActivationBiasKernel<<<1, 1>>>(sh_bias, res_bias);
+}
+
+__global__ void setBakeCompactMultKernel(float val) { d_compact_mult = val; }
+void FORWARD::setCompactMult(float val) {
+	setBakeCompactMultKernel<<<1, 1>>>(val);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

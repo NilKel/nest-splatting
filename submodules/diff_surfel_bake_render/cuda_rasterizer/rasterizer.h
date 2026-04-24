@@ -8,6 +8,7 @@
 #include <functional>
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_runtime_api.h>  // cudaTextureObject_t
 
 namespace CudaRasterizer
 {
@@ -52,7 +53,12 @@ namespace CudaRasterizer
 			const __half* atlas_texture,
 			const float* atlas_rects,
 			const int atlas_width,
-			const int aabb_mode = 3);
+			const int aabb_mode = 3,
+			const float* sb_params = nullptr,
+			const int sb_number = 0,
+			cudaTextureObject_t atlas_tex_obj = 0,
+			float atlas_offset = 0.0f,
+			float atlas_scale = 1.0f);
 	};
 };
 

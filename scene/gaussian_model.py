@@ -205,15 +205,25 @@ class GaussianModel:
         self._sg_sharpness_sg = torch.empty(0)   # separate from _sb_sharpness
         self._sg_rgb = torch.empty(0)
 
-        # Spherical Voronoi (SV) feature — --feature voronoi
+        # Spherical Voronoi (SV) feature — --feature voronoi (legacy hybrid SH+SV)
+        # and --feature SV (reference-faithful SV-only, sphericalvoronoi/radiance).
         # Per-Gaussian: K sites on sphere, each with an RGB.
         #   _sv_sites   [N, K, 3]  raw 3D vectors (normalized at eval, magnitude = τ).
         #   _sv_colors  [N, K, 3]  per-site RGB (no activation).
+        #   _sv_mask    [N, K]     bool buffer (SV mode only) — sites with zero
+        #                          color get masked at eval (push direction → 1e8).
+        #   _sv_dc      [N, 3]     optional --sv_dc: explicit per-Gaussian
+        #                          view-independent RGB added to SV softmax mix.
         # Color: logits = -τ_k * ||sites_k − view_dir||,  W = softmax(logits),
-        #        V = clamp_min(Σ_k W_k * color_k, 0).
+        #        V = clamp_min(sv_dc + Σ_k W_k * color_k, 0).  (sv_dc optional)
         self.sv_number = 0
         self._sv_sites = torch.empty(0)
         self._sv_colors = torch.empty(0)
+        self._sv_dc = torch.empty(0)
+        self._sv_mask = None
+        # When False, the renderer applies _sv_mask (eval-time sparsification).
+        # train.py flips this around scene.eval calls.
+        self._sv_training_flag = True
 
         # Flex kernel: per-Gaussian learnable beta for Gaussian sharpening
         # softplus(_flex_beta) gives range [0, inf), typically [0, ~50]
@@ -670,6 +680,50 @@ class GaussianModel:
             self._sg_directions = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             self._sg_sharpness_sg = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             self._sg_rgb = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+        elif self.feature_mode == "SV":
+            # Reference-faithful Spherical Voronoi (sphericalvoronoi/radiance).
+            # SV-only color: rendered RGB = clamp_min(softmax(-τ·||s_norm − ω||) · colors, 0).
+            # SH-DC and bias are NOT added — the rasterizer receives `colors_precomp`
+            # directly (shs=None). To force SV to carry the full color signal from
+            # iter 1, sites are fibonacci-distributed and colors are initialized to
+            # the pcd RGB (replicated K times) — matches reference's `_colors` init.
+            #
+            # Optional --sv_dc: add an explicit per-Gaussian diffuse channel.
+            #   color = clamp_min(sv_dc + SV(view), 0)
+            #   Init: sv_dc = pcd RGB, sv_colors = 0 → Gaussian starts at pcd
+            #   color with zero directional residual.
+            # Without --sv_dc (default): matches strict reference (no DC term).
+            self.sv_number = int(getattr(args, 'sb_number', 8))  # reuse --sb_number (default 8)
+            N = fused_point_cloud.shape[0]
+            fib = _fibonacci_sphere(self.sv_number).to("cuda")
+            sites = fib.unsqueeze(0).expand(N, -1, -1).contiguous()
+            self._sv_sites = nn.Parameter(sites.requires_grad_(True))
+            pcd_rgb = torch.tensor(np.asarray(pcd.colors), dtype=torch.float, device="cuda")
+            _use_dc = bool(getattr(args, 'sv_dc', False))
+            if _use_dc:
+                # DC carries the diffuse; SV starts as pure directional residual.
+                self._sv_dc = nn.Parameter(pcd_rgb.clone().requires_grad_(True))
+                colors = torch.zeros((N, self.sv_number, 3), device="cuda")
+                self._sv_colors = nn.Parameter(colors.requires_grad_(True))
+                print(f"[FEATURE SV +DC] Initialized {N} Gaussians with sv_number={self.sv_number} sites "
+                      f"(sv_dc=pcd RGB, sv_colors=0 → SV is directional residual).")
+            else:
+                # Strict reference: sites get pcd RGB; no DC term.
+                colors = pcd_rgb.unsqueeze(1).expand(N, self.sv_number, 3).contiguous()
+                self._sv_colors = nn.Parameter(colors.requires_grad_(True))
+                self._sv_dc = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+                print(f"[FEATURE SV] Initialized {N} Gaussians with sv_number={self.sv_number} sites "
+                      f"(reference-faithful: SV-only color, pcd RGB init, no SH-DC, no bias)")
+            # Eval-time mask buffer; populated by update_sites_mask() during densify.
+            self._sv_mask = None
+            self._sv_training_flag = True
+            # Empty SB / SG params
+            self.sb_number = 0
+            self._sb_params = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self.sg_number = 0
+            self._sg_directions = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._sg_sharpness_sg = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._sg_rgb = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
         else:
             self.sb_number = 0
             self._sb_params = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
@@ -680,6 +734,27 @@ class GaussianModel:
             self.sv_number = 0
             self._sv_sites = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             self._sv_colors = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+
+    @torch.no_grad()
+    def update_sites_mask(self):
+        """--feature SV: refresh the per-site eval mask. A site is alive when its
+        RGB has any non-zero magnitude. The L1 loss on `_sv_colors` (gated to
+        the densification window) drives unused sites to exactly zero, so this
+        criterion identifies them. The mask is then applied at eval time only
+        (the renderer pushes masked-site directions to 1e8 → softmax weight ≈ 0),
+        mirroring the reference's `_nn_sites[~mask] = 1e8`. No-op outside SV mode.
+        """
+        if getattr(self, 'feature_mode', 'sh') != "SV":
+            return
+        if self._sv_colors.numel() == 0:
+            return
+        self._sv_mask = (self._sv_colors.abs().sum(dim=-1) > 0)  # [N, K] bool
+
+    def set_sv_eval_mode(self, eval_mode: bool):
+        """--feature SV: toggle eval-time site masking. Call before/after a test
+        render. During training the mask is not applied (matches reference).
+        """
+        self._sv_training_flag = (not eval_mode)
 
     def reinitial_pts(self, pts, rgb):
         """Reinitialize Gaussian parameters from point positions and RGB colors.
@@ -745,6 +820,14 @@ class GaussianModel:
         if self.feature_mode in ("voronoi", "beta", "sg"):
             f_rest_lr = 0.0  # only DC is trainable for directional-lobe features
 
+        # --feature SV: reference-faithful, SV-only color. The renderer passes
+        # `colors_precomp` directly so SH is never read by the rasterizer. Freeze
+        # both DC and rest so they don't drift on (zero) gradients and waste
+        # optimizer state.
+        if self.feature_mode == "SV":
+            f_dc_lr = 0.0
+            f_rest_lr = 0.0
+
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale * xyz_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': f_dc_lr, "name": "f_dc"},
@@ -793,6 +876,25 @@ class GaussianModel:
                 lr_delay_mult=training_args.position_lr_delay_mult,
                 max_steps=_max_steps,
             )
+
+        # --feature SV: reference-faithful constant LR for sites (no scheduler).
+        # The reference's `update_learning_rate` only updates xyz; its
+        # `sites_scheduler_args` is constructed and never called, so sites stay
+        # at their per-scene config value (blender=0.01, indoor=0.03,
+        # outdoor=0.0035, tandt/db=0.01). Pass the right per-scene value via
+        # --sites_lr (and matching --sv_color_lr).
+        if self.feature_mode == "SV" and self._sv_sites.numel() > 0:
+            _sites_lr = float(getattr(training_args, 'sites_lr', 0.01))
+            _color_lr = float(getattr(training_args, 'sv_color_lr', 1.25e-4))
+            l.append({'params': [self._sv_sites],  'lr': _sites_lr, "name": "sv_sites"})
+            l.append({'params': [self._sv_colors], 'lr': _color_lr, "name": "sv_colors"})
+            # --sv_dc: explicit per-Gaussian diffuse RGB. Default LR matches
+            # reference sh_lr (0.0025).
+            if hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
+                _dc_lr = float(getattr(training_args, 'sv_dc_lr', 2.5e-3))
+                l.append({'params': [self._sv_dc], 'lr': _dc_lr, "name": "sv_dc"})
+            # Intentionally NOT setting self.sv_sites_scheduler_args — keeps the
+            # LR constant in update_learning_rate (matches reference behavior).
         
         # Add adaptive mode parameters (if present)
         if self._adaptive_feat_dim > 0:
@@ -877,6 +979,43 @@ class GaussianModel:
         # Add beta kernel shape parameter
         if hasattr(self, '_shape') and self._shape.numel() > 0:
             l.append('shape')
+        # --- Directional appearance banks (SB / SG / SV) ---
+        # Each gets flattened [N, D] columns with a distinct prefix; the lobe
+        # count K is implicit in column count / per-lobe dim.
+        if hasattr(self, '_sb_params') and self._sb_params.numel() > 0:
+            # Spherical-Beta: [N, K, 6]  → K*6 columns
+            K6 = self._sb_params.shape[1] * self._sb_params.shape[2]
+            for i in range(K6):
+                l.append(f'sb_{i}')
+        if hasattr(self, '_sg_directions') and self._sg_directions.numel() > 0:
+            # Spherical-Gaussian: [N, K, 3] dirs + [N, K, 1] sharp + [N, K, 3] rgb
+            Kd = self._sg_directions.shape[1] * self._sg_directions.shape[2]
+            for i in range(Kd):
+                l.append(f'sg_dir_{i}')
+            Ks = self._sg_sharpness_sg.shape[1] * self._sg_sharpness_sg.shape[2]
+            for i in range(Ks):
+                l.append(f'sg_sh_{i}')
+            Kr = self._sg_rgb.shape[1] * self._sg_rgb.shape[2]
+            for i in range(Kr):
+                l.append(f'sg_rgb_{i}')
+        if hasattr(self, '_sv_sites') and self._sv_sites.numel() > 0:
+            # Spherical-Voronoi: [N, K, 3] sites + [N, K, 3] colors
+            Ks = self._sv_sites.shape[1] * self._sv_sites.shape[2]
+            for i in range(Ks):
+                l.append(f'sv_site_{i}')
+            Kc = self._sv_colors.shape[1] * self._sv_colors.shape[2]
+            for i in range(Kc):
+                l.append(f'sv_col_{i}')
+        # --feature SV with --sv_dc: per-Gaussian diffuse RGB ([N, 3]).
+        # Optional and absent for strict-reference SV / older checkpoints.
+        if hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
+            l += ['sv_dc_r', 'sv_dc_g', 'sv_dc_b']
+        # Flex kernel per-Gaussian β
+        if hasattr(self, '_flex_beta') and self._flex_beta.numel() > 0:
+            l.append('flex_beta')
+        # Appearance level (which hash-grid levels are active per Gaussian)
+        if hasattr(self, '_appearance_level') and self._appearance_level.numel() > 0:
+            l.append('ap_level')
         return l
 
     def save_ply(self, path):
@@ -906,6 +1045,40 @@ class GaussianModel:
         if hasattr(self, '_shape') and self._shape.numel() > 0:
             shapes = self._shape.detach().cpu().numpy()
             attr_list.append(shapes)
+
+        # --- Directional appearance banks (SB / SG / SV) ---
+        # Flatten each [N, K, D] bank to [N, K*D] so every column is a scalar,
+        # matching PLY format.
+        if hasattr(self, '_sb_params') and self._sb_params.numel() > 0:
+            sb_flat = self._sb_params.detach().reshape(
+                self._sb_params.shape[0], -1).cpu().numpy()
+            attr_list.append(sb_flat)
+        if hasattr(self, '_sg_directions') and self._sg_directions.numel() > 0:
+            sg_dir = self._sg_directions.detach().reshape(
+                self._sg_directions.shape[0], -1).cpu().numpy()
+            sg_sh = self._sg_sharpness_sg.detach().reshape(
+                self._sg_sharpness_sg.shape[0], -1).cpu().numpy()
+            sg_rgb = self._sg_rgb.detach().reshape(
+                self._sg_rgb.shape[0], -1).cpu().numpy()
+            attr_list.extend([sg_dir, sg_sh, sg_rgb])
+        if hasattr(self, '_sv_sites') and self._sv_sites.numel() > 0:
+            sv_site = self._sv_sites.detach().reshape(
+                self._sv_sites.shape[0], -1).cpu().numpy()
+            sv_col = self._sv_colors.detach().reshape(
+                self._sv_colors.shape[0], -1).cpu().numpy()
+            attr_list.extend([sv_site, sv_col])
+        # --feature SV with --sv_dc: per-Gaussian diffuse RGB
+        if hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
+            sv_dc = self._sv_dc.detach().cpu().numpy()
+            attr_list.append(sv_dc)
+        # Flex kernel per-Gaussian β (scalar column)
+        if hasattr(self, '_flex_beta') and self._flex_beta.numel() > 0:
+            flex_beta = self._flex_beta.detach().cpu().numpy()
+            attr_list.append(flex_beta)
+        # Appearance level (scalar column)
+        if hasattr(self, '_appearance_level') and self._appearance_level.numel() > 0:
+            ap_level = self._appearance_level.detach().cpu().numpy()
+            attr_list.append(ap_level)
 
         attributes = np.concatenate(attr_list, axis=1)
         elements[:] = list(map(tuple, attributes))
@@ -989,12 +1162,20 @@ class GaussianModel:
             self._gaussian_feat_dim = 0
             self._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
-        init_level = 6
-        ap_level = init_level * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
-        self._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
+        # Appearance level: prefer the column from the PLY if present,
+        # otherwise fall back to the legacy init_level=6 default.
+        ply_props = [p.name for p in plydata.elements[0].properties]
+        if "ap_level" in ply_props:
+            ap_level_np = np.asarray(plydata.elements[0]["ap_level"])[..., np.newaxis]
+            self._appearance_level = nn.Parameter(
+                torch.tensor(ap_level_np, dtype=torch.float, device="cuda").requires_grad_(True))
+        else:
+            init_level = 6
+            ap_level = init_level * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
+            self._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
 
         # Load beta kernel shape parameter (if present in PLY)
-        if "shape" in [p.name for p in plydata.elements[0].properties]:
+        if "shape" in ply_props:
             shapes = np.asarray(plydata.elements[0]["shape"])[..., np.newaxis]
             self._shape = nn.Parameter(torch.tensor(shapes, dtype=torch.float, device="cuda").requires_grad_(True))
             # Determine kernel type from args if available, otherwise default to "beta"
@@ -1017,6 +1198,117 @@ class GaussianModel:
         else:
             self._shape = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             self.kernel_type = "gaussian"
+
+        # --- Directional appearance banks (SB / SG / SV) + flex_beta ---
+        # Each is detected by its column-name prefix; lobe count K is inferred
+        # from the number of matching columns divided by per-lobe dimension.
+        def _read_flat(prefix):
+            names = [p.name for p in plydata.elements[0].properties if p.name.startswith(prefix)]
+            if len(names) == 0:
+                return None
+            names = sorted(names, key=lambda x: int(x.split('_')[-1]))
+            arr = np.zeros((xyz.shape[0], len(names)), dtype=np.float32)
+            for j, nm in enumerate(names):
+                arr[:, j] = np.asarray(plydata.elements[0][nm])
+            return arr
+
+        # Spherical-Beta [N, K, 6]
+        sb_flat = _read_flat("sb_")
+        if sb_flat is not None and (sb_flat.shape[1] % 6 == 0) and sb_flat.shape[1] > 0:
+            K = sb_flat.shape[1] // 6
+            self.sb_number = K
+            self.feature_mode = "beta"
+            self._sb_params = nn.Parameter(
+                torch.tensor(sb_flat.reshape(xyz.shape[0], K, 6), dtype=torch.float, device="cuda")
+                     .requires_grad_(True))
+            print(f"Loaded SB params: [{xyz.shape[0]}, K={K}, 6] (feature_mode='beta')")
+        else:
+            self.sb_number = getattr(self, 'sb_number', 0)
+            self._sb_params = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+
+        # Spherical-Gaussian [N, K, 3] + [N, K, 1] + [N, K, 3]
+        sg_dir = _read_flat("sg_dir_")
+        sg_sh  = _read_flat("sg_sh_")
+        sg_rgb = _read_flat("sg_rgb_")
+        if (sg_dir is not None and sg_sh is not None and sg_rgb is not None
+                and sg_dir.shape[1] % 3 == 0 and sg_rgb.shape[1] % 3 == 0
+                and sg_dir.shape[1] > 0):
+            K = sg_dir.shape[1] // 3
+            assert sg_sh.shape[1] == K and sg_rgb.shape[1] == 3 * K, \
+                f"SG column count mismatch: dir {sg_dir.shape[1]}, sh {sg_sh.shape[1]}, rgb {sg_rgb.shape[1]} (K={K})"
+            self.sg_number = K
+            self.feature_mode = "sg"
+            self._sg_directions = nn.Parameter(
+                torch.tensor(sg_dir.reshape(xyz.shape[0], K, 3), dtype=torch.float, device="cuda").requires_grad_(True))
+            self._sg_sharpness_sg = nn.Parameter(
+                torch.tensor(sg_sh.reshape(xyz.shape[0], K, 1), dtype=torch.float, device="cuda").requires_grad_(True))
+            self._sg_rgb = nn.Parameter(
+                torch.tensor(sg_rgb.reshape(xyz.shape[0], K, 3), dtype=torch.float, device="cuda").requires_grad_(True))
+            print(f"Loaded SG params: [{xyz.shape[0]}, K={K}] (dir+sh+rgb) (feature_mode='sg')")
+        else:
+            self.sg_number = getattr(self, 'sg_number', 0)
+            self._sg_directions = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._sg_sharpness_sg = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._sg_rgb = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+
+        # Spherical-Voronoi [N, K, 3] sites + [N, K, 3] colors.
+        # PLY columns are mode-agnostic; both 'voronoi' (legacy hybrid SH+SV) and
+        # 'SV' (reference-faithful SV-only) write the same site/color blocks.
+        # If `self.feature_mode` was set to 'SV' before load (e.g. caller
+        # constructed GaussianModel with --feature SV), keep it; otherwise
+        # default to 'voronoi' for back-compat with older checkpoints.
+        sv_site = _read_flat("sv_site_")
+        sv_col  = _read_flat("sv_col_")
+        if (sv_site is not None and sv_col is not None
+                and sv_site.shape[1] % 3 == 0 and sv_site.shape[1] == sv_col.shape[1]
+                and sv_site.shape[1] > 0):
+            K = sv_site.shape[1] // 3
+            self.sv_number = K
+            requested_mode = getattr(self, 'feature_mode', None)
+            self.feature_mode = "SV" if requested_mode == "SV" else "voronoi"
+            self._sv_sites = nn.Parameter(
+                torch.tensor(sv_site.reshape(xyz.shape[0], K, 3), dtype=torch.float, device="cuda").requires_grad_(True))
+            self._sv_colors = nn.Parameter(
+                torch.tensor(sv_col.reshape(xyz.shape[0], K, 3), dtype=torch.float, device="cuda").requires_grad_(True))
+            # Optional --sv_dc: per-Gaussian diffuse RGB. Loaded unconditionally
+            # if present (cheap, [N,3]); render() ignores it for non-SV modes.
+            ply_props_set = set(p.name for p in plydata.elements[0].properties)
+            if {'sv_dc_r', 'sv_dc_g', 'sv_dc_b'}.issubset(ply_props_set):
+                dc = np.stack(
+                    (np.asarray(plydata.elements[0]['sv_dc_r']),
+                     np.asarray(plydata.elements[0]['sv_dc_g']),
+                     np.asarray(plydata.elements[0]['sv_dc_b'])), axis=1)
+                self._sv_dc = nn.Parameter(
+                    torch.tensor(dc, dtype=torch.float, device="cuda").requires_grad_(True))
+            else:
+                self._sv_dc = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            if self.feature_mode == "SV":
+                # Rebuild eval-time mask from colors and switch to eval-mode by
+                # default. Caller can flip back via set_sv_eval_mode(False) when
+                # resuming training.
+                self._sv_mask = (self._sv_colors.abs().sum(dim=-1) > 0)
+                self._sv_training_flag = False
+            _has_dc = self._sv_dc.numel() > 0
+            print(f"Loaded SV params: [{xyz.shape[0]}, K={K}] (sites+colors{'+dc' if _has_dc else ''}) (feature_mode='{self.feature_mode}')")
+        else:
+            self.sv_number = getattr(self, 'sv_number', 0)
+            self._sv_sites = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._sv_colors = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+            self._sv_dc = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+
+        # Default feature_mode if no directional bank was found.
+        if not hasattr(self, 'feature_mode') or self.feature_mode is None:
+            self.feature_mode = "sh"
+
+        # Flex kernel per-Gaussian β
+        if "flex_beta" in ply_props:
+            flex_beta_np = np.asarray(plydata.elements[0]["flex_beta"])[..., np.newaxis]
+            self._flex_beta = nn.Parameter(
+                torch.tensor(flex_beta_np, dtype=torch.float, device="cuda").requires_grad_(True))
+            print(f"Loaded flex_beta per-Gaussian parameter")
+        else:
+            if not hasattr(self, '_flex_beta'):
+                self._flex_beta = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -1103,6 +1395,14 @@ class GaussianModel:
             self._sv_sites = optimizable_tensors["sv_sites"]
         if "sv_colors" in optimizable_tensors:
             self._sv_colors = optimizable_tensors["sv_colors"]
+        # --feature SV with --sv_dc
+        if "sv_dc" in optimizable_tensors:
+            self._sv_dc = optimizable_tensors["sv_dc"]
+
+        # --feature SV: per-site eval mask is a non-optimizable buffer; slice manually.
+        if getattr(self, '_sv_mask', None) is not None and \
+           self._sv_mask.shape[0] == valid_points_mask.shape[0]:
+            self._sv_mask = self._sv_mask[valid_points_mask]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
@@ -1159,7 +1459,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level=None, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None, new_adaptive_zero_weight=None, new_gate_logits=None, new_shape=None, new_flex_beta=None, new_sb_params=None, new_sg_directions=None, new_sg_sharpness=None, new_sg_rgb=None, new_sv_sites=None, new_sv_colors=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level=None, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None, new_adaptive_zero_weight=None, new_gate_logits=None, new_shape=None, new_flex_beta=None, new_sb_params=None, new_sg_directions=None, new_sg_sharpness=None, new_sg_rgb=None, new_sv_sites=None, new_sv_colors=None, new_sv_dc=None):
         # CRITICAL: ap_level defaults to 24 (all hash levels active).
         # ap_level=0 silently disables hash encoding — see hashgrid.h: max_level = min(ap_level, L).
         if new_ap_level is None:
@@ -1218,6 +1518,9 @@ class GaussianModel:
             d["sv_sites"] = new_sv_sites
         if new_sv_colors is not None and self._sv_colors.numel() > 0:
             d["sv_colors"] = new_sv_colors
+        # --feature SV with --sv_dc: per-Gaussian diffuse RGB
+        if new_sv_dc is not None and hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
+            d["sv_dc"] = new_sv_dc
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -1258,6 +1561,15 @@ class GaussianModel:
             self._sv_sites = optimizable_tensors["sv_sites"]
         if "sv_colors" in optimizable_tensors:
             self._sv_colors = optimizable_tensors["sv_colors"]
+        if "sv_dc" in optimizable_tensors:
+            self._sv_dc = optimizable_tensors["sv_dc"]
+
+        # --feature SV: regenerate the eval-time site mask if it was already
+        # populated. Tensor sizes just changed, so a stale mask would be wrong.
+        # Mask is fully derivable from `_sv_colors` (mask = colors.abs().sum(-1) > 0),
+        # so a regen here keeps it in lock-step with the (possibly grown) tensor.
+        if getattr(self, '_sv_mask', None) is not None:
+            self.update_sites_mask()
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -1377,11 +1689,14 @@ class GaussianModel:
         # SV sites — children inherit donor's sites/colors
         new_sv_sites = None
         new_sv_colors = None
+        new_sv_dc = None
         if self._sv_sites.numel() > 0:
             new_sv_sites = self._sv_sites[selected_pts_mask].repeat(N, 1, 1)
             new_sv_colors = self._sv_colors[selected_pts_mask].repeat(N, 1, 1)
+            if hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
+                new_sv_dc = self._sv_dc[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions, new_sg_sharpness_split, new_sg_rgb_split, new_sv_sites, new_sv_colors)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions, new_sg_sharpness_split, new_sg_rgb_split, new_sv_sites, new_sv_colors, new_sv_dc)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -1471,11 +1786,14 @@ class GaussianModel:
         # Handle spherical-voronoi params (--feature voronoi)
         new_sv_sites_c = None
         new_sv_colors_c = None
+        new_sv_dc_c = None
         if self._sv_sites.numel() > 0:
             new_sv_sites_c = self._sv_sites[selected_pts_mask]
             new_sv_colors_c = self._sv_colors[selected_pts_mask]
+            if hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
+                new_sv_dc_c = self._sv_dc[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions_c, new_sg_sharpness_c, new_sg_rgb_c, new_sv_sites_c, new_sv_colors_c)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions_c, new_sg_sharpness_c, new_sg_rgb_c, new_sv_sites_c, new_sv_colors_c, new_sv_dc_c)
 
     def _clone_by_mask_fastgs(self, selected_pts_mask):
         """Clone Gaussians flagged by ``selected_pts_mask`` (bool, [N]).
@@ -1546,9 +1864,12 @@ class GaussianModel:
 
         new_sv_sites_c = None
         new_sv_colors_c = None
+        new_sv_dc_c = None
         if self._sv_sites.numel() > 0:
             new_sv_sites_c = self._sv_sites[selected_pts_mask]
             new_sv_colors_c = self._sv_colors[selected_pts_mask]
+            if hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
+                new_sv_dc_c = self._sv_dc[selected_pts_mask]
 
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacities,
@@ -1556,7 +1877,7 @@ class GaussianModel:
             new_gamma, new_adaptive_features, new_adaptive_cat_weight,
             new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta,
             new_sb_params, new_sg_directions_c, new_sg_sharpness_c,
-            new_sg_rgb_c, new_sv_sites_c, new_sv_colors_c)
+            new_sg_rgb_c, new_sv_sites_c, new_sv_colors_c, new_sv_dc_c)
         return num_new
 
     def _split_by_mask_fastgs(self, selected_pts_mask, N=2):
@@ -1635,9 +1956,12 @@ class GaussianModel:
 
         new_sv_sites = None
         new_sv_colors = None
+        new_sv_dc = None
         if self._sv_sites.numel() > 0:
             new_sv_sites = self._sv_sites[selected_pts_mask].repeat(N, 1, 1)
             new_sv_colors = self._sv_colors[selected_pts_mask].repeat(N, 1, 1)
+            if hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
+                new_sv_dc = self._sv_dc[selected_pts_mask].repeat(N, 1)
 
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacity,
@@ -1645,7 +1969,7 @@ class GaussianModel:
             new_gamma, new_adaptive_features, new_adaptive_cat_weight,
             new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta,
             new_sb_params, new_sg_directions, new_sg_sharpness_split,
-            new_sg_rgb_split, new_sv_sites, new_sv_colors)
+            new_sg_rgb_split, new_sv_sites, new_sv_colors, new_sv_dc)
 
         # Prune the parents (children inherit at the tail of the tensor).
         prune_filter = torch.cat((

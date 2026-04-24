@@ -10,6 +10,7 @@
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
 #include <cuda_fp16.h>
+#include <cuda_runtime_api.h>  // cudaTextureObject_t
 
 namespace FORWARD
 {
@@ -67,7 +68,16 @@ namespace FORWARD
 		const float* cam_pos,
 		const __half* atlas_texture,
 		const float* atlas_rects,
-		const int atlas_width);
+		const int atlas_width,
+		const float* sb_params = nullptr,
+		const int sb_number = 0,
+		cudaTextureObject_t atlas_tex_obj = 0,
+		float atlas_offset = 0.0f,
+		float atlas_scale = 1.0f);
+
+	// Device-global setters (mirror diff_surfel_3D_sh_res training-time setters).
+	void setActivationBias(float sh_bias, float res_bias);
+	void setCompactMult(float val);
 }
 
 #endif

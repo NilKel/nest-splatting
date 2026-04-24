@@ -209,7 +209,12 @@ int CudaRasterizer::Rasterizer::forward(
 	const __half* atlas_texture,
 	const float* atlas_rects,
 	const int atlas_width,
-	const int aabb_mode)
+	const int aabb_mode,
+	const float* sb_params,
+	const int sb_number,
+	cudaTextureObject_t atlas_tex_obj,
+	float atlas_offset,
+	float atlas_scale)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -336,7 +341,12 @@ int CudaRasterizer::Rasterizer::forward(
 		cam_pos,
 		atlas_texture,
 		atlas_rects,
-		atlas_width), debug)
+		atlas_width,
+		sb_params,
+		sb_number,
+		atlas_tex_obj,
+		atlas_offset,
+		atlas_scale), debug)
 
 	return num_rendered;
 }

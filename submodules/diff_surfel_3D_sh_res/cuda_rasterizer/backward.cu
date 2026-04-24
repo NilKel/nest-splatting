@@ -732,6 +732,8 @@ renderCUDAsurfelBackward(
 
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
+	// Warp partition for per-Gaussian gradient reductions (GEMM path).
+	auto warp = cg::tiled_partition<32>(block);
 
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
 	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
@@ -943,6 +945,17 @@ renderCUDAsurfelBackward(
 		block.sync();
 	}
 
+	// Tile-level max last_contributor — enables batch-level early-out in the GEMM path.
+	// If every Gaussian in a batch has contributor-index >= tile_max_last_contrib, no
+	// pixel participates, so we skip the whole batch (SMEM load + inner loop). This is
+	// the analog of FastGS's per-tile max_contrib bucket-skip, adapted to our layout.
+	__shared__ int s_tile_max_last_contrib;
+	if (block.thread_rank() == 0) s_tile_max_last_contrib = 0;
+	block.sync();
+	if (inside && last_contributor > 0) atomicMax(&s_tile_max_last_contrib, last_contributor);
+	block.sync();
+	const int tile_max_last_contrib = s_tile_max_last_contrib;
+
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -950,6 +963,18 @@ renderCUDAsurfelBackward(
 		int num_done = __syncthreads_count(done);
 		if (num_done == BLOCK_SIZE)
 			break;
+
+		// Batch-level early-out (GEMM path only): all Gaussians in this batch have
+		// contributor index in [contributor - effective_toDo, contributor). If the
+		// LOWEST of these is already >= tile_max_last_contrib, no pixel needs the batch.
+		if ((render_mode & 0x100) && dL_dmlp_W1 != nullptr) {
+			const int effective_toDo_check = min((int)BLOCK_SIZE, (int)toDo);
+			const int min_current_contrib = (int)contributor - effective_toDo_check;
+			if (min_current_contrib >= tile_max_last_contrib) {
+				contributor -= effective_toDo_check;
+				continue;
+			}
+		}
 
 		// Load auxiliary data into shared memory, start in the BACK
 		// and load them in revers order.
@@ -1030,6 +1055,18 @@ renderCUDAsurfelBackward(
 				const float4 nor_o = collected_normal_opacity[j];
 				const float opa = nor_o.w;
 				float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
+
+				// Per-Gaussian gradient accumulators (register-local). Per-pixel
+				// contributions accumulate into these; at the end of this j-iteration
+				// we warp-reduce and perform a single atomicAdd per warp per field.
+				// Non-participating threads contribute 0.
+				float acc_dL_dcolors[3]    = {0.0f, 0.0f, 0.0f};
+				float acc_dL_dnormal3D[3]  = {0.0f, 0.0f, 0.0f};
+				float acc_dL_dshapes[2]    = {0.0f, 0.0f};
+				float acc_dL_dhomoMat[9]   = {0};
+				float acc_dL_dtransMat[9]  = {0};
+				float acc_dL_dmean2D[4]    = {0.0f, 0.0f, 0.0f, 0.0f};
+				float acc_dL_dopacity      = 0.0f;
 
 				// Per-pixel intersection data
 				float2 s = {0, 0};
@@ -1196,7 +1233,7 @@ renderCUDAsurfelBackward(
 					// SH gradient: same outer ReLU gate as residual.
 					for (int ch = 0; ch < 3; ch++) {
 						float relu_grad = (sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
-						atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_dpixel[ch] * w * relu_grad);
+						acc_dL_dcolors[ch] += dL_dpixel[ch] * w * relu_grad;
 					}
 				}
 
@@ -1332,7 +1369,7 @@ renderCUDAsurfelBackward(
 						accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
 						last_normal[ch] = normal[ch];
 						dL_dalpha += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
-						atomicAdd((&dL_dnormal3D[global_id * 3 + ch]), alpha * T * dL_dnormal2D[ch]);
+						acc_dL_dnormal3D[ch] += alpha * T * dL_dnormal2D[ch];
 					}
 #endif
 
@@ -1369,7 +1406,7 @@ renderCUDAsurfelBackward(
 					if (kernel_type == 1 || kernel_type == 4) {
 						if (beta_wins && dL_dshapes != nullptr && base > 1e-7f) {
 							float dL_dshape = dL_dalpha * opa * alpha_beta * logf(base);
-							atomicAdd(&dL_dshapes[global_id], dL_dshape);
+							acc_dL_dshapes[0] += dL_dshape;
 						}
 					} else if (kernel_type == 2 && per_gaussian_beta_val > 0.0f) {
 						const float dG_dg_raw = (1.0f + per_gaussian_beta_val) / (demon_val * demon_val);
@@ -1377,13 +1414,13 @@ renderCUDAsurfelBackward(
 						if (dL_dshapes != nullptr) {
 							float dG_dbeta = G_raw * (1.0f - G_raw) / (demon_val * demon_val);
 							float dL_dbeta = dL_dalpha * opa * dG_dbeta;
-							atomicAdd(&dL_dshapes[global_id], dL_dbeta);
+							acc_dL_dshapes[0] += dL_dbeta;
 						}
 					} else if (kernel_type == 3 && dL_dshapes != nullptr) {
 						float log_rho = logf(general_rho_safe_val);
 						float dG_dbeta = -0.25f * G * general_pow_term_val * log_rho;
 						float dL_dbeta = dL_dalpha * opa * dG_dbeta;
-						atomicAdd(&dL_dshapes[global_id], dL_dbeta);
+						acc_dL_dshapes[0] += dL_dbeta;
 					}
 
 					// Compute dL_duv from dL_dxyz (hash gradients flowing to geometry)
@@ -1402,17 +1439,17 @@ renderCUDAsurfelBackward(
 							};
 
 							// Backprop to homotrans matrix
-							atomicAdd(&dL_dhomoMat[global_id * 9 + 0],  dL_dpx * s.x);
-							atomicAdd(&dL_dhomoMat[global_id * 9 + 1],  dL_dpy * s.x);
-							atomicAdd(&dL_dhomoMat[global_id * 9 + 2],  dL_dpz * s.x);
-							atomicAdd(&dL_dhomoMat[global_id * 9 + 3],  dL_dpx * s.y);
-							atomicAdd(&dL_dhomoMat[global_id * 9 + 4],  dL_dpy * s.y);
-							atomicAdd(&dL_dhomoMat[global_id * 9 + 5],  dL_dpz * s.y);
+							acc_dL_dhomoMat[0] += dL_dpx * s.x;
+							acc_dL_dhomoMat[1] += dL_dpy * s.x;
+							acc_dL_dhomoMat[2] += dL_dpz * s.x;
+							acc_dL_dhomoMat[3] += dL_dpx * s.y;
+							acc_dL_dhomoMat[4] += dL_dpy * s.y;
+							acc_dL_dhomoMat[5] += dL_dpz * s.y;
 						}
 						// for both rho3d and rho2d
-						atomicAdd(&dL_dhomoMat[global_id * 9 + 6],  dL_dxyz[0]);
-						atomicAdd(&dL_dhomoMat[global_id * 9 + 7],  dL_dxyz[1]);
-						atomicAdd(&dL_dhomoMat[global_id * 9 + 8],  dL_dxyz[2]);
+						acc_dL_dhomoMat[6] += dL_dxyz[0];
+						acc_dL_dhomoMat[7] += dL_dxyz[1];
+						acc_dL_dhomoMat[8] += dL_dxyz[2];
 					}
 
 					// Geometry gradients based on whether rho3d or rho2d was used
@@ -1434,8 +1471,8 @@ renderCUDAsurfelBackward(
 							// dL_dgamma: -0.5 * dL_dG * G * log(comp) * pow(comp, gamma)
 							float dL_dgamma_x = -0.5f * dL_dG * G * logf(comp_x) * powf(comp_x, gamma_x);
 							float dL_dgamma_y = -0.5f * dL_dG * G * logf(comp_y) * powf(comp_y, gamma_y);
-							atomicAdd(&dL_dshapes[global_id * 2 + 0], dL_dgamma_x);
-							atomicAdd(&dL_dshapes[global_id * 2 + 1], dL_dgamma_y);
+							acc_dL_dshapes[0] += dL_dgamma_x;
+							acc_dL_dshapes[1] += dL_dgamma_y;
 						} else {
 							// Compute dG_factor based on kernel type
 							float dG_factor;
@@ -1472,18 +1509,18 @@ renderCUDAsurfelBackward(
 							pixf.x * dL_dk.y + pixf.y * dL_dl.y + dL_dz * dz_dTw.y,
 							pixf.x * dL_dk.z + pixf.y * dL_dl.z + dL_dz * dz_dTw.z};
 
-						atomicAdd(&dL_dtransMat[global_id * 9 + 0],  dL_dTu.x);
-						atomicAdd(&dL_dtransMat[global_id * 9 + 1],  dL_dTu.y);
-						atomicAdd(&dL_dtransMat[global_id * 9 + 2],  dL_dTu.z);
-						atomicAdd(&dL_dtransMat[global_id * 9 + 3],  dL_dTv.x);
-						atomicAdd(&dL_dtransMat[global_id * 9 + 4],  dL_dTv.y);
-						atomicAdd(&dL_dtransMat[global_id * 9 + 5],  dL_dTv.z);
-						atomicAdd(&dL_dtransMat[global_id * 9 + 6],  dL_dTw.x);
-						atomicAdd(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
-						atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
+						acc_dL_dtransMat[0] += dL_dTu.x;
+						acc_dL_dtransMat[1] += dL_dTu.y;
+						acc_dL_dtransMat[2] += dL_dTu.z;
+						acc_dL_dtransMat[3] += dL_dTv.x;
+						acc_dL_dtransMat[4] += dL_dTv.y;
+						acc_dL_dtransMat[5] += dL_dTv.z;
+						acc_dL_dtransMat[6] += dL_dTw.x;
+						acc_dL_dtransMat[7] += dL_dTw.y;
+						acc_dL_dtransMat[8] += dL_dTw.z;
 						// AbsGS: accumulate absolute Tu.z / Tv.z for cancellation-free densification
-						atomicAdd(&dL_dmean2D[global_id].z, fabsf(dL_dTu.z));
-						atomicAdd(&dL_dmean2D[global_id].w, fabsf(dL_dTv.z));
+						acc_dL_dmean2D[2] += fabsf(dL_dTu.z);
+						acc_dL_dmean2D[3] += fabsf(dL_dTv.z);
 					} else {
 						// 2D fallback: gradient w.r.t. screen-space position
 						float dG_factor_2d;
@@ -1500,11 +1537,11 @@ renderCUDAsurfelBackward(
 						}
 						const float dG_ddelx = dG_factor_2d * (xy.x - pixf.x);
 						const float dG_ddely = dG_factor_2d * (xy.y - pixf.y);
-						atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx);
-						atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely);
+						acc_dL_dmean2D[0] += dL_dG * dG_ddelx;
+						acc_dL_dmean2D[1] += dL_dG * dG_ddely;
 						// AbsGS: abs gradient from low-pass filter path
-						atomicAdd(&dL_dmean2D[global_id].z, fabsf(dL_dG * dG_ddelx));
-						atomicAdd(&dL_dmean2D[global_id].w, fabsf(dL_dG * dG_ddely));
+						acc_dL_dmean2D[2] += fabsf(dL_dG * dG_ddelx);
+						acc_dL_dmean2D[3] += fabsf(dL_dG * dG_ddely);
 						if (render_mode & 0x400) {
 							// --lowpass: propagate low-pass filter + depth gradient to transMat
 							const float dL_dxy_x = dL_dG * dG_ddelx;
@@ -1523,25 +1560,96 @@ renderCUDAsurfelBackward(
 								pixf.x * dL_dk_lp.x + pixf.y * dL_dl_lp.x + dL_dz * dz_dTw_lp.x + dL_dxy_x * inv_Tw_z,
 								pixf.x * dL_dk_lp.y + pixf.y * dL_dl_lp.y + dL_dz * dz_dTw_lp.y + dL_dxy_y * inv_Tw_z,
 								pixf.x * dL_dk_lp.z + pixf.y * dL_dl_lp.z + dL_dz * dz_dTw_lp.z - (dL_dxy_x * xy.x + dL_dxy_y * xy.y) * inv_Tw_z};
-							atomicAdd(&dL_dtransMat[global_id * 9 + 0], dL_dTu_lp.x);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 1], dL_dTu_lp.y);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 2], dL_dTu_lp.z);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 3], dL_dTv_lp.x);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 4], dL_dTv_lp.y);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 5], dL_dTv_lp.z);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 6], dL_dTw_lp.x);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 7], dL_dTw_lp.y);
-							atomicAdd(&dL_dtransMat[global_id * 9 + 8], dL_dTw_lp.z);
+							acc_dL_dtransMat[0] += dL_dTu_lp.x;
+							acc_dL_dtransMat[1] += dL_dTu_lp.y;
+							acc_dL_dtransMat[2] += dL_dTu_lp.z;
+							acc_dL_dtransMat[3] += dL_dTv_lp.x;
+							acc_dL_dtransMat[4] += dL_dTv_lp.y;
+							acc_dL_dtransMat[5] += dL_dTv_lp.z;
+							acc_dL_dtransMat[6] += dL_dTw_lp.x;
+							acc_dL_dtransMat[7] += dL_dTw_lp.y;
+							acc_dL_dtransMat[8] += dL_dTw_lp.z;
 						} else {
-							atomicAdd(&dL_dtransMat[global_id * 9 + 8], dL_dz);
+							acc_dL_dtransMat[8] += dL_dz;
 						}
 					}
 
-					atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+					acc_dL_dopacity += G * dL_dalpha;
 
 					// NOTE: T was already updated at the start of this iteration
 					// (T = T / (1-alpha) to recover T_before, matching 2DGS backward)
 					// No T-based termination needed - loop runs through all contributors
+				}
+
+				// ====================================================================
+				// Per-Gaussian gradient flush: warp-reduce register accumulators, then
+				// one atomicAdd per warp per field. All 32 lanes in the warp must
+				// participate in cg::reduce (non-participants carry 0 → benign).
+				// This replaces up-to-256 colliding atomicAdds per Gaussian per field
+				// with up-to-8 (one per warp). MLP weight grads (tile_dL_dW*) remain
+				// on the collaborative-GEMM path — not touched here. Hash-table grads
+				// inside query_feature<true> also stay as-is (each pixel hits distinct
+				// cells, no locality to reduce across).
+				// ====================================================================
+				{
+					// dL_dopacity: 1 slot
+					{
+						float s_ = cg::reduce(warp, acc_dL_dopacity, cg::plus<float>());
+						if (warp.thread_rank() == 0) atomicAdd(&dL_dopacity[global_id], s_);
+					}
+					// dL_dcolors: 3 slots
+					#pragma unroll
+					for (int ch = 0; ch < 3; ch++) {
+						float s_ = cg::reduce(warp, acc_dL_dcolors[ch], cg::plus<float>());
+						if (warp.thread_rank() == 0) atomicAdd(&dL_dcolors[global_id * 3 + ch], s_);
+					}
+					// dL_dnormal3D: 3 slots
+					#pragma unroll
+					for (int ch = 0; ch < 3; ch++) {
+						float s_ = cg::reduce(warp, acc_dL_dnormal3D[ch], cg::plus<float>());
+						if (warp.thread_rank() == 0) atomicAdd(&dL_dnormal3D[global_id * 3 + ch], s_);
+					}
+					// dL_dtransMat: 9 slots
+					#pragma unroll
+					for (int k = 0; k < 9; k++) {
+						float s_ = cg::reduce(warp, acc_dL_dtransMat[k], cg::plus<float>());
+						if (warp.thread_rank() == 0) atomicAdd(&dL_dtransMat[global_id * 9 + k], s_);
+					}
+					// dL_dmean2D: 4 slots (.x, .y, .z, .w)
+					{
+						float sx = cg::reduce(warp, acc_dL_dmean2D[0], cg::plus<float>());
+						float sy = cg::reduce(warp, acc_dL_dmean2D[1], cg::plus<float>());
+						float sz = cg::reduce(warp, acc_dL_dmean2D[2], cg::plus<float>());
+						float sw = cg::reduce(warp, acc_dL_dmean2D[3], cg::plus<float>());
+						if (warp.thread_rank() == 0) {
+							atomicAdd(&dL_dmean2D[global_id].x, sx);
+							atomicAdd(&dL_dmean2D[global_id].y, sy);
+							atomicAdd(&dL_dmean2D[global_id].z, sz);
+							atomicAdd(&dL_dmean2D[global_id].w, sw);
+						}
+					}
+					// dL_dhomoMat: 9 slots (only written when homotrans != nullptr)
+					if (homotrans != nullptr) {
+						#pragma unroll
+						for (int k = 0; k < 9; k++) {
+							float s_ = cg::reduce(warp, acc_dL_dhomoMat[k], cg::plus<float>());
+							if (warp.thread_rank() == 0) atomicAdd(&dL_dhomoMat[global_id * 9 + k], s_);
+						}
+					}
+					// dL_dshapes: 1 or 2 slots depending on kernel_type (guard on nullptr)
+					if (dL_dshapes != nullptr) {
+						if (kernel_type == 5) {
+							float s0 = cg::reduce(warp, acc_dL_dshapes[0], cg::plus<float>());
+							float s1 = cg::reduce(warp, acc_dL_dshapes[1], cg::plus<float>());
+							if (warp.thread_rank() == 0) {
+								atomicAdd(&dL_dshapes[global_id * 2 + 0], s0);
+								atomicAdd(&dL_dshapes[global_id * 2 + 1], s1);
+							}
+						} else {
+							float s0 = cg::reduce(warp, acc_dL_dshapes[0], cg::plus<float>());
+							if (warp.thread_rank() == 0) atomicAdd(&dL_dshapes[global_id], s0);
+						}
+					}
 				}
 
 				// Profiling: T3 at end of Phase C (sync needed to measure wall time)
