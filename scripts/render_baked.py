@@ -76,7 +76,6 @@ def render_baked(viewpoint_camera, gaussians, pipe, background,
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     means3D = gaussians.get_xyz
-    means2D = torch.zeros_like(means3D[:, :2], requires_grad=False)
     opacity = gaussians.get_opacity
 
     scales = gaussians.get_scaling
@@ -87,9 +86,8 @@ def render_baked(viewpoint_camera, gaussians, pipe, background,
     if kernel_type > 0 and hasattr(gaussians, '_shape') and gaussians._shape is not None and gaussians._shape.numel() > 0:
         shapes = gaussians.get_shape
 
-    color, radii = rasterizer(
+    color, _ = rasterizer(
         means3D=means3D,
-        means2D=means2D,
         opacities=opacity,
         shs=shs,
         scales=scales,
@@ -137,7 +135,7 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
             img_np = rendered.clamp(0, 1).permute(1, 2, 0).cpu().numpy()
             save_img_u8(img_np, os.path.join(save_dir, f"{cam.image_name}.png"))
 
-    # FPS benchmark
+    # FPS benchmark — CUDA event timing, no Python wall-clock noise.
     with torch.no_grad():
         for i in range(num_warmup):
             cam = test_cameras[i % len(test_cameras)]
@@ -152,11 +150,11 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                             sb_number=sb_number)
         torch.cuda.synchronize()
 
-        times = []
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_benchmark)]
+        ends   = [torch.cuda.Event(enable_timing=True) for _ in range(num_benchmark)]
         for i in range(num_benchmark):
             cam = test_cameras[i % len(test_cameras)]
-            torch.cuda.synchronize()
-            t0 = time.time()
+            starts[i].record()
             _ = render_baked(cam, gaussians, None, bg_color,
                             residual_textures=residual_textures,
                             beta=beta, kernel_type=kernel_type,
@@ -166,16 +164,18 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                             aabb_mode=aabb_mode,
                             sb_params=sb_params,
                             sb_number=sb_number)
-            torch.cuda.synchronize()
-            times.append(time.time() - t0)
+            ends[i].record()
+        torch.cuda.synchronize()
+        times_ms = [starts[i].elapsed_time(ends[i]) for i in range(num_benchmark)]
+        mean_ms = float(np.mean(times_ms))
 
-    fps = 1.0 / np.mean(times)
+    fps = 1000.0 / mean_ms
     return {
         "psnr": float(np.mean(psnrs)),
         "l1": float(np.mean(l1s)),
         "ssim": float(np.mean(ssims)),
         "fps": float(fps),
-        "ms_per_frame": float(np.mean(times) * 1000),
+        "ms_per_frame": mean_ms,
     }
 
 

@@ -19,8 +19,9 @@ __device__ float d_res_bias = 0.0f;
 __device__ float d_compact_mult = 1.0f;
 
 // Forward method for converting the input spherical harmonics
-// coefficients of each Gaussian to a simple RGB color.
-__device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
+// coefficients of each Gaussian to a simple RGB color. Forward-only baked
+// path: no `clamped` tracking (no backward pass that needs it).
+__device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs)
 {
 	glm::vec3 pos = means[idx];
 	glm::vec3 dir = pos - campos;
@@ -61,10 +62,6 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 		}
 	}
 	result += d_sh_bias;
-
-	clamped[3 * idx + 0] = (result.x < 0);
-	clamped[3 * idx + 1] = (result.y < 0);
-	clamped[3 * idx + 2] = (result.z < 0);
 	return glm::max(result, 0.0f);
 }
 
@@ -185,7 +182,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const glm::vec4* rotations,
 	const float* opacities,
 	const float* shs,
-	bool* clamped,
 	const float* colors_precomp,
 	const float* viewmatrix,
 	const float* projmatrix,
@@ -199,7 +195,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float2* points_xy_image,
 	float* depths,
 	float* transMats,
-	float* rgb,
+	__half* rgb,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
@@ -311,23 +307,23 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		cutoff = 4.0f;
 	}
 
+	// Project the surfel disk to a screen-space ellipse and take its rectangular
+	// AABB. SnugBox/AccuTile would be tighter here, but the conic-from-T
+	// derivation isn't right for our 2DGS T (see docs/SNUGBOX_ATTEMPT.md).
 	float2 point_image;
 	float2 extent;
 	bool ok = compute_aabb(T, cutoff, point_image, extent);
 	if (!ok) return;
 
-	// Compute tile bounding box
 	float filter_r = cutoff * FilterSize;
 	int rx, ry;
 	uint2 rect_min, rect_max;
-
-	if (use_rect) {
-		// Rectangular AABB: separate X/Y radii for tighter tile coverage
+	bool use_rect_aabb = (aabb_mode >= 2);
+	if (use_rect_aabb) {
 		rx = (int)ceilf(fmaxf(extent.x, filter_r));
 		ry = (int)ceilf(fmaxf(extent.y, filter_r));
 		getRectXY(point_image, rx, ry, rect_min, rect_max, grid);
 	} else {
-		// Square AABB: max(x, y) as scalar radius (original 2DGS behavior)
 		float radius = ceilf(fmaxf(fmaxf(extent.x, extent.y), filter_r));
 		rx = (int)radius;
 		ry = (int)radius;
@@ -337,15 +333,17 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
 		return;
 
-	// Compute colors from SH
+	// FP16 SH-color storage: range is [0, ~5] post-bias+clamp — well within
+	// FP16 precision and halves the global-mem bandwidth of the inner-loop fetch
+	// in renderBakedCUDA.
 	if (colors_precomp == nullptr) {
-		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
-		rgb[idx * C + 0] = result.x;
-		rgb[idx * C + 1] = result.y;
-		rgb[idx * C + 2] = result.z;
+		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs);
+		rgb[idx * C + 0] = __float2half(result.x);
+		rgb[idx * C + 1] = __float2half(result.y);
+		rgb[idx * C + 2] = __float2half(result.z);
 	} else {
 		for(int i = 0; i < C; i++){
-			rgb[idx * C + i] = colors_precomp[idx * C + i];
+			rgb[idx * C + i] = __float2half(colors_precomp[idx * C + i]);
 		}
 	}
 
@@ -368,27 +366,22 @@ renderBakedCUDA(
 	const float beta,
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
-	const float* __restrict__ features,    // SH base RGB from preprocessing [N, 3]
+	const __half* __restrict__ features,    // SH base RGB from preprocessing [N, 3] FP16
 	const float* __restrict__ transMats,   // [N, 9]
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
-	float* __restrict__ final_T,
-	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
-	float* __restrict__ out_others,
 	const float* __restrict__ shapes,       // Beta kernel shape [N] (nullable)
 	const int kernel_type,
-	const __half* __restrict__ residual_textures,  // [N, stride] FP16 (nullable), stride = 8*8*residual_dim
-	const int residual_dim,                        // 3 (DC) or 48 (full SH)
-	const float* __restrict__ means3D,             // [N, 3] Gaussian centers (for viewdir, nullable)
-	const float* __restrict__ cam_pos,             // [3] camera position (for viewdir, nullable)
-	const __half* __restrict__ atlas_texture,      // [atlas_W * atlas_W * 3] FP16 (nullable; kept for back-compat)
-	const float* __restrict__ atlas_rects,         // [N, 4] (u0_px, v0_px, w_px, h_px) (nullable)
+	const float* __restrict__ means3D,             // [N, 3] Gaussian centers (for SB viewdir, nullable when sb_number==0)
+	const float* __restrict__ cam_pos,             // [3] camera position (for SB viewdir, nullable when sb_number==0)
+	const __half* __restrict__ atlas_texture,      // [atlas_h * atlas_width * 3] FP16 — used by SW fallback when atlas_tex_obj==0
+	const float* __restrict__ atlas_rects,         // [N, 4] (u0_px, v0_px, w_px, h_px) (required for atlas mode)
 	const int atlas_width,                         // atlas dimension (e.g. 4096)
 	const float* __restrict__ sb_params,           // [N, K, 6] SB params (nullable)
 	const int sb_number,                           // K lobes per Gaussian (0 = SB disabled)
-	cudaTextureObject_t atlas_tex_obj,             // hardware texture object for atlas (0 = software path)
+	cudaTextureObject_t atlas_tex_obj,             // hardware texture object for atlas (required)
 	float atlas_offset,                            // dequantization offset (uint8 atlas)
 	float atlas_scale)                             // dequantization scale  (uint8 atlas)
 {
@@ -417,19 +410,7 @@ renderBakedCUDA(
 	__shared__ float collected_shapes[BLOCK_SIZE];
 
 	float T = 1.0f;
-	uint32_t contributor = 0;
-	uint32_t last_contributor = 0;
 	float C[3] = { 0 };
-
-#if RENDER_AXUTILITY
-	float N[3] = {0};
-	float D = { 0 };
-	float M1 = {0};
-	float M2 = {0};
-	float distortion = {0};
-	float median_depth = {0};
-	float median_contributor = {-1};
-#endif
 
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -456,8 +437,6 @@ renderBakedCUDA(
 
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
 		{
-			contributor++;
-
 			const float2 xy = collected_xy[j];
 			const float3 Tu = collected_Tu[j];
 			const float3 Tv = collected_Tv[j];
@@ -541,15 +520,19 @@ renderBakedCUDA(
 			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
 #endif
 
-			// SH base color (from preprocessing)
+			// SH base color (from preprocessing). FP16 storage halves the
+			// global-memory bandwidth of this hot read (called 256× per tile).
 			int gauss_id = collected_id[j];
-			float feat[3];
-			for (int ch = 0; ch < 3; ch++)
-				feat[ch] = features[gauss_id * 3 + ch];
+			float feat[3] = {
+				__half2float(features[gauss_id * 3 + 0]),
+				__half2float(features[gauss_id * 3 + 1]),
+				__half2float(features[gauss_id * 3 + 2]),
+			};
 
-			// Residual texture lookup (atlas or shared mode)
-			if (atlas_texture != nullptr && atlas_rects != nullptr) {
-				// Atlas mode: variable-resolution packed atlas
+			// Residual texture lookup (atlas mode). Skip when no atlas was
+			// bound (SH-only render path) — atlas_rects is nullptr and
+			// atlas_tex_obj is 0; dereferencing either is illegal.
+			if (atlas_rects != nullptr) {
 				float u0_px  = atlas_rects[gauss_id * 4 + 0];
 				float v0_px  = atlas_rects[gauss_id * 4 + 1];
 				float u_span = atlas_rects[gauss_id * 4 + 2];
@@ -571,8 +554,9 @@ renderBakedCUDA(
 					feat[0] += rgba.x * atlas_scale + atlas_offset;
 					feat[1] += rgba.y * atlas_scale + atlas_offset;
 					feat[2] += rgba.z * atlas_scale + atlas_offset;
-				} else {
-					// Software bilinear fallback (no hardware texture bound).
+				} else if (atlas_texture != nullptr) {
+					// Software bilinear fallback for atlases that exceed the
+					// 65,536 cudaArray 2D dimension limit (very tall packed atlases).
 					int au0 = (int)au, av0 = (int)av;
 					float fu = au - au0, fv = av - av0;
 					int au1 = min(au0 + 1, (int)(u0_px + u_span - 1));
@@ -586,86 +570,8 @@ renderBakedCUDA(
 						float c10 = __half2float(atlas_texture[idx10 + ch]);
 						float c01 = __half2float(atlas_texture[idx01 + ch]);
 						float c11 = __half2float(atlas_texture[idx11 + ch]);
-						float res = (1-fu)*(1-fv)*c00 + fu*(1-fv)*c10
+						feat[ch] += (1-fu)*(1-fv)*c00 + fu*(1-fv)*c10
 						          + (1-fu)*fv*c01 + fu*fv*c11;
-						feat[ch] += res;
-					}
-				}
-			}
-			// Shared mode: fixed 8×8 per-Gaussian texture
-			else if (residual_textures != nullptr) {
-				// Texel-center convention: bake sample i at s = (i+0.5)*step - E
-				// Inverse: tex_coord = (s+E)/(2E) * G - 0.5 = s + 3.5 (for G=8, E=4)
-				float tex_u = fmaxf(0.0f, fminf(6.999f, s.x + 3.5f));
-				float tex_v = fmaxf(0.0f, fminf(6.999f, s.y + 3.5f));
-				int u0 = (int)tex_u, v0 = (int)tex_v;
-				float fu = tex_u - u0, fv = tex_v - v0;
-				int u1 = min(u0 + 1, 7), v1 = min(v0 + 1, 7);
-				float w00 = (1-fu)*(1-fv), w10 = fu*(1-fv);
-				float w01 = (1-fu)*fv, w11 = fu*fv;
-
-				if (residual_dim == 48 && means3D != nullptr && cam_pos != nullptr) {
-					// 48D SH residual: bilinear lookup + SH evaluation at viewdir
-					int tex_stride = 8 * 8 * 48;  // 3072 per Gaussian
-					int base = gauss_id * tex_stride;
-
-					// Compute view direction (same convention as computeColorFromSH)
-					float dx = means3D[gauss_id * 3 + 0] - cam_pos[0];
-					float dy = means3D[gauss_id * 3 + 1] - cam_pos[1];
-					float dz = means3D[gauss_id * 3 + 2] - cam_pos[2];
-					float inv_len = rsqrtf(dx*dx + dy*dy + dz*dz + 1e-8f);
-					float dir_x = dx * inv_len, dir_y = dy * inv_len, dir_z = dz * inv_len;
-
-					// Precompute SH basis (degree 3, 16 terms)
-					float xx = dir_x*dir_x, yy = dir_y*dir_y, zz = dir_z*dir_z;
-					float xy = dir_x*dir_y, yz = dir_y*dir_z, xz = dir_x*dir_z;
-					float sh_basis[16];
-					sh_basis[0]  = SH_C0;
-					sh_basis[1]  = -SH_C1 * dir_y;
-					sh_basis[2]  = SH_C1 * dir_z;
-					sh_basis[3]  = -SH_C1 * dir_x;
-					sh_basis[4]  = SH_C2[0] * xy;
-					sh_basis[5]  = SH_C2[1] * yz;
-					sh_basis[6]  = SH_C2[2] * (2.0f*zz - xx - yy);
-					sh_basis[7]  = SH_C2[3] * xz;
-					sh_basis[8]  = SH_C2[4] * (xx - yy);
-					sh_basis[9]  = SH_C3[0] * dir_y * (3.0f*xx - yy);
-					sh_basis[10] = SH_C3[1] * xy * dir_z;
-					sh_basis[11] = SH_C3[2] * dir_y * (4.0f*zz - xx - yy);
-					sh_basis[12] = SH_C3[3] * dir_z * (2.0f*zz - 3.0f*xx - 3.0f*yy);
-					sh_basis[13] = SH_C3[4] * dir_x * (4.0f*zz - xx - yy);
-					sh_basis[14] = SH_C3[5] * dir_z * (xx - yy);
-					sh_basis[15] = SH_C3[6] * dir_x * (xx - 3.0f*yy);
-
-					// Bilinear offsets into texture
-					int off00 = base + (v0*8+u0)*48;
-					int off10 = base + (v0*8+u1)*48;
-					int off01 = base + (v1*8+u0)*48;
-					int off11 = base + (v1*8+u1)*48;
-
-					// Per-channel SH evaluation: channel layout is [R×16, G×16, B×16]
-					for (int ch = 0; ch < 3; ch++) {
-						int ch_off = ch * 16;
-						float result = 0.0f;
-						for (int k = 0; k < 16; k++) {
-							float val = w00 * __half2float(residual_textures[off00 + ch_off + k])
-							          + w10 * __half2float(residual_textures[off10 + ch_off + k])
-							          + w01 * __half2float(residual_textures[off01 + ch_off + k])
-							          + w11 * __half2float(residual_textures[off11 + ch_off + k]);
-							result += sh_basis[k] * val;
-						}
-						feat[ch] += result;
-					}
-				} else {
-					// 3D DC residual (legacy path)
-					int base = gauss_id * 192;  // 8*8*3
-					for (int ch = 0; ch < 3; ch++) {
-						float c00 = __half2float(residual_textures[base + (v0*8+u0)*3 + ch]);
-						float c10 = __half2float(residual_textures[base + (v0*8+u1)*3 + ch]);
-						float c01 = __half2float(residual_textures[base + (v1*8+u0)*3 + ch]);
-						float c11 = __half2float(residual_textures[base + (v1*8+u1)*3 + ch]);
-						float res = w00*c00 + w10*c10 + w01*c01 + w11*c11;
-						feat[ch] += res;  // final ReLU + d_res_bias applied once after all residual sources
 					}
 				}
 			}
@@ -697,28 +603,13 @@ renderBakedCUDA(
 			for (int ch = 0; ch < 3; ch++)
 				C[ch] += feat[ch] * w;
 			T = test_T;
-
-			last_contributor = contributor;
 		}
 	}
 
 	if (inside)
 	{
-		final_T[pix_id] = T;
-		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < 3; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
-
-#if RENDER_AXUTILITY
-		n_contrib[pix_id + H * W] = median_contributor;
-		final_T[pix_id + H * W] = M1;
-		final_T[pix_id + 2 * H * W] = M2;
-		out_others[pix_id + DEPTH_OFFSET * H * W] = D;
-		out_others[pix_id + ALPHA_OFFSET * H * W] = 1 - T;
-		for (int ch=0; ch<3; ch++) out_others[pix_id + (NORMAL_OFFSET+ch) * H * W] = N[ch];
-		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = median_depth;
-		out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
-#endif
 	}
 }
 
@@ -733,19 +624,14 @@ void FORWARD::render(
 	const float beta,
 	int W, int H,
 	const float2* points_xy_image,
-	const float* features,
+	const __half* features,
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
-	float* final_T,
-	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
-	float* out_others,
 	const float* shapes,
 	const int kernel_type,
-	const __half* residual_textures,
-	const int residual_dim,
 	const float* means3D,
 	const float* cam_pos,
 	const __half* atlas_texture,
@@ -760,9 +646,9 @@ void FORWARD::render(
 	renderBakedCUDA<<<grid, block>>>(
 		ranges, point_list, beta, W, H,
 		points_xy_image, features, transMats, depths, normal_opacity,
-		final_T, n_contrib, bg_color, out_color, out_others,
-		shapes, kernel_type, residual_textures,
-		residual_dim, means3D, cam_pos,
+		bg_color, out_color,
+		shapes, kernel_type,
+		means3D, cam_pos,
 		atlas_texture, atlas_rects, atlas_width,
 		sb_params, sb_number, atlas_tex_obj,
 		atlas_offset, atlas_scale);
@@ -789,7 +675,6 @@ void FORWARD::preprocess(int P, int D, int M,
 	const glm::vec4* rotations,
 	const float* opacities,
 	const float* shs,
-	bool* clamped,
 	const float* colors_precomp,
 	const float* viewmatrix,
 	const float* projmatrix,
@@ -803,7 +688,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float2* points_xy_image,
 	float* depths,
 	float* transMats,
-	float* colors,
+	__half* colors,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
@@ -820,7 +705,6 @@ void FORWARD::preprocess(int P, int D, int M,
 		rotations,
 		opacities,
 		shs,
-		clamped,
 		colors_precomp,
 		viewmatrix,
 		projmatrix,

@@ -15,6 +15,7 @@
 #include <vector>
 #include "rasterizer.h"
 #include <cuda_runtime_api.h>
+#include <cuda_fp16.h>
 
 namespace CudaRasterizer
 {
@@ -31,14 +32,13 @@ namespace CudaRasterizer
 		size_t scan_size;
 		float* depths;
 		char* scanning_space;
-		bool* clamped;
 		int* internal_radii;
 		int* radii_x;
 		int* radii_y;
 		float2* means2D;
 		float* transMat;
 		float4* normal_opacity;
-		float* rgb;
+		__half* rgb;
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
 
@@ -48,8 +48,6 @@ namespace CudaRasterizer
 	struct ImageState
 	{
 		uint2* ranges;
-		uint32_t* n_contrib;
-		float* accum_alpha;
 
 		static ImageState fromChunk(char*& chunk, size_t N);
 	};

@@ -703,6 +703,25 @@ def set_aa_kernel_size(val=0.0):
     _C.set_aa_kernel_size(float(val))
 
 
+def set_skip_mlp_grad(val=True):
+    """Periodic-freeze toggle for mode 5 (3D_SH_res) backward.
+
+    When True, the backward skips ALL hash/MLP gradient work this iteration:
+      - 3 weight-grad WMMA GEMMs (dL_dW1/W2/W3)
+      - Scalar input-chain backprop (W3ᵀ → W2ᵀ → W1ᵀ, i.e. Phase 2/3/4 scalar)
+      - query_feature<true> call (hash-table dL_dgrid atomicAdds AND dL/dxyz-from-hash)
+      - Tile-level dL_dW flush to global memory
+
+    Geometry backward (transMat, normals, alpha, opacity, shapes) runs
+    unchanged. When False (default), the backward runs byte-for-byte
+    identically to pre-flag behavior.
+
+    Pair with a Python optimizer.step() skip on hash_encoding / mlp_fused
+    param groups on skip iterations.
+    """
+    _C.set_skip_mlp_grad(bool(val))
+
+
 def set_depth_sort(val):
     """Set depth sort toggle. True = separated depth sort, False = standard sort (default)."""
     _C.set_depth_sort(val)

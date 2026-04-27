@@ -886,6 +886,13 @@ void SetAaKernelSizeCUDA(float val) {
     BACKWARD::setAaKernelSize(val);
 }
 
+// Periodic-freeze toggle: when true, backward skips all hash/MLP-grad work
+// (weight-grad GEMMs, input-chain backprop, query_feature<true>, tile flush).
+// Geometry backward runs as normal.
+void SetSkipMlpGradCUDA(bool val) {
+    BACKWARD::setSkipMlpGrad(val);
+}
+
 // Defined in rasterizer_impl.cu
 extern bool g_depth_sort;
 

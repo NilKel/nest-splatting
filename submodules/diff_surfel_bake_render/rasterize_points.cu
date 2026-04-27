@@ -197,7 +197,7 @@ void ClearAtlasCacheCUDA() {
 	g_atlas_cache.clear();
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -220,7 +220,6 @@ RasterizeGaussiansCUDA(
 	const float beta,
 	const torch::Tensor& shapes,
 	const int kernel_type,
-	const torch::Tensor& residual_textures,
 	const torch::Tensor& atlas_texture,
 	const torch::Tensor& atlas_rects,
 	const int atlas_width,
@@ -228,10 +227,13 @@ RasterizeGaussiansCUDA(
 	// Optional Spherical-Beta params [N, K, 6], K=sb_number (empty if SB disabled)
 	const torch::Tensor& sb_params,
 	const int sb_number,
-	// Persistent buffers — pass empty on first call, reused on subsequent calls
+	// Persistent scratch buffers (resized in place when growth is needed).
 	torch::Tensor geomBuffer,
 	torch::Tensor binningBuffer,
-	torch::Tensor imgBuffer)
+	torch::Tensor imgBuffer,
+	// Persistent caller-owned outputs (Python pre-allocates and reuses).
+	torch::Tensor out_color,
+	torch::Tensor radii)
 {
 	if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 		AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -251,20 +253,11 @@ RasterizeGaussiansCUDA(
 	CHECK_INPUT(sh);
 	CHECK_INPUT(campos);
 
-	auto int_opts = means3D.options().dtype(torch::kInt32);
-	auto float_opts = means3D.options().dtype(torch::kFloat32);
-
-	// Kernel writes all inside pixels directly — no zeroing needed
-	torch::Tensor out_color = torch::empty({3, H, W}, float_opts);
-	// Kernel zeros all entries in preprocess — no zeroing needed
-	torch::Tensor radii = torch::empty({P}, int_opts);
-
-	// Persistent buffers: resizeFunctional will grow if needed, no-op if already big enough
+	// Persistent scratch buffers: resizeFunctional grows when needed, no-op otherwise.
 	std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
 	std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
 	std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
 
-	int rendered = 0;
 	if (P != 0)
 	{
 		int M = 0;
@@ -327,16 +320,19 @@ RasterizeGaussiansCUDA(
 			}
 		}
 
-		// Infer residual dimension from tensor size: total / (P * 8 * 8)
-		int residual_dim = 3;  // default: DC residual
-		if (residual_textures.numel() > 0 && P > 0) {
-			residual_dim = (int)(residual_textures.numel() / (P * 64));
-		}
-
+		// All input tensors are caller-pre-validated contiguous (we only run
+		// in inference mode against fixed pre-activated buffers from Python).
+		// Skip the redundant .contiguous() calls — they're no-ops on already-
+		// contiguous tensors but still cost a Python/C++ shape check per frame.
 		const float* sb_params_ptr = (sb_params.numel() > 0 && sb_number > 0)
 			? sb_params.contiguous().data<float>() : nullptr;
 
-		rendered = CudaRasterizer::Rasterizer::forward(
+		// Camera matrices (viewmatrix / projmatrix) come from PyTorch with a
+		// transpose applied — they're strided views, NOT contiguous. The
+		// kernel assumes row-major dense layout, so .contiguous() is required.
+		// Other inputs are already contiguous (gaussian tensors are snapshotted
+		// via .contiguous() in prepare_gaussian_inputs) so the call is a no-op.
+		CudaRasterizer::Rasterizer::forward(
 			geomFunc,
 			binningFunc,
 			imgFunc,
@@ -357,14 +353,11 @@ RasterizeGaussiansCUDA(
 			tan_fovy,
 			prefiltered,
 			out_color.contiguous().data<float>(),
-			nullptr,  // out_others not needed (RENDER_AXUTILITY=0)
 			radii.contiguous().data<int>(),
 			debug,
 			beta,
 			shapes_ptr,
 			kernel_type,
-			(residual_textures.numel() > 0) ? (const __half*)residual_textures.contiguous().data_ptr<at::Half>() : nullptr,
-			residual_dim,
 			atlas_texture_ptr,
 			atlas_rects_ptr,
 			atlas_width,
@@ -376,7 +369,7 @@ RasterizeGaussiansCUDA(
 			atlas_scale);
 	}
 
-	return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer);
+	return std::make_tuple(geomBuffer, binningBuffer, imgBuffer);
 }
 
 // Device-global setter bindings (mirror diff_surfel_3D_sh_res).
@@ -400,10 +393,10 @@ torch::Tensor markVisible(
 	if (P != 0)
 	{
 		CudaRasterizer::Rasterizer::markVisible(P,
-			means3D.contiguous().data<float>(),
-			viewmatrix.contiguous().data<float>(),
-			projmatrix.contiguous().data<float>(),
-			present.contiguous().data<bool>());
+			means3D.data<float>(),
+			viewmatrix.data<float>(),
+			projmatrix.data<float>(),
+			present.data<bool>());
 	}
 
 	return present;

@@ -14,6 +14,9 @@
 
 #include "config.h"
 #include "stdio.h"
+#define GLM_FORCE_CUDA
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
 
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 #define NUM_WARPS (BLOCK_SIZE/32)
@@ -92,6 +95,229 @@ __forceinline__ __device__ void getRectXY(const float2 p, int radius_x, int radi
 		min(grid.x, max((int)0, (int)((p.x + radius_x + BLOCK_X - 1) / BLOCK_X))),
 		min(grid.y, max((int)0, (int)((p.y + radius_y + BLOCK_Y - 1) / BLOCK_Y)))
 	};
+}
+
+// =============================================================================
+// SnugBox / AccuTile (FastGS / Speedy-Splat ports)
+//
+// 2DGS's `transMat T` is the homogeneous mapping pixel → surfel:
+//   (u_h, v_h, w_h) = T * (px, py, 1)   with   surfel s = (u_h/w_h, v_h/w_h)
+// (this is what `compute_aabb` uses directly, no inverse).
+//
+// The surfel-space disk `s.x² + s.y² <= cutoff²` pulls back to the inequality
+//   u_h² + v_h² − cutoff²·w_h² <= 0
+// in homogeneous pixel coords, expanding to a quadratic form in (px, py):
+//   Q(px, py) = A·px² + 2B·px·py + E·py² + 2D·px + 2F·py + G  <=  0
+//
+// Centering at the gradient-zero point p:
+//   A·dx² + 2B·dx·dy + E·dy² <= t,   t = -(D·p.x + F·p.y + G)
+//
+// FastGS's processTiles / computeEllipseIntersection consume exactly this
+// (A, B, E, t, p, disc=B²-AE) form.
+// =============================================================================
+
+// Compute conic form (A, B, E, t) and screen-space center p from transMat T
+// and a surfel-space cutoff radius. Returns false on degenerate projections.
+//
+// 2DGS uses transMat T to recover surfel coords from a pixel via the
+// cross-product trick (in render kernel):
+//   k = px·Tw − Tu,  l = py·Tw − Tv,  s = cross(k,l) / cross(k,l).z
+// Expanding cross(k,l) componentwise (the px·py terms cancel):
+//   cross(k,l) = px·(Tv×Tw) + py·(Tw×Tu) + (Tu×Tv)
+// So with n0 = Tv×Tw, n1 = Tw×Tu, n2 = Tu×Tv:
+//   cross(k,l).x = n0.x·px + n1.x·py + n2.x    (linear in px, py)
+//   cross(k,l).y = n0.y·px + n1.y·py + n2.y
+//   cross(k,l).z = n0.z·px + n1.z·py + n2.z
+//
+// The disk `s.x² + s.y² ≤ k²` becomes `cross.x² + cross.y² − k²·cross.z² ≤ 0`,
+// a quadratic in (px, py). Coefficients are extracted by squaring each
+// cross-component (linear in px, py) and combining with the appropriate sign:
+//   A (px²) = n0.x² + n0.y² − k²·n0.z²
+// (NOT n0.x² + n1.x² − k²·n2.x² — that confuses cross-components with vectors!)
+__forceinline__ __device__ bool compute_conic_from_transmat(
+	const glm::mat3& T, const float cutoff,
+	float& A, float& B, float& E, float& t, float2& p)
+{
+	const float k_sq = cutoff * cutoff;
+	const glm::vec3 Tu = T[0];
+	const glm::vec3 Tv = T[1];
+	const glm::vec3 Tw = T[2];
+
+	// Coefficient vectors of (px, py, 1) in cross(k,l) — see derivation above.
+	const glm::vec3 n0 = glm::cross(Tv, Tw);   // coef of px in (cross.x, cross.y, cross.z)
+	const glm::vec3 n1 = glm::cross(Tw, Tu);   // coef of py
+	const glm::vec3 n2 = glm::cross(Tu, Tv);   // constant
+
+	// Q(px,py) = cross.x² + cross.y² − k²·cross.z².
+	// Coefficients group by *which px/py power*, summed across cross-components.
+	const float A_ = n0.x*n0.x + n0.y*n0.y - k_sq * n0.z*n0.z;         // px²
+	const float B_ = n0.x*n1.x + n0.y*n1.y - k_sq * n0.z*n1.z;         // px·py (half)
+	const float E_ = n1.x*n1.x + n1.y*n1.y - k_sq * n1.z*n1.z;         // py²
+	const float D_ = n0.x*n2.x + n0.y*n2.y - k_sq * n0.z*n2.z;         // px linear (half)
+	const float F_ = n1.x*n2.x + n1.y*n2.y - k_sq * n1.z*n2.z;         // py linear (half)
+	const float G_ = n2.x*n2.x + n2.y*n2.y - k_sq * n2.z*n2.z;         // const
+
+	const float det = A_*E_ - B_*B_;
+	if (!(det > 0.0f) || !(A_ > 0.0f) || !(E_ > 0.0f)) return false;
+
+	p.x = (B_*F_ - E_*D_) / det;
+	p.y = (B_*D_ - A_*F_) / det;
+	const float t_ = -(D_*p.x + F_*p.y + G_);
+	if (!(t_ > 0.0f)) return false;
+
+	A = A_; B = B_; E = E_; t = t_;
+	return true;
+}
+
+__forceinline__ __device__ float2 computeEllipseIntersection(
+	const float A, const float B, const float E,
+	const float disc, const float t, const float2 p,
+	const bool isY, const float coord)
+{
+	const float p_u = isY ? p.y : p.x;
+	const float p_v = isY ? p.x : p.y;
+	const float coeff = isY ? A : E;
+	const float h = coord - p_u;
+	const float radicand = disc * h * h + t * coeff;
+	const float sqrt_term = sqrtf(fmaxf(radicand, 0.0f));
+	return {
+		(-B * h - sqrt_term) / coeff + p_v,
+		(-B * h + sqrt_term) / coeff + p_v
+	};
+}
+
+// Scan-line walk along the ellipse boundary. Returns total tile count;
+// when key/value buffers are non-null, also emits a (depth-keyed) entry per tile.
+__device__ inline uint32_t processTiles(
+	const float A, const float B, const float E,
+	const float disc, const float t, const float2 p,
+	float2 bbox_min, float2 bbox_max,
+	float2 bbox_argmin, float2 bbox_argmax,
+	int2 rect_min, int2 rect_max,
+	const dim3 grid, const bool isY,
+	uint32_t idx, uint32_t off, float depth,
+	uint64_t* gaussian_keys_unsorted,
+	uint32_t* gaussian_values_unsorted)
+{
+	const float BLOCK_U = isY ? (float)BLOCK_Y : (float)BLOCK_X;
+	const float BLOCK_V = isY ? (float)BLOCK_X : (float)BLOCK_Y;
+
+	if (isY) {
+		rect_min = {rect_min.y, rect_min.x};
+		rect_max = {rect_max.y, rect_max.x};
+		bbox_min = {bbox_min.y, bbox_min.x};
+		bbox_max = {bbox_max.y, bbox_max.x};
+		bbox_argmin = {bbox_argmin.y, bbox_argmin.x};
+		bbox_argmax = {bbox_argmax.y, bbox_argmax.x};
+	}
+
+	uint32_t tiles_count = 0;
+	float2 intersect_min_line, intersect_max_line;
+	float ellipse_min, ellipse_max;
+	float min_line, max_line;
+
+	intersect_max_line = {bbox_max.y, bbox_min.y};
+	min_line = rect_min.x * BLOCK_U;
+	if (bbox_min.x <= min_line) {
+		intersect_min_line = computeEllipseIntersection(
+			A, B, E, disc, t, p, isY, rect_min.x * BLOCK_U);
+	} else {
+		intersect_min_line = intersect_max_line;
+	}
+
+	for (int u = rect_min.x; u < rect_max.x; ++u)
+	{
+		max_line = min_line + BLOCK_U;
+		if (max_line <= bbox_max.x) {
+			intersect_max_line = computeEllipseIntersection(
+				A, B, E, disc, t, p, isY, max_line);
+		}
+
+		if (min_line <= bbox_argmin.y && bbox_argmin.y < max_line) {
+			ellipse_min = bbox_min.y;
+		} else {
+			ellipse_min = fminf(intersect_min_line.x, intersect_max_line.x);
+		}
+
+		if (min_line <= bbox_argmax.y && bbox_argmax.y < max_line) {
+			ellipse_max = bbox_max.y;
+		} else {
+			ellipse_max = fmaxf(intersect_min_line.y, intersect_max_line.y);
+		}
+
+		const int min_tile_v = max(rect_min.y, min(rect_max.y, (int)(ellipse_min / BLOCK_V)));
+		const int max_tile_v = min(rect_max.y, max(rect_min.y, (int)(ellipse_max / BLOCK_V + 1)));
+		tiles_count += (uint32_t)max(0, max_tile_v - min_tile_v);
+
+		if (gaussian_keys_unsorted != nullptr) {
+			for (int v = min_tile_v; v < max_tile_v; v++) {
+				uint64_t key = isY ? (u * grid.x + v) : (v * grid.x + u);
+				key <<= 32;
+				key |= *((uint32_t*)&depth);
+				gaussian_keys_unsorted[off] = key;
+				gaussian_values_unsorted[off] = idx;
+				off++;
+			}
+		}
+
+		intersect_min_line = intersect_max_line;
+		min_line = max_line;
+	}
+	return tiles_count;
+}
+
+// Two-mode driver: compute screen-space ellipse extents from (A, B, E, t, p)
+// and either count touched tiles (keys=null) or emit (key, value) pairs.
+__device__ inline uint32_t duplicateToTilesTouched(
+	const float A, const float B, const float E,
+	const float t, const float2 p, const dim3 grid,
+	uint32_t idx, uint32_t off, float depth,
+	uint64_t* gaussian_keys_unsorted,
+	uint32_t* gaussian_values_unsorted)
+{
+	const float disc = B * B - A * E;
+	if (A <= 0.0f || E <= 0.0f || disc >= 0.0f || t <= 0.0f) return 0;
+
+	// Ellipse extreme points (where ∂Q/∂x = 0 and ∂Q/∂y = 0 respectively).
+	const float x_term_sq = -(B * B * t) / (disc * A);
+	const float y_term_sq = -(B * B * t) / (disc * E);
+	if (x_term_sq < 0.0f || y_term_sq < 0.0f) return 0;
+	float x_term = sqrtf(x_term_sq);
+	float y_term = sqrtf(y_term_sq);
+	x_term = (B < 0.0f) ? x_term : -x_term;
+	y_term = (B < 0.0f) ? y_term : -y_term;
+
+	const float2 bbox_argmin = { p.y - y_term, p.x - x_term };
+	const float2 bbox_argmax = { p.y + y_term, p.x + x_term };
+	const float2 bbox_min = {
+		computeEllipseIntersection(A, B, E, disc, t, p, true, bbox_argmin.x).x,
+		computeEllipseIntersection(A, B, E, disc, t, p, false, bbox_argmin.y).x
+	};
+	const float2 bbox_max = {
+		computeEllipseIntersection(A, B, E, disc, t, p, true, bbox_argmax.x).y,
+		computeEllipseIntersection(A, B, E, disc, t, p, false, bbox_argmax.y).y
+	};
+
+	const int2 rect_min = {
+		max(0, min((int)grid.x, (int)(bbox_min.x / BLOCK_X))),
+		max(0, min((int)grid.y, (int)(bbox_min.y / BLOCK_Y)))
+	};
+	const int2 rect_max = {
+		max(0, min((int)grid.x, (int)(bbox_max.x / BLOCK_X + 1))),
+		max(0, min((int)grid.y, (int)(bbox_max.y / BLOCK_Y + 1)))
+	};
+
+	const int y_span = rect_max.y - rect_min.y;
+	const int x_span = rect_max.x - rect_min.x;
+	if (y_span * x_span == 0) return 0;
+
+	const bool isY = y_span < x_span;
+	return processTiles(
+		A, B, E, disc, t, p,
+		bbox_min, bbox_max, bbox_argmin, bbox_argmax,
+		rect_min, rect_max, grid, isY,
+		idx, off, depth,
+		gaussian_keys_unsorted, gaussian_values_unsorted);
 }
 
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)

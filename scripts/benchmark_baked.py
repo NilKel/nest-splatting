@@ -28,6 +28,7 @@ from arguments import ModelParams
 from utils.render_utils import save_img_u8
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
+from lpipsPyTorch import lpips
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +296,12 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
                 mlp_input = torch.zeros(xyz_flat.shape[0], mlp_input_padded,
                                         device='cuda', dtype=torch.float16)
                 mlp_input[:, :hash_dim] = hash_feat[:, :hash_dim].to(torch.float16)
-                mlp_input[:, bias_col] = 1.0
+                # 3D_SH_res has NO bias column in its input — training builds the
+                # MLP with `bias=False` on every layer and pads the unused tail
+                # of the input with zeros (see hash_encoder/modules.py:336 "no bias
+                # in input"). Writing 1.0 anywhere here would diverge from the
+                # training-time forward pass. (Earlier code wrote 1.0 at hash_dim
+                # which silently corrupted bakes for hash_dim < 16.)
                 mlp_out = mlp(mlp_input)  # FP16 in, FP16 out
                 rgb_residual = mlp_out[:, :3].to(torch.float32)
 
@@ -345,44 +351,37 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
 # ---------------------------------------------------------------------------
 # Render baked model
 # ---------------------------------------------------------------------------
-def render_baked(viewpoint_camera, gaussians, background,
-                 residual_textures=None, beta=0.0, kernel_type=0,
+def render_baked(viewpoint_camera, gaussian_pkg, background,
+                 beta=0.0, sh_degree=3, aabb_mode=3,
                  atlas_texture=None, atlas_rects=None, atlas_width=0,
-                 aabb_mode=3,
                  sb_params=None, sb_number=0):
-    from diff_surfel_bake_render import GaussianRasterizationSettings, GaussianRasterizer
+    """Render one view. `gaussian_pkg` is the dict from
+    `prepare_gaussian_inputs(gaussians, ...)` — pre-activated tensors that are
+    constant for the whole scene."""
+    from diff_surfel_bake_render import get_rasterizer
 
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
-    raster_settings = GaussianRasterizationSettings(
+    rasterizer = get_rasterizer(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx, tanfovy=tanfovy,
-        bg=background, scale_modifier=1.0,
+        bg=background,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=gaussians.active_sh_degree,
         campos=viewpoint_camera.camera_center,
-        prefiltered=False, debug=False, beta=beta,
-        aabb_mode=aabb_mode,
+        sh_degree=sh_degree, beta=beta, aabb_mode=aabb_mode,
     )
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-    shapes = None
-    if kernel_type > 0 and hasattr(gaussians, '_shape') and gaussians._shape is not None and gaussians._shape.numel() > 0:
-        shapes = gaussians.get_shape
-
-    color, radii = rasterizer(
-        means3D=gaussians.get_xyz,
-        means2D=torch.zeros_like(gaussians.get_xyz[:, :2], requires_grad=False),
-        opacities=gaussians.get_opacity,
-        shs=gaussians.get_features,
-        scales=gaussians.get_scaling,
-        rotations=gaussians.get_rotation,
-        shapes=shapes, kernel_type=kernel_type,
-        residual_textures=residual_textures,
+    color, _ = rasterizer(
+        means3D=gaussian_pkg['means3D'],
+        opacities=gaussian_pkg['opacities'],
+        shs=gaussian_pkg['shs'],
+        scales=gaussian_pkg['scales'],
+        rotations=gaussian_pkg['rotations'],
+        shapes=gaussian_pkg['shapes'],
+        kernel_type=gaussian_pkg['kernel_type'],
         atlas_texture=atlas_texture,
         atlas_rects=atlas_rects,
         atlas_width=atlas_width,
@@ -393,28 +392,38 @@ def render_baked(viewpoint_camera, gaussians, background,
 
 
 def evaluate_baked(test_cameras, gaussians, bg_color, beta, kernel_type,
-                   residual_textures=None, atlas_texture=None, atlas_rects=None,
+                   atlas_texture=None, atlas_rects=None,
                    atlas_width=0, num_warmup=10, num_benchmark=100, save_dir=None,
                    aabb_mode=3,
                    sb_params=None, sb_number=0):
-    """Render all test views, compute metrics, benchmark FPS. Optionally save images."""
-    psnrs, l1s, ssims_list = [], [], []
-    kwargs = dict(residual_textures=residual_textures,
-                  atlas_texture=atlas_texture, atlas_rects=atlas_rects,
+    """Render all test views, compute metrics, benchmark FPS."""
+    from diff_surfel_bake_render import prepare_gaussian_inputs
+
+    # Snapshot post-activation tensors once for the whole scene.
+    gaussian_pkg = prepare_gaussian_inputs(
+        gaussians, sh_degree=gaussians.active_sh_degree, kernel_type=kernel_type)
+
+    psnrs, l1s, ssims_list, lpips_list = [], [], [], []
+    kwargs = dict(atlas_texture=atlas_texture, atlas_rects=atlas_rects,
                   atlas_width=atlas_width, aabb_mode=aabb_mode,
-                  sb_params=sb_params, sb_number=sb_number)
+                  sb_params=sb_params, sb_number=sb_number,
+                  sh_degree=gaussians.active_sh_degree)
 
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
 
     with torch.no_grad():
         for cam in test_cameras:
-            rendered = render_baked(cam, gaussians, bg_color,
-                                    beta=beta, kernel_type=kernel_type, **kwargs)
+            rendered = render_baked(cam, gaussian_pkg, bg_color,
+                                    beta=beta, **kwargs)
             gt = cam.original_image[:3].cuda()
             psnrs.append(psnr(rendered, gt).mean().item())
             l1s.append(l1_loss(rendered, gt).item())
             ssims_list.append(ssim(rendered, gt).item())
+            # LPIPS expects [B, 3, H, W] in [0, 1]; rendered/gt are already [3, H, W].
+            lpips_list.append(lpips(rendered.clamp(0, 1).unsqueeze(0),
+                                    gt.clamp(0, 1).unsqueeze(0),
+                                    net_type='vgg').item())
 
             if save_dir is not None:
                 img_np = rendered.clamp(0, 1).permute(1, 2, 0).cpu().numpy()
@@ -423,27 +432,32 @@ def evaluate_baked(test_cameras, gaussians, bg_color, beta, kernel_type,
         # FPS warmup
         for i in range(num_warmup):
             cam = test_cameras[i % len(test_cameras)]
-            _ = render_baked(cam, gaussians, bg_color,
-                             beta=beta, kernel_type=kernel_type, **kwargs)
+            _ = render_baked(cam, gaussian_pkg, bg_color,
+                             beta=beta, **kwargs)
         torch.cuda.synchronize()
 
-        # FPS benchmark
-        times = []
+        # FPS benchmark using CUDA events. We time each frame with its own
+        # event pair so the measurement excludes Python-side wall-clock noise.
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_benchmark)]
+        ends   = [torch.cuda.Event(enable_timing=True) for _ in range(num_benchmark)]
         for i in range(num_benchmark):
             cam = test_cameras[i % len(test_cameras)]
-            torch.cuda.synchronize()
-            t0 = time.time()
-            _ = render_baked(cam, gaussians, bg_color,
-                             beta=beta, kernel_type=kernel_type, **kwargs)
-            torch.cuda.synchronize()
-            times.append(time.time() - t0)
+            starts[i].record()
+            _ = render_baked(cam, gaussian_pkg, bg_color,
+                             beta=beta, **kwargs)
+            ends[i].record()
+        torch.cuda.synchronize()
+        # elapsed_time returns ms; convert to seconds for parity with old API.
+        times_ms = [starts[i].elapsed_time(ends[i]) for i in range(num_benchmark)]
+        mean_ms = float(np.mean(times_ms))
 
     return {
         "psnr": float(np.mean(psnrs)),
         "ssim": float(np.mean(ssims_list)),
+        "lpips": float(np.mean(lpips_list)),
         "l1": float(np.mean(l1s)),
-        "fps": float(1.0 / np.mean(times)),
-        "ms_per_frame": float(np.mean(times) * 1000),
+        "fps": float(1000.0 / mean_ms),
+        "ms_per_frame": mean_ms,
     }
 
 
@@ -739,18 +753,21 @@ def main():
     print("  RESULTS SUMMARY")
     print("=" * 70)
 
-    print(f"\n  {'Mode':<25} {'PSNR':>8} {'SSIM':>8} {'FPS':>8}")
-    print(f"  {'-'*25} {'-'*8} {'-'*8} {'-'*8}")
+    n_gauss = int(gaussians.get_xyz.shape[0])
+    print(f"\n  Gaussians: {n_gauss:,}")
+    print(f"\n  {'Mode':<25} {'PSNR':>8} {'SSIM':>8} {'LPIPS':>8} {'FPS':>8}")
+    print(f"  {'-'*25} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
 
     if test_info.get("neural_psnr"):
         neural_fps = train_info.get("train_fps", "?")
         print(f"  {'Neural renderer':<25} {test_info['neural_psnr']:>7.2f}  "
-              f"{test_info.get('neural_ssim', 0):>7.4f}  {neural_fps:>7}")
+              f"{test_info.get('neural_ssim', 0):>7.4f}  "
+              f"{test_info.get('neural_lpips', 0):>7.4f}  {neural_fps:>7}")
 
     print(f"  {'Baked (SH only)':<25} {sh_metrics['psnr']:>7.2f}  "
-          f"{sh_metrics['ssim']:>7.4f}  {sh_metrics['fps']:>7.1f}")
+          f"{sh_metrics['ssim']:>7.4f}  {sh_metrics['lpips']:>7.4f}  {sh_metrics['fps']:>7.1f}")
     print(f"  {'Baked (SH + atlas)':<25} {baked_metrics['psnr']:>7.2f}  "
-          f"{baked_metrics['ssim']:>7.4f}  {baked_metrics['fps']:>7.1f}")
+          f"{baked_metrics['ssim']:>7.4f}  {baked_metrics['lpips']:>7.4f}  {baked_metrics['fps']:>7.1f}")
 
     if test_info.get("neural_psnr"):
         delta = baked_metrics['psnr'] - test_info['neural_psnr']

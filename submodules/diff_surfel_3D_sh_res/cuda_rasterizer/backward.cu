@@ -28,6 +28,15 @@ __device__ float d_overdraw_lambda_bw = 0.0f;
 __device__ float d_weight_reg_lambda_bw = 0.0f;  // Weight-squared reg: -lambda * 2 * w * T per Gaussian
 __device__ float d_res_bias = 0.5f;  // Residual activation bias: ReLU(residual + d_res_bias)
 __device__ float d_aa_kernel_size = 0.0f;  // AA-2DGS Jacobian mip filter σ (0 = off)
+// Periodic-freeze flag for the mode 5 (3D_SH_res) backward. When true, the
+// kernel skips EVERYTHING hash/MLP-gradient-related: the 3 weight-grad WMMA
+// GEMMs, the scalar W^T input-chain backprop (Phase 2/3/4), the
+// query_feature<true> call (hash-table dL_dgrid + dL/dxyz-from-hash), and
+// the tile-level dL_dW flush. Geometry backward (transMat, normals, alpha,
+// opacity) is untouched. Default false — when flag is false, ALL gates below
+// evaluate true and the kernel runs byte-for-byte identically to pre-flag.
+// Controlled from Python via BACKWARD::setSkipMlpGrad().
+__device__ bool d_skip_mlp_grad = false;
 
 // ============================================================================
 // BACKWARD KERNEL PROFILING (clock64 instrumentation)
@@ -1239,11 +1248,18 @@ renderCUDAsurfelBackward(
 
 				// Note: no __syncthreads needed here - ballot check above provides sync
 				extern __shared__ __half dynamic_smem[];
-				wmma_gemm_layer3(my_dL_dz3, my_h2_post, tile_dL_dW3, dynamic_smem);
+				// d_skip_mlp_grad: periodic-freeze flag. All threads see the same
+				// device-global value, so each of the conditionals below is
+				// uniform across the block — collective WMMA GEMMs are either
+				// entered by everyone or skipped by everyone. Default false →
+				// every branch evaluates true → identical to pre-flag path.
+				if (!d_skip_mlp_grad) {
+					wmma_gemm_layer3(my_dL_dz3, my_h2_post, tile_dL_dW3, dynamic_smem);
+				}
 
 				// --- Phase 2: Layer 3 backward → dL_dz2 ---
 				float my_dL_dz2[TC_HIDDEN_DIM] = {0};
-				if (participates) {
+				if (participates && !d_skip_mlp_grad) {
 					// dL_dh2 = W3^T @ dL_dz3, then ReLU backward: dL_dz2 = dL_dh2 * (h2_post > 0)
 					#pragma unroll
 					for (int h = 0; h < TC_HIDDEN_DIM; h++) {
@@ -1258,11 +1274,13 @@ renderCUDAsurfelBackward(
 				__syncthreads();
 				// Profiling: T1 at sync before GEMM L2 (end of Phase A)
 				unsigned long long _prof_t1 = clock64();
-				wmma_gemm_layer2(my_dL_dz2, my_h1_post, tile_dL_dW2, dynamic_smem);
+				if (!d_skip_mlp_grad) {
+					wmma_gemm_layer2(my_dL_dz2, my_h1_post, tile_dL_dW2, dynamic_smem);
+				}
 
 				// --- Phase 3: Layer 2 backward → dL_dz1 ---
 				float my_dL_dz1[TC_HIDDEN_DIM] = {0};
-				if (participates) {
+				if (participates && !d_skip_mlp_grad) {
 					// dL_dh1 = W2^T @ dL_dz2, then ReLU backward: dL_dz1 = dL_dh1 * (h1_post > 0)
 					#pragma unroll
 					for (int h = 0; h < TC_HIDDEN_DIM; h++) {
@@ -1277,24 +1295,31 @@ renderCUDAsurfelBackward(
 				__syncthreads();
 				// Profiling: T2 at sync before GEMM L1 (end of Phase B)
 				unsigned long long _prof_t2 = clock64();
-				wmma_gemm_layer1(my_dL_dz1, my_input, tile_dL_dW1, dynamic_smem);
+				if (!d_skip_mlp_grad) {
+					wmma_gemm_layer1(my_dL_dz1, my_input, tile_dL_dW1, dynamic_smem);
+				}
 
 				// ======== Phase 4: dL_dinput → hash & geometry gradients ========
 				if (participates) {
 					// dL_dinput = W1^T @ dL_dz1 (first hash_dim elements = hash features)
 					const int hash_dim = active_hashgrid_levels * l_dim;
 					float my_dL_dinput[12];  // Max 12D (3 levels × 4D)
-					for (int i = 0; i < hash_dim && i < 12; i++) {
-						float sum = 0;
-						for (int h = 0; h < TC_HIDDEN_DIM; h++) {
-							sum += my_dL_dz1[h] * __half2float(smem_mlp_W1[h * TC_INPUT_DIM + i]);
+					if (!d_skip_mlp_grad) {
+						for (int i = 0; i < hash_dim && i < 12; i++) {
+							float sum = 0;
+							for (int h = 0; h < TC_HIDDEN_DIM; h++) {
+								sum += my_dL_dz1[h] * __half2float(smem_mlp_W1[h * TC_INPUT_DIM + i]);
+							}
+							my_dL_dinput[i] = sum;
 						}
-						my_dL_dinput[i] = sum;
 					}
 
-					// Backprop to hash features - dL_dxyz flows to geometry
+					// Backprop to hash features - dL_dxyz flows to geometry.
+					// Skipped entirely under d_skip_mlp_grad: no hash-table dL_dgrid
+					// atomicAdds, no dL/dxyz-from-hash accumulation. Geometry
+					// backward below still runs for transMat / normals / alpha.
 					float dL_dxyz[3] = {0, 0, 0};
-					if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
+					if (!d_skip_mlp_grad && !skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
 						float dL_dhash[16];
 						for (int i = 0; i < hash_dim; i++) dL_dhash[i] = my_dL_dinput[i];
 						float hash_feat_dummy[16];
@@ -2616,8 +2641,12 @@ renderCUDAsurfelBackward(
 		}
 	}
 
-	// Flush tile-local MLP gradients to global memory (once per tile, bias-free)
-	if (((render_mode & 0xFF) == 5 || (render_mode & 0xFF) == 6) && dL_dmlp_W1 != nullptr) {
+	// Flush tile-local MLP gradients to global memory (once per tile, bias-free).
+	// When d_skip_mlp_grad is set, the three wmma_gemm_layer* calls above were
+	// skipped so tile_dL_dW* buffers remain zero — flushing would just do 48
+	// zero atomicAdds per tile, wasted bandwidth. Skip cleanly.
+	if (((render_mode & 0xFF) == 5 || (render_mode & 0xFF) == 6) && dL_dmlp_W1 != nullptr
+	        && !d_skip_mlp_grad) {
 		block.sync();
 		unsigned long long _prof_flush_t0 = clock64();
 		MODES::flush_tile_mlp_grads(
@@ -2893,6 +2922,11 @@ void BACKWARD::setResBias(float val) {
 __global__ void setAaKernelSizeBwKernel(float val) { d_aa_kernel_size = val; }
 void BACKWARD::setAaKernelSize(float val) {
 	setAaKernelSizeBwKernel<<<1, 1>>>(val);
+}
+
+__global__ void setSkipMlpGradKernel(bool val) { d_skip_mlp_grad = val; }
+void BACKWARD::setSkipMlpGrad(bool val) {
+	setSkipMlpGradKernel<<<1, 1>>>(val);
 }
 
 void BACKWARD::preprocess(

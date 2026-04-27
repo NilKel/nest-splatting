@@ -32,6 +32,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_anti_alias", &SetAntiAliasCUDA);
   m.def("set_compact_mult", &SetCompactMultCUDA);
   m.def("set_aa_kernel_size", &SetAaKernelSizeCUDA);
+  m.def("set_skip_mlp_grad", &SetSkipMlpGradCUDA);
   m.def("set_depth_sort", &SetDepthSortCUDA);
   m.def("reset_backward_profile", &ResetBackwardProfileCUDA);
   m.def("read_backward_profile", &ReadBackwardProfileCUDA);

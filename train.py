@@ -1108,6 +1108,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 optim_ngp = True
                 optim_gaussian = ingp.optim_gaussian
 
+            # Periodic hashgrid+MLP freeze for 3D_SH_res. After `freeze_hash_iter`,
+            # train hash+MLP on 1 iter out of every `freeze_hash_period`. On skip
+            # iters: CUDA backward skips all hash/MLP-grad work (weight-grad GEMMs,
+            # input-chain backprop, query_feature<true>, tile flush) and the
+            # optimizer.step() for ingp is skipped. Geometry backward runs unchanged.
+            if (args.freeze_hash_iter > 0 and iteration >= args.freeze_hash_iter
+                    and args.method == "3D_SH_res"):
+                period = max(1, int(args.freeze_hash_period))
+                should_train = (iteration % period) == 0
+                desired_skip = not should_train
+                # Flip the CUDA flag only on state transitions (saves a 1-thread
+                # kernel launch every iter).
+                current_skip = getattr(ingp, '_skip_mlp_grad', None)
+                if current_skip != desired_skip:
+                    try:
+                        from diff_surfel_3D_sh_res import set_skip_mlp_grad
+                        set_skip_mlp_grad(desired_skip)
+                    except (ImportError, AttributeError):
+                        tqdm.write("[FREEZE_HASH] WARN: set_skip_mlp_grad not available; rebuild?")
+                    ingp._skip_mlp_grad = desired_skip
+                    if current_skip is None:
+                        tqdm.write(f"[FREEZE_HASH] Periodic freeze active at iter {iteration} "
+                                   f"(train hash+MLP 1 of every {period} iters)")
+                optim_ngp = should_train
+
             if iteration % surfel_cfg.update_interval == 0 and optim_gaussian \
                 and beta < surfel_cfg.tg_beta and active_levels == cfg_model.encoding.levels:
                 
@@ -4199,7 +4224,7 @@ if __name__ == "__main__":
     parser.add_argument("--decompose_mode", type=str, default=None,
                         choices=[None, "gaussian_only", "ngp_only"],
                         help="Decomposition mode for hybrid_SH visualization: 'gaussian_only' (only per-Gaussian SH), 'ngp_only' (only hashgrid DC residual), or None (normal combined rendering)")
-    parser.add_argument("--disable_c2f", action="store_true",
+    parser.add_argument("--disable_c2f", action="store_false",
                         help="Disable coarse-to-fine for cat mode (all levels active from start)")
     parser.add_argument("--dropout_lambda", type=float, default=0.0,
                         help="Hash dropout rate for cat_dropout mode: fraction of Gaussians that don't query hash during training (0.2 = 20%% dropout)")
@@ -4207,6 +4232,16 @@ if __name__ == "__main__":
                         help="Regularization weight for adaptive mode to encourage per-Gaussian features")
     parser.add_argument("--freeze_mlp", action="store_true",
                         help="Freeze MLP weights (random init or from --freeze_mlp_from). Only hashgrid learns. Skips MLP weight gradient computation in CUDA.")
+    parser.add_argument("--freeze_hash_iter", type=int, default=0,
+                        help="Start periodic hash+MLP freeze at this iteration. 0 = never "
+                             "freeze (default). Once active, the 3D_SH_res backward skips all "
+                             "hash/MLP gradient work (weight-grad GEMMs, input-chain backprop, "
+                             "query_feature<true>, tile flush) except on every Nth iter where "
+                             "N is --freeze_hash_period. Geometry backward always runs.")
+    parser.add_argument("--freeze_hash_period", type=int, default=10,
+                        help="Period for --freeze_hash_iter. Default 10: train hash+MLP on 1 "
+                             "of every 10 iters after the freeze starts. Large value (e.g. "
+                             "999999) = permanent freeze.")
     parser.add_argument("--freeze_mlp_from", type=str, default=None,
                         help="Load frozen MLP weights from this model_path (loads ngp checkpoint's mlp_fused weights)")
     parser.add_argument("--res_lr_scale", type=float, default=1.0,

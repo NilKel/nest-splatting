@@ -55,7 +55,10 @@ __global__ void checkFrustum(int P,
 	present[idx] = in_frustum(idx, orig_points, viewmatrix, projmatrix, false, p_view);
 }
 
-// Generates one key/value pair for all Gaussian / tile overlaps.
+// Rectangular AABB key emission. Tile-Gaussian pairs are enumerated over
+// the rect [radii_x, radii_y] around points_xy. Tighter ellipse-aware
+// emission (SnugBox / AccuTile) didn't pan out for our 2DGS T —
+// see docs/SNUGBOX_ATTEMPT.md.
 __global__ void duplicateWithKeys(
 	int P,
 	const float2* points_xy,
@@ -133,14 +136,13 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 {
 	GeometryState geom;
 	obtain(chunk, geom.depths, P, 128);
-	obtain(chunk, geom.clamped, P * 3, 128);
 	obtain(chunk, geom.internal_radii, P, 128);
 	obtain(chunk, geom.radii_x, P, 128);
 	obtain(chunk, geom.radii_y, P, 128);
 	obtain(chunk, geom.means2D, P, 128);
 	obtain(chunk, geom.transMat, P * 9, 128);
 	obtain(chunk, geom.normal_opacity, P, 128);
-	obtain(chunk, geom.rgb, P * 3, 128);
+	obtain(chunk, geom.rgb, P * 3, 128);  // FP16 — half the bandwidth on the inner-loop fetch
 	obtain(chunk, geom.tiles_touched, P, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
@@ -151,13 +153,6 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
 {
 	ImageState img;
-#if RENDER_AXUTILITY
-	obtain(chunk, img.accum_alpha, N * 3, 128);
-	obtain(chunk, img.n_contrib, N * 2, 128);
-#else
-	obtain(chunk, img.accum_alpha, N, 128);
-	obtain(chunk, img.n_contrib, N, 128);
-#endif
 	obtain(chunk, img.ranges, N, 128);
 	return img;
 }
@@ -198,14 +193,11 @@ int CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
-	float* out_others,
 	int* radii,
 	bool debug,
 	const float beta,
 	const float* shapes,
 	const int kernel_type,
-	const __half* residual_textures,
-	const int residual_dim,
 	const __half* atlas_texture,
 	const float* atlas_rects,
 	const int atlas_width,
@@ -240,7 +232,7 @@ int CudaRasterizer::Rasterizer::forward(
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
 	}
 
-	// Preprocess: SH eval, transmat, tile counting
+	// Preprocess: SH eval, transmat, AABB → tile-touched count.
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
 		means3D,
@@ -249,7 +241,6 @@ int CudaRasterizer::Rasterizer::forward(
 		(glm::vec4*)rotations,
 		opacities,
 		shs,
-		geomState.clamped,
 		colors_precomp,
 		viewmatrix, projmatrix,
 		(glm::vec3*)cam_pos,
@@ -282,7 +273,7 @@ int CudaRasterizer::Rasterizer::forward(
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
-	// Tile-Gaussian key generation
+	// Tile-Gaussian key generation (rect AABB).
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,
@@ -315,8 +306,8 @@ int CudaRasterizer::Rasterizer::forward(
 			imgState.ranges);
 	CHECK_CUDA(, debug)
 
-	// Render: SH base color + residual texture
-	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	// Render: SH base color + atlas residual. preprocessCUDA already wrote
+	// the SH-evaluated (or precomputed) base color into geomState.rgb (FP16).
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
@@ -324,19 +315,14 @@ int CudaRasterizer::Rasterizer::forward(
 		beta,
 		width, height,
 		geomState.means2D,
-		feature_ptr,
+		geomState.rgb,
 		geomState.transMat,
 		geomState.depths,
 		geomState.normal_opacity,
-		imgState.accum_alpha,
-		imgState.n_contrib,
 		background,
 		out_color,
-		out_others,
 		shapes,
 		kernel_type,
-		residual_textures,
-		residual_dim,
 		means3D,
 		cam_pos,
 		atlas_texture,

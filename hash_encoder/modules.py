@@ -109,7 +109,8 @@ class INGP(nn.Module):
         # Auto-enable disable_c2f for all methods except baseline
         # Baseline is the only method that benefits from coarse-to-fine scheduling
         explicit_disable_c2f = args is not None and hasattr(args, 'disable_c2f') and args.disable_c2f
-        self.disable_c2f = explicit_disable_c2f or (not self.is_baseline_mode)
+        # self.disable_c2f = explicit_disable_c2f or (not self.is_baseline_mode)
+        self.disable_c2f = explicit_disable_c2f
         
         # Store args for diffuse mode configuration (per-Gaussian RGB, no viewdir, no hashgrid)
         self.is_diffuse_mode = args is not None and hasattr(args, 'method') and args.method == "diffuse"
@@ -1009,10 +1010,14 @@ class INGP(nn.Module):
             self.active_hashgrid_levels = self.hashgrid_levels  # All hashgrid levels active
             self.optim_gaussian = True  # Train Gaussians throughout
         elif self.is_3D_direct_fused_mode:
-            # 3D_SH_res / 3D_SH_cat: C2F for multi-level hash grids.
+            # 3D_SH_res / 3D_SH_cat: progressive C2F for multi-level hash grids.
             # Coarsest hash level always on, add one finer level every 2k iters.
-            # Other fused modes (3D_direct_lean, 3D_direct_tc, etc.): all levels active.
-            if (self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode) and self.hashgrid_levels > 1:
+            # Gated on self.disable_c2f (auto-True for non-baseline in __init__ →
+            # effectively off by default; flip the auto-True logic at line ~112 to
+            # experiment with C2F here). Other fused modes (3D_direct_lean, etc.):
+            # all levels active.
+            if ((self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode)
+                    and self.hashgrid_levels > 1 and not self.disable_c2f):
                 c2f_step = 2000
                 self.active_hashgrid_levels = min(
                     self.hashgrid_levels,

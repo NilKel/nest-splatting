@@ -82,6 +82,11 @@ namespace BACKWARD
 	void setWeightRegLambda(float val);
 	void setResBias(float val);
 	void setAaKernelSize(float val);
+	// Periodic-freeze flag: when true, the mode 5 backward skips all
+	// hash/MLP gradient work (weight-grad GEMMs, input-chain backprop,
+	// query_feature<true>, and the tile dL_dW flush). Geometry backward
+	// runs unchanged. Default false restores exact pre-flag behavior.
+	void setSkipMlpGrad(bool val);
 
 	void preprocess(
 		int P, int D, int M,

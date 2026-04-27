@@ -7,8 +7,10 @@
 #include <cstdio>
 #include <tuple>
 
-// Forward-only rendering: returns (num_rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer)
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+// Forward-only rendering. All output tensors (out_color, radii) and scratch
+// buffers are caller-owned and persistent. We return only the (possibly
+// resized) scratch buffers so Python can hold their new pointers.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -31,18 +33,20 @@ RasterizeGaussiansCUDA(
 	const float beta,
 	const torch::Tensor& shapes,     // beta kernel shape parameters (empty if not using)
 	const int kernel_type,
-	const torch::Tensor& residual_textures,  // [N, 192] FP16 residual textures (empty if SH-only)
-	const torch::Tensor& atlas_texture,      // [H*W*3] FP16 atlas (empty if not atlas mode)
-	const torch::Tensor& atlas_rects,        // [N, 4] float atlas UV rects (empty if not atlas mode)
-	const int atlas_width,                   // atlas dimension (0 if not atlas mode)
+	const torch::Tensor& atlas_texture,      // [H*W*3] FP16 atlas (required — only mode supported)
+	const torch::Tensor& atlas_rects,        // [N, 4] float atlas UV rects (required)
+	const int atlas_width,                   // atlas dimension
 	const int aabb_mode,                     // 0=square, 1=square+AdR, 2=rect, 3=rect+AdR
 	// Optional Spherical-Beta params [N, K, 6], K=sb_number (empty if SB disabled)
 	const torch::Tensor& sb_params,
 	const int sb_number,
-	// Persistent buffers — pass empty on first call, reused on subsequent calls
+	// Persistent scratch buffers (resized in place when growth is needed).
 	torch::Tensor geomBuffer,
 	torch::Tensor binningBuffer,
-	torch::Tensor imgBuffer);
+	torch::Tensor imgBuffer,
+	// Persistent caller-owned outputs (Python pre-allocates and reuses).
+	torch::Tensor out_color,
+	torch::Tensor radii);
 
 // Device-global setters mirroring training-time setters.
 void SetActivationBiasBakeCUDA(float sh_bias, float res_bias);

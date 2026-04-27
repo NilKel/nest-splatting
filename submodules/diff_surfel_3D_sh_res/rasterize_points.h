@@ -223,6 +223,11 @@ void SetCompactMultCUDA(float val);
 // Set AA-2DGS mip filter kernel size σ (0 disables, typical 0.1).
 void SetAaKernelSizeCUDA(float val);
 
+// Periodic-freeze toggle for mode 5 backward. True = skip all hash/MLP
+// gradient work this iter (weight-grad GEMMs, input-chain backprop,
+// query_feature<true>, tile flush). False = normal backward.
+void SetSkipMlpGradCUDA(bool val);
+
 // Set depth sort toggle (true = separated depth sort, false = standard sort)
 void SetDepthSortCUDA(bool val);
 
