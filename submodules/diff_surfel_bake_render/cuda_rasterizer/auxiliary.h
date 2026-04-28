@@ -149,26 +149,41 @@ __forceinline__ __device__ bool compute_conic_from_transmat(
 	const glm::vec3 n2 = glm::cross(Tu, Tv);   // constant
 
 	// Q(px,py) = cross.x² + cross.y² − k²·cross.z².
-	// Coefficients group by *which px/py power*, summed across cross-components.
+	// Quadratic coefficients group by px/py power, summed across cross-components.
 	const float A_ = n0.x*n0.x + n0.y*n0.y - k_sq * n0.z*n0.z;         // px²
 	const float B_ = n0.x*n1.x + n0.y*n1.y - k_sq * n0.z*n1.z;         // px·py (half)
 	const float E_ = n1.x*n1.x + n1.y*n1.y - k_sq * n1.z*n1.z;         // py²
 	const float D_ = n0.x*n2.x + n0.y*n2.y - k_sq * n0.z*n2.z;         // px linear (half)
 	const float F_ = n1.x*n2.x + n1.y*n2.y - k_sq * n1.z*n2.z;         // py linear (half)
-	const float G_ = n2.x*n2.x + n2.y*n2.y - k_sq * n2.z*n2.z;         // const
+	// G is the constant term but we never need it explicitly — see t below.
 
 	const float det = A_*E_ - B_*B_;
 	if (!(det > 0.0f) || !(A_ > 0.0f) || !(E_ > 0.0f)) return false;
 
+	// Center: ∇Q = 0 solved by Cramer (A·p.x + B·p.y = -D, B·p.x + E·p.y = -F).
 	p.x = (B_*F_ - E_*D_) / det;
 	p.y = (B_*D_ - A_*F_) / det;
-	const float t_ = -(D_*p.x + F_*p.y + G_);
+
+	// t = -Q(p). The polynomial form (D·p.x + F·p.y + G) involves canceling
+	// O(1e9) magnitudes — float32 loses ~7 digits and can return values 2×
+	// off, blowing up bbox extents (verified in Python — see
+	// scripts/test_snugbox_math.py). Evaluate Q at p directly via the
+	// cross-product form (each component O(1) after gradient cancellation):
+	//     cross_p = p.x·n0 + p.y·n1 + n2
+	//     Q(p)   = cross_p.x² + cross_p.y² − k²·cross_p.z²
+	const float cx_p = p.x*n0.x + p.y*n1.x + n2.x;
+	const float cy_p = p.x*n0.y + p.y*n1.y + n2.y;
+	const float cz_p = p.x*n0.z + p.y*n1.z + n2.z;
+	const float t_   = -(cx_p*cx_p + cy_p*cy_p - k_sq * cz_p*cz_p);
 	if (!(t_ > 0.0f)) return false;
 
 	A = A_; B = B_; E = E_; t = t_;
 	return true;
 }
 
+// No-FMA explicit form: see processTiles comment for why this matters.
+// The two call sites (count in preprocessCUDA, emit in duplicateWithKeys)
+// must produce bit-identical output regardless of NVCC's FMA-fusion choice.
 __forceinline__ __device__ float2 computeEllipseIntersection(
 	const float A, const float B, const float E,
 	const float disc, const float t, const float2 p,
@@ -177,17 +192,34 @@ __forceinline__ __device__ float2 computeEllipseIntersection(
 	const float p_u = isY ? p.y : p.x;
 	const float p_v = isY ? p.x : p.y;
 	const float coeff = isY ? A : E;
-	const float h = coord - p_u;
-	const float radicand = disc * h * h + t * coeff;
+	const float h = __fadd_rn(coord, -p_u);
+	const float disc_h2 = __fmul_rn(__fmul_rn(disc, h), h);
+	const float t_coeff = __fmul_rn(t, coeff);
+	const float radicand = __fadd_rn(disc_h2, t_coeff);
 	const float sqrt_term = sqrtf(fmaxf(radicand, 0.0f));
+	const float neg_Bh = __fmul_rn(-B, h);
 	return {
-		(-B * h - sqrt_term) / coeff + p_v,
-		(-B * h + sqrt_term) / coeff + p_v
+		__fadd_rn(__fdiv_rn(__fadd_rn(neg_Bh, -sqrt_term), coeff), p_v),
+		__fadd_rn(__fdiv_rn(__fadd_rn(neg_Bh,  sqrt_term), coeff), p_v)
 	};
 }
 
 // Scan-line walk along the ellipse boundary. Returns total tile count;
 // when key/value buffers are non-null, also emits a (depth-keyed) entry per tile.
+//
+// IMPORTANT: This function is inlined into BOTH the count phase
+// (preprocessCUDA in forward.cu, nullptr buffers) AND the emit phase
+// (duplicateWithKeys in rasterizer_impl.cu, real buffers). NVCC compiles
+// the two specializations independently; under --use_fast_math, the
+// FMA-fusion choice for `disc*h*h + t*coeff` (in computeEllipseIntersection)
+// and `ellipse_min/BLOCK_V` (here) can shift `min_tile_v`/`max_tile_v` by 1.
+// That makes count != emit → emit overshoots its prefix-sum slot →
+// cudaErrorIllegalAddress / InvalidAddressSpace. Verified on bicycle 0w0g,
+// room 0w0g, treehill 005w25.
+//
+// Fix: use round-to-nearest no-fusion intrinsics (__fmul_rn, __fadd_rn) on
+// every FP op that feeds into the integer cast. This forces both call sites
+// to compile to identical (non-fused) PTX.
 __device__ inline uint32_t processTiles(
 	const float A, const float B, const float E,
 	const float disc, const float t, const float2 p,
@@ -196,8 +228,10 @@ __device__ inline uint32_t processTiles(
 	int2 rect_min, int2 rect_max,
 	const dim3 grid, const bool isY,
 	uint32_t idx, uint32_t off, float depth,
-	uint64_t* gaussian_keys_unsorted,
-	uint32_t* gaussian_values_unsorted)
+	uint64_t* gaussian_keys_unsorted,        // legacy 64-bit composite (sort_mode==0); set null for FastGS
+	uint32_t* gaussian_values_unsorted,
+	uint32_t* tile_keys_unsorted = nullptr,  // FastGS 32-bit tile-only (sort_mode==1); set null for legacy
+	uint32_t* tile_prim_indices = nullptr)
 {
 	const float BLOCK_U = isY ? (float)BLOCK_Y : (float)BLOCK_X;
 	const float BLOCK_V = isY ? (float)BLOCK_X : (float)BLOCK_Y;
@@ -217,17 +251,17 @@ __device__ inline uint32_t processTiles(
 	float min_line, max_line;
 
 	intersect_max_line = {bbox_max.y, bbox_min.y};
-	min_line = rect_min.x * BLOCK_U;
+	min_line = __fmul_rn((float)rect_min.x, BLOCK_U);
 	if (bbox_min.x <= min_line) {
 		intersect_min_line = computeEllipseIntersection(
-			A, B, E, disc, t, p, isY, rect_min.x * BLOCK_U);
+			A, B, E, disc, t, p, isY, min_line);
 	} else {
 		intersect_min_line = intersect_max_line;
 	}
 
 	for (int u = rect_min.x; u < rect_max.x; ++u)
 	{
-		max_line = min_line + BLOCK_U;
+		max_line = __fadd_rn(min_line, BLOCK_U);
 		if (max_line <= bbox_max.x) {
 			intersect_max_line = computeEllipseIntersection(
 				A, B, E, disc, t, p, isY, max_line);
@@ -245,17 +279,29 @@ __device__ inline uint32_t processTiles(
 			ellipse_max = fmaxf(intersect_min_line.y, intersect_max_line.y);
 		}
 
-		const int min_tile_v = max(rect_min.y, min(rect_max.y, (int)(ellipse_min / BLOCK_V)));
-		const int max_tile_v = min(rect_max.y, max(rect_min.y, (int)(ellipse_max / BLOCK_V + 1)));
+		// No-FMA scaling of the integer-cast bounds — see comment above the
+		// function. __fdiv_rn ensures bit-equal results across both call sites.
+		const int min_tile_v = max(rect_min.y, min(rect_max.y, (int)__fdiv_rn(ellipse_min, BLOCK_V)));
+		const int max_tile_v = min(rect_max.y, max(rect_min.y, (int)__fadd_rn(__fdiv_rn(ellipse_max, BLOCK_V), 1.0f)));
 		tiles_count += (uint32_t)max(0, max_tile_v - min_tile_v);
 
 		if (gaussian_keys_unsorted != nullptr) {
+			// Legacy 64-bit composite key (tile<<32 | depth_bits).
 			for (int v = min_tile_v; v < max_tile_v; v++) {
 				uint64_t key = isY ? (u * grid.x + v) : (v * grid.x + u);
 				key <<= 32;
 				key |= *((uint32_t*)&depth);
 				gaussian_keys_unsorted[off] = key;
 				gaussian_values_unsorted[off] = idx;
+				off++;
+			}
+		} else if (tile_keys_unsorted != nullptr) {
+			// FastGS 32-bit tile-only key (depth ordering preserved by stable
+			// sort, since caller iterates in depth-sorted order).
+			for (int v = min_tile_v; v < max_tile_v; v++) {
+				const uint32_t tile_idx = isY ? (u * grid.x + v) : (v * grid.x + u);
+				tile_keys_unsorted[off] = tile_idx;
+				tile_prim_indices[off] = idx;
 				off++;
 			}
 		}
@@ -267,20 +313,25 @@ __device__ inline uint32_t processTiles(
 }
 
 // Two-mode driver: compute screen-space ellipse extents from (A, B, E, t, p)
-// and either count touched tiles (keys=null) or emit (key, value) pairs.
+// and either count touched tiles (all key buffers null) or emit (key, value)
+// pairs. Pass either the 64-bit composite buffer (legacy) OR the 32-bit
+// tile-only buffer (FastGS), not both.
 __device__ inline uint32_t duplicateToTilesTouched(
 	const float A, const float B, const float E,
 	const float t, const float2 p, const dim3 grid,
 	uint32_t idx, uint32_t off, float depth,
 	uint64_t* gaussian_keys_unsorted,
-	uint32_t* gaussian_values_unsorted)
+	uint32_t* gaussian_values_unsorted,
+	uint32_t* tile_keys_unsorted = nullptr,
+	uint32_t* tile_prim_indices = nullptr)
 {
-	const float disc = B * B - A * E;
+	const float disc = __fadd_rn(__fmul_rn(B, B), -__fmul_rn(A, E));
 	if (A <= 0.0f || E <= 0.0f || disc >= 0.0f || t <= 0.0f) return 0;
 
 	// Ellipse extreme points (where ∂Q/∂x = 0 and ∂Q/∂y = 0 respectively).
-	const float x_term_sq = -(B * B * t) / (disc * A);
-	const float y_term_sq = -(B * B * t) / (disc * E);
+	const float B2t = __fmul_rn(__fmul_rn(B, B), t);
+	const float x_term_sq = -__fdiv_rn(B2t, __fmul_rn(disc, A));
+	const float y_term_sq = -__fdiv_rn(B2t, __fmul_rn(disc, E));
 	if (x_term_sq < 0.0f || y_term_sq < 0.0f) return 0;
 	float x_term = sqrtf(x_term_sq);
 	float y_term = sqrtf(y_term_sq);
@@ -299,12 +350,12 @@ __device__ inline uint32_t duplicateToTilesTouched(
 	};
 
 	const int2 rect_min = {
-		max(0, min((int)grid.x, (int)(bbox_min.x / BLOCK_X))),
-		max(0, min((int)grid.y, (int)(bbox_min.y / BLOCK_Y)))
+		max(0, min((int)grid.x, (int)__fdiv_rn(bbox_min.x, (float)BLOCK_X))),
+		max(0, min((int)grid.y, (int)__fdiv_rn(bbox_min.y, (float)BLOCK_Y)))
 	};
 	const int2 rect_max = {
-		max(0, min((int)grid.x, (int)(bbox_max.x / BLOCK_X + 1))),
-		max(0, min((int)grid.y, (int)(bbox_max.y / BLOCK_Y + 1)))
+		max(0, min((int)grid.x, (int)__fadd_rn(__fdiv_rn(bbox_max.x, (float)BLOCK_X), 1.0f))),
+		max(0, min((int)grid.y, (int)__fadd_rn(__fdiv_rn(bbox_max.y, (float)BLOCK_Y), 1.0f)))
 	};
 
 	const int y_span = rect_max.y - rect_min.y;
@@ -317,7 +368,8 @@ __device__ inline uint32_t duplicateToTilesTouched(
 		bbox_min, bbox_max, bbox_argmin, bbox_argmax,
 		rect_min, rect_max, grid, isY,
 		idx, off, depth,
-		gaussian_keys_unsorted, gaussian_values_unsorted);
+		gaussian_keys_unsorted, gaussian_values_unsorted,
+		tile_keys_unsorted, tile_prim_indices);
 }
 
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)

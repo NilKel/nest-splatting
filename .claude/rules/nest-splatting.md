@@ -56,16 +56,25 @@ Hash levels are selected **finest-first** from `[128, 203, 322, 512]`. Hash tabl
 
 Goal: bake the MLP residual into static per-Gaussian SH textures for fast inference.
 
+**Full reference**: see [`docs/BAKED_RENDERING.md`](../../docs/BAKED_RENDERING.md) — includes BC7 atlas compression, AABB modes (SnugBox+AccuTile), sort modes, importance-based pruning/skip-texture, atlas-width auto-grow, FP16/uint8/BC7 dtype trade-offs, and the 18-pair mip-360 results.
+
 **Pipeline**:
 1. **Bake** (`diff_surfel_bake`): evaluate MLP at 8×8 UV grid per Gaussian → 48D SH residual per texel
 2. **Render** (`diff_surfel_bake_render`): forward-only 2DGS rasterizer, samples atlas via texture lookup
-3. **Format**: mean SH stored in PLY; 48D residual textures `[N, 8, 8, 48]` FP16 in atlas
+3. **Format**: mean SH stored in PLY; per-Gaussian residual textures (uint8 or BC7) in a packed atlas
 
 **Scripts**:
 - `scripts/benchmark_baked.py` — neural vs baked-SH-only vs baked-SH+atlas timings + PSNR/SSIM/LPIPS
 - `scripts/render_baked.py` — save baked renders to disk (no benchmarking)
 
-**Reference quality** (chair scene):
+**Production defaults** (mip-360 18-pair mean, max_res=64, BC7 atlas):
+| | PSNR | SSIM | LPIPS | FPS | Atlas |
+|---|---|---|---|---|---|
+| Neural renderer | 26.81 | 0.7811 | 0.2307 | 67.2 | — |
+| Baked BC7 | 26.76 | 0.7762 | 0.2487 | 472.8 | 638 MB |
+| Δ vs neural | −0.05 | −0.005 | +0.018 | **7.04×** | — |
+
+**Reference quality** (chair scene, legacy 48D residual format):
 | Mode | PSNR | SSIM |
 |---|---|---|
 | Neural renderer (training) | 34.66 | 0.9844 |

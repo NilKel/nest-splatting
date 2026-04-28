@@ -39,8 +39,26 @@ namespace CudaRasterizer
 		float* transMat;
 		float4* normal_opacity;
 		__half* rgb;
+		float4* conic_t;        // SnugBox+AccuTile conic (A, B, E, t) — used when aabb_mode==2/5
+
+		// Legacy single-sort path (sort_mode == 0).
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
+
+		// FastGS two-stage sort path (sort_mode == 1).
+		// preprocessCUDA atomicAdds visible-Gaussian entries into the *_compact
+		// arrays, sized N (only n_visible entries used). Per-Gaussian metadata
+		// above (means2D, depths, transMat, ...) stays indexed by the original
+		// primitive id; `prim_idx_compact[v]` is the indirection.
+		uint32_t* depth_keys_compact;       // [n_visible] float-bit depth (32-bit sort key)
+		uint32_t* prim_idx_compact;         // [n_visible] original primitive idx (sort value, unsorted)
+		uint32_t* prim_idx_compact_sorted;  // [n_visible] depth-sorted output of SortPairs
+		uint32_t* offset_compact;           // [n_visible] exclusive prefix sum of reordered tile counts
+		uint32_t* n_visible_atomic;         // single-uint atomic counter
+		uint32_t* n_instances_atomic;       // single-uint atomic counter
+		// Note: per-primitive tile count is stored in the legacy `tiles_touched`
+		// array above (indexed by primitive_idx). apply_depth_ordering reads it
+		// indirectly via prim_idx_compact_sorted[v] to populate offset_compact.
 
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
@@ -54,12 +72,21 @@ namespace CudaRasterizer
 
 	struct BinningState
 	{
+		// Legacy 64-bit composite keys (sort_mode == 0).
 		size_t sorting_size;
 		uint64_t* point_list_keys_unsorted;
 		uint64_t* point_list_keys;
+		// FastGS 32-bit tile-only keys (sort_mode == 1) — second of two sorts.
+		size_t sorting_size_tile;
+		uint32_t* tile_keys_unsorted;
+		uint32_t* tile_keys;
+		// Shared between both modes: per-instance primitive-index list.
 		uint32_t* point_list_unsorted;
 		uint32_t* point_list;
 		char* list_sorting_space;
+		// Workspace + buffers for the depth-sort phase (sort_mode == 1):
+		size_t sorting_size_depth;
+		char* depth_sorting_space;
 
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};

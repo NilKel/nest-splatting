@@ -36,8 +36,14 @@ namespace FORWARD
 		float* transMats,
 		__half* colors,
 		float4* normal_opacity,
+		float4* conic_t,
 		const dim3 grid,
-		uint32_t* tiles_touched,
+		uint32_t* tiles_touched,        // both modes: per-primitive tile count
+		uint32_t* depth_keys_compact,   // FastGS (sort_mode==1)
+		uint32_t* prim_idx_compact,     // FastGS
+		uint32_t* n_visible_atomic,     // FastGS
+		uint32_t* n_instances_atomic,   // FastGS
+		const int sort_mode,            // 0 = legacy, 1 = FastGS two-stage
 		bool prefiltered,
 		const float* shapes,
 		const int kernel_type,

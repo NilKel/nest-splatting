@@ -4224,7 +4224,7 @@ if __name__ == "__main__":
     parser.add_argument("--decompose_mode", type=str, default=None,
                         choices=[None, "gaussian_only", "ngp_only"],
                         help="Decomposition mode for hybrid_SH visualization: 'gaussian_only' (only per-Gaussian SH), 'ngp_only' (only hashgrid DC residual), or None (normal combined rendering)")
-    parser.add_argument("--disable_c2f", action="store_false",
+    parser.add_argument("--disable_c2f", action="store_true",
                         help="Disable coarse-to-fine for cat mode (all levels active from start)")
     parser.add_argument("--dropout_lambda", type=float, default=0.0,
                         help="Hash dropout rate for cat_dropout mode: fraction of Gaussians that don't query hash during training (0.2 = 20%% dropout)")

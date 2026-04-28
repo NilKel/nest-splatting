@@ -109,8 +109,8 @@ class INGP(nn.Module):
         # Auto-enable disable_c2f for all methods except baseline
         # Baseline is the only method that benefits from coarse-to-fine scheduling
         explicit_disable_c2f = args is not None and hasattr(args, 'disable_c2f') and args.disable_c2f
-        # self.disable_c2f = explicit_disable_c2f or (not self.is_baseline_mode)
-        self.disable_c2f = explicit_disable_c2f
+        self.disable_c2f = explicit_disable_c2f or (not self.is_baseline_mode)
+        # self.disable_c2f = explicit_disable_c2f
         
         # Store args for diffuse mode configuration (per-Gaussian RGB, no viewdir, no hashgrid)
         self.is_diffuse_mode = args is not None and hasattr(args, 'method') and args.method == "diffuse"

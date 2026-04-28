@@ -154,6 +154,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             scratch['img'],
             out_color,
             radii,
+            settings.sort_mode,
         )
 
         scratch['geom'], scratch['binning'], scratch['img'] = _C.rasterize_gaussians(*args)
@@ -179,6 +180,7 @@ class GaussianRasterizationSettings(NamedTuple):
     debug: bool
     beta: float
     aabb_mode: int = 3  # 0=square, 1=square+AdR, 2=rect, 3=rect+AdR
+    sort_mode: int = 0  # 0=legacy 64-bit single sort, 1=FastGS two-stage (32-bit depth + 32-bit tile)
 
 
 class GaussianRasterizer(nn.Module):
@@ -262,16 +264,17 @@ _rasterizer_cache = {}  # (H, W, sh_degree, beta, aabb_mode) -> GaussianRasteriz
 
 def get_rasterizer(image_height, image_width, tanfovx, tanfovy, bg,
                    viewmatrix, projmatrix, campos,
-                   sh_degree=3, beta=0.0, aabb_mode=3,
+                   sh_degree=3, beta=0.0, aabb_mode=3, sort_mode=0,
                    scale_modifier=1.0, prefiltered=False, debug=False):
     """Build (or reuse) a GaussianRasterizer with fresh per-frame camera params.
 
-    The `nn.Module` wrapper is cached keyed by (H, W, sh_degree, beta, aabb_mode).
+    `sort_mode`: 0 = legacy 64-bit single sort, 1 = FastGS two-stage sort.
+    The `nn.Module` wrapper is cached keyed by (H, W, sh_degree, beta, aabb_mode, sort_mode).
     The settings NamedTuple is rebuilt every call (microsecond-cheap) so
     viewmatrix / projmatrix / campos / tanfov can change per frame.
     """
     key = (int(image_height), int(image_width), int(sh_degree),
-           float(beta), int(aabb_mode))
+           float(beta), int(aabb_mode), int(sort_mode))
     settings = GaussianRasterizationSettings(
         image_height=image_height, image_width=image_width,
         tanfovx=tanfovx, tanfovy=tanfovy,
@@ -279,7 +282,7 @@ def get_rasterizer(image_height, image_width, tanfovx, tanfovy, bg,
         viewmatrix=viewmatrix, projmatrix=projmatrix,
         sh_degree=sh_degree, campos=campos,
         prefiltered=prefiltered, debug=debug,
-        beta=beta, aabb_mode=aabb_mode,
+        beta=beta, aabb_mode=aabb_mode, sort_mode=sort_mode,
     )
     rasterizer = _rasterizer_cache.get(key)
     if rasterizer is None:
@@ -304,6 +307,17 @@ def clear_atlas_cache():
 
 def set_atlas_use_uint8(val=True):
     _C.set_atlas_use_uint8(bool(val))
+
+
+def set_atlas_bc7(bc7_bytes_tensor, W, H, offset, scale):
+    """Install a BC7-encoded atlas. After this call all renders sample from the
+    BC7 cudaArray directly (hardware decode). Pass an empty tensor (numel=0)
+    + W=0,H=0 (or call clear_atlas_bc7) to revert to the FP16/uint8 path."""
+    _C.set_atlas_bc7(bc7_bytes_tensor, int(W), int(H), float(offset), float(scale))
+
+
+def clear_atlas_bc7():
+    _C.clear_atlas_bc7()
 
 
 def set_use_atlas_tex_object(val=True):

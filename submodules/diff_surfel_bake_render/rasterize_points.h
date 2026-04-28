@@ -46,11 +46,16 @@ RasterizeGaussiansCUDA(
 	torch::Tensor imgBuffer,
 	// Persistent caller-owned outputs (Python pre-allocates and reuses).
 	torch::Tensor out_color,
-	torch::Tensor radii);
+	torch::Tensor radii,
+	const int sort_mode = 0);                // 0 = legacy 64-bit single sort, 1 = FastGS two-stage
 
 // Device-global setters mirroring training-time setters.
 void SetActivationBiasBakeCUDA(float sh_bias, float res_bias);
 void SetCompactMultBakeCUDA(float val);
+
+// BC7 atlas (Phase 2). Pass empty tensor + zeros to clear.
+void SetAtlasBC7CUDA(torch::Tensor bc7_bytes, int W, int H, float offset, float scale);
+void ClearAtlasBC7CUDA();
 
 // Frees the cached cudaArrays + cudaTextureObjects for all atlases seen so far.
 void ClearAtlasCacheCUDA();

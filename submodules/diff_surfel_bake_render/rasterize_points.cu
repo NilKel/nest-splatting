@@ -56,6 +56,15 @@ static bool g_atlas_use_uint8 = true;
 // Useful for A/B benchmarking the GPU-texturing speedup.
 static bool g_use_atlas_tex_obj = true;
 
+// BC7 atlas (block-compressed). When set via SetAtlasBC7CUDA, the renderer
+// uses the BC7 cudaArray + textureObject directly (hardware decode, full bilinear).
+// Single global because we render one atlas at a time.
+static cudaArray_t        g_bc7_array  = nullptr;
+static cudaTextureObject_t g_bc7_tex   = 0;
+static int   g_bc7_W = 0, g_bc7_H = 0;       // padded to multiples of 4
+static float g_bc7_offset = 0.0f;
+static float g_bc7_scale  = 1.0f;
+
 // Kernel: copy [H*W*3] FP16 RGB → [H, W] half4 with alpha=0.
 __global__ void rgb_to_rgba_half4(const __half* __restrict__ rgb,
                                   __half* __restrict__ rgba,
@@ -197,6 +206,75 @@ void ClearAtlasCacheCUDA() {
 	g_atlas_cache.clear();
 }
 
+void ClearAtlasBC7CUDA() {
+	if (g_bc7_tex)   { cudaDestroyTextureObject(g_bc7_tex);  g_bc7_tex   = 0; }
+	if (g_bc7_array) { cudaFreeArray(g_bc7_array);          g_bc7_array = nullptr; }
+	g_bc7_W = g_bc7_H = 0;
+	g_bc7_offset = 0.0f; g_bc7_scale = 1.0f;
+}
+
+// Install a BC7-encoded atlas. `bc7_bytes` is a flat torch::kUInt8 tensor of
+// length (W/4)*(H/4)*16; W and H must be multiples of 4. After this call, all
+// subsequent renders sample from the BC7 cudaArray directly (hardware decode).
+// Pass empty tensor or call ClearAtlasBC7CUDA() to revert to the FP16/uint8 path.
+void SetAtlasBC7CUDA(torch::Tensor bc7_bytes, int W, int H, float offset, float scale) {
+	ClearAtlasBC7CUDA();
+	if (bc7_bytes.numel() == 0) return;
+	TORCH_CHECK(bc7_bytes.dtype() == torch::kUInt8, "BC7 bytes must be uint8");
+	TORCH_CHECK(W % 4 == 0 && H % 4 == 0, "BC7 atlas dims must be multiples of 4");
+	const size_t expected = (size_t)(W / 4) * (size_t)(H / 4) * 16;
+	TORCH_CHECK((size_t)bc7_bytes.numel() == expected,
+	            "BC7 bytes size mismatch: got ", bc7_bytes.numel(),
+	            " expected ", expected);
+
+	cudaChannelFormatDesc desc = cudaCreateChannelDesc(
+		8, 8, 8, 8, cudaChannelFormatKindUnsignedBlockCompressed7);
+	cudaError_t err = cudaMallocArray(&g_bc7_array, &desc, W, H);
+	if (err != cudaSuccess) {
+		printf("[BAKE_RENDER] BC7 cudaMallocArray failed (%s) for %dx%d — "
+		       "falling back to non-BC7 path.\n", cudaGetErrorString(err), W, H);
+		g_bc7_array = nullptr;
+		// Clear the sticky error so subsequent cudaMalloc / kernel launches
+		// from PyTorch don't propagate it.
+		cudaGetLastError();
+		return;
+	}
+	// Stage on host or device — bc7_bytes can be either; cudaMemcpy2DToArray
+	// dispatches by kind. Use device memcpy if tensor is on CUDA, else host.
+	auto kind = bc7_bytes.is_cuda() ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
+	const size_t row_bytes = (size_t)(W / 4) * 16;   // BC7 = 16 B per 4×4 block
+	const size_t row_count = (size_t)(H / 4);
+	cudaMemcpy2DToArray(g_bc7_array, 0, 0,
+	                    bc7_bytes.data_ptr<uint8_t>(),
+	                    row_bytes,
+	                    row_bytes, row_count,
+	                    kind);
+
+	cudaResourceDesc res{};
+	res.resType = cudaResourceTypeArray;
+	res.res.array.array = g_bc7_array;
+	cudaTextureDesc td{};
+	td.addressMode[0] = cudaAddressModeClamp;
+	td.addressMode[1] = cudaAddressModeClamp;
+	td.filterMode = cudaFilterModeLinear;
+	td.readMode = cudaReadModeNormalizedFloat;
+	td.normalizedCoords = 0;
+	cudaError_t e2 = cudaCreateTextureObject(&g_bc7_tex, &res, &td, nullptr);
+	cudaDeviceSynchronize();
+	cudaError_t e3 = cudaGetLastError();
+	if (e2 != cudaSuccess || e3 != cudaSuccess) {
+		printf("[BAKE_RENDER] BC7 texObj/sync error: createTex=%s last=%s\n",
+		       cudaGetErrorString(e2), cudaGetErrorString(e3));
+		ClearAtlasBC7CUDA();
+		return;
+	}
+	g_bc7_W = W; g_bc7_H = H;
+	g_bc7_offset = offset; g_bc7_scale = scale;
+	printf("[BAKE_RENDER] BC7 atlas installed: %dx%d, %.1f MB, "
+	       "scale=%.4f offset=%.4f\n",
+	       W, H, (float)bc7_bytes.numel() / (1024.0f * 1024.0f), scale, offset);
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
@@ -233,7 +311,8 @@ RasterizeGaussiansCUDA(
 	torch::Tensor imgBuffer,
 	// Persistent caller-owned outputs (Python pre-allocates and reuses).
 	torch::Tensor out_color,
-	torch::Tensor radii)
+	torch::Tensor radii,
+	const int sort_mode)
 {
 	if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 		AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -282,6 +361,15 @@ RasterizeGaussiansCUDA(
 		// central mass while clipping outliers.
 		cudaTextureObject_t atlas_tex_obj = 0;
 		float atlas_offset = 0.0f, atlas_scale = 1.0f;
+
+		// Fast path: BC7 atlas (already installed via SetAtlasBC7CUDA).
+		// Bypasses the FP16/uint8 cache entirely; samples directly from the
+		// hardware-decompressed BC7 cudaArray.
+		if (g_bc7_tex != 0 && atlas_texture_ptr != nullptr) {
+			atlas_tex_obj = g_bc7_tex;
+			atlas_offset  = g_bc7_offset;
+			atlas_scale   = g_bc7_scale;
+		} else {
 		// CUDA 2D cudaArray max dimension (per CUDA guide; 65,536 for sm_60+).
 		// If either axis exceeds this we silently skip tex-object creation and
 		// fall through to the software bilinear path, which has no such limit.
@@ -319,6 +407,7 @@ RasterizeGaussiansCUDA(
 				atlas_tex_obj = e.tex;
 			}
 		}
+		}  // closes the BC7-fast-path else branch
 
 		// All input tensors are caller-pre-validated contiguous (we only run
 		// in inference mode against fixed pre-activated buffers from Python).
@@ -366,7 +455,8 @@ RasterizeGaussiansCUDA(
 			sb_number,
 			atlas_tex_obj,
 			atlas_offset,
-			atlas_scale);
+			atlas_scale,
+			sort_mode);
 	}
 
 	return std::make_tuple(geomBuffer, binningBuffer, imgBuffer);
