@@ -301,6 +301,11 @@ def set_compact_mult(val=1.0):
     _C.set_compact_mult(float(val))
 
 
+def set_residual_mode(mode=0):
+    """0 = 3D_SH_res outer ReLU (default). 1 = 3D_SH_add separate ReLUs."""
+    _C.set_residual_mode(int(mode))
+
+
 def clear_atlas_cache():
     _C.clear_atlas_cache()
 

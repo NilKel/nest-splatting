@@ -678,6 +678,13 @@ def set_activation_bias(sh_bias=0.5, res_bias=0.5):
     Default: 0.5/0.5. For decomposition: sh_only uses res_bias=-999, tex_only uses sh_bias=-999."""
     _C.set_activation_bias(sh_bias, res_bias)
 
+def set_residual_mode(mode=0):
+    """Select residual activation:
+       0 = 3D_SH_res (default): color = ReLU(ReLU(SH+sh_bias) + residual + res_bias)
+       1 = 3D_SH_add:           color = ReLU(SH+sh_bias) + ReLU(residual + res_bias)
+    Patches both forward and backward device globals — call once at startup."""
+    _C.set_residual_mode(int(mode))
+
 def set_anti_alias(factor=0.0, focal=1.0):
     """Set Nexels-style hash-grid anti-aliasing down-weighting.
     factor=0 disables AA. factor=1.0 and focal=max(fx,fy) matches Nexels default.

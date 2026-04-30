@@ -873,6 +873,11 @@ void SetActivationBiasCUDA(float sh_bias, float res_bias) {
     BACKWARD::setResBias(res_bias);
 }
 
+void SetResidualModeCUDA(int mode) {
+    FORWARD::setResidualMode(mode);
+    BACKWARD::setResidualMode(mode);
+}
+
 void SetAntiAliasCUDA(float factor, float focal) {
     FORWARD::setAntiAlias(factor, focal);
 }

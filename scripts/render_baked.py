@@ -247,14 +247,16 @@ def main():
         texture_mode = "shared"
 
     # Call the CUDA device-global setters so the baked kernel matches training.
-    from diff_surfel_bake_render import set_activation_bias, set_compact_mult
+    from diff_surfel_bake_render import set_activation_bias, set_compact_mult, set_residual_mode
     _sh_bias = float(bake_meta.get("sh_bias", getattr(args, 'activation_bias', [0.5, 0.0])[0]))
     _res_bias = float(bake_meta.get("res_bias", getattr(args, 'activation_bias', [0.5, 0.0])[1]))
     _compact_mult = float(bake_meta.get("compact_mult", 1.0))
+    _residual_mode = int(bake_meta.get("residual_mode", 0))
     set_activation_bias(_sh_bias, _res_bias)
     set_compact_mult(_compact_mult)
+    set_residual_mode(_residual_mode)
     print(f"[RENDER] set_activation_bias(sh={_sh_bias}, res={_res_bias})  "
-          f"set_compact_mult({_compact_mult})")
+          f"set_compact_mult({_compact_mult})  set_residual_mode({_residual_mode})")
 
     # Load textures based on mode
     residual_textures = None

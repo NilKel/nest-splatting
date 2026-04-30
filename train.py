@@ -116,20 +116,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     training_start_time = time.time()
 
+    # 3D_SH_add: same architecture as 3D_SH_res, only the outer activation differs.
+    # Set the residual-mode flag now so `--decomp` validation accepts it. The
+    # actual `args.method = "3D_SH_res"` alias happens AFTER
+    # prepare_output_and_logger so the run lands in its own `3D_SH_add/` folder.
+    args._residual_mode = 1 if args.method == "3D_SH_add" else 0
+
     # --decomp: only the diff_surfel_3D_sh_res rasterizer exposes the sh_only /
     # tex_only decompose_mode paths needed to split the supervision.
-    if getattr(args, 'decomp', False) and args.method != "3D_SH_res":
+    if getattr(args, 'decomp', False) and args.method not in ("3D_SH_res", "3D_SH_add"):
         raise RuntimeError(
-            f"--decomp requires --method 3D_SH_res; got --method {args.method}. "
+            f"--decomp requires --method 3D_SH_res or 3D_SH_add; got --method {args.method}. "
             f"Other rasterizers don't expose the sh_only/tex_only decompose path."
         )
     # --blurprog: uses the same gt_low cache as --decomp but only needs main-loop
     # render — no decompose_mode dependency. Gated to 3D_SH_res here only because
     # the cache plumbing (Scene.__init__) is tied to the same code path. Could be
     # relaxed if needed.
-    if getattr(args, 'blurprog', False) and args.method != "3D_SH_res":
+    if getattr(args, 'blurprog', False) and args.method not in ("3D_SH_res", "3D_SH_add"):
         raise RuntimeError(
-            f"--blurprog requires --method 3D_SH_res; got --method {args.method}."
+            f"--blurprog requires --method 3D_SH_res or 3D_SH_add; got --method {args.method}."
         )
 
     # Pass mini flag to OptimizationParams so training_setup can pick SparseGaussianAdam
@@ -147,7 +153,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene_name = args.scene_name
     tb_writer = prepare_output_and_logger(dataset, scene_name, args.yaml, args)
     args.model_path = dataset.model_path
-    
+
+    # 3D_SH_add → alias to 3D_SH_res for the rest of training. We had to wait
+    # until after prepare_output_and_logger so the run gets its own
+    # `outputs/.../3D_SH_add/<run>` folder; downstream code only knows about
+    # 3D_SH_res. The activation switch is plumbed via set_residual_mode(1)
+    # further below (gated on args._residual_mode == 1).
+    if args.method == "3D_SH_add":
+        args.method = "3D_SH_res"
+        print("[3D_SH_add] activation = ReLU(SH+sh_bias) + ReLU(residual+res_bias) (separate ReLUs)")
+
     # Pass method, hybrid_levels, and decompose_mode to dataset for use in Scene/GaussianModel
     dataset.method = args.method
     dataset.hybrid_levels = args.hybrid_levels if hasattr(args, 'hybrid_levels') else 3
@@ -885,6 +900,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         from gaussian_renderer import set_default_activation_bias
         set_default_activation_bias(_sh_bias, _res_bias)
         print(f"[ACTIVATION_BIAS] SH bias={_sh_bias}, residual bias={_res_bias}")
+
+        # 3D_SH_add: flip outer activation to separate ReLUs (mode 1). Default is 0.
+        if getattr(args, '_residual_mode', 0) == 1 and args.method == "3D_SH_res":
+            from diff_surfel_3D_sh_res import set_residual_mode
+            set_residual_mode(1)
+            print("[RESIDUAL_MODE] mode=1 (3D_SH_add: separate outer ReLUs for SH and residual)")
 
     if args.depth_sort and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
         if args.method == "3D_SH_32":
@@ -3087,16 +3108,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     tex_name = os.path.join(output_path, str(iteration) + '_tex_only.png')
                     save_img_u8(tex_image.permute(1,2,0).detach().cpu().numpy(), tex_name)
 
-                    # True residual = full - sh_only (can be negative where hash subtracts from SH)
+                    # True residual = full - sh_only.
+                    # Mode 0 (3D_SH_res): outer ReLU couples SH and residual, so
+                    #   the residual contribution can be negative where hash
+                    #   subtracts from SH — abs / signed visualizations are useful.
+                    # Mode 1 (3D_SH_add): per-Gaussian ReLU(residual+bias) ≥ 0 and
+                    #   alpha-blending preserves sign, so abs / signed are
+                    #   redundant with `_tex_only` itself — skip both.
                     residual_true = full_raw - sh_raw
-                    # Absolute value (magnitude of residual contribution)
-                    tex_abs = torch.clamp(residual_true.abs(), 0.0, 1.0)
-                    tex_abs_name = os.path.join(output_path, str(iteration) + '_tex_only_abs.png')
-                    save_img_u8(tex_abs.permute(1,2,0).detach().cpu().numpy(), tex_abs_name)
-                    # Signed: gray(0.5)=zero, bright=positive residual, dark=negative/subtractive
-                    tex_signed = torch.clamp(residual_true * 2.0 + 0.5, 0.0, 1.0)
-                    tex_signed_name = os.path.join(output_path, str(iteration) + '_tex_residual_signed.png')
-                    save_img_u8(tex_signed.permute(1,2,0).detach().cpu().numpy(), tex_signed_name)
+                    if getattr(args, '_residual_mode', 0) == 0:
+                        # Absolute value (magnitude of residual contribution)
+                        tex_abs = torch.clamp(residual_true.abs(), 0.0, 1.0)
+                        tex_abs_name = os.path.join(output_path, str(iteration) + '_tex_only_abs.png')
+                        save_img_u8(tex_abs.permute(1,2,0).detach().cpu().numpy(), tex_abs_name)
+                        # Signed: gray(0.5)=zero, bright=positive residual, dark=negative/subtractive
+                        tex_signed = torch.clamp(residual_true * 2.0 + 0.5, 0.0, 1.0)
+                        tex_signed_name = os.path.join(output_path, str(iteration) + '_tex_residual_signed.png')
+                        save_img_u8(tex_signed.permute(1,2,0).detach().cpu().numpy(), tex_signed_name)
 
                     # Save SH+residual summed image (should match full render exactly)
                     sum_image = torch.clamp(sh_raw + tex_raw, 0.0, 1.0)
@@ -4217,7 +4245,7 @@ if __name__ == "__main__":
     
     # Method argument - baseline, cat, cat_dropout, adaptive, adaptive_add, adaptive_cat, adaptive_zero, adaptive_gate, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "2dgs", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat", "3D_SH_32"],
+                        choices=["baseline", "2dgs", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_add", "3D_SH_cat", "3D_SH_32"],
                         help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'cat_dropout' (cat with hash dropout during training - use --dropout_lambda), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'adaptive_zero' (cat with weighted hash vs zeros - w=0 skips hash query), 'adaptive_gate' (VQ-AD style gating: soft→STE→hard, L1 regularization toward zeros), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual), '3D' (intersection-based SH rendering), '3D_direct' (intersection-based RGB MLP), or '3D_direct_fused' (fused in-kernel MLP, no intersection buffer)")
     parser.add_argument("--hybrid_levels", type=int, default=5,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")

@@ -123,8 +123,11 @@ namespace FORWARD
 	// Set weight-squared regularization lambda (0 = disabled)
 	void setWeightRegLambda(float val);
 
-	// Set activation biases: color = ReLU(SH + sh_bias) + ReLU(residual + res_bias)
+	// Set activation biases for SH and residual.
 	void setActivationBias(float sh_bias, float res_bias);
+	// 0 = 3D_SH_res (stacked: ReLU(ReLU(SH+bias)+residual+bias), default).
+	// 1 = 3D_SH_add (separate: ReLU(SH+bias) + ReLU(residual+bias)).
+	void setResidualMode(int mode);
 
 	// Set Nexels-style anti-aliasing params for hash-grid down-weighting.
 	// factor=0 disables AA. Typical factor=1.0, focal=max(fx,fy).

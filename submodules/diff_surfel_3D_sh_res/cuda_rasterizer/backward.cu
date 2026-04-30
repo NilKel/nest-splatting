@@ -27,6 +27,9 @@ __device__ int d_count_thresh_bw = 0;
 __device__ float d_overdraw_lambda_bw = 0.0f;
 __device__ float d_weight_reg_lambda_bw = 0.0f;  // Weight-squared reg: -lambda * 2 * w * T per Gaussian
 __device__ float d_res_bias = 0.5f;  // Residual activation bias: ReLU(residual + d_res_bias)
+// d_residual_mode: 0 = 3D_SH_res (stacked outer ReLU), 1 = 3D_SH_add (separate ReLUs).
+// Mirrors forward.cu — the backward gradient routing differs between the two modes.
+__device__ int d_residual_mode = 0;
 __device__ float d_aa_kernel_size = 0.0f;  // AA-2DGS Jacobian mip filter σ (0 = off)
 // Periodic-freeze flag for the mode 5 (3D_SH_res) backward. When true, the
 // kernel skips EVERYTHING hash/MLP-gradient-related: the 3 weight-grad WMMA
@@ -1228,21 +1231,33 @@ renderCUDAsurfelBackward(
 					for (int ch = 0; ch < 3; ch++)
 						sh_color[ch] = colors[global_id * 3 + ch];
 
-					// Combo #6: feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias )
-					// Outer ReLU gate: both SH and residual paths share the same
-					// (sh_color + residual + res_bias > 0) gate. SH's own inner
-					// ReLU is handled upstream in preprocessCUDA (clamped[]).
+					// Activation gates depend on d_residual_mode (see forward.cu):
+					//   0 (3D_SH_res): outer ReLU gates BOTH branches together.
+					//   1 (3D_SH_add): separate ReLUs — residual gated by
+					//                  (residual + res_bias > 0); SH path is
+					//                  ungated here (SH's inner ReLU lives
+					//                  upstream in preprocessCUDA).
 					#pragma unroll
 					for (int o = 0; o < ORIG_OUTPUT_DIM; o++) {
-						float relu_grad = (sh_color[o] + my_residual[o] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
-						my_dL_dz3[o] = dL_dpixel[o] * w * relu_grad;
+						float gate_res;
+						if (d_residual_mode == 1) {
+							gate_res = (my_residual[o] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						} else {
+							gate_res = (sh_color[o] + my_residual[o] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						}
+						my_dL_dz3[o] = dL_dpixel[o] * w * gate_res;
 					}
 					// Positions 3-15 of dL_dz3 stay zero (WMMA padding)
 
-					// SH gradient: same outer ReLU gate as residual.
 					for (int ch = 0; ch < 3; ch++) {
-						float relu_grad = (sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
-						acc_dL_dcolors[ch] += dL_dpixel[ch] * w * relu_grad;
+						float gate_sh;
+						if (d_residual_mode == 1) {
+							// SH always passes the outer activation in add mode.
+							gate_sh = 1.0f;
+						} else {
+							gate_sh = (sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						}
+						acc_dL_dcolors[ch] += dL_dpixel[ch] * w * gate_sh;
 					}
 				}
 
@@ -1350,12 +1365,16 @@ renderCUDAsurfelBackward(
 
 					// ======== GEOMETRY GRADIENTS ========
 					float dL_dalpha = 0.0f;
-					// feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias ) recompute for alpha gradient
+					// Recompute feat for alpha gradient — branched on d_residual_mode.
 					float feat[C];
 					float sh_color_recomp[3];
 					for (int ch = 0; ch < 3; ch++) {
 						sh_color_recomp[ch] = colors[global_id * 3 + ch];
-						feat[ch] = fmaxf(0.0f, sh_color_recomp[ch] + my_residual[ch] + d_res_bias);
+						if (d_residual_mode == 1) {
+							feat[ch] = sh_color_recomp[ch] + fmaxf(0.0f, my_residual[ch] + d_res_bias);
+						} else {
+							feat[ch] = fmaxf(0.0f, sh_color_recomp[ch] + my_residual[ch] + d_res_bias);
+						}
 					}
 
 					// Update accumulators
@@ -1974,22 +1993,32 @@ renderCUDAsurfelBackward(
 				MlpWeights smem_mlp2 = {smem_mlp_W1, smem_mlp_W2, smem_mlp_W3};
 				mlp_forward_inline(mlp_input, residual, h1_post, h2_post, false, smem_mlp2);
 
-				// Combo #6: feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias )
-				// Outer ReLU gates both SH and residual paths identically.
+				// d_residual_mode = 0: feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias )
+				// d_residual_mode = 1: feat = ReLU(SH+sh_bias) + ReLU(residual + res_bias)
 				// SH's own inner ReLU is handled upstream in preprocessCUDA (clamped[]).
 				float sh_color_bw[3];
 				for (int c = 0; c < 3; c++)
 					sh_color_bw[c] = colors[global_id * 3 + c];
 
-				float dL_drgb[3];
+				float dL_drgb[3];     // grad flowing into residual (MLP) path
+				float dL_drgb_sh[3];  // grad flowing into SH path
 				for (int c = 0; c < 3; c++) {
-					float relu_grad = (sh_color_bw[c] + residual[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
-					dL_drgb[c] = dL_dchannels[c] * w * relu_grad;
+					float gate_res, gate_sh;
+					if (d_residual_mode == 1) {
+						gate_res = (residual[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						gate_sh = 1.0f;
+					} else {
+						float g = (sh_color_bw[c] + residual[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						gate_res = g;
+						gate_sh = g;
+					}
+					dL_drgb[c] = dL_dchannels[c] * w * gate_res;
+					dL_drgb_sh[c] = dL_dchannels[c] * w * gate_sh;
 				}
 
-				// SH gradient: same outer ReLU gate.
+				// SH gradient: gated separately under add mode.
 				for (int ch = 0; ch < 3; ch++)
-					atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_drgb[ch]);
+					atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_drgb_sh[ch]);
 
 				// 6. MLP backward
 				float dL_dinput_full[TC_INPUT_DIM];
@@ -2048,9 +2077,13 @@ renderCUDAsurfelBackward(
 					if (detach_hash_grad) { dL_dxyz[0] = 0; dL_dxyz[1] = 0; dL_dxyz[2] = 0; }
 				}
 
-				// 8. Set feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias ) for alpha gradient.
+				// 8. Set feat for alpha gradient (matches forward activation).
 				for (int ch = 0; ch < C; ch++) {
-					feat[ch] = fmaxf(0.0f, colors[global_id * 3 + ch] + residual[ch] + d_res_bias);
+					float sh_c = colors[global_id * 3 + ch];
+					if (d_residual_mode == 1)
+						feat[ch] = sh_c + fmaxf(0.0f, residual[ch] + d_res_bias);
+					else
+						feat[ch] = fmaxf(0.0f, sh_c + residual[ch] + d_res_bias);
 				}
 
 				break;
@@ -2115,7 +2148,8 @@ renderCUDAsurfelBackward(
 				MlpWeights smem_mlp_6 = {smem_mlp_W1, smem_mlp_W2, smem_mlp_W3};
 				mlp_forward_inline(mlp_input_6, residual_6, h1_post_6, h2_post_6, false, smem_mlp_6);
 
-				// Combo #6 (same as case 5): outer ReLU gates both paths.
+				// d_residual_mode = 0: outer ReLU gates both paths together.
+				// d_residual_mode = 1: separate ReLUs for SH and residual.
 				// NOTE: for case 6, colors[] holds DC_SH (MLP input), not the SH-
 				// evaluated sh_color. We use DC_SH as a stand-in in the gate test —
 				// this matches the pre-decoupling approximation in this kernel.
@@ -2123,15 +2157,25 @@ renderCUDAsurfelBackward(
 				for (int c = 0; c < 3; c++)
 					sh_color_bw_6[c] = colors[global_id * 3 + c];
 
-				float dL_drgb_6[3];
+				float dL_drgb_6[3];      // grad flowing into residual (MLP) path
+				float dL_drgb_sh_6[3];   // grad flowing into SH path
 				for (int c = 0; c < 3; c++) {
-					float relu_grad = (sh_color_bw_6[c] + residual_6[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
-					dL_drgb_6[c] = dL_dchannels[c] * w * relu_grad;
+					float gate_res, gate_sh;
+					if (d_residual_mode == 1) {
+						gate_res = (residual_6[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						gate_sh = 1.0f;
+					} else {
+						float g = (sh_color_bw_6[c] + residual_6[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						gate_res = g;
+						gate_sh = g;
+					}
+					dL_drgb_6[c] = dL_dchannels[c] * w * gate_res;
+					dL_drgb_sh_6[c] = dL_dchannels[c] * w * gate_sh;
 				}
 
-				// SH gradient: same outer ReLU gate.
+				// SH gradient: gated separately under add mode.
 				for (int ch = 0; ch < 3; ch++)
-					atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_drgb_6[ch]);
+					atomicAdd(&(dL_dcolors[global_id * 3 + ch]), dL_drgb_sh_6[ch]);
 
 				// 6. MLP backward
 				float dL_dinput_full_6[TC_INPUT_DIM];
@@ -2180,11 +2224,16 @@ renderCUDAsurfelBackward(
 					if (detach_hash_grad) { dL_dxyz[0] = 0; dL_dxyz[1] = 0; dL_dxyz[2] = 0; }
 				}
 
-				// 8. Set feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias ) for alpha gradient.
+				// 8. Set feat for alpha gradient (matches forward activation).
 				// NOTE: for case 6, colors[] holds DC_SH (MLP input), not the SH-evaluated
 				// sh_color. We use DC_SH as a stand-in — matches prior approximation.
-				for (int ch = 0; ch < C; ch++)
-					feat[ch] = fmaxf(0.0f, colors[global_id * 3 + ch] + residual_6[ch] + d_res_bias);
+				for (int ch = 0; ch < C; ch++) {
+					float sh_c = colors[global_id * 3 + ch];
+					if (d_residual_mode == 1)
+						feat[ch] = sh_c + fmaxf(0.0f, residual_6[ch] + d_res_bias);
+					else
+						feat[ch] = fmaxf(0.0f, sh_c + residual_6[ch] + d_res_bias);
+				}
 
 				break;
 			}
@@ -2917,6 +2966,11 @@ void BACKWARD::setWeightRegLambda(float val) {
 __global__ void setResBiasBwKernel(float val) { d_res_bias = val; }
 void BACKWARD::setResBias(float val) {
 	setResBiasBwKernel<<<1, 1>>>(val);
+}
+
+__global__ void setResidualModeBwKernel(int v) { d_residual_mode = v; }
+void BACKWARD::setResidualMode(int mode) {
+	setResidualModeBwKernel<<<1, 1>>>(mode);
 }
 
 __global__ void setAaKernelSizeBwKernel(float val) { d_aa_kernel_size = val; }

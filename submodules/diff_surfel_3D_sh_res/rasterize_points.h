@@ -213,6 +213,11 @@ void SetWeightRegLambdaCUDA(float val);
 // Set activation biases: color = ReLU(SH + sh_bias) + ReLU(residual + res_bias)
 void SetActivationBiasCUDA(float sh_bias, float res_bias);
 
+// Select residual activation mode (mirrors training render method).
+//   0 = 3D_SH_res (default): color = ReLU(ReLU(SH+sh_bias) + residual + res_bias)
+//   1 = 3D_SH_add:           color = ReLU(SH+sh_bias) + ReLU(residual + res_bias)
+void SetResidualModeCUDA(int mode);
+
 // Set Nexels-style anti-aliasing params (hash-grid down-weighting)
 void SetAntiAliasCUDA(float factor, float focal);
 

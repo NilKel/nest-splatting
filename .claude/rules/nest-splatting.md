@@ -31,9 +31,14 @@ cd <submodule-path> && conda run -n nest_splatting python -m pip install -e . --
 
 The primary rendering mode. **Color formula**:
 ```
-color = clamp(SH + sh_bias, 0) + clamp(MLP_residual + res_bias, 0)
+color = ReLU( ReLU(SH + sh_bias) + MLP_residual + res_bias )      # 3D_SH_res (default, stacked outer ReLU)
+color = ReLU(SH + sh_bias) + ReLU(MLP_residual + res_bias)        # 3D_SH_add (separate ReLUs)
 ```
 Defaults: `sh_bias=0.5`, `res_bias=0.0` (configurable at runtime via `set_activation_bias(sh, res)` — no rebuild needed). SH is unbounded; the residual rides on top to add high-frequency detail. Both components are evaluated in CUDA inside `diff_surfel_3D_sh_res`.
+
+**Activation mode** (`d_residual_mode`, set via `set_residual_mode(0|1)` in both training and bake_render extensions):
+- `--method 3D_SH_res` (mode 0, default): outer ReLU gates SH and residual together. Residual can subtract from SH up to where the sum hits zero.
+- `--method 3D_SH_add` (mode 1): separate ReLUs. Residual can only ADD to SH (since `ReLU(x) ≥ 0`); it cannot subtract. Same architecture as 3D_SH_res — only the activation differs. Stored in `bake_meta.json` as `residual_mode` and re-applied automatically at bake-render time.
 
 **Components**:
 - **SH** (Lagrangian, attached to Gaussians): handles low-frequency color + view-dependence

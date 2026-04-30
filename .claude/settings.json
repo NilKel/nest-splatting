@@ -1,7 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "Bash(identify:*)"
+      "Bash(identify:*)",
+      "Bash(/home/nilkel/miniconda3/envs/mini_splatting/bin/cargo check *)",
+      "Bash(/home/nilkel/Projects/Halloumi-web-splat/target/release/render /home/nilkel/Projects/nest-splatting/outputs/mip_360/bonsai/3D_SH_res/SB_5thr_01w25g4levN2F_FRP5k10/baked_atlas/baked.ply /home/nilkel/Projects/nest-splatting/outputs/mip_360/bonsai/3D_SH_res/SB_5thr_01w25g4levN2F_FRP5k10/cameras.json /tmp/bonsai_render --atlas /tmp/bonsai_bc7.nat2)",
+      "Bash(mkdir -p /home/nilkel/Projects/nest-splatting/outputs/mip_360/bonsai/3D_SH_res/SB_5thr_01w25g4levN2F_FRP5k10/baked_atlas/websplat)",
+      "Bash(cp -r /tmp/bonsai_render/test /home/nilkel/Projects/nest-splatting/outputs/mip_360/bonsai/3D_SH_res/SB_5thr_01w25g4levN2F_FRP5k10/baked_atlas/websplat/)",
+      "Bash(cp -r /tmp/bonsai_render/train /home/nilkel/Projects/nest-splatting/outputs/mip_360/bonsai/3D_SH_res/SB_5thr_01w25g4levN2F_FRP5k10/baked_atlas/websplat/)",
+      "Bash(disown)",
+      "Bash(grep -n \"duplicate_keys\\\\|emit_tile\\\\|fn duplicate\\\\|@compute\" src/shaders/duplicate_keys*.wgsl)",
+      "Bash(ls src/shaders/duplicate_keys*.wgsl src/shaders/*tile*.wgsl)"
     ]
   }
 }

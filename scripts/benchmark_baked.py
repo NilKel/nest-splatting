@@ -1041,6 +1041,9 @@ def main():
         bake_meta["feature_mode"] = _feature_mode_train
         bake_meta["sb_number"] = 0
         bake_meta["sb_params_file"] = None
+        # 0 = 3D_SH_res (default outer ReLU). 1 = 3D_SH_add (separate ReLUs).
+        # Captured from training args._residual_mode (set in train.py training()).
+        bake_meta["residual_mode"] = int(getattr(args, '_residual_mode', 0))
 
         # Save
         os.makedirs(output_dir, exist_ok=True)
@@ -1200,11 +1203,14 @@ def main():
     _sh_bias = float(bake_meta_render.get("sh_bias", getattr(args, 'activation_bias', [0.5, 0.0])[0]))
     _res_bias = float(bake_meta_render.get("res_bias", getattr(args, 'activation_bias', [0.5, 0.0])[1]))
     _compact_mult = float(bake_meta_render.get("compact_mult", 1.0))
-    from diff_surfel_bake_render import set_activation_bias, set_compact_mult
+    from diff_surfel_bake_render import set_activation_bias, set_compact_mult, set_residual_mode
     set_activation_bias(_sh_bias, _res_bias)
     set_compact_mult(_compact_mult)
+    # 0 = 3D_SH_res outer ReLU; 1 = 3D_SH_add separate ReLUs. Default 0 if absent.
+    _residual_mode = int(bake_meta_render.get("residual_mode", 0))
+    set_residual_mode(_residual_mode)
     print(f"[RENDER] set_activation_bias(sh={_sh_bias}, res={_res_bias})  "
-          f"set_compact_mult({_compact_mult})")
+          f"set_compact_mult({_compact_mult})  set_residual_mode({_residual_mode})")
 
     # SB params (only present if training used --feature beta).
     sb_params = None

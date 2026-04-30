@@ -471,6 +471,10 @@ void SetCompactMultBakeCUDA(float val) {
 	FORWARD::setCompactMult(val);
 }
 
+void SetResidualModeBakeCUDA(int mode) {
+	FORWARD::setResidualMode(mode);
+}
+
 torch::Tensor markVisible(
 	torch::Tensor& means3D,
 	torch::Tensor& viewmatrix,

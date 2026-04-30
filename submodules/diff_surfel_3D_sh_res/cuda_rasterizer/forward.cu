@@ -43,9 +43,14 @@ __device__ float d_overdraw_lambda = 0.0f;
 // When lambda > 0, backward adds dL_dalpha = -lambda * 2 * w * T per Gaussian
 __device__ float d_weight_reg_lambda = 0.0f;
 
-// Activation biases for SH and MLP residual: color = ReLU(ReLU(SH + sh_bias) + residual + res_bias)
+// Activation biases for SH and MLP residual.
+// d_residual_mode selects the OUTER activation:
+//   0 = 3D_SH_res (default):   color = ReLU(ReLU(SH + sh_bias) + residual + res_bias)
+//   1 = 3D_SH_add:             color = ReLU(SH + sh_bias) + ReLU(residual + res_bias)
+// (In both modes the SH branch's inner ReLU is applied by computeColorFromSH.)
 // Default: sh_bias=0.5, res_bias=0.5 (standard 3DGS gray init + residual offset)
 // For decomposition: sh_only sets res_bias=-999 (ReLU clamps to 0), tex_only sets sh_bias=-999
+__device__ int d_residual_mode = 0;
 __device__ float d_sh_bias = 0.5f;
 // Nexels-style anti-aliasing d_aa_factor / d_aa_focal are now declared in hashgrid.h
 // (per-TU static __device__). Setters below update this TU's copy.
@@ -1446,12 +1451,21 @@ renderCUDAsurfelForward(
 			wmma_forward_all(smem_fw_half, smem_fw_float,
 				smem_mlp_W1, smem_mlp_W2, smem_mlp_W3);
 
-			// Phase 4: Read MLP result, combine with SH, accumulate
-			// Combo #6: feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias )
+			// Phase 4: Read MLP result, combine with SH, accumulate.
+			// Activation is selected by d_residual_mode (see top of file):
+			//   0 (3D_SH_res): feat = ReLU(ReLU(SH+sh_bias) + residual + res_bias)
+			//   1 (3D_SH_add): feat = ReLU(SH+sh_bias) + ReLU(residual + res_bias)
 			if (active) {
 				for (int ch = 0; ch < ORIG_OUTPUT_DIM; ch++) {
 					float residual = smem_fw_float[tid * TC_OUTPUT_DIM + ch];
-					C[ch] += fmaxf(0.0f, my_sh_color[ch] + residual + d_res_bias) * my_w;
+					float feat_ch;
+					if (d_residual_mode == 1) {
+						// my_sh_color is already ReLU(SH+sh_bias) from computeColorFromSH.
+						feat_ch = my_sh_color[ch] + fmaxf(0.0f, residual + d_res_bias);
+					} else {
+						feat_ch = fmaxf(0.0f, my_sh_color[ch] + residual + d_res_bias);
+					}
+					C[ch] += feat_ch * my_w;
 				}
 
 				if (record_transmittance) {
@@ -1947,12 +1961,17 @@ renderCUDAsurfelForward(
 				mlp_input, residual, h1, h2, false,  // false = identity (no sigmoid)
 				smem_mlp_W1, smem_mlp_W2, smem_mlp_W3);
 
-			// Combo #6: feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias )
+			// Activation: d_residual_mode selects 3D_SH_res (0) vs 3D_SH_add (1).
 			// sh_color is already ReLU(SH+sh_bias) from computeColorFromSH (inner ReLU).
-			// Residual is unbounded — can push the sum down. Outer ReLU clamps the
-			// whole sum so final color can't go negative.
-			for (int ch = 0; ch < 3; ch++)
-				feat[ch] = fmaxf(0.0f, sh_color[ch] + residual[ch] + d_res_bias);
+			for (int ch = 0; ch < 3; ch++) {
+				if (d_residual_mode == 1) {
+					// 3D_SH_add: separate ReLUs on each branch.
+					feat[ch] = sh_color[ch] + fmaxf(0.0f, residual[ch] + d_res_bias);
+				} else {
+					// 3D_SH_res: single outer ReLU on the sum.
+					feat[ch] = fmaxf(0.0f, sh_color[ch] + residual[ch] + d_res_bias);
+				}
+			}
 
 			break;
 		}
@@ -2182,6 +2201,12 @@ void FORWARD::setWeightRegLambda(float val) {
 __global__ void setActivationBiasKernel(float sh, float res) { d_sh_bias = sh; d_res_bias = res; }
 void FORWARD::setActivationBias(float sh_bias, float res_bias) {
 	setActivationBiasKernel<<<1, 1>>>(sh_bias, res_bias);
+}
+
+// Set residual activation mode (0 = 3D_SH_res stacked outer ReLU, 1 = 3D_SH_add separate ReLUs)
+__global__ void setResidualModeFwdKernel(int v) { d_residual_mode = v; }
+void FORWARD::setResidualMode(int mode) {
+	setResidualModeFwdKernel<<<1, 1>>>(mode);
 }
 
 // Set anti-aliasing params (Nexels-style hash-grid down-weighting)

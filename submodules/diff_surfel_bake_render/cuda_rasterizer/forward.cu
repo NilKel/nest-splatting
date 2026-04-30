@@ -17,6 +17,10 @@ namespace cg = cooperative_groups;
 __device__ float d_sh_bias = 0.5f;
 __device__ float d_res_bias = 0.0f;
 __device__ float d_compact_mult = 1.0f;
+// d_residual_mode mirrors the training-time global in diff_surfel_3D_sh_res:
+//   0 (3D_SH_res): color = ReLU(SH_clamped + residual + d_res_bias)
+//   1 (3D_SH_add): color = SH_clamped + ReLU(residual + d_res_bias)
+__device__ int d_residual_mode = 0;
 
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color. Forward-only baked
@@ -594,6 +598,9 @@ renderBakedCUDA(
 				__half2float(features[gauss_id * 3 + 1]),
 				__half2float(features[gauss_id * 3 + 2]),
 			};
+			// Snapshot SH-only feat for d_residual_mode == 1 (3D_SH_add), where
+			// SH bypasses the residual ReLU. Cheap (3 regs); ignored under mode 0.
+			float sh_feat[3] = { feat[0], feat[1], feat[2] };
 
 			// Residual texture lookup (atlas mode). Skip when no atlas was
 			// bound (SH-only render path) — atlas_rects is nullptr and
@@ -662,12 +669,20 @@ renderBakedCUDA(
 				feat[2] += sb_rgb.z;
 			}
 
-			// Final activation matches training's line 1455:
-			//   color = ReLU(SH_clamped + residual + d_res_bias)
+			// Final activation matches training's outer ReLU site:
+			//   mode 0 (3D_SH_res): color = ReLU(SH_clamped + residual + d_res_bias)
+			//   mode 1 (3D_SH_add): color = SH_clamped + ReLU(residual + d_res_bias)
 			// SH_clamped is already in feat[] (precomputed via computeColorFromSH
-			// which uses d_sh_bias). We apply res_bias + final ReLU once here.
-			for (int ch = 0; ch < 3; ch++)
-				feat[ch] = fmaxf(0.0f, feat[ch] + d_res_bias);
+			// which uses d_sh_bias). residual = feat[] - sh_feat[] (atlas + SB).
+			if (d_residual_mode == 1) {
+				for (int ch = 0; ch < 3; ch++) {
+					float residual_part = feat[ch] - sh_feat[ch];
+					feat[ch] = sh_feat[ch] + fmaxf(0.0f, residual_part + d_res_bias);
+				}
+			} else {
+				for (int ch = 0; ch < 3; ch++)
+					feat[ch] = fmaxf(0.0f, feat[ch] + d_res_bias);
+			}
 
 			// Alpha compositing
 			for (int ch = 0; ch < 3; ch++)
@@ -736,6 +751,11 @@ void FORWARD::setActivationBias(float sh_bias, float res_bias) {
 __global__ void setBakeCompactMultKernel(float val) { d_compact_mult = val; }
 void FORWARD::setCompactMult(float val) {
 	setBakeCompactMultKernel<<<1, 1>>>(val);
+}
+
+__global__ void setBakeResidualModeKernel(int mode) { d_residual_mode = mode; }
+void FORWARD::setResidualMode(int mode) {
+	setBakeResidualModeKernel<<<1, 1>>>(mode);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
