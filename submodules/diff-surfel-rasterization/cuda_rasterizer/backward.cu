@@ -17,6 +17,12 @@
 
 namespace cg = cooperative_groups;
 
+// Periodic-freeze flag (mirrors diff_surfel_3D_sh_res). When true, the hash
+// query in the backward kernel runs forward-only so feat[] stays correct for
+// the alpha reconstruction, but no gradient is propagated into hash features
+// or xyz from the hash path. Toggled from Python via BACKWARD::setSkipMlpGrad().
+__device__ bool d_skip_mlp_grad = false;
+
 // Backward pass for conversion of spherical harmonics to RGB for
 // each Gaussian.
 __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, const bool* clamped, const glm::vec3* dL_dcolor, glm::vec3* dL_dmeans, glm::vec3* dL_dshs)
@@ -849,21 +855,40 @@ renderCUDAsurfelBackward(
 			// Note: render_mode may have flags in upper bits (e.g., inference flag), so mask to get base mode
 			switch (render_mode & 0xFF){
 				case 0:
-					// Baseline mode: use l_dim directly (includes surface_blend with 12D features)
-					if(l_dim == 2) {
-						query_feature<true, C, 2>(feat, xyz, voxel_min, voxel_max, collec_offsets,
-							appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, grad_feat, dL_dfeatures, dL_dxyz);
-					} else if(l_dim == 4) {
-						query_feature<true, C, 4>(feat, xyz, voxel_min, voxel_max, collec_offsets,
-							appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, grad_feat, dL_dfeatures, dL_dxyz);
-					} else if(l_dim == 8) {
-						query_feature<true, C, 8>(feat, xyz, voxel_min, voxel_max, collec_offsets,
-							appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, grad_feat, dL_dfeatures, dL_dxyz);
-					} else if(l_dim == 12) {
-						query_feature<true, C, 12>(feat, xyz, voxel_min, voxel_max, collec_offsets,
-							appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, grad_feat, dL_dfeatures, dL_dxyz);
+					// Baseline mode: use l_dim directly (includes surface_blend with 12D features).
+					// d_skip_mlp_grad: forward-only query, no gradient propagation into hash/xyz.
+					if (!d_skip_mlp_grad) {
+						if(l_dim == 2) {
+							query_feature<true, C, 2>(feat, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, grad_feat, dL_dfeatures, dL_dxyz);
+						} else if(l_dim == 4) {
+							query_feature<true, C, 4>(feat, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, grad_feat, dL_dfeatures, dL_dxyz);
+						} else if(l_dim == 8) {
+							query_feature<true, C, 8>(feat, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, grad_feat, dL_dfeatures, dL_dxyz);
+						} else if(l_dim == 12) {
+							query_feature<true, C, 12>(feat, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, grad_feat, dL_dfeatures, dL_dxyz);
+						} else {
+							printf("BW unsupported level dim : %d\n", l_dim);
+						}
 					} else {
-						printf("BW unsupported level dim : %d\n", l_dim);
+						if(l_dim == 2) {
+							query_feature<false, C, 2>(feat, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, nullptr, nullptr, nullptr);
+						} else if(l_dim == 4) {
+							query_feature<false, C, 4>(feat, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, nullptr, nullptr, nullptr);
+						} else if(l_dim == 8) {
+							query_feature<false, C, 8>(feat, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, nullptr, nullptr, nullptr);
+						} else if(l_dim == 12) {
+							query_feature<false, C, 12>(feat, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, level, l_scale, Base, align_corners, interp, contract, debug, nullptr, nullptr, nullptr);
+						} else {
+							printf("BW unsupported level dim : %d\n", l_dim);
+						}
 					}
 					break;
 			case 1: {
@@ -901,24 +926,48 @@ renderCUDAsurfelBackward(
 						grad_feat_hashgrid[i] = grad_feat[per_gaussian_dim + i];
 					}
 
-					if(l_dim == 2) {
-						query_feature<true, 16 * 4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
-							appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
-							grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
-					} else if(l_dim == 4) {
-						query_feature<true, 16 * 4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
-							appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
-							grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
-					} else if(l_dim == 8) {
-						query_feature<true, 16 * 4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
-							appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
-							grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
-					} else if(l_dim == 12) {
-						query_feature<true, 16 * 4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
-							appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
-							grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
+					// d_skip_mlp_grad: forward-only query (populates feat_hashgrid for the
+					// alpha reconstruction below); no backprop into hash features or xyz.
+					if (!d_skip_mlp_grad) {
+						if(l_dim == 2) {
+							query_feature<true, 16 * 4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+								grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
+						} else if(l_dim == 4) {
+							query_feature<true, 16 * 4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+								grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
+						} else if(l_dim == 8) {
+							query_feature<true, 16 * 4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+								grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
+						} else if(l_dim == 12) {
+							query_feature<true, 16 * 4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+								grad_feat_hashgrid, dL_dfeatures, dL_dxyz);
+						} else {
+							printf("BW unsupported level dim : %d\n", l_dim);
+						}
 					} else {
-						printf("BW unsupported level dim : %d\n", l_dim);
+						if(l_dim == 2) {
+							query_feature<false, 16 * 4, 2>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+								nullptr, nullptr, nullptr);
+						} else if(l_dim == 4) {
+							query_feature<false, 16 * 4, 4>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+								nullptr, nullptr, nullptr);
+						} else if(l_dim == 8) {
+							query_feature<false, 16 * 4, 8>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+								nullptr, nullptr, nullptr);
+						} else if(l_dim == 12) {
+							query_feature<false, 16 * 4, 12>(feat_hashgrid, xyz, voxel_min, voxel_max, collec_offsets,
+								appearance_level, hash_features, hashgrid_levels, l_scale, Base, align_corners, interp, contract, debug,
+								nullptr, nullptr, nullptr);
+						} else {
+							printf("BW unsupported level dim : %d\n", l_dim);
+						}
 					}
 
 					// Copy hash features back into feat array
@@ -1438,6 +1487,12 @@ __global__ void preprocessCUDA(
 	// system (same depth * 0.5 * W/H factor as x/y).
 	dL_dmean2Ds[idx].z *= depth * 0.5f * float(W);
 	dL_dmean2Ds[idx].w *= depth * 0.5f * float(H);
+}
+
+
+__global__ void setSkipMlpGradKernel(bool val) { d_skip_mlp_grad = val; }
+void BACKWARD::setSkipMlpGrad(bool val) {
+	setSkipMlpGradKernel<<<1, 1>>>(val);
 }
 
 

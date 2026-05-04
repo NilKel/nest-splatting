@@ -419,3 +419,17 @@ def compute_relocation(opacity_old, scale_old, N, binoms, n_max):
     """
     new_opacity, new_scale = _C.compute_relocation(opacity_old, scale_old, N.int(), binoms, n_max)
     return new_opacity, new_scale
+
+
+def set_skip_mlp_grad(val=True):
+    """Periodic-freeze toggle for cat-mode hash backward.
+
+    When True, the backward kernel runs the hash query forward-only — feat[]
+    is reconstructed for the alpha computation but no gradient flows into hash
+    features or xyz from the hash path. Per-Gaussian feature gradients (the
+    Lagrangian path) keep flowing.
+
+    Mirrors diff_surfel_3D_sh_res.set_skip_mlp_grad. Toggle to control whether
+    a given backward iteration trains the hash; pair with skipping the INGP
+    optimizer step on the same iteration in your training loop."""
+    _C.set_skip_mlp_grad(bool(val))

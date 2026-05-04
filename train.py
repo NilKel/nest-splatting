@@ -1313,13 +1313,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 optim_ngp = True
                 optim_gaussian = ingp.optim_gaussian
 
-            # Periodic hashgrid+MLP freeze for 3D_SH_res. After `freeze_hash_iter`,
-            # train hash+MLP on 1 iter out of every `freeze_hash_period`. On skip
-            # iters: CUDA backward skips all hash/MLP-grad work (weight-grad GEMMs,
-            # input-chain backprop, query_feature<true>, tile flush) and the
-            # optimizer.step() for ingp is skipped. Geometry backward runs unchanged.
+            # Periodic hashgrid freeze. After `freeze_hash_iter`, train hash on 1 iter
+            # out of every `freeze_hash_period`. CUDA backward runs the hash query
+            # forward-only on skip iters (no hash/xyz gradient propagation).
+            #   3D_SH_res → freezes hash + MLP together (MLP is part of the residual
+            #               path, no shared decoder concern). Skip optimizer.step too.
+            #   cat       → MLP is a SHARED DECODER for both per-Gaussian and hash
+            #               features. Freezing it would starve per-Gauss features of
+            #               useful gradients. So skip only the hash gradient (CUDA-side)
+            #               and keep the INGP optimizer.step running so the MLP updates.
+            #               Hash table sees ~zero gradient, Adam moments decay slightly,
+            #               weights effectively don't move.
+            _freeze_methods = ("3D_SH_res", "cat")
             if (args.freeze_hash_iter > 0 and iteration >= args.freeze_hash_iter
-                    and args.method == "3D_SH_res"):
+                    and args.method in _freeze_methods):
                 period = max(1, int(args.freeze_hash_period))
                 should_train = (iteration % period) == 0
                 desired_skip = not should_train
@@ -1328,15 +1335,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 current_skip = getattr(ingp, '_skip_mlp_grad', None)
                 if current_skip != desired_skip:
                     try:
-                        from diff_surfel_3D_sh_res import set_skip_mlp_grad
+                        if args.method == "3D_SH_res":
+                            from diff_surfel_3D_sh_res import set_skip_mlp_grad
+                        else:  # cat
+                            from diff_surfel_rasterization import set_skip_mlp_grad
                         set_skip_mlp_grad(desired_skip)
                     except (ImportError, AttributeError):
                         tqdm.write("[FREEZE_HASH] WARN: set_skip_mlp_grad not available; rebuild?")
                     ingp._skip_mlp_grad = desired_skip
                     if current_skip is None:
-                        tqdm.write(f"[FREEZE_HASH] Periodic freeze active at iter {iteration} "
-                                   f"(train hash+MLP 1 of every {period} iters)")
-                optim_ngp = should_train
+                        if args.method == "cat":
+                            tqdm.write(f"[FREEZE_HASH] Periodic hash freeze active at iter "
+                                       f"{iteration} (cat: hash 1 of {period} iters, MLP "
+                                       f"trains every iter)")
+                        else:
+                            tqdm.write(f"[FREEZE_HASH] Periodic freeze active at iter "
+                                       f"{iteration} (train hash+MLP 1 of every {period} iters)")
+                # 3D_SH_res: skip whole INGP optimizer on freeze iters (freezes MLP too).
+                # cat: keep INGP optimizer stepping so the shared MLP decoder updates;
+                # CUDA-side zero gradient already freezes the hash table.
+                if args.method == "3D_SH_res":
+                    optim_ngp = should_train
+                # else: leave optim_ngp at its default (True) for cat.
 
             if iteration % surfel_cfg.update_interval == 0 and optim_gaussian \
                 and beta < surfel_cfg.tg_beta and active_levels == cfg_model.encoding.levels:

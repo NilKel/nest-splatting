@@ -92,6 +92,11 @@ namespace BACKWARD
 		glm::vec3* dL_dmeans,
 		glm::vec2* dL_dscale,
 		glm::vec4* dL_drot);
+
+	// Periodic-freeze toggle: when true, the backward kernel runs the hash query
+	// in forward-only mode (alpha reconstruction stays correct, no gradient into
+	// hash features or xyz from the hash path). Mirrors diff_surfel_3D_sh_res.
+	void setSkipMlpGrad(bool val);
 }
 
 #endif

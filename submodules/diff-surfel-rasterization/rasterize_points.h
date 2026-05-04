@@ -112,3 +112,7 @@ torch::Tensor markVisible(
 		torch::Tensor& means3D,
 		torch::Tensor& viewmatrix,
 		torch::Tensor& projmatrix);
+
+// Periodic-freeze toggle: forwarded to BACKWARD::setSkipMlpGrad. When true, the
+// hash backward query runs forward-only, no hash/xyz gradient propagation.
+void SetSkipMlpGradCUDA(bool val);

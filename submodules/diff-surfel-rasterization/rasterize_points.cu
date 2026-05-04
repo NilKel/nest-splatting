@@ -21,6 +21,7 @@
 #include "cuda_rasterizer/config.h"
 #include "cuda_rasterizer/rasterizer.h"
 #include "cuda_rasterizer/rasterizer_impl.h"
+#include "cuda_rasterizer/backward.h"
 #include <fstream>
 #include <string>
 #include <functional>
@@ -462,4 +463,8 @@ torch::Tensor markVisible(
   }
 
   return present;
+}
+
+void SetSkipMlpGradCUDA(bool val) {
+  BACKWARD::setSkipMlpGrad(val);
 }

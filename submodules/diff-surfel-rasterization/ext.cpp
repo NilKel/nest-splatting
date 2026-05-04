@@ -18,4 +18,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rasterize_gaussians_backward", &RasterizeGaussiansBackwardCUDA);
   m.def("mark_visible", &markVisible);
   m.def("compute_relocation", &compute_relocation_tensor);
+  m.def("set_skip_mlp_grad", &SetSkipMlpGradCUDA);
 }
