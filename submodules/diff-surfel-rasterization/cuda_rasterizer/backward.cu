@@ -160,7 +160,7 @@ renderCUDA(
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_depths,
 	float * __restrict__ dL_dtransMat,
-	float3* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors)
@@ -431,8 +431,13 @@ renderCUDA(
 				// // Update gradients w.r.t. center of Gaussian 2D mean position
 				const float dG_ddelx = -G * FilterInvSquare * d.x;
 				const float dG_ddely = -G * FilterInvSquare * d.y;
-				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
-				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
+				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled (overwritten by preprocess)
+				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled (overwritten by preprocess)
+				// AbsGS: per-pixel absolute screen-space grad magnitude. Survives the
+				// preprocess overwrite (only .x/.y are overwritten there); .z/.w are
+				// scaled by the same depth*W/H factor in preprocess to land in NDC units.
+				atomicAdd(&dL_dmean2D[global_id].z, fabsf(dL_dG * dG_ddelx));
+				atomicAdd(&dL_dmean2D[global_id].w, fabsf(dL_dG * dG_ddely));
 				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz); // propagate depth loss
 			}
 
@@ -475,7 +480,7 @@ renderCUDAsurfelBackward(
 	float * __restrict__ dL_dfeatures,
 	float * __restrict__ dL_dtransMat,
 	float * __restrict__ dL_dhomoMat,
-	float3* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
@@ -1191,8 +1196,13 @@ renderCUDAsurfelBackward(
 				}
 				const float dG_ddelx = dG_factor_2d * d.x;
 				const float dG_ddely = dG_factor_2d * d.y;
-				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
-				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
+				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled (overwritten by preprocess)
+				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled (overwritten by preprocess)
+				// AbsGS: per-pixel absolute screen-space grad magnitude. Survives the
+				// preprocess overwrite (only .x/.y are overwritten there); .z/.w are
+				// scaled by the same depth*W/H factor in preprocess to land in NDC units.
+				atomicAdd(&dL_dmean2D[global_id].z, fabsf(dL_dG * dG_ddelx));
+				atomicAdd(&dL_dmean2D[global_id].w, fabsf(dL_dG * dG_ddely));
 				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz); // propagate depth loss
 			}
 
@@ -1215,7 +1225,7 @@ __device__ void compute_transmat_aabb(
 	const float* viewmatrix, 
 	const int W, const int H, 
 	const float3* dL_dnormals,
-	const float3* dL_dmean2Ds, 
+	const float4* dL_dmean2Ds,
 	float* dL_dTs, 
 	float* dL_dhomoMat,
 	glm::vec3* dL_dmeans, 
@@ -1277,7 +1287,7 @@ __device__ void compute_transmat_aabb(
 		dL_dTs[idx*9+3], dL_dTs[idx*9+4], dL_dTs[idx*9+5],
 		dL_dTs[idx*9+6], dL_dTs[idx*9+7], dL_dTs[idx*9+8]
 	);
-	float3 dL_dmean2D = dL_dmean2Ds[idx];
+	float4 dL_dmean2D = dL_dmean2Ds[idx];
 	if(dL_dmean2D.x != 0 || dL_dmean2D.y != 0)
 	{
 		glm::vec3 t_vec = glm::vec3(9.0f, 9.0f, -1.0f);
@@ -1389,7 +1399,7 @@ __global__ void preprocessCUDA(
 	const float* dL_dnormal3Ds,
 	float* dL_dcolors,
 	float* dL_dshs,
-	float3* dL_dmean2Ds,
+	float4* dL_dmean2Ds,
 	glm::vec3* dL_dmean3Ds,
 	glm::vec2* dL_dscales,
 	glm::vec4* dL_drots)
@@ -1420,8 +1430,14 @@ __global__ void preprocessCUDA(
 	
 	// hack the gradient here for densitification
 	float depth = transMats[idx * 9 + 8];
-	dL_dmean2Ds[idx].x = dL_dtransMats[idx * 9 + 2] * depth * 0.5 * float(W); // to ndc 
+	dL_dmean2Ds[idx].x = dL_dtransMats[idx * 9 + 2] * depth * 0.5 * float(W); // to ndc
 	dL_dmean2Ds[idx].y = dL_dtransMats[idx * 9 + 5] * depth * 0.5 * float(H); // to ndc
+
+	// AbsGS: scale the abs signal accumulated during the render backward
+	// (per-pixel fabs(dL_dG * dG_ddelx)) to match the densification coordinate
+	// system (same depth * 0.5 * W/H factor as x/y).
+	dL_dmean2Ds[idx].z *= depth * 0.5f * float(W);
+	dL_dmean2Ds[idx].w *= depth * 0.5f * float(H);
 }
 
 
@@ -1440,7 +1456,7 @@ void BACKWARD::preprocess(
 	const float focal_x, const float focal_y,
 	const float tan_fovx, const float tan_fovy,
 	const glm::vec3* campos, 
-	float3* dL_dmean2Ds,
+	float4* dL_dmean2Ds,
 	const float* dL_dnormal3Ds,
 	float* dL_dtransMats,
 	float* dL_dhomoMat,
@@ -1510,7 +1526,7 @@ void BACKWARD::render(
 	float* dL_dfeatures,
 	float * dL_dtransMat,
 	float * dL_dhomoMat,
-	float3* dL_dmean2D,
+	float4* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
 	float* dL_dcolors,

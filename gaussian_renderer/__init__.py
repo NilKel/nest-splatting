@@ -1051,12 +1051,34 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         elif is_3D_SH_cat_mode:
             from diff_surfel_3D_sh_res import set_mlp_weights
 
-            # Full SH for view-dependent base color (evaluated in CUDA preprocessing)
+            # Full SH for view-dependent base color (evaluated in CUDA preprocessing).
+            # Under --feature beta/sg/voronoi/SV, _effective_shs() injects the directional
+            # lobe term into the FAKE-DC slot so the rasterizer's SH eval reproduces the
+            # paper formula: `SH_eval(real_dc + lobe_rgb/SH_C0 + higher_SH) = SH_eval(real)+lobe`.
             shs = _effective_shs()
 
-            # DC SH for MLP input: raw SH_C0 * coeff + 0.5 (same as computeColorFromSH DC term)
+            # MLP DC identity input: must be the VIEW-INDEPENDENT real DC SH evaluated to
+            # RGB. The MLP residual rides on top of (SH_eval + lobe). Reading from
+            # `_effective_shs()[:,0,:]` here would leak the (view-dependent) lobe into the
+            # MLP's identity input and make the residual itself view-dependent — defeating
+            # the intended decomposition (lobe = view-dep, MLP = view-indep spatial residual).
+            # Use real `_features_dc` directly so the MLP sees pure view-independent identity.
+            #
+            # NOTE on the .detach():
+            #   _features_dc gets gradient via TWO valid paths through the rasterizer:
+            #     (a) `shs = _effective_shs()` → CUDA SH-eval backward → dL_dshs → grad_sh
+            #         → autograd through `_effective_shs()` clone → _features_dc
+            #     (b) `colors_precomp = SH_C0·_features_dc + 0.5` → grad_colors_precomp
+            #         → autograd through this expression → _features_dc
+            #   The CUDA cat backward routes BOTH the SH-color gradient AND the MLP's
+            #   dc_sh-slot gradient into the SAME dL_dcolors buffer (which the SH backward
+            #   then turns into dL_dshs[0,:] = SH_C0·dL_dcolors). If we left this expression
+            #   differentiable, _features_dc would receive every contribution twice (once
+            #   via SH backward → grad_sh, once via grad_colors_precomp). We .detach() so
+            #   only the SH path feeds _features_dc — and that single path now carries
+            #   BOTH the SH-color and the MLP-DC-slot contributions.
             SH_C0 = 0.28209479177387814
-            dc_sh = SH_C0 * _effective_shs()[:, 0, :] + 0.5  # [N, 3]
+            dc_sh = SH_C0 * pc._features_dc.detach().squeeze(1) + 0.5  # [N, 3], view-indep, detached
             colors_precomp = dc_sh.contiguous()
 
             # Decompose mode for 3D_SH_cat:
@@ -1109,10 +1131,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             global _3D_DIRECT_FUSED_VERIFIED
             if not _3D_DIRECT_FUSED_VERIFIED:
                 hash_dim = active_hashgrid_levels * ingp.level_dim
+                _pad = 16 - hash_dim - 3 - 1  # MLP input is 16D total
                 print(f"[3D_SH_CAT] render_mode={render_mode}, "
                       f"SH=degree-3 (48 params), "
                       f"hash={active_hashgrid_levels}×{ingp.level_dim}={hash_dim}D, "
-                      f"MLP input=[hash(4)|DC_SH(3)|bias(1)]=8D, "
+                      f"MLP input=[hash({hash_dim})|DC_SH(3)|bias(1)|pad({_pad})]=16D, "
                       f"MLP=16→16→16→3 residual")
                 _3D_DIRECT_FUSED_VERIFIED = True
 
@@ -2426,6 +2449,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rets['max_weight'] = max_weight_buf
         if accum_weights_buf is not None:
             rets['accum_weights'] = accum_weights_buf
+
+    # Unbiased Depth: convergence-loss per-pixel scalar (only present when the
+    # diff_surfel_3D_sh_res_unbiased rasterizer is active — its allmap has 19
+    # channels, channel 18 = CONVERGE_OFFSET; the legacy rasterizer has 18).
+    if allmap.shape[0] >= 19:
+        rets['converge'] = allmap[18:19]
 
     rets.update({
             'rend_alpha': render_alpha,

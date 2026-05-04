@@ -64,6 +64,15 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
     bool flag_oob = false;
 	const uint32_t D = 3;
     float grad_scale = 0.0;
+    // Saved state for backward Jacobian transpose. Only meaningful when BW.
+    // Non-contract: inv_world_step = 1/(vmax-vmin), Jacobian is scalar.
+    // Contract: pre_warp[] = centered+rescaled point BEFORE the radial warp,
+    //           r_norm = its L2 norm, inv_world_step = 2/(vmax-vmin).
+    // The contract Jacobian is non-isotropic in the outer (norm > 1) region;
+    // see the assembly block at the end of this function.
+    float inv_world_step = 0.0f;
+    float pre_warp[3] = {0.0f, 0.0f, 0.0f};
+    float r_norm = 0.0f;
 
     if(!contract){
         // warp the pos to [0, 1]
@@ -72,28 +81,36 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
         inputs[1] = (xyz.y-vmin)*inv_vsize;
         inputs[2] = (xyz.z-vmin)*inv_vsize;
         grad_scale = inv_vsize;
+        inv_world_step = inv_vsize;
         flag_oob = (inputs[0] < 0 || inputs[0] > 1 || inputs[1] < 0 || inputs[1] > 1 || inputs[2] < 0 || inputs[2] > 1);
     }
     else{
         // warp the center region to [-1, 1]
         float vmid = (vmax + vmin) * 0.5;
         float inv_vsize_ = 1.0 / ((vmax - vmin) * 0.5);
-        inputs[0] = (xyz.x-vmid)*inv_vsize_;
-        inputs[1] = (xyz.y-vmid)*inv_vsize_;
-        inputs[2] = (xyz.z-vmid)*inv_vsize_;
+        pre_warp[0] = (xyz.x-vmid)*inv_vsize_;
+        pre_warp[1] = (xyz.y-vmid)*inv_vsize_;
+        pre_warp[2] = (xyz.z-vmid)*inv_vsize_;
+        inputs[0] = pre_warp[0];
+        inputs[1] = pre_warp[1];
+        inputs[2] = pre_warp[2];
         // warp the outside region to [-2, 2], then warp to [0, 1]
-        float norm = sqrtf(inputs[0]*inputs[0] + inputs[1]*inputs[1] + inputs[2]*inputs[2]);
-        float inv_norm = 1.0f / norm;
-        float scale_trans = (norm <= 1.0f) ? 1.0f : (2.0f - inv_norm) * inv_norm;
+        r_norm = sqrtf(pre_warp[0]*pre_warp[0] + pre_warp[1]*pre_warp[1] + pre_warp[2]*pre_warp[2]);
+        float inv_norm = 1.0f / r_norm;
+        float scale_trans = (r_norm <= 1.0f) ? 1.0f : (2.0f - inv_norm) * inv_norm;
         #pragma unroll
-        for (uint32_t d = 0; d < D; d++) 
+        for (uint32_t d = 0; d < D; d++)
         {
             // warp to range [-2, 2]
             inputs[d] = scale_trans * inputs[d] ;
             // norm to [0, 1]
             inputs[d] = (inputs[d] + 2.0) * 0.25f;
-        } 
+        }
+        // grad_scale: scalar approximation of d_normalized/d_world (kept for any
+        // future scalar-Jacobian uses). The proper non-isotropic backward Jacobian
+        // is applied at the end of this function.
         grad_scale = inv_vsize_ * scale_trans * 0.25f;
+        inv_world_step = inv_vsize_;
     }
 
     uint32_t max_level = min(appearance_level, L);
@@ -245,8 +262,10 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 
                 #pragma unroll
                 for (uint32_t idx = 0; idx < (1 << (D - 1)); idx++) {
-                    // float w = scale;
-                    float w = scale * grad_scale;
+                    // dy_dx accumulates d(feature)/d(input_normalized). The world-space
+                    // Jacobian (scalar non-contract / anisotropic contract) is applied
+                    // once at the end of this function.
+                    float w = scale;
                     uint32_t pos_grid_local[D];
 
                     #pragma unroll
@@ -281,6 +300,17 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
             }
         }
 
+        // First accumulate dL/d(input_normalized) in [0,1] coords, then map to
+        // dL/d(xyz) via the proper Jacobian transpose:
+        //   non-contract: J = inv_world_step * I  (scalar, isotropic)
+        //   contract pipeline: xyz → step1 (linear, scale inv_vsize_)
+        //                          → step2 (radial warp scale_trans(r) * x)
+        //                          → step3 (linear, +2 then *0.25)
+        //   J^T_step3 = 0.25 * I
+        //   J^T_step2 v = scale_trans * v + (d_scale_trans/dr) * (x_step1 · v) * x_step1 / r
+        //                 with d_scale_trans/dr = -2(r-1)/r^3 for r>1, 0 for r<=1.
+        //   J^T_step1 = inv_vsize_ * I  (= inv_world_step * I)
+        float dL_dnormalized[D];
         # pragma unroll
         for (uint32_t d = 0; d < D; d++) {
             float result = 0;
@@ -289,12 +319,36 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
                 float* grad_level_feat = grad_feat + level * LD;
                 # pragma unroll
                 for (int ch = 0; ch < LD; ch++) {
-                    // grad_feat (C & L * LD), dy_dx (D * F & D * L * LD), 
+                    // grad_feat (C & L * LD), dy_dx (D * F & D * L * LD),
                     result += grad_level_feat[ch] * dy_dx[d * C + level * LD + ch];
                 }
             }
+            dL_dnormalized[d] = result;
+        }
 
-            dL_dxyz[d] = result;
+        if (!contract) {
+            #pragma unroll
+            for (uint32_t d = 0; d < D; d++) {
+                dL_dxyz[d] = inv_world_step * dL_dnormalized[d];
+            }
+        } else {
+            const float r_safe = fmaxf(r_norm, 1e-8f);
+            float scale_trans = 1.0f;
+            float d_st_dr = 0.0f;
+            if (r_norm > 1.0f) {
+                const float inv_r = 1.0f / r_safe;
+                scale_trans = (2.0f - inv_r) * inv_r;             // (2 - 1/r)/r
+                d_st_dr = -2.0f * (r_norm - 1.0f) * inv_r * inv_r * inv_r;  // -2(r-1)/r^3
+            }
+            const float dot_pw_g = pre_warp[0] * dL_dnormalized[0]
+                                 + pre_warp[1] * dL_dnormalized[1]
+                                 + pre_warp[2] * dL_dnormalized[2];
+            const float radial_coef = (r_norm > 1.0f) ? (d_st_dr * dot_pw_g / r_safe) : 0.0f;
+            const float chain = 0.25f * inv_world_step;
+            #pragma unroll
+            for (uint32_t d = 0; d < D; d++) {
+                dL_dxyz[d] = chain * (scale_trans * dL_dnormalized[d] + radial_coef * pre_warp[d]);
+            }
         }
     }
 }
@@ -315,6 +369,15 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
     bool flag_oob = false;
 	const uint32_t D = 3;
     float grad_scale = 0.0;
+    // Saved state for backward Jacobian transpose. Only meaningful when BW.
+    // Non-contract: inv_world_step = 1/(vmax-vmin), Jacobian is scalar.
+    // Contract: pre_warp[] = centered+rescaled point BEFORE the radial warp,
+    //           r_norm = its L2 norm, inv_world_step = 2/(vmax-vmin).
+    // The contract Jacobian is non-isotropic in the outer (norm > 1) region;
+    // see the assembly block at the end of this function.
+    float inv_world_step = 0.0f;
+    float pre_warp[3] = {0.0f, 0.0f, 0.0f};
+    float r_norm = 0.0f;
 
     if(!contract){
         // warp the pos to [0, 1]
@@ -323,28 +386,36 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
         inputs[1] = (xyz.y-vmin)*inv_vsize;
         inputs[2] = (xyz.z-vmin)*inv_vsize;
         grad_scale = inv_vsize;
+        inv_world_step = inv_vsize;
         flag_oob = (inputs[0] < 0 || inputs[0] > 1 || inputs[1] < 0 || inputs[1] > 1 || inputs[2] < 0 || inputs[2] > 1);
     }
     else{
         // warp the center region to [-1, 1]
         float vmid = (vmax + vmin) * 0.5;
         float inv_vsize_ = 1.0 / ((vmax - vmin) * 0.5);
-        inputs[0] = (xyz.x-vmid)*inv_vsize_;
-        inputs[1] = (xyz.y-vmid)*inv_vsize_;
-        inputs[2] = (xyz.z-vmid)*inv_vsize_;
+        pre_warp[0] = (xyz.x-vmid)*inv_vsize_;
+        pre_warp[1] = (xyz.y-vmid)*inv_vsize_;
+        pre_warp[2] = (xyz.z-vmid)*inv_vsize_;
+        inputs[0] = pre_warp[0];
+        inputs[1] = pre_warp[1];
+        inputs[2] = pre_warp[2];
         // warp the outside region to [-2, 2], then warp to [0, 1]
-        float norm = sqrtf(inputs[0]*inputs[0] + inputs[1]*inputs[1] + inputs[2]*inputs[2]);
-        float inv_norm = 1.0f / norm;
-        float scale_trans = (norm <= 1.0f) ? 1.0f : (2.0f - inv_norm) * inv_norm;
+        r_norm = sqrtf(pre_warp[0]*pre_warp[0] + pre_warp[1]*pre_warp[1] + pre_warp[2]*pre_warp[2]);
+        float inv_norm = 1.0f / r_norm;
+        float scale_trans = (r_norm <= 1.0f) ? 1.0f : (2.0f - inv_norm) * inv_norm;
         #pragma unroll
-        for (uint32_t d = 0; d < D; d++) 
+        for (uint32_t d = 0; d < D; d++)
         {
             // warp to range [-2, 2]
             inputs[d] = scale_trans * inputs[d] ;
             // norm to [0, 1]
             inputs[d] = (inputs[d] + 2.0) * 0.25f;
-        } 
+        }
+        // grad_scale: scalar approximation of d_normalized/d_world (kept for any
+        // future scalar-Jacobian uses). The proper non-isotropic backward Jacobian
+        // is applied at the end of this function.
         grad_scale = inv_vsize_ * scale_trans * 0.25f;
+        inv_world_step = inv_vsize_;
     }
 
     uint32_t max_level = min(appearance_level, L);
@@ -496,8 +567,10 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
 
                 #pragma unroll
                 for (uint32_t idx = 0; idx < (1 << (D - 1)); idx++) {
-                    // float w = scale;
-                    float w = scale * grad_scale;
+                    // dy_dx accumulates d(feature)/d(input_normalized). The world-space
+                    // Jacobian (scalar non-contract / anisotropic contract) is applied
+                    // once at the end of this function.
+                    float w = scale;
                     uint32_t pos_grid_local[D];
 
                     #pragma unroll
@@ -532,6 +605,17 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
             }
         }
 
+        // First accumulate dL/d(input_normalized) in [0,1] coords, then map to
+        // dL/d(xyz) via the proper Jacobian transpose:
+        //   non-contract: J = inv_world_step * I  (scalar, isotropic)
+        //   contract pipeline: xyz → step1 (linear, scale inv_vsize_)
+        //                          → step2 (radial warp scale_trans(r) * x)
+        //                          → step3 (linear, +2 then *0.25)
+        //   J^T_step3 = 0.25 * I
+        //   J^T_step2 v = scale_trans * v + (d_scale_trans/dr) * (x_step1 · v) * x_step1 / r
+        //                 with d_scale_trans/dr = -2(r-1)/r^3 for r>1, 0 for r<=1.
+        //   J^T_step1 = inv_vsize_ * I  (= inv_world_step * I)
+        float dL_dnormalized[D];
         # pragma unroll
         for (uint32_t d = 0; d < D; d++) {
             float result = 0;
@@ -540,12 +624,36 @@ float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = null
                 float* grad_level_feat = grad_feat + level * LD;
                 # pragma unroll
                 for (int ch = 0; ch < LD; ch++) {
-                    // grad_feat (C & L * LD), dy_dx (D * F & D * L * LD), 
+                    // grad_feat (C & L * LD), dy_dx (D * F & D * L * LD),
                     result += grad_level_feat[ch] * dy_dx[d * C + level * LD + ch];
                 }
             }
+            dL_dnormalized[d] = result;
+        }
 
-            dL_dxyz[d] = result;
+        if (!contract) {
+            #pragma unroll
+            for (uint32_t d = 0; d < D; d++) {
+                dL_dxyz[d] = inv_world_step * dL_dnormalized[d];
+            }
+        } else {
+            const float r_safe = fmaxf(r_norm, 1e-8f);
+            float scale_trans = 1.0f;
+            float d_st_dr = 0.0f;
+            if (r_norm > 1.0f) {
+                const float inv_r = 1.0f / r_safe;
+                scale_trans = (2.0f - inv_r) * inv_r;             // (2 - 1/r)/r
+                d_st_dr = -2.0f * (r_norm - 1.0f) * inv_r * inv_r * inv_r;  // -2(r-1)/r^3
+            }
+            const float dot_pw_g = pre_warp[0] * dL_dnormalized[0]
+                                 + pre_warp[1] * dL_dnormalized[1]
+                                 + pre_warp[2] * dL_dnormalized[2];
+            const float radial_coef = (r_norm > 1.0f) ? (d_st_dr * dot_pw_g / r_safe) : 0.0f;
+            const float chain = 0.25f * inv_world_step;
+            #pragma unroll
+            for (uint32_t d = 0; d < D; d++) {
+                dL_dxyz[d] = chain * (scale_trans * dL_dnormalized[d] + radial_coef * pre_warp[d]);
+            }
         }
     }
 }

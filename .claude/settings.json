@@ -9,7 +9,25 @@
       "Bash(cp -r /tmp/bonsai_render/train /home/nilkel/Projects/nest-splatting/outputs/mip_360/bonsai/3D_SH_res/SB_5thr_01w25g4levN2F_FRP5k10/baked_atlas/websplat/)",
       "Bash(disown)",
       "Bash(grep -n \"duplicate_keys\\\\|emit_tile\\\\|fn duplicate\\\\|@compute\" src/shaders/duplicate_keys*.wgsl)",
-      "Bash(ls src/shaders/duplicate_keys*.wgsl src/shaders/*tile*.wgsl)"
+      "Bash(ls src/shaders/duplicate_keys*.wgsl src/shaders/*tile*.wgsl)",
+      "Bash(./target/release/render /mnt/nilkel_hdd/outputs/mip_360/bonsai/3D_SH_res/SB_10thr_0w0gLP4levno2f_FRP5k10/baked_atlas/baked.ply /mnt/nilkel_hdd/outputs/mip_360/bonsai/3D_SH_res/SB_10thr_0w0gLP4levno2f_FRP5k10/cameras.json /mnt/nilkel_hdd/outputs/mip_360/bonsai/3D_SH_res/SB_10thr_0w0gLP4levno2f_FRP5k10/baked_atlas/websplat_hw --atlas /mnt/nilkel_hdd/outputs/mip_360/bonsai/3D_SH_res/SB_10thr_0w0gLP4levno2f_FRP5k10/baked_atlas/scene.nat2)",
+      "Bash(./target/release/render /mnt/nilkel_hdd/outputs/mip_360/bonsai/3D_SH_res/SB_10thr_0w0gLP4levno2f_FRP5k10/baked_atlas/baked.ply /mnt/nilkel_hdd/outputs/mip_360/bonsai/3D_SH_res/SB_10thr_0w0gLP4levno2f_FRP5k10/cameras.json /mnt/nilkel_hdd/outputs/mip_360/bonsai/3D_SH_res/SB_10thr_0w0gLP4levno2f_FRP5k10/baked_atlas/websplat_compute --atlas /mnt/nilkel_hdd/outputs/mip_360/bonsai/3D_SH_res/SB_10thr_0w0gLP4levno2f_FRP5k10/baked_atlas/scene.nat2 --compute-raster --tile-size 8)",
+      "Bash(./target/release/render /mnt/nilkel_hdd/outputs/mip_360/bonsai/3D_SH_res/SB_10thr_0w0gLP4levno2f_FRP5k10/baked_atlas/baked.ply /mnt/nilkel_hdd/outputs/mip_360/bonsai/3D_SH_res/SB_10thr_0w0gLP4levno2f_FRP5k10/cameras.json /mnt/nilkel_hdd/outputs/mip_360/bonsai/3D_SH_res/SB_10thr_0w0gLP4levno2f_FRP5k10/baked_atlas/websplat_compute_noatlas --compute-raster --tile-size 8)",
+      "Bash(AABB_DIFF_TAG=4.0 conda run -n nest_splatting python /tmp/diff_aabb_modes.py)",
+      "Bash(AABB_DIFF_TAG=2cut conda run -n nest_splatting python /tmp/diff_aabb_modes.py)",
+      "Bash(AABB_DIFF_TAG=2cutv2 conda run -n nest_splatting python /tmp/diff_aabb_modes.py)",
+      "Bash(AABB_DIFF_TAG=2cutv3 conda run -n nest_splatting python /tmp/diff_aabb_modes.py)",
+      "Bash(AABB_DIFF_TAG=2cutv4 conda run -n nest_splatting python /tmp/diff_aabb_modes.py)",
+      "Bash(AABB_DIFF_TAG=2cutv5 conda run -n nest_splatting python /tmp/diff_aabb_modes.py)",
+      "Bash(AABB_DIFF_TAG=revert conda run -n nest_splatting python /tmp/diff_aabb_modes.py)",
+      "Bash(git ls-remote *)",
+      "Bash(sed -n 380,455p /home/nilkel/Projects/Unbiased_Surfel/submodules/diff-surfel-rasterization/cuda_rasterizer/forward.cu)",
+      "Bash(sed -n '200,233p;317,382p' /home/nilkel/Projects/Unbiased_Surfel/submodules/diff-surfel-rasterization/cuda_rasterizer/backward.cu)",
+      "Bash(sed -n '1395,1450p' /home/nilkel/Projects/nest-splatting/submodules/diff_surfel_3D_sh_res/cuda_rasterizer/forward.cu)",
+      "Bash(sed -n '1908,1955p' /home/nilkel/Projects/nest-splatting/submodules/diff_surfel_3D_sh_res/cuda_rasterizer/forward.cu)"
+    ],
+    "additionalDirectories": [
+      "/home/nilkel/Projects/Unbiased_Surfel/submodules/diff-surfel-rasterization"
     ]
   }
 }

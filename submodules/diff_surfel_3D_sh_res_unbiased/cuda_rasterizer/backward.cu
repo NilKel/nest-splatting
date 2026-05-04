@@ -31,6 +31,10 @@ __device__ float d_res_bias = 0.5f;  // Residual activation bias: ReLU(residual 
 // Mirrors forward.cu — the backward gradient routing differs between the two modes.
 __device__ int d_residual_mode = 0;
 __device__ float d_aa_kernel_size = 0.0f;  // AA-2DGS Jacobian mip filter σ (0 = off)
+// Unbiased Depth: per-pair depth-difference cutoff. Backward needs its own copy
+// (separate translation unit). Set via set_converge_threshold() which patches
+// both the forward and backward globals in lockstep.
+__device__ float d_converge_threshold = 1.0f;
 // Periodic-freeze flag for the mode 5 (3D_SH_res) backward. When true, the
 // kernel skips EVERYTHING hash/MLP-gradient-related: the 3 weight-grad WMMA
 // GEMMs, the scalar W^T input-chain backprop (Phase 2/3/4), the
@@ -439,14 +443,19 @@ renderCUDA(
 	float dL_dmedian_depth;
 	float dL_dmax_dweight;
 
+	// === Unbiased Depth: convergence-loss backward state ===
+	const int final_converge = inside ? n_contrib[pix_id + 2 * H * W] : 0;
+	float dL_dpixConverge = 0.0f;
+
 	if (inside) {
 		dL_ddepth = dL_depths[DEPTH_OFFSET * H * W + pix_id];
 		dL_daccum = dL_depths[ALPHA_OFFSET * H * W + pix_id];
 		dL_dreg = dL_depths[DISTORTION_OFFSET * H * W + pix_id];
-		for (int i = 0; i < 3; i++) 
+		for (int i = 0; i < 3; i++)
 			dL_dnormal2D[i] = dL_depths[(NORMAL_OFFSET + i) * H * W + pix_id];
 
 		dL_dmedian_depth = dL_depths[MIDDEPTH_OFFSET * H * W + pix_id];
+		dL_dpixConverge = dL_depths[CONVERGE_OFFSET * H * W + pix_id];
 		// dL_dmax_dweight = dL_depths[MEDIAN_WEIGHT_OFFSET * H * W + pix_id];
 	}
 
@@ -461,6 +470,10 @@ renderCUDA(
 	const float final_D2 = inside ? final_Ts[pix_id + 2 * H * W] : 0;
 	const float final_A = 1 - T_final;
 	float last_dL_dT = 0;
+
+	// Unbiased convergence-loss carry state (back-to-front iteration, per-pixel)
+	float last_convergeDepth = 0.0f;
+	float last_G = 0.0f;
 #endif
 
 	if (inside){
@@ -582,6 +595,65 @@ renderCUDA(
 				dL_dz += dL_dmedian_depth;
 				// dL_dweight += dL_dmax_dweight;
 			}
+
+			// === Unbiased Depth: convergence-loss backward ===
+			// Bidirectional gradient: front_grad (vs next-iter Gaussian which is in front
+			// of current camera-wise) + back_grad (vs previous backward-iter Gaussian).
+			// Asymmetric k=1.25 scaling when current depth is BEHIND neighbor — encourages
+			// convergence toward camera. Skip pair if |dd| > 1.0 (matches forward cutoff).
+			if (contributor < final_converge) {
+				// Find front_depth: scan forward in collected[] for next valid Gaussian.
+				// In backward, j+1 is the next Gaussian to be processed = forward's
+				// previous (in-front) Gaussian.
+				float front_depth = -1.0f;
+				float front_G = 0.0f;
+				for (int ll = j + 1; ll < min((int)BLOCK_SIZE, (int)toDo); ll++) {
+					const float2 xy_f = collected_xy[ll];
+					const float3 Tu_f = collected_Tu[ll];
+					const float3 Tv_f = collected_Tv[ll];
+					const float3 Tw_f = collected_Tw[ll];
+					float3 k_f = pix.x * Tw_f - Tu_f;
+					float3 l_f = pix.y * Tw_f - Tv_f;
+					float3 p_f = cross(k_f, l_f);
+					if (p_f.z == 0) continue;
+					float2 s_f = {p_f.x / p_f.z, p_f.y / p_f.z};
+					float rho3d_f = (s_f.x * s_f.x + s_f.y * s_f.y);
+					float2 d_f = {xy_f.x - pixf.x, xy_f.y - pixf.y};
+					float rho2d_f = FilterInvSquare * (d_f.x * d_f.x + d_f.y * d_f.y);
+					float rho_f = min(rho3d_f, rho2d_f);
+					float c_d_f = (rho3d_f <= rho2d_f) ? (s_f.x * Tw_f.x + s_f.y * Tw_f.y) + Tw_f.z : Tw_f.z;
+					if (c_d_f < near_n) continue;
+					float opa_f = collected_normal_opacity[ll].w;
+					float power_f = -0.5f * rho_f;
+					if (power_f > 0.0f) continue;
+					float G_f = exp(power_f);
+					float alpha_f = min(0.99f, opa_f * G_f);
+					if (alpha_f < 1.0f / 255.0f) continue;
+					front_depth = c_d_f;
+					front_G = G_f;
+					break;
+				}
+
+				if (front_depth >= 0.0f) {
+					// front_grad: pair (current, front)
+					float front_grad = fminf(G, front_G) * 2.0f * (c_d - front_depth) * dL_dpixConverge;
+					if (c_d > front_depth) front_grad *= CONVERGE_BACKWARD_SCALE;
+					if (fabsf(c_d - front_depth) > d_converge_threshold) front_grad = 0.0f;
+					dL_dz += front_grad;
+
+					// back_grad: pair (current, back) — only if back exists in convergence chain
+					if (contributor < final_converge - 1) {
+						float back_grad = fminf(G, last_G) * 2.0f * (c_d - last_convergeDepth) * dL_dpixConverge;
+						if (c_d > last_convergeDepth) back_grad *= CONVERGE_BACKWARD_SCALE;
+						if (fabsf(c_d - last_convergeDepth) > d_converge_threshold) back_grad = 0.0f;
+						dL_dz += back_grad;
+					}
+				}
+
+				last_convergeDepth = c_d;
+				last_G = G;
+			}
+
 #if DETACH_WEIGHT 
 			// if not detached weight, sometimes 
 			// it will bia toward creating extragated 2D Gaussians near front
@@ -823,18 +895,27 @@ renderCUDAsurfelBackward(
 	float dL_dmedian_depth;
 	float dL_dmax_dweight;
 
+	// === Unbiased Depth: convergence-loss backward state (MODE 5) ===
+	const int final_converge = inside ? n_contrib[pix_id + 2 * H * W] : 0;
+	float dL_dpixConverge = 0.0f;
+
 	if (inside) {
-		// here dL_ddepth is dL_dD (blended depth value), so no change here. 
+		// here dL_ddepth is dL_dD (blended depth value), so no change here.
 		dL_ddepth = dL_depths[DEPTH_OFFSET * H * W + pix_id];
 		dL_daccum = dL_depths[ALPHA_OFFSET * H * W + pix_id];
 		dL_dreg = dL_depths[DISTORTION_OFFSET * H * W + pix_id];
-		for (int i = 0; i < 3; i++) 
+		for (int i = 0; i < 3; i++)
 			dL_dnormal2D[i] = dL_depths[(NORMAL_OFFSET + i) * H * W + pix_id];
 
 		dL_dmedian_depth = dL_depths[MIDDEPTH_OFFSET * H * W + pix_id];
+		dL_dpixConverge = dL_depths[CONVERGE_OFFSET * H * W + pix_id];
 		// dL_dmax_dweight = dL_depths[MEDIAN_WEIGHT_OFFSET * H * W + pix_id];
 
 	}
+
+	// Unbiased convergence carry state (back-to-front, per-pixel)
+	float last_convergeDepth_u = 0.0f;
+	float last_G_u = 0.0f;
 	
 	int collec_offsets[16] = {0};
 	// float feat[C] = {0};
@@ -1219,43 +1300,6 @@ renderCUDAsurfelBackward(
 							                           appearance_level, hash_features, active_hashgrid_levels,
 							                           l_scale, Base, align_corners, interp, if_contract, false);
 						for (int i = 0; i < hash_dim_collab && i < TC_INPUT_DIM; i++) my_input[i] = hash_feat[i];
-					} else if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 2) {
-						// 2D per level — supports 1..8 hash levels (hash_dim ∈ {2,4,6,8,10,12,14,16}).
-						float hash_feat[16] = {0};
-						uint32_t appearance_level = collected_ap_level[j];
-						if (hash_dim_collab == 2)
-							query_feature<false, 2, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							                           appearance_level, hash_features, active_hashgrid_levels,
-							                           l_scale, Base, align_corners, interp, if_contract, false);
-						else if (hash_dim_collab == 4)
-							query_feature<false, 4, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							                           appearance_level, hash_features, active_hashgrid_levels,
-							                           l_scale, Base, align_corners, interp, if_contract, false);
-						else if (hash_dim_collab == 6)
-							query_feature<false, 6, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							                           appearance_level, hash_features, active_hashgrid_levels,
-							                           l_scale, Base, align_corners, interp, if_contract, false);
-						else if (hash_dim_collab == 8)
-							query_feature<false, 8, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							                           appearance_level, hash_features, active_hashgrid_levels,
-							                           l_scale, Base, align_corners, interp, if_contract, false);
-						else if (hash_dim_collab == 10)
-							query_feature<false, 10, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							                           appearance_level, hash_features, active_hashgrid_levels,
-							                           l_scale, Base, align_corners, interp, if_contract, false);
-						else if (hash_dim_collab == 12)
-							query_feature<false, 12, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							                           appearance_level, hash_features, active_hashgrid_levels,
-							                           l_scale, Base, align_corners, interp, if_contract, false);
-						else if (hash_dim_collab == 14)
-							query_feature<false, 14, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							                           appearance_level, hash_features, active_hashgrid_levels,
-							                           l_scale, Base, align_corners, interp, if_contract, false);
-						else if (hash_dim_collab == 16)
-							query_feature<false, 16, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							                           appearance_level, hash_features, active_hashgrid_levels,
-							                           l_scale, Base, align_corners, interp, if_contract, false);
-						for (int i = 0; i < hash_dim_collab && i < TC_INPUT_DIM; i++) my_input[i] = hash_feat[i];
 					}
 					// Remaining positions are zero (WMMA padding)
 
@@ -1398,54 +1442,6 @@ renderCUDAsurfelBackward(
 							                          dL_dhash, dL_dfeatures, dL_dxyz);
 						}
 						if (detach_hash_grad) { dL_dxyz[0] = 0; dL_dxyz[1] = 0; dL_dxyz[2] = 0; }
-					} else if (!d_skip_mlp_grad && !skip_hash && active_hashgrid_levels > 0 && l_dim == 2) {
-						// 2D per level — supports 1..8 hash levels (hash_dim ∈ {2,4,6,8,10,12,14,16}).
-						float dL_dhash[16];
-						for (int i = 0; i < hash_dim; i++) dL_dhash[i] = my_dL_dinput[i];
-						float hash_feat_dummy[16];
-						uint32_t appearance_level = collected_ap_level[j];
-						if (hash_dim == 2) {
-							query_feature<true, 2, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-							                          appearance_level, hash_features, active_hashgrid_levels,
-							                          l_scale, Base, align_corners, interp, if_contract, false,
-							                          dL_dhash, dL_dfeatures, dL_dxyz);
-						} else if (hash_dim == 4) {
-							query_feature<true, 4, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-							                          appearance_level, hash_features, active_hashgrid_levels,
-							                          l_scale, Base, align_corners, interp, if_contract, false,
-							                          dL_dhash, dL_dfeatures, dL_dxyz);
-						} else if (hash_dim == 6) {
-							query_feature<true, 6, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-							                          appearance_level, hash_features, active_hashgrid_levels,
-							                          l_scale, Base, align_corners, interp, if_contract, false,
-							                          dL_dhash, dL_dfeatures, dL_dxyz);
-						} else if (hash_dim == 8) {
-							query_feature<true, 8, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-							                          appearance_level, hash_features, active_hashgrid_levels,
-							                          l_scale, Base, align_corners, interp, if_contract, false,
-							                          dL_dhash, dL_dfeatures, dL_dxyz);
-						} else if (hash_dim == 10) {
-							query_feature<true, 10, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-							                          appearance_level, hash_features, active_hashgrid_levels,
-							                          l_scale, Base, align_corners, interp, if_contract, false,
-							                          dL_dhash, dL_dfeatures, dL_dxyz);
-						} else if (hash_dim == 12) {
-							query_feature<true, 12, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-							                          appearance_level, hash_features, active_hashgrid_levels,
-							                          l_scale, Base, align_corners, interp, if_contract, false,
-							                          dL_dhash, dL_dfeatures, dL_dxyz);
-						} else if (hash_dim == 14) {
-							query_feature<true, 14, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-							                          appearance_level, hash_features, active_hashgrid_levels,
-							                          l_scale, Base, align_corners, interp, if_contract, false,
-							                          dL_dhash, dL_dfeatures, dL_dxyz);
-						} else if (hash_dim == 16) {
-							query_feature<true, 16, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-							                          appearance_level, hash_features, active_hashgrid_levels,
-							                          l_scale, Base, align_corners, interp, if_contract, false,
-							                          dL_dhash, dL_dfeatures, dL_dxyz);
-						}
-						if (detach_hash_grad) { dL_dxyz[0] = 0; dL_dxyz[1] = 0; dL_dxyz[2] = 0; }
 					}
 
 					// ======== GEOMETRY GRADIENTS ========
@@ -1477,6 +1473,76 @@ renderCUDAsurfelBackward(
 					if (current_contributor == median_contributor-1) {
 						dL_dz += dL_dmedian_depth;
 					}
+
+					// === Unbiased Depth: convergence-loss backward (MODE 5) ===
+					// Mirrors standard-path logic; front-search is kernel-aware so
+					// G_f matches what forward computed for beta / beta-scaled (the
+					// production kernels). For other kernel types we fall back to
+					// the standard-Gaussian footprint (an approximation, but the
+					// gradient direction is still correct).
+					if (current_contributor < final_converge) {
+						float front_depth = -1.0f;
+						float front_G = 0.0f;
+						for (int ll = j + 1; ll < effective_toDo; ll++) {
+							const float2 xy_f = collected_xy[ll];
+							const float3 Tu_f = collected_Tu[ll];
+							const float3 Tv_f = collected_Tv[ll];
+							const float3 Tw_f = collected_Tw[ll];
+							float3 k_f = pix.x * Tw_f - Tu_f;
+							float3 l_f = pix.y * Tw_f - Tv_f;
+							float3 p_f = cross(k_f, l_f);
+							if (p_f.z == 0) continue;
+							float2 s_f = {p_f.x / p_f.z, p_f.y / p_f.z};
+							float rho3d_f = (s_f.x * s_f.x + s_f.y * s_f.y);
+							float2 d_f = {xy_f.x - pixf.x, xy_f.y - pixf.y};
+							float rho2d_f = FilterInvSquare * (d_f.x * d_f.x + d_f.y * d_f.y);
+							float c_d_f = (rho3d_f <= rho2d_f) ? (s_f.x * Tw_f.x + s_f.y * Tw_f.y) + Tw_f.z : Tw_f.z;
+							if (c_d_f < near_n) continue;
+							float opa_f = collected_normal_opacity[ll].w;
+
+							float G_f = 0.0f, alpha_f = 0.0f;
+							if (kernel_type == 1 || kernel_type == 4) {
+								// Beta / Beta-scaled — production path
+								float k_sq = (kernel_type == 4) ? 9.0f : 1.0f;
+								if (rho3d_f >= k_sq + 1e-6f) continue;
+								float shape_f = collected_shapes[ll].x;
+								float base_f = fmaxf(0.0f, 1.0f - rho3d_f / k_sq);
+								float alpha_beta_f = powf(base_f, shape_f);
+								float alpha_lp_f = expf(-rho2d_f / 2.0f);
+								G_f = fmaxf(alpha_beta_f, alpha_lp_f);
+								alpha_f = fminf(0.99f, opa_f * G_f);
+							} else {
+								// Standard Gaussian (also: approximate for flex/general/nexel/AA)
+								float rho_f = min(rho3d_f, rho2d_f);
+								float power_f = -0.5f * rho_f;
+								if (power_f > 0.0f) continue;
+								G_f = exp(power_f);
+								alpha_f = min(0.99f, opa_f * G_f);
+							}
+							if (alpha_f < 1.0f / 255.0f) continue;
+							front_depth = c_d_f;
+							front_G = G_f;
+							break;
+						}
+
+						if (front_depth >= 0.0f) {
+							float front_grad = fminf(G, front_G) * 2.0f * (c_d - front_depth) * dL_dpixConverge;
+							if (c_d > front_depth) front_grad *= CONVERGE_BACKWARD_SCALE;
+							if (fabsf(c_d - front_depth) > d_converge_threshold) front_grad = 0.0f;
+							dL_dz += front_grad;
+
+							if (current_contributor < final_converge - 1) {
+								float back_grad = fminf(G, last_G_u) * 2.0f * (c_d - last_convergeDepth_u) * dL_dpixConverge;
+								if (c_d > last_convergeDepth_u) back_grad *= CONVERGE_BACKWARD_SCALE;
+								if (fabsf(c_d - last_convergeDepth_u) > d_converge_threshold) back_grad = 0.0f;
+								dL_dz += back_grad;
+							}
+						}
+
+						last_convergeDepth_u = c_d;
+						last_G_u = G;
+					}
+
 #if DETACH_WEIGHT
 					dL_dweight += 0;
 #else
@@ -2065,40 +2131,6 @@ renderCUDAsurfelBackward(
 						query_feature<false, 16, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 						                           appearance_level, hash_features, active_hashgrid_levels,
 						                           l_scale, Base, align_corners, interp, contract, false);
-				} else if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 2) {
-					// 2D per level — supports 1..8 hash levels (hash_dim ∈ {2,4,6,8,10,12,14,16}).
-					if (hash_dim_px == 2)
-						query_feature<false, 2, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false);
-					else if (hash_dim_px == 4)
-						query_feature<false, 4, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false);
-					else if (hash_dim_px == 6)
-						query_feature<false, 6, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false);
-					else if (hash_dim_px == 8)
-						query_feature<false, 8, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false);
-					else if (hash_dim_px == 10)
-						query_feature<false, 10, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false);
-					else if (hash_dim_px == 12)
-						query_feature<false, 12, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false);
-					else if (hash_dim_px == 14)
-						query_feature<false, 14, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false);
-					else if (hash_dim_px == 16)
-						query_feature<false, 16, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false);
 				}
 
 				// 2. Build MLP input: [hash(hash_dim) | pad(16-hash_dim)] = 16D
@@ -2189,55 +2221,6 @@ renderCUDAsurfelBackward(
 						                           dL_dhash, dL_dfeatures, dL_dxyz);
 					} else if (hash_dim == 16) {
 						query_feature<true, 16, 4>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false,
-						                           dL_dhash, dL_dfeatures, dL_dxyz);
-					}
-					if (detach_hash_grad) { dL_dxyz[0] = 0; dL_dxyz[1] = 0; dL_dxyz[2] = 0; }
-				} else if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 2) {
-					// 2D per level — supports 1..8 hash levels (hash_dim ∈ {2,4,6,8,10,12,14,16}).
-					float dL_dhash[16];
-					for (int i = 0; i < hash_dim; i++)
-						dL_dhash[i] = dL_dinput_full[i];
-
-					float hash_feat_dummy[16];
-					if (hash_dim == 2) {
-						query_feature<true, 2, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false,
-						                           dL_dhash, dL_dfeatures, dL_dxyz);
-					} else if (hash_dim == 4) {
-						query_feature<true, 4, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false,
-						                           dL_dhash, dL_dfeatures, dL_dxyz);
-					} else if (hash_dim == 6) {
-						query_feature<true, 6, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false,
-						                           dL_dhash, dL_dfeatures, dL_dxyz);
-					} else if (hash_dim == 8) {
-						query_feature<true, 8, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false,
-						                           dL_dhash, dL_dfeatures, dL_dxyz);
-					} else if (hash_dim == 10) {
-						query_feature<true, 10, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false,
-						                           dL_dhash, dL_dfeatures, dL_dxyz);
-					} else if (hash_dim == 12) {
-						query_feature<true, 12, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false,
-						                           dL_dhash, dL_dfeatures, dL_dxyz);
-					} else if (hash_dim == 14) {
-						query_feature<true, 14, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
-						                           appearance_level, hash_features, active_hashgrid_levels,
-						                           l_scale, Base, align_corners, interp, contract, false,
-						                           dL_dhash, dL_dfeatures, dL_dxyz);
-					} else if (hash_dim == 16) {
-						query_feature<true, 16, 2>(hash_feat_dummy, xyz, voxel_min, voxel_max, collec_offsets,
 						                           appearance_level, hash_features, active_hashgrid_levels,
 						                           l_scale, Base, align_corners, interp, contract, false,
 						                           dL_dhash, dL_dfeatures, dL_dxyz);
@@ -2362,20 +2345,8 @@ renderCUDAsurfelBackward(
 						smem_mlp_6, false);
 				}
 
-				// 6b. Route MLP's dc_sh-slot gradients into dL_dcolors so they flow back
-				//     to _features_dc through the SH backward chain (dL_dshs[0,:] gets
-				//     SH_C0 * dL_dcolors, which PyTorch chains through `_effective_shs()`
-				//     → `_features_dc`). The Python-side `colors_precomp` expression is
-				//     `.detach()`'d w.r.t. `_features_dc` to prevent double-counting via
-				//     `grad_colors_precomp`. MLP input layout: [hash | dc_sh(3) | bias(1) | pad].
-				for (int ch = 0; ch < 3; ch++) {
-					atomicAdd(&(dL_dcolors[global_id * 3 + ch]),
-					          dL_dinput_full_6[hash_dim_6 + ch]);
-				}
-
 				// 7. Backprop to hash features
 				if (!skip_hash_6 && active_hashgrid_levels_6 > 0 && l_dim == 4) {
-					// 4D per level — cat caps hash_dim at 12 (1..3 hash levels of 4D each).
 					float dL_dhash_6[16];
 					for (int i = 0; i < hash_dim_6; i++)
 						dL_dhash_6[i] = dL_dinput_full_6[i];
@@ -2398,44 +2369,6 @@ renderCUDAsurfelBackward(
 						    dL_dhash_6, dL_dfeatures, dL_dxyz);
 					else if (hash_dim_6 == 16)
 						query_feature<true, 16, 4>(hash_feat_dummy_6, xyz6, voxel_min, voxel_max, collec_offsets,
-						    appearance_level, hash_features, active_hashgrid_levels_6,
-						    l_scale, Base, align_corners, interp, contract, false,
-						    dL_dhash_6, dL_dfeatures, dL_dxyz);
-					if (detach_hash_grad) { dL_dxyz[0] = 0; dL_dxyz[1] = 0; dL_dxyz[2] = 0; }
-				} else if (!skip_hash_6 && active_hashgrid_levels_6 > 0 && l_dim == 2) {
-					// 2D per level — cat caps hash_dim at 12 (1..6 hash levels of 2D each).
-					float dL_dhash_6[16];
-					for (int i = 0; i < hash_dim_6; i++)
-						dL_dhash_6[i] = dL_dinput_full_6[i];
-
-					float hash_feat_dummy_6[16];
-					if (hash_dim_6 == 2)
-						query_feature<true, 2, 2>(hash_feat_dummy_6, xyz6, voxel_min, voxel_max, collec_offsets,
-						    appearance_level, hash_features, active_hashgrid_levels_6,
-						    l_scale, Base, align_corners, interp, contract, false,
-						    dL_dhash_6, dL_dfeatures, dL_dxyz);
-					else if (hash_dim_6 == 4)
-						query_feature<true, 4, 2>(hash_feat_dummy_6, xyz6, voxel_min, voxel_max, collec_offsets,
-						    appearance_level, hash_features, active_hashgrid_levels_6,
-						    l_scale, Base, align_corners, interp, contract, false,
-						    dL_dhash_6, dL_dfeatures, dL_dxyz);
-					else if (hash_dim_6 == 6)
-						query_feature<true, 6, 2>(hash_feat_dummy_6, xyz6, voxel_min, voxel_max, collec_offsets,
-						    appearance_level, hash_features, active_hashgrid_levels_6,
-						    l_scale, Base, align_corners, interp, contract, false,
-						    dL_dhash_6, dL_dfeatures, dL_dxyz);
-					else if (hash_dim_6 == 8)
-						query_feature<true, 8, 2>(hash_feat_dummy_6, xyz6, voxel_min, voxel_max, collec_offsets,
-						    appearance_level, hash_features, active_hashgrid_levels_6,
-						    l_scale, Base, align_corners, interp, contract, false,
-						    dL_dhash_6, dL_dfeatures, dL_dxyz);
-					else if (hash_dim_6 == 10)
-						query_feature<true, 10, 2>(hash_feat_dummy_6, xyz6, voxel_min, voxel_max, collec_offsets,
-						    appearance_level, hash_features, active_hashgrid_levels_6,
-						    l_scale, Base, align_corners, interp, contract, false,
-						    dL_dhash_6, dL_dfeatures, dL_dxyz);
-					else if (hash_dim_6 == 12)
-						query_feature<true, 12, 2>(hash_feat_dummy_6, xyz6, voxel_min, voxel_max, collec_offsets,
 						    appearance_level, hash_features, active_hashgrid_levels_6,
 						    l_scale, Base, align_corners, interp, contract, false,
 						    dL_dhash_6, dL_dfeatures, dL_dxyz);
@@ -3194,6 +3127,12 @@ void BACKWARD::setResidualMode(int mode) {
 __global__ void setAaKernelSizeBwKernel(float val) { d_aa_kernel_size = val; }
 void BACKWARD::setAaKernelSize(float val) {
 	setAaKernelSizeBwKernel<<<1, 1>>>(val);
+}
+
+// Unbiased Depth: per-pair depth-difference cutoff (backward's TU copy).
+__global__ void setConvergeThresholdBwKernel(float val) { d_converge_threshold = val; }
+void BACKWARD::setConvergeThreshold(float val) {
+	setConvergeThresholdBwKernel<<<1, 1>>>(val);
 }
 
 __global__ void setSkipMlpGradKernel(bool val) { d_skip_mlp_grad = val; }

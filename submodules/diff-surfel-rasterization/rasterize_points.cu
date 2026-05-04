@@ -347,7 +347,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   }
 
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
-  torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
+  // dL_dmeans2D is [P, 4]: channels (x, y) signed densification gradient,
+  // (z, w) per-pixel absolute screen-space gradient magnitude (AbsGS / --grads abs).
+  torch::Tensor dL_dmeans2D = torch::zeros({P, 4}, means3D.options());
   // For gradients, use actual input dimension from colors_precomp
   int colors_dim = 0;
 

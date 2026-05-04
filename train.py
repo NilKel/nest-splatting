@@ -12,13 +12,33 @@
 import os
 import json
 import math
+import sys
+
+# === Unbiased Depth: pre-import sys.modules swap ===
+# When --unbiased is set on the command line, transparently substitute the
+# diff_surfel_3D_sh_res_unbiased rasterizer for diff_surfel_3D_sh_res so every
+# downstream `import diff_surfel_3D_sh_res` (gaussian_renderer's top-level
+# import + many inline imports inside render()) resolves to the unbiased fork.
+# Done BEFORE importing gaussian_renderer so the binding takes effect.
+if "--unbiased" in sys.argv:
+    try:
+        import diff_surfel_3D_sh_res_unbiased as _unb_rast
+        sys.modules['diff_surfel_3D_sh_res'] = _unb_rast
+        sys.modules['diff_surfel_3D_sh_res._C'] = _unb_rast._C
+        print("[UNBIASED] Substituted diff_surfel_3D_sh_res_unbiased for diff_surfel_3D_sh_res")
+    except ImportError as _e:
+        raise ImportError(
+            "--unbiased requested but diff_surfel_3D_sh_res_unbiased not installed. "
+            "Build it via: cd submodules/diff_surfel_3D_sh_res_unbiased && "
+            "python -m pip install -e . --no-build-isolation"
+        ) from _e
+
 import torch
 import torch.nn as nn
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from optimizing_spa import OptimizingSpa
 from gaussian_renderer import render, network_gui
-import sys
 import traceback
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, build_scaling_rotation
@@ -143,6 +163,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     testing_iterations += [opt.iterations]
     testing_iterations += [1]  # Also evaluate at first iteration for debugging
+    # Periodic eval every 5k from 25k onwards so you can pick a good stop point.
+    # The final iter is already covered by line above.
+    testing_iterations += list(range(25_000, opt.iterations, 5_000))
     saving_iterations += [opt.iterations]
 
     test_psnr = []
@@ -183,9 +206,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     else:
         warmup_checkpoint_path = os.path.join(dataset.source_path, "warmup_checkpoint.pth")
     loaded_from_warmup = False
+
+    # Shared-resume checkpoint path (only used when --share_ckpt_iter > 0).
+    # Captures Gaussians + their optimizer + densif state + INGP model + INGP
+    # optimizer + gs_alpha_masks at iteration N. Sweeps that vary downstream-only
+    # knobs (e.g., --lambda_converge after iter N) load from this snapshot
+    # instead of re-running iters 0 → N.
+    share_ckpt_path = None
+    if args.share_ckpt_iter > 0:
+        if args.share_ckpt_tag:
+            _share_tag = args.share_ckpt_tag
+        else:
+            _share_tag = f"{args.method}_{args.kernel}_h{args.hybrid_levels}_iter{args.share_ckpt_iter}"
+        share_ckpt_path = os.path.join(dataset.source_path, f"shared_ckpt_{_share_tag}.pth")
+    shared_ckpt_data = None  # populated on load; INGP state applied later, post-INGP-creation
+    loaded_from_shared = False
     
+    # Shared-resume checkpoint takes precedence over --cold IF the file already
+    # exists — explicit opt-in via --share_ckpt_iter signals "I want sweep-mode
+    # resumption". First run with --cold + --share_ckpt_iter still trains from
+    # scratch (file doesn't exist yet) and saves at iter N; subsequent runs hit
+    # the elif below and resume.
+    _shared_ckpt_overrides_cold = (
+        args.cold and share_ckpt_path is not None
+        and os.path.exists(share_ckpt_path) and not args.scratch
+    )
+    if _shared_ckpt_overrides_cold:
+        print("\n" + "="*70)
+        print("  --cold OVERRIDDEN by existing shared-resume checkpoint")
+        print("="*70)
+        print(f"  Shared ckpt found at: {share_ckpt_path}")
+        print(f"  Falling through to share-ckpt load (cold start skipped).")
+        print("="*70 + "\n")
+
     # Cold start mode: skip all checkpoint loading
-    if args.cold:
+    if args.cold and not _shared_ckpt_overrides_cold:
         print("\n" + "="*70)
         print("  COLD START MODE")
         print("="*70)
@@ -258,6 +313,82 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.training_setup(opt)
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
+    elif share_ckpt_path is not None and os.path.exists(share_ckpt_path) and not args.scratch:
+        # === LOAD SHARED-RESUME CHECKPOINT (takes precedence over warmup ckpt) ===
+        # Restores everything: Gaussian params + their optimizer + densif accumulators
+        # + gs_alpha_masks + (later, after INGP creation) INGP weights + INGP optimizer.
+        print("\n" + "="*70)
+        print("  LOADING SHARED-RESUME CHECKPOINT")
+        print("="*70)
+        print(f"  Path: {share_ckpt_path}")
+
+        shared_ckpt_data = torch.load(share_ckpt_path, map_location='cpu', weights_only=False)
+        sckpt = shared_ckpt_data
+        print(f"  Saved at iteration: {sckpt['iteration']}")
+        print(f"  Number of Gaussians: {sckpt['n_gaussians']}")
+
+        # --- Gaussian parameters ---
+        gaussians.active_sh_degree = sckpt['active_sh_degree']
+        gaussians._xyz = nn.Parameter(sckpt['xyz'].cuda().requires_grad_(True))
+        gaussians._features_dc = nn.Parameter(sckpt['features_dc'].cuda().requires_grad_(True))
+        gaussians._features_rest = nn.Parameter(sckpt['features_rest'].cuda().requires_grad_(True))
+        gaussians._scaling = nn.Parameter(sckpt['scaling'].cuda().requires_grad_(True))
+        gaussians._rotation = nn.Parameter(sckpt['rotation'].cuda().requires_grad_(True))
+        gaussians._opacity = nn.Parameter(sckpt['opacity'].cuda().requires_grad_(True))
+        gaussians._appearance_level = nn.Parameter(sckpt['appearance_level'].cuda().requires_grad_(True))
+        gaussians.max_radii2D = sckpt['max_radii2D'].cuda()
+        gaussians.spatial_lr_scale = sckpt['spatial_lr_scale']
+        # Method/kernel-specific params (saved only when present at save time)
+        if 'shape' in sckpt:
+            gaussians._shape = nn.Parameter(sckpt['shape'].cuda().requires_grad_(True))
+        if 'flex_beta' in sckpt:
+            gaussians._flex_beta = nn.Parameter(sckpt['flex_beta'].cuda().requires_grad_(True))
+        if 'gaussian_features' in sckpt and sckpt['gaussian_features'].numel() > 0:
+            gaussians._gaussian_features = nn.Parameter(sckpt['gaussian_features'].cuda().requires_grad_(True))
+            gaussians._gaussian_feat_dim = sckpt.get('gaussian_feat_dim', sckpt['gaussian_features'].shape[1])
+
+        # Skip the from-scratch Scene init below — Gaussians already populated
+        gaussians._loaded_from_checkpoint = True
+        scene = Scene(dataset, gaussians, mcmc_fps=args.mcmc_fps, cap_max=args.cap_max, full_args=args)
+
+        # Optimizer + densif state restore
+        gaussians.training_setup(opt)
+        if 'gaussians_optimizer_state' in sckpt:
+            try:
+                ckpt_groups = len(sckpt['gaussians_optimizer_state']['param_groups'])
+                cur_groups = len(gaussians.optimizer.param_groups)
+                if ckpt_groups == cur_groups:
+                    gaussians.optimizer.load_state_dict(sckpt['gaussians_optimizer_state'])
+                    for state in gaussians.optimizer.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.cuda()
+                    print(f"  Gaussians optimizer state: restored ({ckpt_groups} param groups)")
+                else:
+                    print(f"  [WARN] Optimizer state mismatch: ckpt has {ckpt_groups} groups, "
+                          f"current has {cur_groups}. Skipping optimizer state load.")
+            except Exception as _e:
+                print(f"  [WARN] Failed to restore Gaussians optimizer: {_e}")
+        if 'xyz_gradient_accum' in sckpt:
+            gaussians.xyz_gradient_accum = sckpt['xyz_gradient_accum'].cuda()
+            gaussians.denom = sckpt['denom'].cuda()
+            if 'feat_gradient_accum' in sckpt:
+                gaussians.feat_gradient_accum = sckpt['feat_gradient_accum'].cuda()
+            print(f"  Densification accumulators: restored")
+        # gs_alpha_masks
+        gs_alpha_masks = sckpt.get('gs_alpha_masks', {})
+        for cam in scene.getTrainCameras():
+            if cam.image_name in gs_alpha_masks:
+                cam.gs_alpha_mask = gs_alpha_masks[cam.image_name].cpu().float()
+
+        first_iter = sckpt['iteration']
+        loaded_from_shared = True
+        # Suppress the warmup-ckpt save branch (we have a more complete snapshot)
+        loaded_from_warmup = True
+        print(f"  GS alpha masks loaded: {len(gs_alpha_masks)}")
+        print(f"  Resuming from iteration {first_iter + 1}")
+        print(f"  (INGP weights + optimizer will be applied after INGP construction)")
+        print("="*70 + "\n")
     elif cfg_model.settings.if_ingp and args.method != "2dgs" and os.path.exists(warmup_checkpoint_path) and not args.scratch:
         # Load warmup checkpoint - skip 2DGS phase
         print("\n" + "="*70)
@@ -810,6 +941,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if not os.path.exists(os.path.join(scene.model_path, "training_output")):
         os.mkdir(os.path.join(scene.model_path, "training_output"))
 
+    # Initialise test_metrics.txt with a periodic-eval header. training_report appends
+    # one row per periodic test eval; render_final_images appends the final block.
+    test_metrics_path = os.path.join(scene.model_path, 'test_metrics.txt')
+    with open(test_metrics_path, 'w') as f:
+        f.write("Periodic Test Eval (during training, full test set)\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"{'Iter':<10}{'PSNR(dB)':<10}{'SSIM':<9}{'LPIPS':<9}{'L1':<12}{'Points':<12}\n")
+        f.write("-" * 70 + "\n")
+
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     
@@ -832,6 +972,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_dist_for_log = 0.0
     ema_normal_for_log = 0.0
+    ema_converge_for_log = 0.0
+    ema_converge_raw_for_log = 0.0  # raw Converge.mean() before lambda scaling
     ema_mask_for_log = 0.0
     ema_mcmc_loss_for_log = 0.0
 
@@ -845,6 +987,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ingp_model = None
     if cfg_model.settings.if_ingp and args.method != "2dgs":
         ingp_model = INGP(cfg_model, args=args).to('cuda')
+
+        # Restore INGP state from shared-resume checkpoint (if loaded earlier).
+        # INGP construction has to happen first because its __init__ builds the
+        # hash table + MLPs using cfg_model — we then overwrite with the saved
+        # state_dict and Adam moments.
+        if loaded_from_shared and shared_ckpt_data is not None:
+            if 'ingp_state_dict' in shared_ckpt_data:
+                try:
+                    ingp_model.load_state_dict(shared_ckpt_data['ingp_state_dict'], strict=False)
+                    print(f"[SHARED CKPT] INGP weights restored ({len(shared_ckpt_data['ingp_state_dict'])} keys)")
+                except Exception as _e:
+                    print(f"[SHARED CKPT] WARN: INGP state_dict load failed: {_e}")
+            if 'ingp_optimizer_state' in shared_ckpt_data and hasattr(ingp_model, 'optimizer'):
+                try:
+                    ingp_model.optimizer.load_state_dict(shared_ckpt_data['ingp_optimizer_state'])
+                    for state in ingp_model.optimizer.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.cuda()
+                    print(f"[SHARED CKPT] INGP optimizer state restored")
+                except Exception as _e:
+                    print(f"[SHARED CKPT] WARN: INGP optimizer load failed: {_e}")
+            # Drop the buffer once applied — large tensors don't need to linger.
+            shared_ckpt_data = None
 
     # FastGS Compact Box: set the Mahalanobis² multiplier + auto-enable AdR+rect AABB.
     if args.fastgs and args.method == "3D_SH_res":
@@ -914,6 +1080,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             from diff_surfel_3D_sh_res import set_depth_sort
         set_depth_sort(True)
         print(f"[DEPTH_SORT] Using separated depth sort")
+
+    # Unbiased Depth: set the per-pair depth-difference cutoff to scene_radius / 4
+    # (paper formulation). The hardcoded 1.0 default is fine for DTU/T&T-scale
+    # objects but clips most pairs in mip-360-scale outdoor scenes (extent ≈ 5).
+    # `set_converge_threshold` resolves to the unbiased fork via the sys.modules
+    # swap at the top of this file when --unbiased is on.
+    if args.unbiased:
+        try:
+            from diff_surfel_3D_sh_res import set_converge_threshold
+            _converge_thresh = float(scene.cameras_extent) / 4.0
+            set_converge_threshold(_converge_thresh)
+            print(f"[UNBIASED] CONVERGE_THRESHOLD = scene.cameras_extent / 4 = {_converge_thresh:.4f}")
+        except (ImportError, AttributeError) as _e:
+            print(f"[UNBIASED] WARNING: set_converge_threshold not available ({_e}); "
+                  f"falling back to compiled default 1.0")
 
     if args.aa_2dgs > 0.0 and args.method == "3D_SH_res":
         from diff_surfel_3D_sh_res import set_aa_kernel_size
@@ -1009,6 +1190,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.update_learning_rate(iteration - args.gspa_simp_iter + 5000)
         else:
             gaussians.update_learning_rate(iteration)
+
+        if args.nexelparam and ingp_model is not None and hasattr(ingp_model, 'update_nexel_lr'):
+            ingp_model.update_nexel_lr(iteration)
 
         # Freeze/unfreeze SH learning rates
         if args.sh_freeze_iter > 0:
@@ -1397,6 +1581,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         lambda_normal = opt.lambda_normal if iteration > cfg_model.loss.normal_iter else 0.0
         lambda_dist = opt.lambda_dist if iteration > cfg_model.loss.dist_iter else 0.0
         lambda_mask = opt.lambda_mask if iteration > cfg_model.loss.mask_iter else 0.0
+
+        # Unbiased Depth: replace 2DGS depth distortion with convergence loss.
+        # Paper sets λ_dist=0 in the unbiased configuration (the two regularizers
+        # would otherwise compete on the same depth signal with opposite biases).
+        if args.unbiased:
+            lambda_dist = 0.0
         
         rend_dist = render_pkg["rend_dist"]
         rend_normal  = render_pkg['rend_normal']
@@ -1660,8 +1850,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 from diff_surfel_3D_sh_res import set_weight_reg_lambda
             set_weight_reg_lambda(effective_lambda)
 
+        # Unbiased Depth: convergence loss (Peng et al.). Only added when --unbiased
+        # is on AND iteration > unbiased_iter (paper default: 10000). The 'converge'
+        # tensor is exposed by gaussian_renderer when allmap has the 19th channel
+        # (i.e., when the unbiased rasterizer is in use).
+        converge_loss = torch.tensor(0.0, device="cuda")
+        if args.unbiased and iteration > args.unbiased_iter:
+            converge_t = render_pkg.get('converge')
+            if converge_t is not None:
+                converge_loss = args.lambda_converge * converge_t.mean()
+
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss + l1_sh_rest_loss + gspa_loss + w_overdraw_loss + sv_l1_loss + decomp_sh_loss + decomp_tex_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss + l1_sh_rest_loss + gspa_loss + w_overdraw_loss + sv_l1_loss + decomp_sh_loss + decomp_tex_loss + converge_loss
 
         # --minimc per-step error accumulation: BENCHED.
         # Replaced by the full-view sweep inside `minimc_sweep_and_relocate`,
@@ -1743,6 +1943,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_dist_for_log = 0.4 * dist_loss.item() + 0.6 * ema_dist_for_log
             ema_normal_for_log = 0.4 * normal_loss.item() + 0.6 * ema_normal_for_log
             ema_mask_for_log = 0.4 * mask_loss.item() + 0.6 * ema_mask_for_log
+            # Unbiased Depth: track convergence loss + raw Converge.mean() so we can
+            # diagnose magnitude (paper λ=7 is for vanilla 2DGS Gaussian + DTU/T&T scale;
+            # beta-scaled + mip-360 may need a different λ).
+            if args.unbiased:
+                ema_converge_for_log = 0.4 * converge_loss.item() + 0.6 * ema_converge_for_log
+                _converge_t_log = render_pkg.get('converge')
+                if _converge_t_log is not None:
+                    ema_converge_raw_for_log = 0.4 * _converge_t_log.mean().item() + 0.6 * ema_converge_raw_for_log
             
             # Track MCMC regularization losses
             if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
@@ -1835,6 +2043,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         loss_dict["Gnβ"] = f"{beta_vals.mean().item():.2f}"
                 if args.gspa and optimizing_spa is not None and iteration > args.gspa_start_iter and iteration <= args.gspa_stop_iter:
                     loss_dict["GSPA"] = f"{gspa_loss.item():.5f}"
+                # Unbiased: show λ·Converge.mean() and the raw Converge.mean() (post-iter > unbiased_iter)
+                if args.unbiased:
+                    loss_dict["Cv"] = f"{ema_converge_for_log:.4f}"
+                    loss_dict["Cv_raw"] = f"{ema_converge_raw_for_log:.6f}"
                 progress_bar.set_postfix(loss_dict)
 
                 progress_bar.update(10)
@@ -3262,6 +3474,78 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     print("  Next run will skip 2DGS phase and resume from here.")
                     print("="*70 + "\n")
 
+            # === Save SHARED-RESUME CHECKPOINT at iter == args.share_ckpt_iter ===
+            # Captures the FULL state (Gaussians + their optimizer + densif accumulators
+            # + INGP weights + INGP optimizer + gs_alpha_masks) so a sweep over
+            # downstream-only knobs can resume from this exact snapshot.
+            if (args.share_ckpt_iter > 0 and iteration == args.share_ckpt_iter
+                    and not loaded_from_shared and share_ckpt_path is not None):
+                # Avoid double-save if the file appeared concurrently.
+                if os.path.exists(share_ckpt_path):
+                    print(f"\n[SHARED CKPT] {share_ckpt_path} already exists — skipping save.")
+                else:
+                    print("\n" + "="*70)
+                    print(f"  SAVING SHARED-RESUME CHECKPOINT (iter {iteration})")
+                    print("="*70)
+
+                    # Use the gs_alpha_masks defined above when iteration ==
+                    # cfg_model.ingp_stage.initialize; otherwise fall back to per-camera
+                    # masks accumulated on the cam objects (or empty when not used).
+                    _share_gs_alpha = locals().get('gs_alpha_masks', None)
+                    if _share_gs_alpha is None:
+                        _share_gs_alpha = {}
+                        for _cam in scene.getTrainCameras():
+                            _m = getattr(_cam, 'gs_alpha_mask', None)
+                            if _m is not None:
+                                _share_gs_alpha[_cam.image_name] = _m.cpu().float()
+
+                    share_ckpt = {
+                        'iteration': iteration,
+                        'n_gaussians': len(gaussians.get_xyz),
+                        'active_sh_degree': gaussians.active_sh_degree,
+                        # --- Gaussian parameters (all on CPU) ---
+                        'xyz':            gaussians._xyz.detach().cpu(),
+                        'features_dc':    gaussians._features_dc.detach().cpu(),
+                        'features_rest':  gaussians._features_rest.detach().cpu(),
+                        'scaling':        gaussians._scaling.detach().cpu(),
+                        'rotation':       gaussians._rotation.detach().cpu(),
+                        'opacity':        gaussians._opacity.detach().cpu(),
+                        'appearance_level': gaussians._appearance_level.detach().cpu(),
+                        'max_radii2D':    gaussians.max_radii2D.detach().cpu(),
+                        'spatial_lr_scale': gaussians.spatial_lr_scale,
+                        # --- Gaussian optimizer state (Adam moments) ---
+                        'gaussians_optimizer_state': gaussians.optimizer.state_dict(),
+                        # --- Densification accumulators ---
+                        'xyz_gradient_accum':  gaussians.xyz_gradient_accum.detach().cpu(),
+                        'feat_gradient_accum': gaussians.feat_gradient_accum.detach().cpu(),
+                        'denom':               gaussians.denom.detach().cpu(),
+                        # --- gs_alpha masks (per-camera) ---
+                        'gs_alpha_masks': _share_gs_alpha,
+                    }
+
+                    # Method/kernel-specific params (saved only when present)
+                    if hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
+                        share_ckpt['shape'] = gaussians._shape.detach().cpu()
+                    if hasattr(gaussians, '_flex_beta') and gaussians._flex_beta.numel() > 0:
+                        share_ckpt['flex_beta'] = gaussians._flex_beta.detach().cpu()
+                    if hasattr(gaussians, '_gaussian_features') and gaussians._gaussian_features.numel() > 0:
+                        share_ckpt['gaussian_features'] = gaussians._gaussian_features.detach().cpu()
+                        share_ckpt['gaussian_feat_dim'] = getattr(gaussians, '_gaussian_feat_dim', 0)
+
+                    # INGP model + optimizer (when present — same gate as warmup)
+                    if cfg_model.settings.if_ingp and ingp_model is not None:
+                        share_ckpt['ingp_state_dict'] = {k: v.detach().cpu() for k, v in ingp_model.state_dict().items()}
+                        if hasattr(ingp_model, 'optimizer') and ingp_model.optimizer is not None:
+                            share_ckpt['ingp_optimizer_state'] = ingp_model.optimizer.state_dict()
+
+                    torch.save(share_ckpt, share_ckpt_path)
+                    print(f"  Saved to: {share_ckpt_path}")
+                    print(f"  Gaussians: {share_ckpt['n_gaussians']}")
+                    print(f"  GS alpha masks: {len(_share_gs_alpha)}")
+                    print(f"  INGP weights+optimizer: {'yes' if 'ingp_state_dict' in share_ckpt else 'no'}")
+                    print(f"  Next run with --share_ckpt_iter {args.share_ckpt_iter} will resume from here.")
+                    print("="*70 + "\n")
+
         torch.cuda.empty_cache()
 
     # Prune dead Gaussians in MCMC mode before final rendering
@@ -4010,9 +4294,15 @@ def render_final_images(scene, gaussians, pipe, background, ingp, beta, iteratio
     if old_adaptive_cat_inference is not None and ingp is not None:
         ingp.adaptive_cat_inference = old_adaptive_cat_inference
 
-    # Save metrics file in output root
+    # Save metrics file in output root. For test_metrics.txt the periodic-eval header
+    # was written at training start and rows have been appended through training_report;
+    # open in append mode so the final block goes underneath. Other metrics_file values
+    # (e.g. train_metrics.txt) are written fresh.
     metrics_path = os.path.join(scene.model_path, metrics_file)
-    with open(metrics_path, 'w') as f:
+    open_mode = 'a' if metrics_file == 'test_metrics.txt' else 'w'
+    with open(metrics_path, open_mode) as f:
+        if open_mode == 'a':
+            f.write("\n")
         f.write(f"Final Evaluation (stride={stride})\n")
         f.write(f"════════════════════════════════════════\n")
         f.write(f"Images rendered: {len(psnr_values)}\n\n")
@@ -4186,6 +4476,12 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
 
                 if config['name'] == 'test':
                     test_psnr.append(psnr_test.item())
+                    # Append row to test_metrics.txt (header was written at training start).
+                    try:
+                        with open(os.path.join(scene.model_path, 'test_metrics.txt'), 'a') as f:
+                            f.write(f"{iteration:<10}{psnr_test.item():<14.2f}{l1_test.item():<14.6f}\n")
+                    except Exception as _e:
+                        print(f"[WARN] Failed to append periodic test metric: {_e}")
                 elif config['name'] == 'train':
                     train_psnr.append(psnr_test.item())
 
@@ -4242,6 +4538,33 @@ if __name__ == "__main__":
     parser.add_argument("--time_analysis", action="store_true")
     parser.add_argument("--ingp", action="store_true")
     parser.add_argument("--yaml", type=str, default = "tiny")
+
+    # === Unbiased Depth (Peng et al.) ===
+    # Replaces 2DGS depth distortion with cumulative-opacity surface + convergence loss.
+    # When --unbiased is set, the diff_surfel_3D_sh_res_unbiased rasterizer is used
+    # (sys.modules swap at module top), lambda_dist is forced to 0, and after iter
+    # --unbiased_iter the convergence-loss term is added with weight --lambda_converge.
+    parser.add_argument("--unbiased", action="store_true",
+                        help="Enable Unbiased Depth: cumulative-opacity surface + convergence loss "
+                             "(routes to diff_surfel_3D_sh_res_unbiased; disables lambda_dist)")
+    parser.add_argument("--lambda_converge", type=float, default=7.0,
+                        help="Weight for the convergence loss (paper default 7.0). Active only when --unbiased")
+    parser.add_argument("--unbiased_iter", type=int, default=10000,
+                        help="Iteration after which the convergence loss kicks in (paper default 10000)")
+
+    # Shared-resume checkpoint: save EVERYTHING (Gaussians + their optimizer +
+    # densif accumulators + INGP model + INGP optimizer + gs_alpha_masks) at one
+    # iteration so a sweep over downstream-only knobs (e.g., --lambda_converge)
+    # can resume from a single deterministic snapshot without re-running iters
+    # 0 → N. The first run with --share_ckpt_iter > 0 SAVES the snapshot if the
+    # path doesn't exist; every subsequent run with the same path LOADS it.
+    parser.add_argument("--share_ckpt_iter", type=int, default=0,
+                        help="When > 0, save a comprehensive resume checkpoint at this iteration "
+                             "(or load from it if it already exists). Disabled (0) by default.")
+    parser.add_argument("--share_ckpt_tag", type=str, default="",
+                        help="Tag for the shared resume checkpoint filename. Empty = auto-derive from "
+                             "method+kernel+hybrid_levels+iter so configs don't collide. Path: "
+                             "<source_path>/shared_ckpt_<tag>.pth")
     
     # Method argument - baseline, cat, cat_dropout, adaptive, adaptive_add, adaptive_cat, adaptive_zero, adaptive_gate, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
     parser.add_argument("--method", type=str, default="baseline",
@@ -4249,6 +4572,10 @@ if __name__ == "__main__":
                         help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'cat_dropout' (cat with hash dropout during training - use --dropout_lambda), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'adaptive_zero' (cat with weighted hash vs zeros - w=0 skips hash query), 'adaptive_gate' (VQ-AD style gating: soft→STE→hard, L1 regularization toward zeros), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual), '3D' (intersection-based SH rendering), '3D_direct' (intersection-based RGB MLP), or '3D_direct_fused' (fused in-kernel MLP, no intersection buffer)")
     parser.add_argument("--hybrid_levels", type=int, default=5,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
+    parser.add_argument("--hash_levels", type=int, default=-1,
+                        help="3D_SH_res only: number of HASH levels (preferred name; default -1 = unset, use --hybrid_levels). "
+                             "Internally translates to hybrid_levels = encoding.levels - hash_levels. "
+                             "With levels=8 in config, --hash_levels K (K in [0..8]) gives K hash levels.")
     parser.add_argument("--decompose_mode", type=str, default=None,
                         choices=[None, "gaussian_only", "ngp_only"],
                         help="Decomposition mode for hybrid_SH visualization: 'gaussian_only' (only per-Gaussian SH), 'ngp_only' (only hashgrid DC residual), or None (normal combined rendering)")
@@ -4276,6 +4603,11 @@ if __name__ == "__main__":
                         help="Scale factor for hash encoding and MLP learning rates in 3D_SH_res mode (e.g. 0.1 = 10x lower LR)")
     parser.add_argument("--hash_lr_scale", type=float, default=1.0,
                         help="Scale factor for hash encoding LR only (stacks with --res_lr_scale). e.g. 100 = 100x hash LR")
+    parser.add_argument("--nexelparam", action="store_true",
+                        help="Adopt Nexels' hash+MLP optimization: base LR 1e-3 (vs YAML's 2e-2 hash) "
+                             "with exponential decay to 1e-5 over training. "
+                             "(Adam beta2=0.999 is now the default for the INGP optimizer regardless of this flag.) "
+                             "Stacks with --res_lr_scale / --hash_lr_scale (those scale the curve).")
     parser.add_argument("--res_warmup", type=int, default=0,
                         help="Disable hash/MLP residual for this many iterations in 3D_SH_res mode (e.g. 10000 = SH-only for first 10k iters)")
     parser.add_argument("--sh_freeze_iter", type=int, default=0,
@@ -4493,7 +4825,9 @@ if __name__ == "__main__":
                              "Off by default = pixel-corner convention (matches reference 2DGS).")
     parser.add_argument("--antialiasing", type=float, default=0.0,
                         help="Nexels-style hash-grid anti-aliasing down-weight factor. "
-                             "0 disables (default). Typical value 1.0. Uses max(fx,fy) as focal.")
+                             "0 disables (default). Now unit-matched to Nexels' grid_threshold_factor: "
+                             "1.0 = Nexels paper default; 0.5 mild; 2.0 aggressive. Must be set "
+                             "from iter 1 (model trained without AA can't have AA enabled at render time).")
     parser.add_argument("--aa_2dgs", type=float, default=0.0,
                         help="AA-2DGS Jacobian-based anti-aliasing kernel size (σ) for 3D_SH_res. "
                              "0 disables (default). Typical value 0.1. Replaces the "
@@ -4991,6 +5325,39 @@ if __name__ == "__main__":
 
     cfg_model = Config(args.yaml)
     merge_cfg_to_args(args, cfg_model, cli_args=cli_args)
+
+    # --hash_levels: 3D_SH_res-friendly knob — K = number of HASH levels (vs --hybrid_levels
+    # which is K = number of per-Gauss feature levels, leftover from CAT mode where
+    # hybrid_levels + hash_levels = total_levels). For 3D_SH_res the per-surfel feature
+    # is SH (no per-Gauss hash split), so users naturally think in terms of "how many
+    # hash levels". Translate hash_levels → hybrid_levels for the rest of the pipeline.
+    if args.hash_levels >= 0:
+        if args.method not in ("3D_SH_res", "3D_SH_cat"):
+            raise ValueError(
+                f"--hash_levels is only supported with --method 3D_SH_res or 3D_SH_cat (got --method {args.method}). "
+                f"For other methods use --hybrid_levels."
+            )
+        if 'hybrid_levels' in cli_args:
+            raise ValueError(
+                "Cannot pass both --hash_levels and --hybrid_levels (ambiguous). Pick one."
+            )
+        _total_levels = cfg_model.encoding.levels
+        _level_dim = cfg_model.encoding.hashgrid.dim
+        # Per-mode upper bound on hash_levels — driven by what fits the 16D MLP input:
+        #   3D_SH_res: [hash | pad] = 16D            → max_hash = 16 // dim
+        #   3D_SH_cat: [hash | DC(3) | bias(1) | pad] = 16D → max_hash = (16-3-1) // dim = 3 for dim=4
+        if args.method == "3D_SH_cat":
+            _max_hash = (16 - 3 - 1) // _level_dim
+        else:
+            _max_hash = 16 // _level_dim
+        _max_hash = min(_max_hash, _total_levels)  # also can't exceed configured total levels
+        if not (0 <= args.hash_levels <= _max_hash):
+            raise ValueError(
+                f"--hash_levels must be in [0, {_max_hash}] for --method {args.method} "
+                f"(encoding.levels={_total_levels}, dim={_level_dim} in {args.yaml}); got {args.hash_levels}"
+            )
+        args.hybrid_levels = _total_levels - args.hash_levels
+        print(f"[HASH_LEVELS] hash_levels={args.hash_levels} -> hybrid_levels={_total_levels}-{args.hash_levels}={args.hybrid_levels} (max for {args.method}: {_max_hash})")
 
     # Mini-Splatting v2: override densify_until_iter and opacity_lr AFTER yaml merge
     if args.mini and 'densify_until_iter' not in cli_args:

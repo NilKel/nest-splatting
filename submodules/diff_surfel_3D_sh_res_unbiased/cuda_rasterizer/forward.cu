@@ -61,6 +61,10 @@ __device__ float d_res_bias = 0.5f;
 // AdR cutoff in preprocessCUDA:  cutoff = sqrt(2·log(opacity·255)·mult).
 // Default 1.0 = unchanged (matches our existing AdR cutoff). FastGS paper uses 0.5.
 __device__ float d_compact_mult = 1.0f;
+// Unbiased Depth: per-pair depth-difference cutoff. Paper: scene_radius / 4.
+// 1.0 default keeps the literal-match-to-reference behavior; set via
+// set_converge_threshold() to scale with scene extent.
+__device__ float d_converge_threshold = 1.0f;
 
 // Host-side pointers for memory management
 static __half* h_mlp_W1 = nullptr;
@@ -850,6 +854,17 @@ renderCUDA(
 	// Max contributor tracking for depth reinit
 	float max_w = 0.0f;
 	float max_depth = 0.0f;
+
+	// === Unbiased Depth state (Peng et al., XiaoXinyyx/diff_surfel_rasterization @ b6c7b7a) ===
+	// Cumulative-opacity surface (replaces T>0.5 median):
+	//   O += (alpha + UNBIASED_OPACITY_EPS * G); lock median_depth when O >= UNBIASED_OPACITY_THRESH
+	// Smoothing: median_depth = (last_depth + depth)/2 when last_depth>0 (else just depth)
+	float cum_opacity = 0.0f;
+	float last_depth_u = 0.0f;            // previous-iteration depth (smoothing + converge)
+	// Convergence loss: sum_i min(G_i, G_{i-1}) * (d_i - d_{i-1})^2, gated by T > CONVERGE_T_GATE
+	float Converge = 0.0f;
+	float last_G = 0.0f;
+	uint32_t last_converge = 0;
 #endif
 
 	// Iterate over batches until all done or range is complete
@@ -910,7 +925,8 @@ renderCUDA(
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, opa * exp(power));
+			const float G_unbiased = exp(power);  // raw kernel footprint (no opacity), used by unbiased depth
+			float alpha = min(0.99f, opa * G_unbiased);
 			if (alpha < 1.0f / 255.0f)
 				continue;
 			float test_T = T * (1 - alpha);
@@ -939,11 +955,28 @@ renderCUDA(
 			M1 += m * w;
 			M2 += m * m * w;
 
-			if (T > 0.5) {
-				median_depth = depth;
-				// median_weight = w;
+			// === Unbiased Depth: cumulative-opacity surface (replaces T>0.5) ===
+			// Original biased version (kept for reference, never executed in unbiased build):
+			//   if (T > 0.5) { median_depth = depth; median_contributor = contributor; }
+			if (cum_opacity < UNBIASED_OPACITY_THRESH) {
+				// Smoothed median depth (averaged with previous-iter depth when available)
+				median_depth = (last_depth_u > 0.0f) ? (last_depth_u + depth) * 0.5f : depth;
 				median_contributor = contributor;
 			}
+			cum_opacity += (alpha + UNBIASED_OPACITY_EPS * G_unbiased);
+
+			// === Unbiased Depth: convergence loss accumulator ===
+			if (T > CONVERGE_T_GATE) {
+				if (last_converge > 0) {
+					const float dd = depth - last_depth_u;
+					Converge += (fabsf(dd) > d_converge_threshold)
+						? 0.0f
+						: fminf(G_unbiased, last_G) * dd * dd;
+				}
+				last_G = G_unbiased;
+				last_converge = contributor;
+			}
+
 			// Render normal map
 			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
 #endif
@@ -952,6 +985,9 @@ renderCUDA(
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
 			T = test_T;
+#if RENDER_AXUTILITY
+			last_depth_u = depth;  // updated end-of-iter; used by next-iter smoothing & converge
+#endif
 
 			// Keep track of last range entry to update this
 			// pixel.
@@ -970,6 +1006,7 @@ renderCUDA(
 
 #if RENDER_AXUTILITY
 		n_contrib[pix_id + H * W] = median_contributor;
+		n_contrib[pix_id + 2 * H * W] = last_converge;  // unbiased: chain bound for backward
 		final_T[pix_id + H * W] = M1;
 		final_T[pix_id + 2 * H * W] = M2;
 		out_others[pix_id + DEPTH_OFFSET * H * W] = D;
@@ -979,6 +1016,7 @@ renderCUDA(
 		out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
 		out_others[pix_id + NUM_OFFSET * H * W] = render_number;
 		out_others[pix_id + MAXDEPTH_OFFSET * H * W] = max_depth;
+		out_others[pix_id + CONVERGE_OFFSET * H * W] = Converge;  // unbiased: per-pixel convergence loss
 		// out_others[pix_id + MEDIAN_WEIGHT_OFFSET * H * W] = median_weight;
 #endif
 	}
@@ -1151,6 +1189,13 @@ renderCUDAsurfelForward(
 	float max_w = 0.0f;
 	float max_depth = 0.0f;
 	int max_idx = -1;  // global Gaussian id of the max-weight contributor (or -1 if none)
+
+	// === Unbiased Depth state (Peng et al.) — see standard path comments ~line 855 ===
+	float cum_opacity = 0.0f;
+	float last_depth_u = 0.0f;
+	float Converge = 0.0f;
+	float last_G = 0.0f;
+	uint32_t last_converge = 0;
 
 	int collec_offsets[16] = {0};
 	// float feat[CHANNELS] = { 0 };
@@ -1423,7 +1468,6 @@ renderCUDAsurfelForward(
 							l_scale, Base, align_corners, interp, if_contract, false,
 							nullptr, nullptr, nullptr, my_depth);
 				} else if (active_hashgrid_levels > 0 && l_dim == 2) {
-					// 2D per level — supports 1..8 hash levels (hash_dim ∈ {2,4,6,8,10,12,14,16}).
 					if (hash_dim_batched == 2)
 						query_feature<false, 2, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 							my_ap_level, hash_features, active_hashgrid_levels,
@@ -1431,36 +1475,6 @@ renderCUDAsurfelForward(
 							nullptr, nullptr, nullptr, my_depth);
 					else if (hash_dim_batched == 4)
 						query_feature<false, 4, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
-					else if (hash_dim_batched == 6)
-						query_feature<false, 6, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
-					else if (hash_dim_batched == 8)
-						query_feature<false, 8, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
-					else if (hash_dim_batched == 10)
-						query_feature<false, 10, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
-					else if (hash_dim_batched == 12)
-						query_feature<false, 12, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
-					else if (hash_dim_batched == 14)
-						query_feature<false, 14, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-							my_ap_level, hash_features, active_hashgrid_levels,
-							l_scale, Base, align_corners, interp, if_contract, false,
-							nullptr, nullptr, nullptr, my_depth);
-					else if (hash_dim_batched == 16)
-						query_feature<false, 16, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 							my_ap_level, hash_features, active_hashgrid_levels,
 							l_scale, Base, align_corners, interp, if_contract, false,
 							nullptr, nullptr, nullptr, my_depth);
@@ -1548,6 +1562,7 @@ renderCUDAsurfelForward(
 		float opa = nor_o.w;
 
 		float alpha;
+		float G_unbiased = 0.0f;  // unbiased: per-Gaussian kernel footprint (no opacity), used by convergence loss
 		if (kernel_type == 1 || kernel_type == 4) {
 			// Beta kernel with separate G_obj (Beta) and G_screen (Gaussian low-pass)
 			// kernel_type 1: k²=1 (unit circle cutoff)
@@ -1569,6 +1584,7 @@ renderCUDAsurfelForward(
 
 			// 4. Max-pool handoff: smooth transition between Beta (close) and Gaussian (far)
 			float kernel_val = fmaxf(alpha_beta, alpha_lp);
+			G_unbiased = kernel_val;
 
 			// 5. Final alpha with opacity
 			alpha = fminf(0.99f, opa * kernel_val);
@@ -1584,6 +1600,7 @@ renderCUDAsurfelForward(
 			if (per_gaussian_beta > 0.0f)
 				G = (1.0f + per_gaussian_beta) * G / (1.0f + per_gaussian_beta * G);
 
+			G_unbiased = G;
 			alpha = min(0.99f, opa * G);
 		} else if (kernel_type == 3) {
 			// General kernel: Isotropic Generalized Gaussian
@@ -1610,6 +1627,7 @@ renderCUDAsurfelForward(
 				continue;
 
 			float G = expf(power);
+			G_unbiased = G;
 			alpha = min(0.99f, opa * G);
 		} else if (kernel_type == 5) {
 			// Nexel kernel: per-axis gamma exponents (anisotropic generalized Gaussian)
@@ -1626,6 +1644,7 @@ renderCUDAsurfelForward(
 			if (power > 0.0f)
 				continue;
 			float G = expf(power);
+			G_unbiased = G;
 			alpha = min(0.99f, opa * G);
 		} else if (d_aa_kernel_size > 0.0f) {
 			// AA-2DGS Jacobian-based mip filter (replaces rho3d/rho2d heuristic).
@@ -1652,7 +1671,9 @@ renderCUDAsurfelForward(
 			const float rho_aa = rho_aa_num * det_V_inv;
 			const float power_aa = -0.5f * rho_aa;
 			if (power_aa > 0.0f) continue;
-			alpha = fminf(0.99f, coef * opa * expf(power_aa));
+			const float G_aa = coef * expf(power_aa);
+			G_unbiased = G_aa;
+			alpha = fminf(0.99f, opa * G_aa);
 		} else {
 			// Standard Gaussian kernel
 			float power = -0.5f * rho;
@@ -1668,6 +1689,7 @@ renderCUDAsurfelForward(
 			if(beta > 0.0)
 				G = (1.0 + beta) * G / (1.0 + beta * G);
 
+			G_unbiased = G;
 			alpha = min(0.99f, opa * G);
 		}
 
@@ -1722,16 +1744,32 @@ renderCUDAsurfelForward(
 			M1 += m * w;
 			M2 += m * m * w;
 
-			if (T > 0.5) {
-				median_depth = depth;
-				// median_weight = w;
+			// === Unbiased Depth: cumulative-opacity surface (replaces T>0.5) ===
+			// Original biased version (kept for reference, never executed in unbiased build):
+			//   if (T > 0.5) { median_depth = depth; median_contributor = contributor; }
+			// G_unbiased = per-Gaussian kernel footprint, set in kernel-type if/else above.
+			if (cum_opacity < UNBIASED_OPACITY_THRESH) {
+				median_depth = (last_depth_u > 0.0f) ? (last_depth_u + depth) * 0.5f : depth;
 				median_contributor = contributor;
+			}
+			cum_opacity += (alpha + UNBIASED_OPACITY_EPS * G_unbiased);
+
+			// === Unbiased Depth: convergence loss accumulator ===
+			if (T > CONVERGE_T_GATE) {
+				if (last_converge > 0) {
+					const float dd = depth - last_depth_u;
+					Converge += (fabsf(dd) > d_converge_threshold)
+						? 0.0f
+						: fminf(G_unbiased, last_G) * dd * dd;
+				}
+				last_G = G_unbiased;
+				last_converge = contributor;
 			}
 
 			// Render normal map
 			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
 #endif
-			
+
 			//// now color part is in ingp model
 			// Eq. (3) from 3D Gaussian splatting paper.
 			// MyGs, now color calculation is in ngp part.
@@ -1967,7 +2005,6 @@ renderCUDAsurfelForward(
 					                           nullptr, nullptr, nullptr, depth);
 				}
 			} else if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 2) {
-				// 2D per level — supports 1..8 hash levels (hash_dim ∈ {2,4,6,8,10,12,14,16}).
 				if (hash_dim == 2) {
 					query_feature<false, 2, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 					                           appearance_level, hash_features, active_hashgrid_levels,
@@ -1975,36 +2012,6 @@ renderCUDAsurfelForward(
 					                           nullptr, nullptr, nullptr, depth);
 				} else if (hash_dim == 4) {
 					query_feature<false, 4, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
-				} else if (hash_dim == 6) {
-					query_feature<false, 6, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
-				} else if (hash_dim == 8) {
-					query_feature<false, 8, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
-				} else if (hash_dim == 10) {
-					query_feature<false, 10, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
-				} else if (hash_dim == 12) {
-					query_feature<false, 12, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
-				} else if (hash_dim == 14) {
-					query_feature<false, 14, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels,
-					                           l_scale, Base, align_corners, interp, contract, debug,
-					                           nullptr, nullptr, nullptr, depth);
-				} else if (hash_dim == 16) {
-					query_feature<false, 16, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 					                           appearance_level, hash_features, active_hashgrid_levels,
 					                           l_scale, Base, align_corners, interp, contract, debug,
 					                           nullptr, nullptr, nullptr, depth);
@@ -2057,7 +2064,6 @@ renderCUDAsurfelForward(
 			float hash_feat_6[12];
 			for (int i = 0; i < 12; i++) hash_feat_6[i] = 0.0f;
 			if (!skip_hash_6 && active_hashgrid_levels_6 > 0 && l_dim == 4) {
-				// 4D per level — cat caps hash_dim at 12 (1..3 hash levels of 4D each).
 				if (hash_dim_6 == 4) {
 					query_feature<false, 4, 4>(hash_feat_6, xyz, voxel_min, voxel_max, collec_offsets,
 					                           appearance_level, hash_features, active_hashgrid_levels_6,
@@ -2068,33 +2074,6 @@ renderCUDAsurfelForward(
 					                           l_scale, Base, align_corners, interp, contract, debug);
 				} else if (hash_dim_6 == 12) {
 					query_feature<false, 12, 4>(hash_feat_6, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels_6,
-					                           l_scale, Base, align_corners, interp, contract, debug);
-				}
-			} else if (!skip_hash_6 && active_hashgrid_levels_6 > 0 && l_dim == 2) {
-				// 2D per level — cat caps hash_dim at 12 (1..6 hash levels of 2D each).
-				if (hash_dim_6 == 2) {
-					query_feature<false, 2, 2>(hash_feat_6, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels_6,
-					                           l_scale, Base, align_corners, interp, contract, debug);
-				} else if (hash_dim_6 == 4) {
-					query_feature<false, 4, 2>(hash_feat_6, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels_6,
-					                           l_scale, Base, align_corners, interp, contract, debug);
-				} else if (hash_dim_6 == 6) {
-					query_feature<false, 6, 2>(hash_feat_6, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels_6,
-					                           l_scale, Base, align_corners, interp, contract, debug);
-				} else if (hash_dim_6 == 8) {
-					query_feature<false, 8, 2>(hash_feat_6, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels_6,
-					                           l_scale, Base, align_corners, interp, contract, debug);
-				} else if (hash_dim_6 == 10) {
-					query_feature<false, 10, 2>(hash_feat_6, xyz, voxel_min, voxel_max, collec_offsets,
-					                           appearance_level, hash_features, active_hashgrid_levels_6,
-					                           l_scale, Base, align_corners, interp, contract, debug);
-				} else if (hash_dim_6 == 12) {
-					query_feature<false, 12, 2>(hash_feat_6, xyz, voxel_min, voxel_max, collec_offsets,
 					                           appearance_level, hash_features, active_hashgrid_levels_6,
 					                           l_scale, Base, align_corners, interp, contract, debug);
 				}
@@ -2163,6 +2142,9 @@ renderCUDAsurfelForward(
 			}
 
 			T = test_T;
+#if RENDER_AXUTILITY
+			last_depth_u = depth;  // unbiased: end-of-iter update for next-iter smoothing & convergence
+#endif
 
 			// Keep track of last range entry to update this pixel.
 			last_contributor = contributor;
@@ -2208,6 +2190,8 @@ renderCUDAsurfelForward(
 		out_others[pix_id + OVERDRAW_OFFSET * H * W] = overdraw_sum;
 		out_others[pix_id + MAXDEPTH_OFFSET * H * W] = max_depth;
 		out_others[pix_id + WSQUARE_OFFSET * H * W] = w_square_sum;
+		out_others[pix_id + CONVERGE_OFFSET * H * W] = Converge;  // unbiased
+		n_contrib[pix_id + 2 * H * W] = last_converge;            // unbiased: backward chain bound
 		// Per-pixel id of the max-weight Gaussian (for mini depth-reinit SH transfer).
 		// out_index is a separate int32 [H, W] buffer plumbed all the way to Python.
 		if (out_index != nullptr) out_index[pix_id] = max_idx;
@@ -2309,6 +2293,12 @@ void FORWARD::setAntiAlias(float factor, float focal) {
 __global__ void setCompactMultKernel(float val) { d_compact_mult = val; }
 void FORWARD::setCompactMult(float val) {
 	setCompactMultKernel<<<1, 1>>>(val);
+}
+
+// Unbiased Depth: per-pair depth-difference cutoff (paper: scene_radius / 4).
+__global__ void setConvergeThresholdFwdKernel(float val) { d_converge_threshold = val; }
+void FORWARD::setConvergeThreshold(float val) {
+	setConvergeThresholdFwdKernel<<<1, 1>>>(val);
 }
 
 // Set AA-2DGS mip filter kernel size σ (0 disables; matches AA-2DGS's kernel_size, default 0.1)

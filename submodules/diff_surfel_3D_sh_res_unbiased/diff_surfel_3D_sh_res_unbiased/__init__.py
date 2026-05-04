@@ -687,16 +687,9 @@ def set_residual_mode(mode=0):
 
 def set_anti_alias(factor=0.0, focal=1.0):
     """Set Nexels-style hash-grid anti-aliasing down-weighting.
-    factor=0 disables AA. factor=1.0 matches Nexels' grid_threshold_factor=1.0
-    (their paper default).
-
-    Internally we pre-multiply by 2 so the CUDA kernel implements
-       ts = (2*factor) * depth * scale_world / focal
-    matching Nexels'   ts = grid_threshold_factor * (2*depth/focal) * scale_world.
-    The kernel multiplies the per-level normalised scale by grad_scale
-    (= d_normalized/d_world, set inside query_feature) so the formula is
-    correct under both contract and non-contract paths."""
-    _C.set_anti_alias(float(factor) * 2.0, float(focal))
+    factor=0 disables AA. factor=1.0 and focal=max(fx,fy) matches Nexels default.
+    Downweight per level: Δ = 1 - exp(-1/(2π) * (focal/(s_ℓ·factor·depth))²)."""
+    _C.set_anti_alias(float(factor), float(focal))
 
 def set_compact_mult(val=1.0):
     """Set FastGS Compact Box Mahalanobis² multiplier for AdR cutoff.
@@ -709,6 +702,19 @@ def set_compact_mult(val=1.0):
     Only effective when --aabb is one of {adr, adrrect} (aabb_mode in {1, 3}).
     """
     _C.set_compact_mult(float(val))
+
+def set_converge_threshold(val=1.0):
+    """Unbiased Depth: per-pair depth-difference cutoff for the convergence loss.
+
+    Pairs with |d_i - d_{i-1}| > val are skipped (treated as unrelated kernels).
+    Paper: scene_radius / 4 (e.g., ~1.24 for mip-360 bicycle whose camera_extent ≈ 5).
+    Default 1.0 matches the literal reference impl (XiaoXinyyx/diff_surfel_rasterization).
+
+    Set ONCE at startup (after Scene is loaded) — value is global to the rasterizer.
+    Patches both the forward and backward TU copies in lockstep.
+    """
+    _C.set_converge_threshold(float(val))
+
 
 def set_aa_kernel_size(val=0.0):
     """Set AA-2DGS Jacobian-based mip filter kernel size σ (0 = off, typical 0.1).

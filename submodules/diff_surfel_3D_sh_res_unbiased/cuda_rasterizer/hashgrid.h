@@ -54,19 +54,11 @@ __device__ inline T smoothstep_derivative(T val) {
 // Nexels-style anti-aliasing down-weight: Δ_ℓ = 1 - exp(-1/(2π) * (f/(s_ℓ·t*))²)
 // Per-TU device globals — each TU that includes this header defines its own copy.
 // Setters in forward.cu / backward.cu update the per-TU copy.
-//
-// Semantics match Nexels' grid_threshold_factor: ts = factor * (2*depth/focal) * scale_world,
-// where scale_world = level_scale (cells/[0,1]) * grad_scale (d_normalized/d_world).
-// The Python wrapper pre-multiplies factor by 2, so on the CUDA side we use
-//   ts = d_aa_factor * depth * level_scale * grad_scale / d_aa_focal
-// and d_aa_factor's user-facing value matches Nexels' grid_threshold_factor.
-// grad_scale handles both contract (varies by position) and non-contract (1/vsize).
 static __device__ float d_aa_factor = 0.0f;
 static __device__ float d_aa_focal = 1.0f;
-__device__ __forceinline__ float hashgrid_aa_downweight(float depth, float level_scale, float grad_scale) {
+__device__ __forceinline__ float hashgrid_aa_downweight(float depth, float level_scale) {
     if (d_aa_factor <= 0.0f) return 1.0f;
-    float scale_world = level_scale * grad_scale;
-    float ts = d_aa_factor * depth * scale_world / fmaxf(d_aa_focal, 1e-6f);
+    float ts = d_aa_factor * depth * level_scale / fmaxf(d_aa_focal, 1e-6f);
     if (ts <= 0.0f) return 1.0f;
     float x_sq = 0.5f / (ts * ts);
     return 1.0f - expf(-4.0f * x_sq * 0.3183098862f);  // 1/π
@@ -87,15 +79,6 @@ float aa_depth = 0.0f)
     bool flag_oob = false;
 	const uint32_t D = 3;
     float grad_scale = 0.0;
-    // Saved state for backward Jacobian transpose. Only meaningful when BW.
-    // For non-contract: inv_world_step = 1/(vmax-vmin) and the Jacobian is scalar.
-    // For contract: pre_warp[] is the centered+rescaled point (BEFORE radial warp),
-    //               r_norm is its L2 norm, inv_world_step = 2/(vmax-vmin) (= inv_vsize_).
-    // The contract Jacobian is non-isotropic in the outer (norm > 1) region; see the
-    // accumulation block at the end.
-    float inv_world_step = 0.0f;
-    float pre_warp[3] = {0.0f, 0.0f, 0.0f};
-    float r_norm = 0.0f;
 
     if(!contract){
         // warp the pos to [0, 1]
@@ -104,36 +87,28 @@ float aa_depth = 0.0f)
         inputs[1] = (xyz.y-vmin)*inv_vsize;
         inputs[2] = (xyz.z-vmin)*inv_vsize;
         grad_scale = inv_vsize;
-        inv_world_step = inv_vsize;
         flag_oob = (inputs[0] < 0 || inputs[0] > 1 || inputs[1] < 0 || inputs[1] > 1 || inputs[2] < 0 || inputs[2] > 1);
     }
     else{
         // warp the center region to [-1, 1]
         float vmid = (vmax + vmin) * 0.5;
         float inv_vsize_ = 1.0 / ((vmax - vmin) * 0.5);
-        pre_warp[0] = (xyz.x-vmid)*inv_vsize_;
-        pre_warp[1] = (xyz.y-vmid)*inv_vsize_;
-        pre_warp[2] = (xyz.z-vmid)*inv_vsize_;
-        inputs[0] = pre_warp[0];
-        inputs[1] = pre_warp[1];
-        inputs[2] = pre_warp[2];
+        inputs[0] = (xyz.x-vmid)*inv_vsize_;
+        inputs[1] = (xyz.y-vmid)*inv_vsize_;
+        inputs[2] = (xyz.z-vmid)*inv_vsize_;
         // warp the outside region to [-2, 2], then warp to [0, 1]
-        r_norm = sqrtf(pre_warp[0]*pre_warp[0] + pre_warp[1]*pre_warp[1] + pre_warp[2]*pre_warp[2]);
-        float inv_norm = 1.0f / r_norm;
-        float scale_trans = (r_norm <= 1.0f) ? 1.0f : (2.0f - inv_norm) * inv_norm;
+        float norm = sqrtf(inputs[0]*inputs[0] + inputs[1]*inputs[1] + inputs[2]*inputs[2]);
+        float inv_norm = 1.0f / norm;
+        float scale_trans = (norm <= 1.0f) ? 1.0f : (2.0f - inv_norm) * inv_norm;
         #pragma unroll
-        for (uint32_t d = 0; d < D; d++)
+        for (uint32_t d = 0; d < D; d++) 
         {
             // warp to range [-2, 2]
             inputs[d] = scale_trans * inputs[d] ;
             // norm to [0, 1]
             inputs[d] = (inputs[d] + 2.0) * 0.25f;
-        }
-        // grad_scale: scalar approximation of d_normalized/d_world used by AA only
-        // (AA wants an isotropic per-query scale). The full backward Jacobian is
-        // applied at the end of this function.
+        } 
         grad_scale = inv_vsize_ * scale_trans * 0.25f;
-        inv_world_step = inv_vsize_;
     }
 
     uint32_t max_level = min(appearance_level, L);
@@ -194,7 +169,7 @@ float aa_depth = 0.0f)
 		float results[LD] = {0};
 
 		// Nexels anti-aliasing downweight for this level.
-		const float level_downweight = hashgrid_aa_downweight(aa_depth, scale, grad_scale);
+		const float level_downweight = hashgrid_aa_downweight(aa_depth, scale);
 
 		#pragma unroll
 		for (uint32_t idx = 0; idx < (1 << D); idx++) {
@@ -283,7 +258,7 @@ float aa_depth = 0.0f)
             }
 
             // Nexels AA downweight — applies uniformly to this level's dL/dxyz.
-            const float bw_level_downweight = hashgrid_aa_downweight(aa_depth, scale, grad_scale);
+            const float bw_level_downweight = hashgrid_aa_downweight(aa_depth, scale);
 
             #pragma unroll
             for (uint32_t gd = 0; gd < D; gd++) {
@@ -292,10 +267,8 @@ float aa_depth = 0.0f)
 
                 #pragma unroll
                 for (uint32_t idx = 0; idx < (1 << (D - 1)); idx++) {
-                    // dy_dx accumulates d(feature)/d(input_normalized) for THIS level.
-                    // The world-space Jacobian (grad_scale for non-contract, the full
-                    // anisotropic transpose for contract) is applied once at the end.
-                    float w = scale * bw_level_downweight;
+                    // float w = scale;
+                    float w = scale * grad_scale * bw_level_downweight;
                     uint32_t pos_grid_local[D];
 
                     #pragma unroll
@@ -330,17 +303,6 @@ float aa_depth = 0.0f)
             }
         }
 
-        // First accumulate dL/d(input_normalized) in normalized [0,1] coords.
-        // Then map to dL/d(xyz) via the proper Jacobian transpose:
-        //   non-contract: J = inv_world_step * I  (scalar, isotropic)
-        //   contract: pipeline is  xyz → step1 (linear, scale inv_vsize_)
-        //                              → step2 (radial warp scale_trans(r) * x)
-        //                              → step3 (linear, +2 then *0.25)
-        //   J^T_step3 = 0.25 * I
-        //   J^T_step2 v = scale_trans * v + (d_scale_trans/dr) * (x_step1 · v) * x_step1 / r
-        //                 with d_scale_trans/dr = -2(r-1)/r^3 for r>1, 0 for r<=1.
-        //   J^T_step1 = inv_vsize_ * I  (= inv_world_step * I)
-        float dL_dnormalized[D];
         # pragma unroll
         for (uint32_t d = 0; d < D; d++) {
             float result = 0;
@@ -349,40 +311,12 @@ float aa_depth = 0.0f)
                 float* grad_level_feat = grad_feat + level * LD;
                 # pragma unroll
                 for (int ch = 0; ch < LD; ch++) {
-                    // grad_feat (C & L * LD), dy_dx (D * F & D * L * LD),
+                    // grad_feat (C & L * LD), dy_dx (D * F & D * L * LD), 
                     result += grad_level_feat[ch] * dy_dx[d * C + level * LD + ch];
                 }
             }
-            dL_dnormalized[d] = result;
-        }
 
-        if (!contract) {
-            // Pure scalar Jacobian.
-            #pragma unroll
-            for (uint32_t d = 0; d < D; d++) {
-                dL_dxyz[d] = inv_world_step * dL_dnormalized[d];
-            }
-        } else {
-            // Recover scale_trans and its radial derivative at this query point.
-            // Inner ball (r<=1): scale_trans=1, d_scale_trans/dr=0 -> Jacobian collapses
-            // to scalar (inv_world_step*0.25); outer (r>1): full anisotropic transpose.
-            const float r_safe = fmaxf(r_norm, 1e-8f);
-            float scale_trans = 1.0f;
-            float d_st_dr = 0.0f;
-            if (r_norm > 1.0f) {
-                const float inv_r = 1.0f / r_safe;
-                scale_trans = (2.0f - inv_r) * inv_r;             // (2 - 1/r)/r
-                d_st_dr = -2.0f * (r_norm - 1.0f) * inv_r * inv_r * inv_r;  // -2(r-1)/r^3
-            }
-            const float dot_pw_g = pre_warp[0] * dL_dnormalized[0]
-                                 + pre_warp[1] * dL_dnormalized[1]
-                                 + pre_warp[2] * dL_dnormalized[2];
-            const float radial_coef = (r_norm > 1.0f) ? (d_st_dr * dot_pw_g / r_safe) : 0.0f;
-            const float chain = 0.25f * inv_world_step;
-            #pragma unroll
-            for (uint32_t d = 0; d < D; d++) {
-                dL_dxyz[d] = chain * (scale_trans * dL_dnormalized[d] + radial_coef * pre_warp[d]);
-            }
+            dL_dxyz[d] = result;
         }
     }
 }
@@ -404,15 +338,6 @@ float aa_depth = 0.0f)
     bool flag_oob = false;
 	const uint32_t D = 3;
     float grad_scale = 0.0;
-    // Saved state for backward Jacobian transpose. Only meaningful when BW.
-    // For non-contract: inv_world_step = 1/(vmax-vmin) and the Jacobian is scalar.
-    // For contract: pre_warp[] is the centered+rescaled point (BEFORE radial warp),
-    //               r_norm is its L2 norm, inv_world_step = 2/(vmax-vmin) (= inv_vsize_).
-    // The contract Jacobian is non-isotropic in the outer (norm > 1) region; see the
-    // accumulation block at the end.
-    float inv_world_step = 0.0f;
-    float pre_warp[3] = {0.0f, 0.0f, 0.0f};
-    float r_norm = 0.0f;
 
     if(!contract){
         // warp the pos to [0, 1]
@@ -421,36 +346,28 @@ float aa_depth = 0.0f)
         inputs[1] = (xyz.y-vmin)*inv_vsize;
         inputs[2] = (xyz.z-vmin)*inv_vsize;
         grad_scale = inv_vsize;
-        inv_world_step = inv_vsize;
         flag_oob = (inputs[0] < 0 || inputs[0] > 1 || inputs[1] < 0 || inputs[1] > 1 || inputs[2] < 0 || inputs[2] > 1);
     }
     else{
         // warp the center region to [-1, 1]
         float vmid = (vmax + vmin) * 0.5;
         float inv_vsize_ = 1.0 / ((vmax - vmin) * 0.5);
-        pre_warp[0] = (xyz.x-vmid)*inv_vsize_;
-        pre_warp[1] = (xyz.y-vmid)*inv_vsize_;
-        pre_warp[2] = (xyz.z-vmid)*inv_vsize_;
-        inputs[0] = pre_warp[0];
-        inputs[1] = pre_warp[1];
-        inputs[2] = pre_warp[2];
+        inputs[0] = (xyz.x-vmid)*inv_vsize_;
+        inputs[1] = (xyz.y-vmid)*inv_vsize_;
+        inputs[2] = (xyz.z-vmid)*inv_vsize_;
         // warp the outside region to [-2, 2], then warp to [0, 1]
-        r_norm = sqrtf(pre_warp[0]*pre_warp[0] + pre_warp[1]*pre_warp[1] + pre_warp[2]*pre_warp[2]);
-        float inv_norm = 1.0f / r_norm;
-        float scale_trans = (r_norm <= 1.0f) ? 1.0f : (2.0f - inv_norm) * inv_norm;
+        float norm = sqrtf(inputs[0]*inputs[0] + inputs[1]*inputs[1] + inputs[2]*inputs[2]);
+        float inv_norm = 1.0f / norm;
+        float scale_trans = (norm <= 1.0f) ? 1.0f : (2.0f - inv_norm) * inv_norm;
         #pragma unroll
-        for (uint32_t d = 0; d < D; d++)
+        for (uint32_t d = 0; d < D; d++) 
         {
             // warp to range [-2, 2]
             inputs[d] = scale_trans * inputs[d] ;
             // norm to [0, 1]
             inputs[d] = (inputs[d] + 2.0) * 0.25f;
-        }
-        // grad_scale: scalar approximation of d_normalized/d_world used by AA only
-        // (AA wants an isotropic per-query scale). The full backward Jacobian is
-        // applied at the end of this function.
+        } 
         grad_scale = inv_vsize_ * scale_trans * 0.25f;
-        inv_world_step = inv_vsize_;
     }
 
     uint32_t max_level = min(appearance_level, L);
@@ -511,7 +428,7 @@ float aa_depth = 0.0f)
 		float results[LD] = {0};
 
 		// Nexels anti-aliasing downweight for this level.
-		const float level_downweight = hashgrid_aa_downweight(aa_depth, scale, grad_scale);
+		const float level_downweight = hashgrid_aa_downweight(aa_depth, scale);
 
 		#pragma unroll
 		for (uint32_t idx = 0; idx < (1 << D); idx++) {
@@ -600,7 +517,7 @@ float aa_depth = 0.0f)
             }
 
             // Nexels AA downweight — applies uniformly to this level's dL/dxyz.
-            const float bw_level_downweight = hashgrid_aa_downweight(aa_depth, scale, grad_scale);
+            const float bw_level_downweight = hashgrid_aa_downweight(aa_depth, scale);
 
             #pragma unroll
             for (uint32_t gd = 0; gd < D; gd++) {
@@ -609,10 +526,8 @@ float aa_depth = 0.0f)
 
                 #pragma unroll
                 for (uint32_t idx = 0; idx < (1 << (D - 1)); idx++) {
-                    // dy_dx accumulates d(feature)/d(input_normalized) for THIS level.
-                    // The world-space Jacobian (grad_scale for non-contract, the full
-                    // anisotropic transpose for contract) is applied once at the end.
-                    float w = scale * bw_level_downweight;
+                    // float w = scale;
+                    float w = scale * grad_scale * bw_level_downweight;
                     uint32_t pos_grid_local[D];
 
                     #pragma unroll
@@ -647,17 +562,6 @@ float aa_depth = 0.0f)
             }
         }
 
-        // First accumulate dL/d(input_normalized) in normalized [0,1] coords.
-        // Then map to dL/d(xyz) via the proper Jacobian transpose:
-        //   non-contract: J = inv_world_step * I  (scalar, isotropic)
-        //   contract: pipeline is  xyz → step1 (linear, scale inv_vsize_)
-        //                              → step2 (radial warp scale_trans(r) * x)
-        //                              → step3 (linear, +2 then *0.25)
-        //   J^T_step3 = 0.25 * I
-        //   J^T_step2 v = scale_trans * v + (d_scale_trans/dr) * (x_step1 · v) * x_step1 / r
-        //                 with d_scale_trans/dr = -2(r-1)/r^3 for r>1, 0 for r<=1.
-        //   J^T_step1 = inv_vsize_ * I  (= inv_world_step * I)
-        float dL_dnormalized[D];
         # pragma unroll
         for (uint32_t d = 0; d < D; d++) {
             float result = 0;
@@ -666,40 +570,12 @@ float aa_depth = 0.0f)
                 float* grad_level_feat = grad_feat + level * LD;
                 # pragma unroll
                 for (int ch = 0; ch < LD; ch++) {
-                    // grad_feat (C & L * LD), dy_dx (D * F & D * L * LD),
+                    // grad_feat (C & L * LD), dy_dx (D * F & D * L * LD), 
                     result += grad_level_feat[ch] * dy_dx[d * C + level * LD + ch];
                 }
             }
-            dL_dnormalized[d] = result;
-        }
 
-        if (!contract) {
-            // Pure scalar Jacobian.
-            #pragma unroll
-            for (uint32_t d = 0; d < D; d++) {
-                dL_dxyz[d] = inv_world_step * dL_dnormalized[d];
-            }
-        } else {
-            // Recover scale_trans and its radial derivative at this query point.
-            // Inner ball (r<=1): scale_trans=1, d_scale_trans/dr=0 -> Jacobian collapses
-            // to scalar (inv_world_step*0.25); outer (r>1): full anisotropic transpose.
-            const float r_safe = fmaxf(r_norm, 1e-8f);
-            float scale_trans = 1.0f;
-            float d_st_dr = 0.0f;
-            if (r_norm > 1.0f) {
-                const float inv_r = 1.0f / r_safe;
-                scale_trans = (2.0f - inv_r) * inv_r;             // (2 - 1/r)/r
-                d_st_dr = -2.0f * (r_norm - 1.0f) * inv_r * inv_r * inv_r;  // -2(r-1)/r^3
-            }
-            const float dot_pw_g = pre_warp[0] * dL_dnormalized[0]
-                                 + pre_warp[1] * dL_dnormalized[1]
-                                 + pre_warp[2] * dL_dnormalized[2];
-            const float radial_coef = (r_norm > 1.0f) ? (d_st_dr * dot_pw_g / r_safe) : 0.0f;
-            const float chain = 0.25f * inv_world_step;
-            #pragma unroll
-            for (uint32_t d = 0; d < D; d++) {
-                dL_dxyz[d] = chain * (scale_trans * dL_dnormalized[d] + radial_coef * pre_warp[d]);
-            }
+            dL_dxyz[d] = result;
         }
     }
 }

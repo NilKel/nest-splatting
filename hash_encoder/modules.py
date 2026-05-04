@@ -421,6 +421,14 @@ class INGP(nn.Module):
 
         lr_spec = training_args.params.spec_lr
 
+        # --nexelparam: override base LRs with Nexels' values (1e-3 init for hash + MLP)
+        # and enable exponential decay to 1e-5.
+        nexelparam = self.args is not None and getattr(self.args, 'nexelparam', False)
+        if nexelparam:
+            print(f"[NEXELPARAM] Overriding hash/MLP LR base: encoding {lr_encoding} -> 1e-3, mlp {lr_mlp_rgb} -> 1e-3 (will decay to 1e-5)")
+            lr_encoding = 1e-3
+            lr_mlp_rgb = 1e-3
+
         # Apply LR scaling for 3D_SH_res mode
         if self.args is not None and hasattr(self.args, 'res_lr_scale') and self.args.res_lr_scale != 1.0:
             if self.args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
@@ -456,8 +464,43 @@ class INGP(nn.Module):
             # Create a dummy parameter for the optimizer
             self._dummy_param = nn.Parameter(torch.zeros(1, device="cuda"))
             l.append({'params': [self._dummy_param], 'lr': 0.0, "name": "dummy"})
-        
-        self.optimizer = torch.optim.Adam(l, betas=(0.9, 0.99), eps=1e-15)
+
+        # Default beta2=0.999 (matches Nexels / Unbiased_Surfel / Adam default).
+        # Was previously 0.99; bumped after empirically matching reference projects.
+        self.optimizer = torch.optim.Adam(l, betas=(0.9, 0.999), eps=1e-15)
+
+        # --nexelparam: build exponential LR schedulers for hash + MLP groups
+        # decaying init -> init/100 over args.iterations. Schedules ride on top of
+        # res_lr_scale / hash_lr_scale, since lr_encoding/lr_mlp_rgb were already scaled.
+        self._nexel_lr_schedulers = {}
+        if nexelparam:
+            max_steps = getattr(self.args, 'iterations', 30000)
+            decay_ratio = 0.01  # 1e-3 -> 1e-5
+            sched_specs = {
+                "hash_encoding": lr_encoding,
+                "rgb_mlp": lr_mlp_rgb,
+                "mlp_3D": lr_mlp_rgb,
+                "mlp_3D_direct": lr_mlp_rgb,
+                "mlp_fused": lr_mlp_rgb,
+            }
+            for pg in self.optimizer.param_groups:
+                base = sched_specs.get(pg["name"])
+                if base is None:
+                    continue
+                self._nexel_lr_schedulers[pg["name"]] = get_expon_lr_func(
+                    lr_init=base, lr_final=base * decay_ratio, max_steps=max_steps)
+            print(f"[NEXELPARAM] Adam betas=(0.9, 0.999); decay schedule {max_steps} steps for: "
+                  f"{list(self._nexel_lr_schedulers.keys())}")
+
+    def update_nexel_lr(self, iteration):
+        """Apply --nexelparam exponential LR schedule to hash + MLP param groups.
+        No-op if --nexelparam was not set. Safe to call every iteration."""
+        if not getattr(self, '_nexel_lr_schedulers', None):
+            return
+        for pg in self.optimizer.param_groups:
+            sched = self._nexel_lr_schedulers.get(pg["name"])
+            if sched is not None:
+                pg['lr'] = sched(iteration)
 
     def build_encoding(self, cfg_encoding):
         assert(cfg_encoding.type == "hashgrid")
@@ -800,16 +843,26 @@ class INGP(nn.Module):
                 self.resolutions = []
                 self.active_hashgrid_levels = 0
             else:
-                # Build a reference 4-level progression spanning the full
-                # r_min→r_max range (4 = max hash levels for TC_INPUT_DIM=16
-                # with dim=4). Then take the FINEST hashgrid_levels from it.
-                # This means adding per-Gaussian levels peels off from the
-                # coarsest hash levels while always retaining the finest:
+                # Build a reference progression spanning the full r_min→r_max
+                # range. Reference length = MAX hash levels that fit the MLP
+                # input layout for THIS mode (TC_INPUT_DIM=16). Then take the
+                # FINEST hashgrid_levels from it. Adding per-Gaussian levels
+                # peels off from the coarsest hash levels while always retaining
+                # the finest:
+                #   3D_SH_res with dim=4 (hash | pad):       max=4 hash levels
+                #   3D_SH_res with dim=2 (hash | pad):       max=8 hash levels
+                #   3D_SH_cat with dim=4 (hash | DC(3) | bias(1) | pad): max=3
+                # Example for 3D_SH_res dim=4:
                 #   hybrid=2 → 4 hash: [128, 203, 322, 512]
-                #   hybrid=3 → 3 hash: [203, 322, 512]
+                #   hybrid=3 → 3 hash: [203, 322, 512]   (drops coarsest)
                 #   hybrid=4 → 2 hash: [322, 512]
                 #   hybrid=5 → 1 hash: [512]
-                max_hash_levels = 16 // cfg_encoding.hashgrid.dim  # 4 for dim=4
+                if self.is_3D_SH_cat_mode:
+                    # Cat layout consumes (DC_SH=3) + (bias=1) = 4 input slots,
+                    # leaving (16-4)=12 for hash → max 3 levels at dim=4.
+                    max_hash_levels = (16 - 3 - 1) // cfg_encoding.hashgrid.dim
+                else:
+                    max_hash_levels = 16 // cfg_encoding.hashgrid.dim  # 4 for dim=4, 8 for dim=2
                 if max_hash_levels > 1:
                     ref_growth_rate = np.exp((np.log(r_max) - np.log(r_min)) / (max_hash_levels - 1))
                 else:
