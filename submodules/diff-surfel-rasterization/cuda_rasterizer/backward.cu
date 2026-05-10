@@ -536,6 +536,11 @@ renderCUDAsurfelBackward(
 	__shared__ float3 collected_pk[BLOCK_SIZE];
 	__shared__ uint32_t collected_ap_level[BLOCK_SIZE];
 	__shared__ float collected_shapes[BLOCK_SIZE];  // Beta kernel shape parameter
+	// Cat-mode (render_mode==1) per-Gaussian feature cache. Capped at 5*4=20 to
+	// fit the 48KB ptxas static shared-mem limit; >5 hybrid_levels falls back to
+	// global reads.
+	#define CAT_CACHE_DIM (5 * 4)
+	__shared__ float collected_feat_pk[BLOCK_SIZE][CAT_CACHE_DIM];
 
 
 	// get total rendered points number per pixel.
@@ -585,9 +590,11 @@ renderCUDAsurfelBackward(
 	if(level > 0){
 		// For cat mode (render_mode==1), level is encoded as:
 		// (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
+		// Mask off upper bits so feature flags (e.g. lowpass=0x400, pixel_center=0x800)
+		// in render_mode don't break the strict equality check.
 		// Decode to get actual hashgrid levels for offset copying
 		int actual_levels = level;
-		if(render_mode == 1){
+		if((render_mode & 0xFF) == 1){
 			// cat mode: Extract active_hashgrid_levels from encoded value
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			actual_levels = active_hashgrid_levels;  // Use ACTIVE hashgrid levels for coarse-to-fine
@@ -599,6 +606,10 @@ renderCUDAsurfelBackward(
 		voxel_min = gridrange[0];
 		voxel_max = gridrange[1];
 	}
+
+	// Cat-mode per-Gaussian feature dim. 0 for non-cat or when dim exceeds cache.
+	int _raw_cat_dim = ((render_mode & 0xFF) == 1) ? ((level & 0xFF) * l_dim) : 0;
+	const int cat_per_gaussian_dim = (_raw_cat_dim <= CAT_CACHE_DIM) ? _raw_cat_dim : 0;
 	
 	// Dual hashgrid offsets (unused by current modes, kept for interface compatibility)
 	int collec_offsets_diffuse[16] = {0};
@@ -663,8 +674,16 @@ renderCUDAsurfelBackward(
 				collected_shapes[block.thread_rank()] = shapes[coll_id];
 			}
 
-		// NOTE: Per-Gaussian feature caching disabled due to shared memory limits
-		// Features are now queried on-demand in the per-pixel loop
+		// Cat mode: cooperatively load per-Gaussian features (hybrid_levels*l_dim
+		// floats) into shared memory once per tile; reused across all pixels in
+		// case 1 below to avoid re-reading colors[gauss_id * per_gaussian_dim].
+		if (cat_per_gaussian_dim > 0 && colors != nullptr) {
+			const float* per_gaussian_feat = &colors[coll_id * cat_per_gaussian_dim];
+			#pragma unroll
+			for (int i = 0; i < cat_per_gaussian_dim; i++) {
+				collected_feat_pk[block.thread_rank()][i] = per_gaussian_feat[i];
+			}
+		}
 		}
 		block.sync();
 
@@ -906,10 +925,18 @@ renderCUDAsurfelBackward(
 					}
 				}
 
-				// Reconstruct per-Gaussian features into feat array (if present)
+				// Reconstruct per-Gaussian features. Fast path uses shared-memory
+				// cache; fallback reads from global for per_gaussian_dim > CAT_CACHE_DIM.
 				if (hybrid_levels > 0) {
-					for(int i = 0; i < per_gaussian_dim; i++){
-						feat[i] = colors[global_id * per_gaussian_dim + i];
+					if (per_gaussian_dim <= CAT_CACHE_DIM) {
+						#pragma unroll
+						for(int i = 0; i < per_gaussian_dim; i++){
+							feat[i] = collected_feat_pk[j][i];
+						}
+					} else {
+						for(int i = 0; i < per_gaussian_dim; i++){
+							feat[i] = colors[global_id * per_gaussian_dim + i];
+						}
 					}
 				}
 

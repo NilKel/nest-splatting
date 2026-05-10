@@ -372,7 +372,10 @@ __device__ void mlp_forward_fused(
 	const __half* w2 = W2 ? W2 : mlp_W2;
 	const __half* w3 = W3 ? W3 : mlp_W3;
 
-	// Convert input to FP16 once (only first 5 are non-zero: hash(4) + bias(1))
+	// Convert input to FP16 once. For 3D_SH_res the input is [hash(hash_dim) |
+	// pad(16-hash_dim) all zeros] — NO implicit bias slot. MLP(0) ≡ 0.
+	// (3D_SH_cat / 3D_direct_fused use a different layout with input[4]=1.0
+	// as an implicit L1 bias; that path is in mode_3d_direct_fused.cu, not here.)
 	__half input_h[IN_DIM];
 	#pragma unroll
 	for (int i = 0; i < IN_DIM; i++)

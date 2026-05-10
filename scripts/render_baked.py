@@ -45,12 +45,71 @@ def load_training_config(model_path):
     raise FileNotFoundError(f"No training config found in {model_path}")
 
 
+def _make_sv_eval(gaussians):
+    """Per-frame SV → fake-SH-DC closure.
+
+    Mirrors gaussian_renderer/_build_fake_shs_from_SV: evaluates the
+    Spherical-Voronoi softmax mix in torch and packs the result into the
+    SH-DC slot so the existing CUDA `computeColorFromSH` reproduces
+    `relu(feat + sh_bias)` via `clamp(SH_C0 · fake_dc + sh_bias, 0)`.
+    Option A — no CUDA changes; per-frame torch overhead ~1 ms/view on a 5090.
+    """
+    from gaussian_renderer import eval_voronoi_sv_feat
+    SH_C0 = 0.28209479177387814
+
+    sv_sites = gaussians._sv_sites
+    sv_colors = gaussians._sv_colors
+    sv_tau_raw = getattr(gaussians, '_sv_tau', None)
+    sv_tau = (torch.exp(sv_tau_raw)
+              if sv_tau_raw is not None and sv_tau_raw.numel() > 0
+              else None)
+    sv_dc_param = getattr(gaussians, '_sv_dc', None)
+    sv_dc = (sv_dc_param
+             if sv_dc_param is not None and sv_dc_param.numel() > 0
+             else None)
+    sv_mask = getattr(gaussians, '_sv_mask', None)
+    apply_mask = (
+        sv_mask is not None
+        and (not getattr(gaussians, '_sv_training_flag', True))
+        and sv_mask.shape[0] == sv_sites.shape[0]
+    )
+    sites_mask_tensor = sv_mask if apply_mask else None
+
+    means3D = gaussians.get_xyz
+    N = means3D.shape[0]
+    M = (gaussians.active_sh_degree + 1) ** 2
+
+    def _eval(viewpoint_camera):
+        cam_center = viewpoint_camera.camera_center.to(means3D.device)
+        view_dirs = means3D - cam_center.unsqueeze(0)
+        view_dirs = view_dirs / (view_dirs.norm(dim=-1, keepdim=True) + 1e-8)
+
+        feat = eval_voronoi_sv_feat(
+            sv_sites, sv_colors, view_dirs,
+            sv_tau=sv_tau, sites_mask=sites_mask_tensor)
+        if sv_dc is not None:
+            feat = feat + sv_dc
+
+        fake = torch.zeros((N, M, 3), dtype=feat.dtype, device=feat.device)
+        fake[:, 0, :] = feat / SH_C0
+        return fake.contiguous()
+
+    return _eval
+
+
 def render_baked(viewpoint_camera, gaussians, pipe, background,
                  residual_textures=None, beta=0.0, kernel_type=0,
                  atlas_texture=None, atlas_rects=None, atlas_width=0,
                  aabb_mode=3,
-                 sb_params=None, sb_number=0):
-    """Render using diff_surfel_bake_render submodule (SH + residual textures)."""
+                 sb_params=None, sb_number=0,
+                 sv_eval=None):
+    """Render using diff_surfel_bake_render submodule (SH + residual textures).
+
+    `sv_eval`: optional `(viewpoint_camera) -> fake_shs` callback. When set
+    (i.e. trained model used --feature SV), the returned tensor replaces
+    `gaussians.get_features` for this frame so the existing SH path produces
+    the SV softmax color via the SH-DC slot.
+    """
     from diff_surfel_bake_render import GaussianRasterizationSettings, GaussianRasterizer
 
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -80,7 +139,7 @@ def render_baked(viewpoint_camera, gaussians, pipe, background,
 
     scales = gaussians.get_scaling
     rotations = gaussians.get_rotation
-    shs = gaussians.get_features
+    shs = gaussians.get_features if sv_eval is None else sv_eval(viewpoint_camera)
 
     shapes = None
     if kernel_type > 0 and hasattr(gaussians, '_shape') and gaussians._shape is not None and gaussians._shape.numel() > 0:
@@ -109,8 +168,13 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                   residual_textures, save_dir, num_warmup, num_benchmark,
                   atlas_texture=None, atlas_rects=None, atlas_width=0,
                   aabb_mode=3,
-                  sb_params=None, sb_number=0):
-    """Render all test views, compute metrics, benchmark FPS. Save images to save_dir."""
+                  sb_params=None, sb_number=0,
+                  sv_eval=None):
+    """Render all test views, compute metrics, benchmark FPS. Save images to save_dir.
+
+    `sv_eval`: optional callback `(camera) -> fake_shs` for --feature SV models;
+    bypasses the stored SH and injects per-frame Voronoi color via SH-DC slot.
+    """
     os.makedirs(save_dir, exist_ok=True)
 
     psnrs, l1s, ssims = [], [], []
@@ -124,7 +188,8 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                                  atlas_width=atlas_width,
                                  aabb_mode=aabb_mode,
                                  sb_params=sb_params,
-                                 sb_number=sb_number)
+                                 sb_number=sb_number,
+                                 sv_eval=sv_eval)
             rendered = result["render"]
             gt = cam.original_image[:3].cuda()
 
@@ -147,7 +212,8 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                             atlas_width=atlas_width,
                             aabb_mode=aabb_mode,
                             sb_params=sb_params,
-                            sb_number=sb_number)
+                            sb_number=sb_number,
+                            sv_eval=sv_eval)
         torch.cuda.synchronize()
 
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_benchmark)]
@@ -163,7 +229,8 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                             atlas_width=atlas_width,
                             aabb_mode=aabb_mode,
                             sb_params=sb_params,
-                            sb_number=sb_number)
+                            sb_number=sb_number,
+                            sv_eval=sv_eval)
             ends[i].record()
         torch.cuda.synchronize()
         times_ms = [starts[i].elapsed_time(ends[i]) for i in range(num_benchmark)]
@@ -332,6 +399,21 @@ def main():
     print(f"[RENDER] Reloaded baked PLY after Scene init: {N:,} Gaussians")
     print(f"[RENDER] {len(test_cameras)} test cameras")
 
+    # --feature SV: route per-frame fake-SH-DC eval through render_baked.
+    # bake_meta records `feature_mode='SV'` + `sv_number`; load_ply has just
+    # restored _sv_sites/_sv_colors/_sv_tau/_sv_dc onto the model.
+    _feat_mode_render = bake_meta.get("feature_mode", "sh")
+    gaussians.feature_mode = _feat_mode_render
+    sv_eval_cb = None
+    if _feat_mode_render == "SV":
+        sv_K = int(bake_meta.get("sv_number", 0))
+        if (not hasattr(gaussians, '_sv_sites')) or gaussians._sv_sites.numel() == 0:
+            raise RuntimeError(
+                f"bake_meta says feature_mode='SV' (K={sv_K}) but baked PLY "
+                f"didn't restore _sv_sites — re-bake with the SV-aware save_ply.")
+        print(f"[RENDER] feature_mode=SV: K={sv_K} (per-frame torch fake-SH-DC eval)")
+        sv_eval_cb = _make_sv_eval(gaussians)
+
     beta = cfg_model.surfel.tg_beta
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
@@ -356,6 +438,7 @@ def main():
         aabb_mode=aabb_mode,
         sb_params=sb_params,
         sb_number=sb_number,
+        sv_eval=sv_eval_cb,
     )
     all_metrics["sh_only"] = sh_metrics
     print(f"  PSNR: {sh_metrics['psnr']:.2f} dB  |  SSIM: {sh_metrics['ssim']:.4f}  |  "
@@ -379,6 +462,7 @@ def main():
             aabb_mode=aabb_mode,
             sb_params=sb_params,
             sb_number=sb_number,
+            sv_eval=sv_eval_cb,
         )
         all_metrics[mode_name] = res_metrics
         print(f"  PSNR: {res_metrics['psnr']:.2f} dB  |  SSIM: {res_metrics['ssim']:.4f}  |  "

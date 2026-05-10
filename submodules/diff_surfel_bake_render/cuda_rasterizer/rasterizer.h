@@ -56,7 +56,14 @@ namespace CudaRasterizer
 			cudaTextureObject_t atlas_tex_obj = 0,
 			float atlas_offset = 0.0f,
 			float atlas_scale = 1.0f,
-			const int sort_mode = 0);  // 0 = legacy 64-bit single sort, 1 = FastGS two-stage
+			const int sort_mode = 0,  // 0 = legacy 64-bit single sort, 1 = FastGS two-stage
+			// --feature SV: per-Gaussian voronoi state. Pre-activated:
+			// sites = unit vectors, tau = exp(_sv_tau), colors = raw RGB.
+			// Empty / voronoi_K == 0 ⇒ legacy SH path.
+			const float* voronoi_sites = nullptr,
+			const float* voronoi_tau = nullptr,
+			const float* voronoi_colors = nullptr,
+			const int voronoi_K = 0);
 	};
 };
 

@@ -40,6 +40,17 @@ RasterizeGaussiansCUDA(
 	// Optional Spherical-Beta params [N, K, 6], K=sb_number (empty if SB disabled)
 	const torch::Tensor& sb_params,
 	const int sb_number,
+	// Optional Spherical-Voronoi state (--feature SV). Pre-activated tensors:
+	//   voronoi_sites  [N, K, 3]  unit vectors (caller does F.normalize(_sv_sites))
+	//   voronoi_tau    [N, K]     post-exp scalars (caller does torch.exp(_sv_tau))
+	//   voronoi_colors [N, K, 3]  raw RGB (no activation; ReLU + sh_bias in CUDA)
+	// When voronoi_K > 0 AND colors_precomp is empty, preprocessCUDA replaces
+	// computeColorFromSH with computeColorFromVoronoi (per-Gaussian fused).
+	// Bit-equivalent to nest's torch eval_voronoi_sv → fake-SH-DC path.
+	const torch::Tensor& voronoi_sites,
+	const torch::Tensor& voronoi_tau,
+	const torch::Tensor& voronoi_colors,
+	const int voronoi_K,
 	// Persistent scratch buffers (resized in place when growth is needed).
 	torch::Tensor geomBuffer,
 	torch::Tensor binningBuffer,

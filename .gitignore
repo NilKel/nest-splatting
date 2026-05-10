@@ -100,6 +100,17 @@ slurm_jobs/
 *.zip
 *.tar.gz
 *.rar
+metrics_reports/
+slurm_jobs/
+configs/
+# NEVER TRACK THESE - BULLETPROOF PROTECTION
+data/
+outputs/
+metrics_reports/
+*.pth
+*.pt
+*.npz
+*.npy
 
 # ECCV supplemental
 eccv_suppl/

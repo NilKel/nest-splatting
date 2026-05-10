@@ -246,6 +246,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.transMat, P * 9, 128);
 	obtain(chunk, geom.normal_opacity, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);   // FP16 — halves inner-loop fetch bandwidth
+	obtain(chunk, geom.sb_rgb, P * 3, 128); // SB per-Gaussian color (preprocessCUDA writes, renderBakedCUDA reads when sb_number>0)
 	obtain(chunk, geom.conic_t, P, 128);   // SnugBox conic — used when aabb_mode==2/5
 	// Legacy single-sort buffers.
 	obtain(chunk, geom.tiles_touched, P, 128);
@@ -333,7 +334,11 @@ int CudaRasterizer::Rasterizer::forward(
 	cudaTextureObject_t atlas_tex_obj,
 	float atlas_offset,
 	float atlas_scale,
-	const int sort_mode)
+	const int sort_mode,
+	const float* voronoi_sites,
+	const float* voronoi_tau,
+	const float* voronoi_colors,
+	const int voronoi_K)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -399,7 +404,15 @@ int CudaRasterizer::Rasterizer::forward(
 		prefiltered,
 		shapes,
 		kernel_type,
-		aabb_mode
+		aabb_mode,
+		voronoi_sites,
+		voronoi_tau,
+		voronoi_colors,
+		voronoi_K,
+		// SB fused: preprocess writes per-Gauss RGB to geomState.sb_rgb; render reads it.
+		sb_params,
+		sb_number,
+		geomState.sb_rgb
 	), debug)
 
 	int num_rendered = 0;
@@ -543,6 +556,7 @@ int CudaRasterizer::Rasterizer::forward(
 		atlas_width,
 		sb_params,
 		sb_number,
+		geomState.sb_rgb,    // SB per-Gauss precomputed colors (filled by preprocess above)
 		atlas_tex_obj,
 		atlas_offset,
 		atlas_scale), debug)

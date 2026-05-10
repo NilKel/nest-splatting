@@ -83,6 +83,7 @@ def rasterize_gaussians(
     shapes=None, kernel_type=0,
     atlas_texture=None, atlas_rects=None, atlas_width=0,
     sb_params=None, sb_number=0,
+    voronoi_sites=None, voronoi_tau=None, voronoi_colors=None, voronoi_K=0,
 ):
     return _RasterizeGaussians.apply(
         means3D, sh, colors_precomp, opacities,
@@ -90,6 +91,7 @@ def rasterize_gaussians(
         shapes, kernel_type,
         atlas_texture, atlas_rects, atlas_width,
         sb_params, sb_number,
+        voronoi_sites, voronoi_tau, voronoi_colors, voronoi_K,
     )
 
 
@@ -101,6 +103,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         shapes, kernel_type,
         atlas_texture, atlas_rects, atlas_width,
         sb_params, sb_number,
+        voronoi_sites, voronoi_tau, voronoi_colors, voronoi_K,
     ):
         device = means3D.device
 
@@ -113,6 +116,14 @@ class _RasterizeGaussians(torch.autograd.Function):
             atlas_rects = _empty(device, 'f32', torch.float32)
         if sb_params is None:
             sb_params = _empty(device, 'f32', torch.float32)
+        # Voronoi (--feature SV): all three required together; voronoi_K==0
+        # disables and falls through to SH path.
+        if voronoi_sites is None:
+            voronoi_sites = _empty(device, 'f32', torch.float32)
+        if voronoi_tau is None:
+            voronoi_tau = _empty(device, 'f32', torch.float32)
+        if voronoi_colors is None:
+            voronoi_colors = _empty(device, 'f32', torch.float32)
 
         scratch = _scratch_buffers(device)
         H = settings.image_height
@@ -149,6 +160,10 @@ class _RasterizeGaussians(torch.autograd.Function):
             settings.aabb_mode,
             sb_params,
             sb_number,
+            voronoi_sites,
+            voronoi_tau,
+            voronoi_colors,
+            voronoi_K,
             scratch['geom'],
             scratch['binning'],
             scratch['img'],
@@ -192,6 +207,12 @@ class GaussianRasterizer(nn.Module):
                 scales=None, rotations=None, shapes=None, kernel_type=0,
                 atlas_texture=None, atlas_rects=None, atlas_width=0,
                 sb_params=None, sb_number=0,
+                # --feature SV fused-CUDA path: pre-activated SV state.
+                # Pass all three populated tensors + voronoi_K>0 to skip the
+                # SH/fake-SH-DC roundtrip and let preprocessCUDA call
+                # computeColorFromVoronoi directly.
+                voronoi_sites=None, voronoi_tau=None, voronoi_colors=None,
+                voronoi_K=0,
                 # Backward-compat: old callers passed `means2D` / `residual_textures`,
                 # both unused now. Accept silently.
                 means2D=None, residual_textures=None):
@@ -217,6 +238,7 @@ class GaussianRasterizer(nn.Module):
             shapes, kernel_type,
             atlas_texture, atlas_rects, atlas_width,
             sb_params, sb_number,
+            voronoi_sites, voronoi_tau, voronoi_colors, voronoi_K,
         )
 
 

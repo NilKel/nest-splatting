@@ -39,6 +39,8 @@ if [ $# -lt 2 ]; then
     echo "  nerf_synthetic: chair, drums, ficus, hotdog, lego, materials, mic, ship"
     echo "  DTU: scan24, scan37, scan40, scan55, scan63, scan65, scan69, scan83, scan97, scan105, scan106, scan110, scan114, scan118, scan122"
     echo "  mip_360: bicycle, bonsai, counter, garden, kitchen, room, stump, flowers, treehill"
+    echo "  tnt:     train, truck                    (Tanks & Temples — full res, configs/tandt.yaml)"
+    echo "  db:      drjohnson, playroom             (Deep Blending  — full res, configs/db.yaml)"
     exit 1
 fi
 
@@ -75,9 +77,28 @@ case "$DATASET" in
         MIP360_OUTDOOR_SCENES="bicycle flowers garden stump treehill"
         MIP360_INDOOR_SCENES="room counter kitchen bonsai"
         ;;
+    tnt)
+        # Tanks & Temples (object-centric outdoor: truck + train).
+        # Full-res images, single yaml, no -i downsample (matches official
+        # 3DGS full_eval and our T&T-vs-mip-360 analysis).
+        DATA_DIR="/home/nilkel/Projects/data/tnt"
+        YAML_CONFIG="./configs/tandt.yaml"
+        ALL_SCENES="train,truck"
+        DATASET_PATH="tnt"
+        RESOLUTION_ARG=""
+        ;;
+    db)
+        # Deep Blending (multi-room indoor: drjohnson + playroom).
+        # Full-res images, single yaml, no -i downsample.
+        DATA_DIR="/home/nilkel/Projects/data/db"
+        YAML_CONFIG="./configs/db.yaml"
+        ALL_SCENES="drjohnson,playroom"
+        DATASET_PATH="db"
+        RESOLUTION_ARG=""
+        ;;
     *)
         echo "ERROR: Unknown dataset '$DATASET'"
-        echo "Available datasets: nerf_synthetic, DTU, mip_360"
+        echo "Available datasets: nerf_synthetic, DTU, mip_360, tnt, db"
         exit 1
         ;;
 esac

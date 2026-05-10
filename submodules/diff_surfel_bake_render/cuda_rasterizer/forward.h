@@ -47,7 +47,21 @@ namespace FORWARD
 		bool prefiltered,
 		const float* shapes,
 		const int kernel_type,
-		const int aabb_mode = 3);
+		const int aabb_mode = 3,
+		// --feature SV: optional per-Gaussian Spherical-Voronoi state. When
+		// voronoi_K > 0 AND colors_precomp == nullptr, preprocessCUDA calls
+		// computeColorFromVoronoi instead of computeColorFromSH. Pre-activated:
+		// sites = unit vectors, tau = post-exp scalars, colors = raw RGB.
+		const float* voronoi_sites = nullptr,
+		const float* voronoi_tau = nullptr,
+		const float* voronoi_colors = nullptr,
+		const int voronoi_K = 0,
+		// SB precompute hook: when sb_number > 0, preprocessCUDA also calls
+		// `eval_sb` and writes per-Gauss RGB to `sb_rgb_out` (P*3 fp16). The
+		// render kernel then reads from there instead of recomputing per-pixel.
+		const float* sb_params = nullptr,
+		const int sb_number = 0,
+		__half* sb_rgb_out = nullptr);
 
 	void render(
 		const dim3 grid, dim3 block,
@@ -71,6 +85,8 @@ namespace FORWARD
 		const int atlas_width,
 		const float* sb_params = nullptr,
 		const int sb_number = 0,
+		// Per-Gauss SB RGB precomputed in preprocessCUDA. Read when sb_number > 0.
+		const __half* sb_rgb_in = nullptr,
 		cudaTextureObject_t atlas_tex_obj = 0,
 		float atlas_offset = 0.0f,
 		float atlas_scale = 1.0f);

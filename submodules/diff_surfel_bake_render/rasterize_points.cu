@@ -305,6 +305,17 @@ RasterizeGaussiansCUDA(
 	// Optional Spherical-Beta params [N, K, 6], K=sb_number (empty if SB disabled)
 	const torch::Tensor& sb_params,
 	const int sb_number,
+	// Optional Spherical-Voronoi params: pre-activated tensors. Empty (numel==0)
+	// or voronoi_K==0 ⇒ SH path. When all three are set the rasterizer skips
+	// computeColorFromSH entirely and uses computeColorFromVoronoi (fused into
+	// preprocessCUDA, no extra kernel launch — same per-Gaussian dispatch as SH).
+	//   voronoi_sites  : [N, K, 3] unit vectors  (caller does F.normalize)
+	//   voronoi_tau    : [N, K]    post-exp scalars (caller does torch.exp(_sv_tau))
+	//   voronoi_colors : [N, K, 3] raw RGB  (no activation; ReLU applied in CUDA)
+	const torch::Tensor& voronoi_sites,
+	const torch::Tensor& voronoi_tau,
+	const torch::Tensor& voronoi_colors,
+	const int voronoi_K,
 	// Persistent scratch buffers (resized in place when growth is needed).
 	torch::Tensor geomBuffer,
 	torch::Tensor binningBuffer,
@@ -416,6 +427,17 @@ RasterizeGaussiansCUDA(
 		const float* sb_params_ptr = (sb_params.numel() > 0 && sb_number > 0)
 			? sb_params.contiguous().data<float>() : nullptr;
 
+		// Voronoi pointers — null-safe extraction. Caller passes empty tensors
+		// or voronoi_K=0 to disable. We require all three populated together.
+		const float* voronoi_sites_ptr = (voronoi_sites.numel() > 0 && voronoi_K > 0)
+			? voronoi_sites.contiguous().data<float>() : nullptr;
+		const float* voronoi_tau_ptr = (voronoi_tau.numel() > 0 && voronoi_K > 0)
+			? voronoi_tau.contiguous().data<float>() : nullptr;
+		const float* voronoi_colors_ptr = (voronoi_colors.numel() > 0 && voronoi_K > 0)
+			? voronoi_colors.contiguous().data<float>() : nullptr;
+		const int voronoi_K_eff =
+			(voronoi_sites_ptr && voronoi_tau_ptr && voronoi_colors_ptr) ? voronoi_K : 0;
+
 		// Camera matrices (viewmatrix / projmatrix) come from PyTorch with a
 		// transpose applied — they're strided views, NOT contiguous. The
 		// kernel assumes row-major dense layout, so .contiguous() is required.
@@ -456,7 +478,11 @@ RasterizeGaussiansCUDA(
 			atlas_tex_obj,
 			atlas_offset,
 			atlas_scale,
-			sort_mode);
+			sort_mode,
+			voronoi_sites_ptr,
+			voronoi_tau_ptr,
+			voronoi_colors_ptr,
+			voronoi_K_eff);
 	}
 
 	return std::make_tuple(geomBuffer, binningBuffer, imgBuffer);

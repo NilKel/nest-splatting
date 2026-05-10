@@ -359,7 +359,8 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
                  '_scaling', '_rotation', '_appearance_level',
                  '_gaussian_features', '_shape', '_flex_beta',
                  '_sb_params', '_sg_directions', '_sg_sharpness_sg', '_sg_rgb',
-                 '_sv_sites', '_sv_colors', '_gamma', '_adaptive_features',
+                 '_sv_sites', '_sv_colors', '_sv_tau', '_sv_dc',
+                 '_gamma', '_adaptive_features',
                  '_adaptive_cat_weight', '_adaptive_zero_weight', '_gate_logits']
         n_total = keep_mask.shape[0]
         for attr in attrs:
@@ -729,15 +730,130 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
 # ---------------------------------------------------------------------------
 # Render baked model
 # ---------------------------------------------------------------------------
+def _make_sv_state(gaussians):
+    """Snapshot pre-activated SV tensors for the fused-CUDA voronoi path.
+
+    Returns a dict `{sites, tau, colors, K}` ready to pass to the rasterizer
+    via `voronoi_sites/voronoi_tau/voronoi_colors/voronoi_K`. The CUDA kernel
+    (`computeColorFromVoronoi`) expects normalized sites + post-exp tau +
+    raw colors (ReLU applied inside the kernel via the existing sh_bias).
+
+    Eval-time site mask: bit-equivalent to the torch path's
+    `where(mask, dir, vec3(1e8))` trick — masked sites get distance ≈ 1e8
+    so their softmax weight ≈ 0.
+    """
+    sv_sites = gaussians._sv_sites                            # [N, K, 3]
+    if sv_sites.numel() == 0:
+        return None
+    K = sv_sites.shape[1]
+
+    sites_n = torch.nn.functional.normalize(sv_sites, dim=-1)
+    sv_tau_raw = getattr(gaussians, '_sv_tau', None)
+    if sv_tau_raw is not None and sv_tau_raw.numel() > 0:
+        tau = torch.exp(sv_tau_raw)                           # [N, K]
+    else:
+        tau = torch.norm(sv_sites, dim=-1)                    # legacy: ||sites||
+
+    sv_mask = getattr(gaussians, '_sv_mask', None)
+    apply_mask = (
+        sv_mask is not None
+        and (not getattr(gaussians, '_sv_training_flag', True))
+        and sv_mask.shape[0] == sv_sites.shape[0]
+    )
+    if apply_mask:
+        # Bake the mask into sites: dead sites → vec3(1e8) so their
+        # softmax-distance logit ≈ -inf. Same trick as eval_voronoi_sv_feat.
+        far = torch.full_like(sites_n, 1e8)
+        sites_n = torch.where(sv_mask.unsqueeze(-1), sites_n, far)
+
+    sv_dc_param = getattr(gaussians, '_sv_dc', None)
+    if sv_dc_param is not None and sv_dc_param.numel() > 0:
+        # --sv_dc legacy mode: bake the DC into all K colors so
+        # softmax(W) · (colors+dc) = (softmax(W) · colors) + dc (since W sums to 1).
+        colors = (gaussians._sv_colors + sv_dc_param.unsqueeze(1)).contiguous()
+    else:
+        colors = gaussians._sv_colors.contiguous()
+
+    return {
+        'sites': sites_n.contiguous(),                        # [N, K, 3]
+        'tau':   tau.contiguous(),                            # [N, K]
+        'colors': colors,                                     # [N, K, 3]
+        'K':     int(K),
+    }
+
+
+def _make_sv_eval(gaussians):
+    """Legacy Option-A torch path (per-frame fake-SH-DC). Kept for parity-
+    debug only — production benches go through `_make_sv_state` + the fused
+    CUDA voronoi kernel.
+    """
+    from gaussian_renderer import eval_voronoi_sv_feat
+
+    SH_C0 = 0.28209479177387814
+
+    # Snapshot the SV tensors once — they're constant for the whole render.
+    sv_sites = gaussians._sv_sites
+    sv_colors = gaussians._sv_colors
+    sv_tau_raw = getattr(gaussians, '_sv_tau', None)
+    sv_tau = (torch.exp(sv_tau_raw)
+              if sv_tau_raw is not None and sv_tau_raw.numel() > 0
+              else None)
+    sv_dc_param = getattr(gaussians, '_sv_dc', None)
+    sv_dc = (sv_dc_param
+             if sv_dc_param is not None and sv_dc_param.numel() > 0
+             else None)
+
+    # Eval-time site mask (set by gaussians.update_sites_mask()) — applied
+    # only at inference, mirroring nest's `_nn_sites[~mask] = 1e8` trick.
+    sv_mask = getattr(gaussians, '_sv_mask', None)
+    apply_mask = (
+        sv_mask is not None
+        and (not getattr(gaussians, '_sv_training_flag', True))
+        and sv_mask.shape[0] == sv_sites.shape[0]
+    )
+    sites_mask_tensor = sv_mask if apply_mask else None
+
+    means3D = gaussians.get_xyz                      # [N, 3]
+    N = means3D.shape[0]
+    M = (gaussians.active_sh_degree + 1) ** 2
+
+    def _eval(viewpoint_camera):
+        cam_center = viewpoint_camera.camera_center.to(means3D.device)
+        view_dirs = means3D - cam_center.unsqueeze(0)
+        view_dirs = view_dirs / (view_dirs.norm(dim=-1, keepdim=True) + 1e-8)
+
+        feat = eval_voronoi_sv_feat(
+            sv_sites, sv_colors, view_dirs,
+            sv_tau=sv_tau, sites_mask=sites_mask_tensor)
+        if sv_dc is not None:
+            feat = feat + sv_dc
+
+        # SH-DC slot trick: rasterizer evaluates SH_C0 * fake_dc + sh_bias =
+        # feat + sh_bias, then clamps. Higher orders stay zero.
+        fake = torch.zeros((N, M, 3), dtype=feat.dtype, device=feat.device)
+        fake[:, 0, :] = feat / SH_C0
+        return fake.contiguous()
+
+    return _eval
+
+
 def render_baked(viewpoint_camera, gaussian_pkg, background,
                  beta=0.0, sh_degree=3, aabb_mode=3, sort_mode=0,
                  atlas_texture=None, atlas_rects=None, atlas_width=0,
-                 sb_params=None, sb_number=0):
+                 sb_params=None, sb_number=0,
+                 sv_state=None):
     """Render one view. `gaussian_pkg` is the dict from
     `prepare_gaussian_inputs(gaussians, ...)` — pre-activated tensors that are
     constant for the whole scene.
 
     `sort_mode`: 0 = legacy 64-bit single sort, 1 = FastGS two-stage sort.
+
+    `sv_state`: optional dict `{sites, tau, colors, K}` from `_make_sv_state`.
+    When set, the rasterizer's `voronoi_*` inputs activate the fused CUDA
+    SV path — `preprocessCUDA` calls `computeColorFromVoronoi` directly,
+    skipping the SH branch.  `gaussian_pkg['shs']` is still passed (and
+    ignored in CUDA when voronoi_K > 0) so the wrapper's "exactly one of
+    shs/colors_precomp" guard stays happy.
     """
     from diff_surfel_bake_render import get_rasterizer
 
@@ -755,6 +871,13 @@ def render_baked(viewpoint_camera, gaussian_pkg, background,
         sh_degree=sh_degree, beta=beta, aabb_mode=aabb_mode, sort_mode=sort_mode,
     )
 
+    if sv_state is not None:
+        v_sites, v_tau, v_colors, v_K = (
+            sv_state['sites'], sv_state['tau'], sv_state['colors'], sv_state['K'])
+    else:
+        v_sites = v_tau = v_colors = None
+        v_K = 0
+
     color, _ = rasterizer(
         means3D=gaussian_pkg['means3D'],
         opacities=gaussian_pkg['opacities'],
@@ -768,6 +891,10 @@ def render_baked(viewpoint_camera, gaussian_pkg, background,
         atlas_width=atlas_width,
         sb_params=sb_params,
         sb_number=sb_number,
+        voronoi_sites=v_sites,
+        voronoi_tau=v_tau,
+        voronoi_colors=v_colors,
+        voronoi_K=v_K,
     )
     return color
 
@@ -776,8 +903,13 @@ def evaluate_baked(test_cameras, gaussians, bg_color, beta, kernel_type,
                    atlas_texture=None, atlas_rects=None,
                    atlas_width=0, num_warmup=10, num_benchmark=100, save_dir=None,
                    aabb_mode=3, sort_mode=0,
-                   sb_params=None, sb_number=0):
-    """Render all test views, compute metrics, benchmark FPS."""
+                   sb_params=None, sb_number=0,
+                   sv_state=None):
+    """Render all test views, compute metrics, benchmark FPS.
+
+    `sv_state`: optional dict from `_make_sv_state` — activates the fused
+    CUDA voronoi color path. None ⇒ standard SH path.
+    """
     from diff_surfel_bake_render import prepare_gaussian_inputs
 
     # Snapshot post-activation tensors once for the whole scene.
@@ -788,7 +920,8 @@ def evaluate_baked(test_cameras, gaussians, bg_color, beta, kernel_type,
     kwargs = dict(atlas_texture=atlas_texture, atlas_rects=atlas_rects,
                   atlas_width=atlas_width, aabb_mode=aabb_mode, sort_mode=sort_mode,
                   sb_params=sb_params, sb_number=sb_number,
-                  sh_degree=gaussians.active_sh_degree)
+                  sh_degree=gaussians.active_sh_degree,
+                  sv_state=sv_state)
 
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
@@ -983,7 +1116,7 @@ def main():
                          '_shape', '_flex_beta',
                          '_sb_params',
                          '_sg_directions', '_sg_sharpness_sg', '_sg_rgb',
-                         '_sv_sites', '_sv_colors',
+                         '_sv_sites', '_sv_colors', '_sv_tau', '_sv_dc',
                          '_gamma', '_adaptive_features',
                          '_adaptive_cat_weight', '_adaptive_zero_weight',
                          '_gate_logits']:
@@ -1100,6 +1233,18 @@ def main():
             torch.save(sb_tensor, os.path.join(output_dir, "sb_params.pt"))
             print(f"[BAKE] Saved sb_params.pt  shape={list(sb_tensor.shape)}  "
                   f"(K={bake_meta['sb_number']} lobes)")
+
+        # --feature SV: SV state is carried inside the baked PLY (sv_site_*,
+        # sv_col_*, sv_tau_*, optional sv_dc_*) via GaussianModel.save_ply.
+        # bake_meta records K + dc-flag so the render side can flip into the
+        # SV color path on load (Option A: per-frame torch _build_fake_shs_from_SV
+        # — no CUDA kernel changes).
+        if _feature_mode_train == "SV" and hasattr(gaussians, '_sv_sites') and gaussians._sv_sites.numel() > 0:
+            bake_meta["sv_number"] = int(gaussians._sv_sites.shape[1])
+            bake_meta["sv_has_dc"] = bool(
+                hasattr(gaussians, '_sv_dc') and gaussians._sv_dc.numel() > 0)
+            print(f"[BAKE] --feature SV: K={bake_meta['sv_number']} sites/Gaussian, "
+                  f"sv_dc={'on' if bake_meta['sv_has_dc'] else 'off'} (in baked.ply)")
 
         meta_path = os.path.join(output_dir, "bake_meta.json")
         with open(meta_path, 'w') as f:
@@ -1237,6 +1382,25 @@ def main():
     gaussians.base_opacity = cfg.surfel.tg_base_alpha
     print(f"[RENDER] {len(test_cameras)} test cameras")
 
+    # Activate the SV color path (Option A) when the trained feature_mode was
+    # 'SV'. load_ply just round-tripped _sv_sites/_sv_colors/_sv_tau/_sv_dc;
+    # setting feature_mode lets render_baked decide to inject per-frame fake
+    # shs via _build_fake_shs_from_SV. No CUDA changes — the rasterizer sees
+    # the SV-evaluated color through the existing SH-DC slot.
+    _feat_mode_render = bake_meta_render.get("feature_mode", "sh")
+    gaussians.feature_mode = _feat_mode_render
+    sv_state = None
+    if _feat_mode_render == "SV":
+        sv_K = int(bake_meta_render.get("sv_number", 0))
+        sv_dc_on = bool(bake_meta_render.get("sv_has_dc", False))
+        if (not hasattr(gaussians, '_sv_sites')) or gaussians._sv_sites.numel() == 0:
+            raise RuntimeError(
+                f"bake_meta says feature_mode='SV' (K={sv_K}) but the baked PLY "
+                f"didn't restore _sv_sites — was it saved with the SV-aware save_ply?")
+        print(f"[RENDER] feature_mode=SV active: K={sv_K}, sv_dc={'on' if sv_dc_on else 'off'} "
+              f"(fused CUDA voronoi path)")
+        sv_state = _make_sv_state(gaussians)
+
     beta = cfg.surfel.tg_beta
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
@@ -1249,7 +1413,8 @@ def main():
         test_cameras, gaussians, bg_color, beta, kernel_type,
         num_warmup=bargs.num_warmup, num_benchmark=bargs.num_benchmark,
         save_dir=sh_save_dir, aabb_mode=bargs.aabb_mode, sort_mode=bargs.sort_mode,
-        sb_params=sb_params, sb_number=sb_number)
+        sb_params=sb_params, sb_number=sb_number,
+        sv_state=sv_state)
 
     # --- SH + Atlas residual ---
     atlas_save_dir = os.path.join(render_dir, "sh_atlas")
@@ -1260,7 +1425,8 @@ def main():
         atlas_width=atlas_width,
         num_warmup=bargs.num_warmup, num_benchmark=bargs.num_benchmark,
         save_dir=atlas_save_dir, aabb_mode=bargs.aabb_mode, sort_mode=bargs.sort_mode,
-        sb_params=sb_params, sb_number=sb_number)
+        sb_params=sb_params, sb_number=sb_number,
+        sv_state=sv_state)
 
     # =====================================================================
     # 4. Summary

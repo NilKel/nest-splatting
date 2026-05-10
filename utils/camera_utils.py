@@ -51,7 +51,7 @@ def loadCam(args, id, cam_info, resolution_scale):
         resized_image_rgb = torch.cat([PILtoTorch(im, resolution) for im in cam_info.image.split()[:3]], dim=0)
         loaded_mask = PILtoTorch(cam_info.image.split()[3], resolution)
         gt_image = resized_image_rgb
-        
+
         gt_image = gt_image * loaded_mask
 
         # if cam_info.image_name == '0026':

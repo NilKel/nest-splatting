@@ -61,6 +61,18 @@ def get_expon_lr_func(
 
     return helper
 
+
+def get_cosine_lr_func(lr_init, lr_final, warmup_steps, freeze_steps):
+    """Cosine decay from lr_init to lr_final in [warmup_steps, freeze_steps); 0 outside.
+    Matches 2dgs-voronoi's site/tau scheduler."""
+    def helper(step):
+        if step < warmup_steps or step >= freeze_steps:
+            return 0.0
+        t = (step - warmup_steps) / max(1, (freeze_steps - warmup_steps))
+        return lr_final + 0.5 * (lr_init - lr_final) * (1.0 + np.cos(np.pi * t))
+    return helper
+
+
 def strip_lowerdiag(L):
     uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="cuda")
 

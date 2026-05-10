@@ -1,10 +1,19 @@
 /*
  * mma_utils.h - WMMA Tensor Core utilities for 3D_SH_res residual MLP
  *
- * Tiny residual MLP with all 16×16 tiles:
- *   Input: [hash(4) | bias(1) | pad(11)] = 16D
+ * Tiny residual MLP with all 16×16 tiles, fully BIAS-FREE:
+ *   Input: [hash(hash_dim) | pad(16-hash_dim, all zeros)] = 16D
  *   Hidden: 16D (ReLU)
  *   Output: 16D (only first 3 = RGB residual, identity activation)
+ *
+ * Bias-free guarantee: MLP(0_vector) ≡ 0. Required by the Nexels-style
+ * hashgrid AA path — when the AA downweight pushes hash features to ~0,
+ * the residual must also approach 0 cleanly. Otherwise AA introduces
+ * systematic exposure shifts on affected surfels (exposure pop / saturation
+ * artifacts at depth-aliased levels).
+ *
+ * If you need an L1 bias-via-padding pattern (input[4]=1.0), that's the
+ * 3D_SH_cat / 3D_direct_fused layout — see mode_3d_direct_fused.cu, not here.
  */
 
 #ifndef MMA_UTILS_H_INCLUDED

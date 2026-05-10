@@ -168,6 +168,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     testing_iterations += list(range(25_000, opt.iterations, 5_000))
     saving_iterations += [opt.iterations]
 
+    # --patience: dense periodic test eval for convergence diagnostics.
+    # Inject extra evals every `patience_eval_interval` iters from
+    # `patience_start_iter` onwards so the existing training_report path
+    # picks them up (writes one row to test_metrics.txt per eval).
+    if args.patience > 0:
+        _patience_iters = list(range(args.patience_start_iter,
+                                     opt.iterations + 1,
+                                     args.patience_eval_interval))
+        testing_iterations = sorted(set(testing_iterations + _patience_iters))
+        print(f"[PATIENCE] Convergence study: test eval every "
+              f"{args.patience_eval_interval} iters from {args.patience_start_iter} "
+              f"to {opt.iterations}. Early-stop after {args.patience} consecutive "
+              f"non-improvements (Δ < {args.patience_min_delta} dB). "
+              f"Total dense evals: {len(_patience_iters)}.")
+
+    # Patience tracking state (only consumed when args.patience > 0).
+    _patience_best_psnr = -float('inf')
+    _patience_best_iter = 0
+    _patience_no_improve = 0
+    _patience_evals_seen = 0
+
     test_psnr = []
     train_psnr = []
     iter_list = []
@@ -946,9 +967,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     test_metrics_path = os.path.join(scene.model_path, 'test_metrics.txt')
     with open(test_metrics_path, 'w') as f:
         f.write("Periodic Test Eval (during training, full test set)\n")
-        f.write("=" * 70 + "\n")
-        f.write(f"{'Iter':<10}{'PSNR(dB)':<10}{'SSIM':<9}{'LPIPS':<9}{'L1':<12}{'Points':<12}\n")
-        f.write("-" * 70 + "\n")
+        f.write("LPIPS(L) = legacy 3DGS-ecosystem convention (no rescale, ~18% lower than canonical)\n")
+        f.write("LPIPS(C) = canonical Zhang spec ([-1,1] rescaled before VGG)\n")
+        f.write("=" * 75 + "\n")
+        f.write(f"{'Iter':<10}{'PSNR(dB)':<10}{'SSIM':<9}{'LPIPS(L)':<11}{'LPIPS(C)':<11}{'L1':<12}{'Points':<12}\n")
+        f.write("-" * 75 + "\n")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -1429,7 +1452,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Debug: verify SH is zero on first iteration for 3D_SH_res
         if iteration == first_iter + 1 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
             dc_norm = gaussians._features_dc.data.abs().max().item()
-            rest_norm = gaussians._features_rest.data.abs().max().item()
+            # `_features_rest` is shape [N, 0, 3] under --feature beta (we drop
+            # higher-order SH there). max() on an empty tensor needs special-casing.
+            rest_norm = (gaussians._features_rest.data.abs().max().item()
+                         if gaussians._features_rest.numel() > 0 else 0.0)
             print(f"[DEBUG] First iter SH check: DC max={dc_norm:.6f}, REST max={rest_norm:.6f}, "
                   f"active_sh_degree={gaussians.active_sh_degree}")
 
@@ -1454,6 +1480,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             _t_fwd_end = time.time()
 
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+        # --blur_split (mini-splatting2): accumulate per-Gaussian dominance count
+        # as a "blurry / oversized" flag. Resized/reset after every densify event.
+        if args.blur_split:
+            _N_now = gaussians.get_xyz.shape[0]
+            if (not hasattr(gaussians, "_blur_split_mask")
+                    or gaussians._blur_split_mask is None
+                    or gaussians._blur_split_mask.shape[0] != _N_now):
+                gaussians._blur_split_mask = torch.zeros(_N_now, dtype=torch.bool, device="cuda")
+            _max_idx = render_pkg.get("max_contrib_idx", None)
+            if _max_idx is not None and _max_idx.numel() > 0:
+                _idx_flat = _max_idx.long().reshape(-1)
+                _valid = _idx_flat >= 0
+                if _valid.any():
+                    _ids = _idx_flat[_valid]
+                    _ids = _ids[_ids < _N_now]  # safety: ignore stale ids past current N
+                    _area = torch.bincount(_ids, minlength=_N_now)
+                    _h, _w = image.shape[-2], image.shape[-1]
+                    gaussians._blur_split_mask |= (_area > (_h * _w) / args.blur_thresh)
 
         # MSv2 SparseGaussianAdam: track visibility for sparse optimizer step
         if args.mini:
@@ -2131,6 +2176,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ingp_model=ingp, beta = beta, args = args, cfg_model = cfg_model, test_psnr = test_psnr, train_psnr = train_psnr, iter_list = iter_list, skybox_model = skybox,
                 background_mode = background_mode, bg_hashgrid_model = bg_hashgrid)
 
+            # --patience: convergence early-stop. Only triggers on iters in the
+            # patience eval grid (>= patience_start_iter, on the eval interval).
+            # test_psnr was just appended by training_report if iteration was
+            # in testing_iterations. We compare the latest entry to the best so far.
+            if (args.patience > 0
+                    and iteration >= args.patience_start_iter
+                    and iteration in testing_iterations
+                    and len(test_psnr) > _patience_evals_seen):
+                _patience_evals_seen = len(test_psnr)
+                latest = test_psnr[-1]
+                if latest > _patience_best_psnr + args.patience_min_delta:
+                    _patience_best_psnr = latest
+                    _patience_best_iter = iteration
+                    _patience_no_improve = 0
+                    print(f"[PATIENCE] iter {iteration}: new best PSNR {latest:.4f} dB (counter reset)")
+                else:
+                    _patience_no_improve += 1
+                    print(f"[PATIENCE] iter {iteration}: PSNR {latest:.4f} dB "
+                          f"(no improvement, counter={_patience_no_improve}/{args.patience}; "
+                          f"best={_patience_best_psnr:.4f} @ iter {_patience_best_iter})")
+                    if _patience_no_improve >= args.patience:
+                        print(f"[PATIENCE] Early stop at iter {iteration}: "
+                              f"{args.patience} consecutive evals without improvement. "
+                              f"Best PSNR {_patience_best_psnr:.4f} dB at iter {_patience_best_iter}. "
+                              f"All evals are logged in test_metrics.txt.")
+                        break
+
             # Print beta kernel stats every 1000 iterations
             if args.kernel in ["beta", "beta_scaled"] and iteration % 1000 == 0 and hasattr(gaussians, '_shape') and gaussians._shape.numel() > 0:
                 shape_vals = gaussians.get_shape
@@ -2369,6 +2441,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             densify=True,
                         )
                         size_threshold = 20 if iteration > opacity_reset_interval else None
+                        _blur_mask_for_densify = (gaussians._blur_split_mask
+                                                  if args.blur_split
+                                                  and hasattr(gaussians, "_blur_split_mask")
+                                                  else None)
                         _stats = gaussians.densify_and_prune_fastgs(
                             min_opacity=opt.opacity_cull,
                             extent=scene.cameras_extent,
@@ -2380,7 +2456,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             dense=args.fastgs_dense,
                             importance_thresh=args.fastgs_importance_thresh,
                             prune_budget_frac=args.fastgs_prune_budget_frac,
+                            extra_split_mask=_blur_mask_for_densify,
                         )
+                        # Reset blur-split accumulator (size changed via clone/split/prune).
+                        if args.blur_split:
+                            gaussians._blur_split_mask = torch.zeros(
+                                gaussians.get_xyz.shape[0], dtype=torch.bool, device="cuda")
                         # NOTE: no training_setup() — densification_postfix +
                         # prune_points already preserve Adam state via
                         # cat_tensors_to_optimizer / _prune_optimizer.
@@ -4458,6 +4539,9 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_legacy_test = 0.0   # buggy [0,1] passthrough — matches 3DGS-ecosystem convention
+                lpips_canon_test  = 0.0   # canonical [-1,1]-rescaled LPIPS (Zhang spec)
                 # Use stride 25 for train cameras to speed up eval, stride 1 for test
                 eval_stride = 25 if config['name'] == 'train' else 1
                 cameras_evaluated = 0
@@ -4473,6 +4557,16 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
 
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                    ssim_test += ssim(image, gt_image).mean().double()
+                    # LPIPS in BOTH conventions:
+                    #   legacy: vendored lpipsPyTorch convention (no rescale) — matches Inria
+                    #     3DGS / 2DGS / FastGS / GaussianSpa / mini-splatting2 reported values.
+                    #   canonical: rescale to [-1,1] before scoring (Zhang's PerceptualSimilarity
+                    #     spec). ~+18% higher than legacy in practice on Mip-360.
+                    _img_b = image.unsqueeze(0)
+                    _gt_b = gt_image.unsqueeze(0)
+                    lpips_legacy_test += lpips(_img_b, _gt_b, net_type='vgg').mean().double()
+                    lpips_canon_test  += lpips(_img_b * 2.0 - 1.0, _gt_b * 2.0 - 1.0, net_type='vgg').mean().double()
                     cameras_evaluated += 1
 
                     # Log images for first camera only
@@ -4492,14 +4586,25 @@ ingp_model, beta, args, cfg_model, test_psnr = None, train_psnr = None, iter_lis
 
                 psnr_test /= cameras_evaluated
                 l1_test /= cameras_evaluated
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                ssim_test /= cameras_evaluated
+                lpips_legacy_test /= cameras_evaluated
+                lpips_canon_test  /= cameras_evaluated
+                n_points = scene.gaussians.get_xyz.shape[0]
+                print("\n[ITER {}] Evaluating {}: L1 {:.6f} PSNR {:.4f} SSIM {:.4f} LPIPSᴸ {:.4f} LPIPSᶜ {:.4f} Points {}".format(
+                    iteration, config['name'],
+                    l1_test.item(), psnr_test.item(), ssim_test.item(),
+                    lpips_legacy_test.item(), lpips_canon_test.item(), n_points))
 
                 if config['name'] == 'test':
                     test_psnr.append(psnr_test.item())
                     # Append row to test_metrics.txt (header was written at training start).
+                    # Columns: Iter | PSNR(dB) | SSIM | LPIPSᴸegacy | LPIPSᶜanonical | L1 | Points
                     try:
                         with open(os.path.join(scene.model_path, 'test_metrics.txt'), 'a') as f:
-                            f.write(f"{iteration:<10}{psnr_test.item():<14.2f}{l1_test.item():<14.6f}\n")
+                            f.write(f"{iteration:<10}{psnr_test.item():<10.4f}"
+                                    f"{ssim_test.item():<9.4f}{lpips_legacy_test.item():<11.4f}"
+                                    f"{lpips_canon_test.item():<11.4f}{l1_test.item():<12.6f}"
+                                    f"{n_points:<12}\n")
                     except Exception as _e:
                         print(f"[WARN] Failed to append periodic test metric: {_e}")
                 elif config['name'] == 'train':
@@ -4538,6 +4643,21 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[])
+    # --patience: from iter 15k onwards, run test eval every 500 iters and log
+    # to test_metrics.txt. Track best test-PSNR; if no improvement for `patience`
+    # consecutive evals (~500*N iters), stop early. 0 = disabled (default).
+    # NOTE: this peeks at the test set during training. Use only for convergence
+    # studies / diagnostics, not for paper numbers.
+    parser.add_argument("--patience", type=int, default=0,
+                        help="Periodic test-eval + early-stop convergence study. "
+                             "0 = off (default). N>0 = eval every 500 iters from "
+                             "iter 15k, stop after N consecutive non-improvements.")
+    parser.add_argument("--patience_eval_interval", type=int, default=500,
+                        help="Iterations between periodic test evals (default 500).")
+    parser.add_argument("--patience_start_iter", type=int, default=15000,
+                        help="First iteration to begin periodic test eval (default 15000).")
+    parser.add_argument("--patience_min_delta", type=float, default=1e-4,
+                        help="Minimum PSNR (dB) improvement to reset patience counter.")
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
@@ -4798,19 +4918,23 @@ if __name__ == "__main__":
     parser.add_argument("--feature", type=str, default="sh",
                         choices=["sh", "beta", "sg", "voronoi", "SV"],
                         help="View-dependent color: 'sh' (spherical harmonics, default), 'beta' (spherical-beta), 'sg' (MEGS-2 spherical Gaussians), 'voronoi' (legacy hybrid SH+SV, additive on top of SH-DC), or 'SV' (reference-faithful Spherical Voronoi: SV-only color, pcd-RGB init, no SH-DC, no bias — matches sphericalvoronoi/radiance).")
-    parser.add_argument("--sv_l1", type=float, default=1e-5,
-                        help="L1 regularization on _sv_colors (sphericalvoronoi default 1e-5 for NeRF-synthetic, 0 for indoor/outdoor).")
-    parser.add_argument("--sites_lr", type=float, default=5e-2,
-                        help="--feature voronoi initial LR for _sv_sites (reference scheduler init). Decays exponentially to --sites_lr_final.")
-    parser.add_argument("--sites_lr_final", type=float, default=1e-4,
-                        help="--feature voronoi final LR for _sv_sites at end of training (reference scheduler final).")
+    parser.add_argument("--sv_l1", type=float, default=0.0,
+                        help="L1 regularization on _sv_colors. 0 = off (2dgs-voronoi default). "
+                             "Older radiance preset used 1e-5 for blender/tandt/db, 0 for mip-360.")
+    parser.add_argument("--sites_lr", type=float, default=2e-3,
+                        help="LR for _sv_sites. SV mode: cosine init (decays to sites_lr*0.1, "
+                             "with 1k warmup + 3k freeze). voronoi mode: exponential init "
+                             "(decays to --sites_lr_final). Default 2e-3 matches 2dgs-voronoi.")
+    parser.add_argument("--sites_lr_final", type=float, default=2e-4,
+                        help="--feature voronoi final LR for _sv_sites (exponential decay end). "
+                             "Unused by --feature SV (cosine scheduler hardcodes 0.1× init).")
     parser.add_argument("--sv_metric", type=str, default="l2",
                         choices=["l2", "cosine"],
                         help="SV logit metric: 'l2' (radiance default, -τ·||s_norm − ω||) or "
                              "'cosine' (paper formulation, s · ω = unconstrained dot product). "
                              "Cosine avoids L2's sqrt gradient blowup near alignment.")
-    parser.add_argument("--sv_color_lr", type=float, default=1.25e-4,
-                        help="--feature voronoi LR for _sv_colors (reference blender config: 0.000125).")
+    parser.add_argument("--sv_color_lr", type=float, default=8e-4,
+                        help="LR for _sv_colors. Default 8e-4 matches 2dgs-voronoi.")
     parser.add_argument("--sv_dc", action="store_true",
                         help="--feature SV: add an explicit per-Gaussian view-independent "
                              "DC channel [N, 3]. SV becomes a directional residual on top. "
@@ -4820,8 +4944,20 @@ if __name__ == "__main__":
     parser.add_argument("--sv_dc_lr", type=float, default=2.5e-3,
                         help="--feature SV + --sv_dc: LR for _sv_dc. Default matches the "
                              "reference's sh_lr (0.0025).")
-    parser.add_argument("--sb_number", type=int, default=2,
-                        help="--feature beta: number of spherical beta primitives per Gaussian (K). Default 2")
+    parser.add_argument("--sv_tau_lr", type=float, default=6e-3,
+                        help="--feature SV: LR for _sv_tau (separate sharpness param). "
+                             "2dgs-voronoi default 0.006.")
+    parser.add_argument("--sv_warmup_iter", type=int, default=1000,
+                        help="--feature SV: sites/tau LR is held at 0 for the first N iters "
+                             "so colors settle before geometry of the spherical partition moves. "
+                             "2dgs-voronoi default 1000.")
+    parser.add_argument("--sv_freeze_last", type=int, default=3000,
+                        help="--feature SV: sites/tau LR is held at 0 for the last N iters "
+                             "so colors fine-tune against fixed cells. 2dgs-voronoi default 3000.")
+    parser.add_argument("--sb_number", type=int, default=7,
+                        help="Number of directional primitives per Gaussian (K). "
+                             "Used by --feature beta/sg/voronoi/SV. Default 7 (2dgs-voronoi). "
+                             "Beta-splatting paper uses 2; pass --sb_number 2 to reproduce.")
     parser.add_argument("--sb_params_lr", type=float, default=0.0025,
                         help="--feature beta: LR for sb_params (per-primitive rgb/theta/phi/beta_raw). Default 0.0025")
     parser.add_argument("--sb_beta_lr", type=float, default=0.001,
@@ -4961,6 +5097,20 @@ if __name__ == "__main__":
                         help="FastGS: scale/extent threshold splitting clone vs split region.")
     parser.add_argument("--fastgs_prune_budget_frac", type=float, default=0.5,
                         help="FastGS: fraction of opacity-pruneable Gaussians actually removed per call.")
+    # --blur_split (mini-splatting2 "blur split"): per-pixel max-contributor
+    # bincount → flag Gaussians dominating > H*W/blur_thresh pixels in any
+    # iteration since the last densify, force-split them next densify event.
+    # Targets oversized billboards in outdoor scenes (boost LPIPS for foliage,
+    # large surfaces, sky proxies). Reset to zeros after each densify.
+    parser.add_argument("--blur_split", action="store_true",
+                        help="Enable mini-splatting2-style blur-split: force-split "
+                             "Gaussians dominating > H*W/blur_thresh pixels.")
+    parser.add_argument("--blur_thresh", type=float, default=5000.0,
+                        help="Blur-split threshold: a Gaussian dominating more "
+                             "than image_area/blur_thresh pixels is flagged for "
+                             "splitting at the next densify. Default 5000 = ~1/5000 "
+                             "of pixels (mini-splatting2 setting). Lower = more "
+                             "aggressive splitting.")
     parser.add_argument("--fastgs_densify_interval", type=int, default=100,
                         help="FastGS: run VCD+VCP every N iters (paper: 500; default here 100).")
     parser.add_argument("--fastgs_densify_until", type=int, default=15000,
@@ -5190,6 +5340,19 @@ if __name__ == "__main__":
             args.opacity_reg = 0.01
         if 'scale_reg' not in cli_args and args.scale_reg == 0.0:
             args.scale_reg = 0.01
+
+    # NOTE: --feature SV used to apply a 2dgs-voronoi-style override block here
+    # (sb_number=7, sites_lr=2e-3, sv_color_lr=8e-4, sv_tau_lr=6e-3, sv_l1=0,
+    # sv_warmup_iter=1000, sv_freeze_last=3000). Those values are now the
+    # argparse defaults, so the override block is redundant and was removed.
+
+    # --feature beta: --sb_number default is 7 (matches voronoi/SV) but the
+    # beta-splatting paper uses K=2. Special-case: drop to K=2 unless the user
+    # explicitly set --sb_number on the CLI.
+    if args.feature == "beta" and 'sb_number' not in cli_args:
+        args.sb_number = 2
+        print(f"[FEATURE beta] Using sb_number=2 (beta-splatting paper). "
+              f"Pass --sb_number 7 to match the voronoi/SV K count.")
 
     # Mini-Splatting v1 (--mini1) is a variant of --mini with a v1-style schedule.
     # It reuses all --mini machinery but enables repeated depth reinit, extends

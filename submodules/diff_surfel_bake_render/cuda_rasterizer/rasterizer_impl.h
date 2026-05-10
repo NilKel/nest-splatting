@@ -39,6 +39,13 @@ namespace CudaRasterizer
 		float* transMat;
 		float4* normal_opacity;
 		__half* rgb;
+		// Per-Gaussian Spherical-Beta contribution. Eval'd once per Gaussian
+		// in preprocessCUDA (view_dir is per-Gaussian, identical across pixels)
+		// and added in renderBakedCUDA's inner loop. Was per-pixel before —
+		// each Gaussian's ~K*4 transcendentals were redundantly re-computed
+		// for every pixel it touched (~100×). When sb_number == 0, this
+		// buffer is allocated but never written/read.
+		__half* sb_rgb;
 		float4* conic_t;        // SnugBox+AccuTile conic (A, B, E, t) — used when aabb_mode==2/5
 
 		// Legacy single-sort path (sort_mode == 0).

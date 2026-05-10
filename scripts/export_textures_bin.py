@@ -60,10 +60,11 @@ ATLAS_FORMAT_FP16_RGB   = 0
 ATLAS_FORMAT_UINT8_RGBA = 1
 ATLAS_FORMAT_BC7        = 2
 
-# texture_2d_array layer height for BC7 atlases. wgpu's typical
-# max_texture_dimension_2d is 16384 on Apple Silicon Metal and most desktop
-# adapters; tall packed atlases are sliced into n layers of this height.
-LAYER_H_BC7 = 16384
+# texture_2d_array layer height for BC7 atlases. Capped at 8192 because
+# Android Adreno/Mali typically expose max_texture_dimension_2d=8192 to WebGPU,
+# while iOS Safari and desktop adapters allow 16384. 8192 covers both at the
+# cost of ~2× layer count.
+LAYER_H_BC7 = 8192
 
 
 def _load_meta(meta_path: Path):

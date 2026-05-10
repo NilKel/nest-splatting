@@ -187,7 +187,7 @@ def main():
                      '_shape', '_flex_beta',
                      '_sb_params',
                      '_sg_directions', '_sg_sharpness_sg', '_sg_rgb',
-                     '_sv_sites', '_sv_colors',
+                     '_sv_sites', '_sv_colors', '_sv_tau', '_sv_dc',
                      '_gamma', '_adaptive_features',
                      '_adaptive_cat_weight', '_adaptive_zero_weight',
                      '_gate_logits']:
@@ -458,6 +458,21 @@ def main():
         print(f"[BAKE] Saved sb_params.pt → {sb_path}  shape={list(sb_tensor.shape)}  "
               f"(K={sb_number} lobes per Gaussian)")
 
+    # --feature SV (Spherical Voronoi) per-Gaussian state. The baked PLY
+    # already round-trips _sv_sites / _sv_colors / _sv_tau / _sv_dc via
+    # GaussianModel.{save,load}_ply (no separate .pt sidecar needed). We
+    # only need to record presence + K in bake_meta so the render script
+    # can flip into the SV color path on load. Per-frame fake-SH-DC eval
+    # happens in render_baked / benchmark_baked using the existing torch
+    # _build_fake_shs_from_SV (no CUDA kernel changes — Option A).
+    sv_number = 0
+    sv_has_dc = False
+    if bake_feature_mode == "SV" and hasattr(gaussians, '_sv_sites') and gaussians._sv_sites.numel() > 0:
+        sv_number = int(gaussians._sv_sites.shape[1])
+        sv_has_dc = hasattr(gaussians, '_sv_dc') and gaussians._sv_dc.numel() > 0
+        print(f"[BAKE] --feature SV detected: K={sv_number} sites/Gaussian, "
+              f"sv_dc={'on' if sv_has_dc else 'off'} (carried in baked.ply)")
+
     # Residual stats
     print(f"\n[BAKE] Atlas residual stats: mean={atlas.mean():.6f}, std={atlas.std():.6f}, "
           f"min={atlas.min():.6f}, max={atlas.max():.6f}")
@@ -499,6 +514,11 @@ def main():
         "atlas_offset": atlas_offset,
         "sb_number": sb_number,
         "sb_params_file": "sb_params.pt" if sb_number > 0 else None,
+        # SV — per-Gaussian sites/colors/tau live inside the baked PLY (see
+        # GaussianModel.save_ply). bake_meta only needs the K count so the
+        # render side can branch into the SV color path on load.
+        "sv_number": sv_number,
+        "sv_has_dc": sv_has_dc,
     }
     meta_path = os.path.join(output_dir, "bake_meta.json")
     with open(meta_path, 'w') as f:
