@@ -18,6 +18,7 @@
 #include "device_launch_parameters.h"
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
+#include "rgb_type.h"  // rgb_t typedef (FP16/FP32 via FP16_RGB)
 
 namespace FORWARD
 {
@@ -46,10 +47,11 @@ namespace FORWARD
 		// float* isovals,
 		// float3* normals,
 		float* transMats,
-		float* colors,
+		rgb_t* colors,
 		float4* normal_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
+		float4* conic_t,
 		bool prefiltered,
 		const float* shapes = nullptr,
 		const int kernel_type = 0,
@@ -104,8 +106,9 @@ namespace FORWARD
 		uint32_t max_intersections_per_pixel = 0,  // Cap for memory management
 		// Pre-encoded view directions for 3D_direct_fused (H*W, 16)
 		const float* viewdirs_enc = nullptr,
-		// Separate SH RGB pointer for 3D_SH_cat (render_mode=6)
-		const float* rgb_override = nullptr,
+		// Separate SH RGB pointer for 3D_SH_cat (render_mode=6).
+		// FP16 (rgb_t) when config.h::FP16_RGB=1 — see geomState.rgb.
+		const rgb_t* rgb_override = nullptr,
 		// FastGS VCD/VCP: per-pixel high-error mask [H*W] int32, per-Gaussian
 		// counter [P] int32. Both nullptr => feature disabled.
 		const int* metric_map = nullptr,

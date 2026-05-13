@@ -161,10 +161,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Pass mini flag to OptimizationParams so training_setup can pick SparseGaussianAdam
     opt.mini = getattr(args, 'mini', False)
 
-    testing_iterations += [opt.iterations]
-    testing_iterations += [1]  # Also evaluate at first iteration for debugging
+    # Final-iter eval is handled by render_final_images at the end of training,
+    # so don't ALSO include it here (would double-eval).
+    # First-iter debug eval removed.
     # Periodic eval every 5k from 25k onwards so you can pick a good stop point.
-    # The final iter is already covered by line above.
     testing_iterations += list(range(25_000, opt.iterations, 5_000))
     saving_iterations += [opt.iterations]
 
@@ -1844,6 +1844,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # L1 penalty on shape values - pushes toward 0 (hard disks)
             shape_reg_loss = args.lambda_shape * gaussians.get_shape.mean()
 
+        # --w_lambda_perpix: per-pixel error-guided shape reg.
+        # Forward rasterizer emits beta_sum[pix] = Σ_i w_i · β_i (BETA_SUM_OFFSET).
+        # Loss: λ · mean(w_r · beta_sum) where w_r = exp(-γ · MSE).
+        # CUDA backward injects DIRECT dL/dβ_i += λ · w_r · w_i / N  (no α path).
+        # Composes additively with --w_lambda (scalar) and --lambda_shape (static).
+        w_lambda_perpix_loss = torch.tensor(0.0, device="cuda")
+        if (args.w_lambda_perpix > 0.0 and shape_phase_active
+                and args.kernel in ["beta", "beta_scaled", "general", "flex"]):
+            beta_sum_map = render_pkg.get('render_beta_sum')
+            if beta_sum_map is not None and beta_sum_map.numel() > 0:
+                mse_per_pixel_pp = ((image - gt_image) ** 2).mean(dim=0, keepdim=True).detach()  # [1, H, W]
+                w_r_pp = torch.exp(-args.w_lambda_perpix_gamma * mse_per_pixel_pp)
+                w_lambda_perpix_loss = args.w_lambda_perpix * (w_r_pp * beta_sum_map).mean()
+
         # Flex kernel beta regularization - prevent runaway sharpening
         # Beta in range [0, inf): 0 = standard Gaussian, higher = sharper
         # Positive lambda pushes toward 0 (softer), negative pushes toward infinity (harder)
@@ -1926,7 +1940,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 converge_loss = args.lambda_converge * converge_t.mean()
 
         # loss
-        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss + l1_sh_rest_loss + gspa_loss + w_overdraw_loss + sv_l1_loss + decomp_sh_loss + decomp_tex_loss + converge_loss
+        total_loss = loss + dist_loss + normal_loss + mask_loss + adaptive_reg_loss + scout_loss + mcmc_opacity_reg + mcmc_scale_reg + adaptive_cat_reg_loss + adaptive_zero_reg_loss + adaptive_gate_reg_loss + bce_opacity_loss + shape_reg_loss + flex_beta_reg_loss + general_beta_reg_loss + l1_hash_loss + l1_sh_rest_loss + gspa_loss + w_overdraw_loss + sv_l1_loss + decomp_sh_loss + decomp_tex_loss + converge_loss + w_lambda_perpix_loss
 
         # --minimc per-step error accumulation: BENCHED.
         # Replaced by the full-view sweep inside `minimc_sweep_and_relocate`,
@@ -2097,6 +2111,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         loss_dict["OD"] = f"{od_map.mean().item():.1f}"
                 if args.w_overdraw_reg > 0.0:
                     loss_dict["wOD"] = f"{w_overdraw_loss.item():.5f}"
+                if args.w_lambda_perpix > 0.0:
+                    loss_dict["wλp"] = f"{w_lambda_perpix_loss.item():.5f}"
                 if args.w_weight_reg > 0.0:
                     avg_mse_disp = ((image - gt_image) ** 2).mean().item()
                     eff_lambda = args.w_weight_reg * float(np.exp(-args.w_weight_gamma * avg_mse_disp))
@@ -5007,8 +5023,8 @@ if __name__ == "__main__":
                         choices=["basic", "decay", "scaled", "scaled_decay"],
                         help="General kernel regularization mode: 'basic' (constant), 'decay' (linear decay over training), 'scaled' (scaled by RGB loss), 'scaled_decay' (both)")
     parser.add_argument("--aabb", type=str, default="2dgs",
-                        choices=["2dgs", "adr_only", "rect", "adr", "beta"],
-                        help="AABB mode: '2dgs' (square, fixed 4σ - default), 'adr_only' (square, AdR cutoff), 'rect' (rectangular, fixed 4σ), 'adr' (rectangular + AdR cutoff), 'beta' (fixed r=1 for beta kernels)")
+                        choices=["2dgs", "adr_only", "rect", "adr", "beta", "accutile", "snugbox"],
+                        help="AABB mode: '2dgs' (square, fixed 4σ - default), 'adr_only' (square, AdR cutoff), 'rect' (rectangular, fixed 4σ), 'adr' (rectangular + AdR cutoff), 'beta' (fixed r=1 for beta kernels), 'accutile'/'snugbox' (AdR + rect + AccuTile ellipse cull)")
     parser.add_argument("--warmup", type=str, default=None,
                         help="Warmup checkpoint tag. Creates/loads warmup_checkpoint_{tag}.pth instead of warmup_checkpoint.pth. "
                              "Useful for maintaining separate warmup checkpoints for different configurations (e.g., --warmup beta).")
@@ -5242,6 +5258,14 @@ if __name__ == "__main__":
                              "can keep their soft kernels. 0 = disabled (fall back to static lambda_shape).")
     parser.add_argument("--w_lambda_gamma", type=float, default=50.0,
                         help="Gamma for weighted shape: w = exp(-gamma · MSE). Higher = sharper relaxation.")
+    parser.add_argument("--w_lambda_perpix", type=float, default=0.0,
+                        help="Per-pixel error-guided shape reg. Penalizes sum_i (w_i * beta_i) at each "
+                             "pixel, scaled by per-pixel exp(-gamma * MSE). Unlike --w_lambda (which "
+                             "collapses the weight to a scalar), this attributes shape pressure to the "
+                             "Gaussians actually contributing to each pixel. CUDA direct grad: only "
+                             "dampens beta values, does NOT propagate through alpha. 0 = disabled.")
+    parser.add_argument("--w_lambda_perpix_gamma", type=float, default=50.0,
+                        help="Gamma for --w_lambda_perpix: w_r = exp(-gamma * MSE(pix)).")
 
     # Separated depth sort: pre-sort Gaussians by depth, then sort expanded list by tile_id only
     parser.add_argument("--depth_sort", action="store_true",

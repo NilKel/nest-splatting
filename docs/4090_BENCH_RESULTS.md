@@ -58,6 +58,55 @@ table in the paper.
 | playroom | 95,054 | 1264×832 | 30.01 | 0.9017 | 0.2519 | 538.7 |
 | **MEAN** | **84,122** | | **29.61** | **0.8960** | **0.2643** | **744.3** |
 
+### With vs without the BC7 residual atlas
+
+Re-bench (2026-05-13) of the same 005w25g bundles, paired runs: full
+inference (`with_tex` — SV color + BC7 residual atlas lookup) vs SH-baseline
+only (`no_tex` — `bench_minimal.py --no_atlas`; same Gaussian state and
+geometry, atlas binding disabled). Same methodology (`--num_warmup 10
+--num_benchmark 200`, cuda.Event). Identical N + resolution per row.
+
+#### Mip-NeRF 360
+
+| scene | N | with_tex PSNR / SSIM / LPIPS / FPS | no_tex PSNR / SSIM / LPIPS / FPS | Δ PSNR | Δ FPS |
+|---|---:|:---|:---|---:|---:|
+| bicycle  | 173,755 | 23.83 / 0.666 / 0.301 / **618.0** | 14.37 / 0.308 / 0.529 / 628.9   | −9.46 | +1.8% |
+| bonsai   | 112,481 | 31.91 / 0.929 / 0.206 / **481.6** | 18.08 / 0.637 / 0.411 / 497.6   | −13.82 | +3.3% |
+| counter  | 80,135  | 28.96 / 0.887 / 0.221 / **792.4** | 22.10 / 0.765 / 0.351 / 847.5   | −6.87 | +6.9% |
+| flowers  | 212,272 | 20.56 / 0.534 / 0.352 / **456.0** | 14.53 / 0.306 / 0.545 / 467.0   | −6.03 | +2.4% |
+| garden   | 156,216 | 26.65 / 0.813 / 0.173 / **948.6** | 19.21 / 0.430 / 0.478 / 1022.8  | −7.44 | +7.8% |
+| kitchen  | 147,442 | 30.59 / 0.904 / 0.156 / **609.3** | 20.62 / 0.711 / 0.310 / 652.6   | −9.97 | +7.1% |
+| room     | 75,207  | 30.36 / 0.902 / 0.240 / **992.6** | 22.90 / 0.768 / 0.379 / 1031.0  | −7.46 | +3.9% |
+| stump    | 102,131 | 25.54 / 0.715 / 0.276 / **586.1** | 18.35 / 0.393 / 0.501 / 595.7   | −7.19 | +1.6% |
+| treehill | 211,700 | 22.33 / 0.583 / 0.349 / **469.6** | 15.30 / 0.356 / 0.583 / 482.2   | −7.03 | +2.7% |
+| **MEAN** | 141,260 | **26.75 / 0.770 / 0.253 / 661.6** | **18.39 / 0.520 / 0.454 / 691.7** | **−8.36** | **+4.6%** |
+
+#### Tanks and Temples
+
+| scene | N | with_tex PSNR / SSIM / LPIPS / FPS | no_tex PSNR / SSIM / LPIPS / FPS | Δ PSNR | Δ FPS |
+|---|---:|:---|:---|---:|---:|
+| train | 120,097 | 22.35 / 0.804 / 0.215 / **1019.6** | 16.00 / 0.545 / 0.438 / 1153.8 | −6.35 | +13.2% |
+| truck | 101,636 | 25.44 / 0.874 / 0.153 / **1142.6** | 16.34 / 0.586 / 0.408 / 1251.1 | −9.10 | +9.5% |
+| **MEAN** | 110,867 | **23.89 / 0.839 / 0.184 / 1081.1** | **16.17 / 0.566 / 0.423 / 1202.5** | **−7.73** | **+11.2%** |
+
+#### Deep Blending
+
+| scene | N | with_tex PSNR / SSIM / LPIPS / FPS | no_tex PSNR / SSIM / LPIPS / FPS | Δ PSNR | Δ FPS |
+|---|---:|:---|:---|---:|---:|
+| drjohnson | 73,189 | 29.20 / 0.890 / 0.277 / **952.8** | 20.86 / 0.751 / 0.418 / 987.8 | −8.33 | +3.7% |
+| playroom  | 95,054 | 30.01 / 0.902 / 0.252 / **544.4** | 14.92 / 0.711 / 0.451 / 544.3 | −15.09 | −0.0% |
+| **MEAN**  | 84,122 | **29.60 / 0.896 / 0.264 / 748.6** | **17.89 / 0.731 / 0.434 / 766.1** | **−11.71** | **+2.3%** |
+
+**Read:** removing the residual atlas drops PSNR by **6-15 dB** per scene
+(mean drops 7.7-11.7 dB across the three datasets). LPIPS roughly doubles
+and SSIM falls from ~0.77-0.90 to ~0.52-0.73. FPS gain from skipping the
+atlas fetch is **modest** (+2-13% by dataset, mean +4.6 / +11.2 / +2.3%)
+— the BC7 lookup is cheap relative to the rest of the pixel-loop work
+(SV color, normal, geometry intersection). The atlas earns its memory
+budget by a wide margin: each ~10× MB of texture buys ~6-10 dB of PSNR
+back. Per-scene JSONs at `~/nest-bench/bench_logs_005w_textures/` on the
+4090; aggregate TSV: `~/nest-bench/bench_logs_005w_textures/results.tsv`.
+
 ## `SV_30thr_0w0gLP4lev_FRP5k10_c2f_Jac`
 
 No-overdraw-regularizer ablation: `--w_lambda 0.0 --w_lambda_gamma 0`. Higher

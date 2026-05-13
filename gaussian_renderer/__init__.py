@@ -1758,6 +1758,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # 2 = rectangular AABB, fixed 4σ cutoff
     # 3 = rectangular AABB, AdR cutoff (full optimization) - use "adr" for this
     # 4 = beta kernel: fixed r=1 cutoff (compact support)
+    # 5 = AdR + rectangular AABB + AccuTile ellipse cull (SnugBox; fastest)
     if isinstance(aabb_mode, int):
         aabb_mode_int = aabb_mode
     elif aabb_mode == "adr":
@@ -1770,6 +1771,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         aabb_mode_int = 3  # Same as "adr"
     elif aabb_mode == "beta":
         aabb_mode_int = 4  # Beta kernel: fixed r=1 cutoff
+    elif aabb_mode == "accutile" or aabb_mode == "adrrect_accu" or aabb_mode == "snugbox":
+        aabb_mode_int = 5  # AdR + rect AABB + AccuTile ellipse cull
     else:
         aabb_mode_int = 0  # "2dgs" or default
 
@@ -2194,6 +2197,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # get w² sum (sum of squared weights per pixel, for weight_reg loss)
     render_w_square = allmap[16:17]
 
+    # per-pixel sum of w_i * beta_i (--w_lambda_perpix shape reg). Only meaningful
+    # for beta-supporting kernels (beta / beta_scaled / general / flex). For scalar
+    # Gaussian kernels, shape values are 0 → beta_sum is 0 everywhere → no-op.
+    render_beta_sum = allmap[17:18] if allmap.shape[0] >= 18 else None
+
     # Diffuse_ngp mode: unproject median depth, query hashgrid, add to diffuse RGB
     gaussian_rgb_diffuse_ngp = None
     ngp_rgb_diffuse_ngp = None
@@ -2486,6 +2494,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'depth_max_contributor': render_depth_max_contributor,
             'render_w_square': render_w_square,
             'render_overdraw': render_overdraw,
+            'render_beta_sum': render_beta_sum,
             # int32 [H, W] per-pixel id of the max-weight Gaussian (-1 if none).
             # Used by the mini depth-reinit SH-transfer path. Only populated by
             # rasterizers that thread out_index through (currently diff_surfel_3D_sh_res).

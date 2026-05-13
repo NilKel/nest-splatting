@@ -18,6 +18,7 @@
 #include "device_launch_parameters.h"
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
+#include "rgb_type.h"  // rgb_t typedef (FP16/FP32 via FP16_RGB)
 
 namespace BACKWARD
 {
@@ -37,7 +38,7 @@ namespace BACKWARD
 		const float* bg_color,
 		const float2* means2D,
 		const float4* normal_opacity,
-		const float* colors,
+		const rgb_t* colors,  // FP16 SH baseline (geomState.rgb) — see config.h::FP16_RGB
 		const float* transMats,
 		const float* homotrans,
 		const float* ap_level,

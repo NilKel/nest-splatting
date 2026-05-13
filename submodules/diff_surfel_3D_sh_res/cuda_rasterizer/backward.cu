@@ -700,7 +700,7 @@ renderCUDAsurfelBackward(
 	const __half* __restrict__ hash_features,
 	const int* __restrict__ level_offsets,
 	const float* __restrict__ gridrange,
-	const float* __restrict__ colors,
+	const rgb_t* __restrict__ colors,
 	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
@@ -823,16 +823,32 @@ renderCUDAsurfelBackward(
 	float dL_dmedian_depth;
 	float dL_dmax_dweight;
 
+	// Per-pixel gradient for overdraw_sum from Python-side autograd (e.g.,
+	// --w_overdraw_reg's (w_r * od_map).mean()). Combined with the CUDA-side
+	// global d_overdraw_lambda_bw below so --overdraw_reg and --w_overdraw_reg
+	// can compose additively. Without this read, the autograd grad arriving in
+	// dL_depths[OVERDRAW_OFFSET] would be silently discarded.
+	float dL_doverdraw_px = 0.0f;
+
+	// Per-pixel gradient for beta_sum (= Σ_i w_i · β_i) from Python-side autograd
+	// (--w_lambda_perpix's (w_r * beta_sum).mean()). Injects a DIRECT gradient to
+	// each contributor's shape (β_i): dL/dβ_i += dL_dbeta_sum_px · w_i. Does NOT
+	// propagate through w_i back to α — by design, this reg only dampens β values,
+	// not opacity/coverage. Detached from the α chain.
+	float dL_dbeta_sum_px = 0.0f;
+
 	if (inside) {
-		// here dL_ddepth is dL_dD (blended depth value), so no change here. 
+		// here dL_ddepth is dL_dD (blended depth value), so no change here.
 		dL_ddepth = dL_depths[DEPTH_OFFSET * H * W + pix_id];
 		dL_daccum = dL_depths[ALPHA_OFFSET * H * W + pix_id];
 		dL_dreg = dL_depths[DISTORTION_OFFSET * H * W + pix_id];
-		for (int i = 0; i < 3; i++) 
+		for (int i = 0; i < 3; i++)
 			dL_dnormal2D[i] = dL_depths[(NORMAL_OFFSET + i) * H * W + pix_id];
 
 		dL_dmedian_depth = dL_depths[MIDDEPTH_OFFSET * H * W + pix_id];
 		// dL_dmax_dweight = dL_depths[MEDIAN_WEIGHT_OFFSET * H * W + pix_id];
+		dL_doverdraw_px = dL_depths[OVERDRAW_OFFSET * H * W + pix_id];
+		dL_dbeta_sum_px = dL_depths[BETA_SUM_OFFSET * H * W + pix_id];
 
 	}
 	
@@ -916,8 +932,12 @@ renderCUDAsurfelBackward(
 	float overdraw_accum = 0.0f;
 	const float OD_K = 10.0f;
 	const float OD_THRESH = 1.0f / 255.0f;
-	// dL/d(overdraw) = lambda / (H * W) for mean reduction
-	const float dL_doverdraw = (od_lambda > 0.0f) ? od_lambda / (float)(H * W) : 0.0f;
+	// dL/d(overdraw) combines two sources, both per-pixel-equivalent:
+	//   1. CUDA-global --overdraw_reg via d_overdraw_lambda_bw (mean-reduced, so /(H*W))
+	//   2. Python autograd dL_depths[OVERDRAW_OFFSET, pix] from --w_overdraw_reg's
+	//      (w_r * od_map).mean() — PyTorch already baked in the /(H*W) factor here.
+	const float dL_doverdraw_cuda = (od_lambda > 0.0f) ? od_lambda / (float)(H * W) : 0.0f;
+	const float dL_doverdraw = dL_doverdraw_cuda + dL_doverdraw_px;
 
 	// Weight-squared regularization: d(sum w²)/d(alpha_i) has direct + indirect terms
 	// Direct: 2*w_i*T_i  (changing alpha_i changes w_i directly)
@@ -1002,9 +1022,10 @@ renderCUDAsurfelBackward(
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
 			
 			collected_size[block.thread_rank()] =  PI * scales[coll_id].x * scales[coll_id].y;
-			// Cache evaluated colors (RGB) in shared memory
+			// Cache evaluated colors (RGB) in shared memory.
+			// colors is FP16 (rgb_t) when FP16_RGB=1 — upcast on load; smem stays FP32.
 			for (int ch = 0; ch < C; ch++)
-				collected_colors[ch * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + ch];
+				collected_colors[ch * BLOCK_SIZE + block.thread_rank()] = RGB_TO_FLOAT(colors[coll_id * C + ch]);
 			// from 2dgs eq.(5)
 			if(homotrans != nullptr){
 				collected_SuTu[block.thread_rank()] = {homotrans[16 * coll_id+0], homotrans[16 * coll_id+4], homotrans[16 * coll_id+8]};
@@ -1266,7 +1287,7 @@ renderCUDAsurfelBackward(
 					// 3. Load SH base color and compute feat = SH + residual
 					float sh_color[3];
 					for (int ch = 0; ch < 3; ch++)
-						sh_color[ch] = colors[global_id * 3 + ch];
+						sh_color[ch] = RGB_TO_FLOAT(colors[global_id * 3 + ch]);
 
 					// Activation gates depend on d_residual_mode (see forward.cu):
 					//   0 (3D_SH_res): outer ReLU gates BOTH branches together.
@@ -1454,7 +1475,7 @@ renderCUDAsurfelBackward(
 					float feat[C];
 					float sh_color_recomp[3];
 					for (int ch = 0; ch < 3; ch++) {
-						sh_color_recomp[ch] = colors[global_id * 3 + ch];
+						sh_color_recomp[ch] = RGB_TO_FLOAT(colors[global_id * 3 + ch]);
 						if (d_residual_mode == 1) {
 							feat[ch] = sh_color_recomp[ch] + fmaxf(0.0f, my_residual[ch] + d_res_bias);
 						} else {
@@ -1550,6 +1571,17 @@ renderCUDAsurfelBackward(
 						float dG_dbeta = -0.25f * G * general_pow_term_val * log_rho;
 						float dL_dbeta = dL_dalpha * opa * dG_dbeta;
 						acc_dL_dshapes[0] += dL_dbeta;
+					}
+
+					// --w_lambda_perpix direct shape gradient.
+					// Forward accumulates beta_sum_pix = Σ_i w_i · β_i  (BETA_SUM_OFFSET).
+					// Python loss: (w_r · beta_sum).mean()  →  dL/d(beta_sum_pix) = dL_dbeta_sum_px.
+					// We inject ONLY the direct coefficient: dL/dβ_i += dL_dbeta_sum_px · w_i.
+					// The indirect path (β → α → w) is intentionally NOT followed — by design
+					// this reg dampens β values only, never opacity/coverage.
+					if (dL_dshapes != nullptr && dL_dbeta_sum_px != 0.0f &&
+					    (kernel_type == 1 || kernel_type == 2 || kernel_type == 3 || kernel_type == 4)) {
+						acc_dL_dshapes[0] += dL_dbeta_sum_px * w;
 					}
 
 					// Compute dL_duv from dL_dxyz (hash gradients flowing to geometry)
@@ -2117,7 +2149,7 @@ renderCUDAsurfelBackward(
 				// SH's own inner ReLU is handled upstream in preprocessCUDA (clamped[]).
 				float sh_color_bw[3];
 				for (int c = 0; c < 3; c++)
-					sh_color_bw[c] = colors[global_id * 3 + c];
+					sh_color_bw[c] = RGB_TO_FLOAT(colors[global_id * 3 + c]);
 
 				float dL_drgb[3];     // grad flowing into residual (MLP) path
 				float dL_drgb_sh[3];  // grad flowing into SH path
@@ -2247,7 +2279,7 @@ renderCUDAsurfelBackward(
 
 				// 8. Set feat for alpha gradient (matches forward activation).
 				for (int ch = 0; ch < C; ch++) {
-					float sh_c = colors[global_id * 3 + ch];
+					float sh_c = RGB_TO_FLOAT(colors[global_id * 3 + ch]);
 					if (d_residual_mode == 1)
 						feat[ch] = sh_c + fmaxf(0.0f, residual[ch] + d_res_bias);
 					else
@@ -2323,7 +2355,7 @@ renderCUDAsurfelBackward(
 				// this matches the pre-decoupling approximation in this kernel.
 				float sh_color_bw_6[3];
 				for (int c = 0; c < 3; c++)
-					sh_color_bw_6[c] = colors[global_id * 3 + c];
+					sh_color_bw_6[c] = RGB_TO_FLOAT(colors[global_id * 3 + c]);
 
 				float dL_drgb_6[3];      // grad flowing into residual (MLP) path
 				float dL_drgb_sh_6[3];   // grad flowing into SH path
@@ -2446,7 +2478,7 @@ renderCUDAsurfelBackward(
 				// NOTE: for case 6, colors[] holds DC_SH (MLP input), not the SH-evaluated
 				// sh_color. We use DC_SH as a stand-in — matches prior approximation.
 				for (int ch = 0; ch < C; ch++) {
-					float sh_c = colors[global_id * 3 + ch];
+					float sh_c = RGB_TO_FLOAT(colors[global_id * 3 + ch]);
 					if (d_residual_mode == 1)
 						feat[ch] = sh_c + fmaxf(0.0f, residual_6[ch] + d_res_bias);
 					else
@@ -3273,7 +3305,7 @@ void BACKWARD::render(
 	const float* bg_color,
 	const float2* means2D,
 	const float4* normal_opacity,
-	const float* colors,
+	const rgb_t* colors,  // FP16 SH baseline (geomState.rgb)
 	const float* transMats,
 	const float* homotrans,
 	const float* ap_level,

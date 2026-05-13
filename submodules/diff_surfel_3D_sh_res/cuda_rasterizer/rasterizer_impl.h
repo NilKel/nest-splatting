@@ -14,6 +14,7 @@
 #include <iostream>
 #include <vector>
 #include "rasterizer.h"
+#include "rgb_type.h"  // rgb_t typedef (FP16/FP32 via FP16_RGB) — does not pull in cub-incompatible config.h
 #include <cuda_runtime_api.h>
 
 namespace CudaRasterizer
@@ -38,9 +39,14 @@ namespace CudaRasterizer
 		float2* means2D;
 		float* transMat;
 		float4* normal_opacity;
-		float* rgb;
+		rgb_t* rgb;  // FP16 or FP32 per config.h::FP16_RGB
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
+
+		// SnugBox+AccuTile (aabb_mode==5). conic_t[idx] = (A, B, E, t); w (==t)
+		// > 0 signals "use AccuTile in emit"; w == 0 signals "use rect AABB
+		// fallback" (degenerate conic, or aabb_mode != 5).
+		float4* conic_t;
 
 		// Separated depth sort: pre-sort Gaussians by depth, then sort expanded list by tile_id only
 		uint32_t* depth_order;          // [P] maps sorted position → original Gaussian index

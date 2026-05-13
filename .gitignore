@@ -114,3 +114,14 @@ metrics_reports/
 
 # ECCV supplemental
 eccv_suppl/
+
+# Local-only video output dirs (regenerate by re-rendering trajectories)
+demo_renders
+*.mp4
+*.mov
+
+# Rsync atomic-write temp files (pattern: `<name>.<random6>` like
+# `.bbsplat_test_renders.zip.7YrCHy`). The leading `.zip.` is the most
+# specific catch; the second line picks up any dotfile rsync temp.
+*.zip.*
+.??????*.zip.*

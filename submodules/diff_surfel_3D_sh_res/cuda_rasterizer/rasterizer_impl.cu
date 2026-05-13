@@ -72,9 +72,13 @@ __global__ void checkFrustum(int P,
 
 // Generates one key/value pair for all Gaussian / tile overlaps.
 // Run once per Gaussian (1:N mapping).
+// Two paths, dispatched per-Gaussian via conic_t:
+//   conic_t.w > 0  → SnugBox+AccuTile (aabb_mode==5): ellipse-tight scan
+//   conic_t.w == 0 → rect AABB enumeration (default for aabb_mode 0..4)
 __global__ void duplicateWithKeys(
 	int P,
 	const float2* points_xy,
+	const float4* conic_t,
 	const float* depths,
 	const uint32_t* offsets,
 	uint64_t* gaussian_keys_unsorted,
@@ -91,18 +95,21 @@ __global__ void duplicateWithKeys(
 	// Generate no key/value pair for invisible Gaussians
 	if (radii[idx] > 0)
 	{
-		// Find this Gaussian's offset in buffer for writing keys/values.
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+		const float4 ct = conic_t[idx];
+
+		if (ct.w > 0.0f) {
+			// AccuTile emit. Same conic + same no-fusion FP intrinsics as the
+			// count phase → bit-identical tile count → no overshoot.
+			duplicateToTilesTouched(
+				ct.x, ct.y, ct.z, ct.w, points_xy[idx], grid,
+				(uint32_t)idx, off, depths[idx],
+				gaussian_keys_unsorted, gaussian_values_unsorted);
+			return;
+		}
+
 		uint2 rect_min, rect_max;
-
-		// Use separate X/Y radii for rectangular AABB bounds
 		getRectXY(points_xy[idx], radii_x[idx], radii_y[idx], rect_min, rect_max, grid);
-
-		// For each tile that the bounding rect overlaps, emit a
-		// key/value pair. The key is |  tile ID  |      depth      |,
-		// and the value is the ID of the Gaussian. Sorting the values
-		// with this key yields Gaussian IDs in a list, such that they
-		// are first sorted by tile and then by depth.
 		for (int y = rect_min.y; y < rect_max.y; y++)
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
@@ -202,6 +209,7 @@ __global__ void gatherTilesTouched(int P, const uint32_t* tiles_touched, const u
 __global__ void duplicateWithKeysSorted(
 	int P,
 	const float2* points_xy,
+	const float4* conic_t,
 	const uint32_t* offsets,
 	uint64_t* gaussian_keys_unsorted,
 	uint32_t* gaussian_values_unsorted,
@@ -221,6 +229,19 @@ __global__ void duplicateWithKeysSorted(
 	if (radii[orig_idx] > 0)
 	{
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+		const float4 ct = conic_t[orig_idx];
+
+		if (ct.w > 0.0f) {
+			// AccuTile emit (depth bits left zero — within-tile order from
+			// depth-sorted iteration + stable radix sort).
+			duplicateToTilesTouched(
+				ct.x, ct.y, ct.z, ct.w, points_xy[orig_idx], grid,
+				orig_idx, off, 0.0f,
+				gaussian_keys_unsorted, gaussian_values_unsorted,
+				/*emit_tile_only=*/true);
+			return;
+		}
+
 		uint2 rect_min, rect_max;
 		getRectXY(points_xy[orig_idx], radii_x[orig_idx], radii_y[orig_idx], rect_min, rect_max, grid);
 
@@ -298,6 +319,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
 	obtain(chunk, geom.point_offsets, P, 128);
+	obtain(chunk, geom.conic_t, P, 128);  // SnugBox conic cache (aabb_mode==5)
 
 	// Depth sort buffers
 	obtain(chunk, geom.depth_order, P, 128);
@@ -443,6 +465,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.normal_opacity,
 		tile_grid,
 		geomState.tiles_touched,
+		geomState.conic_t,
 		prefiltered,
 		shapes,
 		kernel_type,
@@ -495,6 +518,7 @@ int CudaRasterizer::Rasterizer::forward(
 		duplicateWithKeysSorted << <(P + 255) / 256, 256 >> > (
 			P,
 			geomState.means2D,
+			geomState.conic_t,
 			geomState.point_offsets,
 			binningState.point_list_keys_unsorted,
 			binningState.point_list_unsorted,
@@ -519,6 +543,7 @@ int CudaRasterizer::Rasterizer::forward(
 		duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 			P,
 			geomState.means2D,
+			geomState.conic_t,
 			geomState.depths,
 			geomState.point_offsets,
 			binningState.point_list_keys_unsorted,
@@ -549,8 +574,11 @@ int CudaRasterizer::Rasterizer::forward(
 			imgState.ranges);
 	CHECK_CUDA(, debug)
 
-	// Let each tile blend its range of Gaussians independently in parallel
-	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	// Let each tile blend its range of Gaussians independently in parallel.
+	// feature_ptr carries FP32 colors_precomp (e.g. DC SH for cat mode); the
+	// FP16 SH baseline (geomState.rgb) always flows through the dedicated `rgb`
+	// param below — case 5/case 6 read it directly with a FP16→FP32 cast.
+	const float* feature_ptr = colors_precomp;
 	const float* transMat_ptr = transMat_precomp != nullptr ? transMat_precomp : geomState.transMat;
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
@@ -596,7 +624,7 @@ int CudaRasterizer::Rasterizer::forward(
 		intersection_count,
 		max_intersections_per_pixel,
 		nullptr,  // viewdirs_enc
-		((render_mode & 0xFF) == 6) ? geomState.rgb : nullptr,  // rgb_override: mode 6 needs SH colors separately from features (which has DC SH)
+		geomState.rgb,  // FP16 SH baseline (case 5 / case 6 read it; case 1/cat reads features instead)
 		metric_map,
 		metric_counts
 		), debug)
@@ -683,9 +711,9 @@ void CudaRasterizer::Rasterizer::backward(
 
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
-	// If we were given precomputed colors and not SHs, use them.
-	// render_mode 6 (3D_SH_cat): colors_precomp has DC SH, but backward needs full SH eval from rgb
-	const float* color_ptr = (colors_precomp != nullptr && (render_mode & 0xFF) != 6) ? colors_precomp : geomState.rgb;
+	// `colors` param in BACKWARD::render is the FP16 SH baseline (geomState.rgb).
+	// For mode 6 (3D_SH_cat), DC SH (colors_precomp, FP32) flows through dc_features.
+	const rgb_t* color_ptr = geomState.rgb;
 	const float* depth_ptr = geomState.depths;
 	const float* transMat_ptr = (transMat_precomp != nullptr) ? transMat_precomp : geomState.transMat;
 	CHECK_CUDA(BACKWARD::render(

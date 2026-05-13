@@ -40,14 +40,25 @@ if __name__ == "__main__":
                         help="Number of coarse levels (cat mode only)")
     parser.add_argument("--warmup", type=int, default=10,
                         help="Number of warmup iterations before timing")
-    parser.add_argument("--iterations", type=int, default=100,
-                        help="Number of iterations to benchmark")
+    parser.add_argument("--bench_iters", type=int, default=100,
+                        help="Number of frames to time for FPS bench (was --iterations; "
+                             "renamed to avoid colliding with the yaml's training_cfg.iterations "
+                             "key that merge_cfg_to_args writes back onto args).")
     parser.add_argument("--skip_save", action="store_true",
                         help="Skip saving images (faster benchmarking)")
     args = get_combined_args(parser)
 
     exp_path = args.model_path
     iteration = args.iteration
+    # Auto-detect latest iteration if -1 (avoids the --iteration/--iterations
+    # argparse prefix collision when both are passed on the cmdline).
+    if iteration == -1:
+        import glob as _glob
+        _ngp_files = _glob.glob(os.path.join(exp_path, "ngp_*.pth"))
+        _iters = [int(os.path.basename(f).replace("ngp_", "").replace(".pth", "")) for f in _ngp_files]
+        if _iters:
+            iteration = max(_iters)
+            print(f"[auto-iter] Using iteration {iteration} (ngp_{iteration}.pth)")
     yaml_file = args.yaml
 
     cfg_model = Config(yaml_file)
@@ -83,7 +94,7 @@ if __name__ == "__main__":
     num_cameras = len(viewpoint_stack)
     print(f"Benchmarking {num_cameras} cameras")
     print(f"Warmup iterations: {args.warmup}")
-    print(f"Benchmark iterations: {args.iterations}")
+    print(f"Benchmark iterations: {args.bench_iters}")
     print(f"Method: {args.method}")
     if args.method == "cat":
         print(f"Hybrid levels: {args.hybrid_levels}")
@@ -107,7 +118,7 @@ if __name__ == "__main__":
     end_event = torch.cuda.Event(enable_timing=True)
     
     with torch.no_grad():
-        for iter_idx in tqdm(range(args.iterations), desc="Benchmarking"):
+        for iter_idx in tqdm(range(args.bench_iters), desc="Benchmarking"):
             cam_idx = iter_idx % num_cameras
             cam = viewpoint_stack[cam_idx]
             
@@ -158,7 +169,7 @@ if __name__ == "__main__":
     print("PER-CAMERA STATISTICS")
     print(f"{'='*70}")
     camera_timings = defaultdict(list)
-    for iter_idx in range(args.iterations):
+    for iter_idx in range(args.bench_iters):
         cam_idx = iter_idx % num_cameras
         camera_timings[cam_idx].append(timings['total'][iter_idx])
     
@@ -172,7 +183,7 @@ if __name__ == "__main__":
     
     print(f"\n{'='*70}")
     print(f"Total cameras benchmarked: {num_cameras}")
-    print(f"Total iterations: {args.iterations}")
+    print(f"Total iterations: {args.bench_iters}")
     print(f"Average time per frame: {np.mean(timings['total']):.3f} ms")
     print(f"Average FPS: {1000.0/np.mean(timings['total']):.2f}")
     print(f"{'='*70}\n")

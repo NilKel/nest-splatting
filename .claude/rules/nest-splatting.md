@@ -63,6 +63,16 @@ Goal: bake the MLP residual into static per-Gaussian SH textures for fast infere
 
 **Full reference**: see [`docs/BAKED_RENDERING.md`](../../docs/BAKED_RENDERING.md) — includes BC7 atlas compression, AABB modes (SnugBox+AccuTile), sort modes, importance-based pruning/skip-texture, atlas-width auto-grow, FP16/uint8/BC7 dtype trade-offs, and the 18-pair mip-360 results.
 
+**Deploy a single scene (quick procedure)**: see [`docs/DEPLOY_DEMO.md`](../../docs/DEPLOY_DEMO.md) — short operational summary of the 4-stage bake → nat2 → pack → upload pipeline plus the `index.html` card snippet. Cross-references BITYMI_BUNDLES for depth. **Live viewer is the Rust `Halloumi-web-splat` WASM build** (not the TS Halloumi-WS).
+
+**Deployment / WebGPU viewer (full reference)**: see [`docs/BITYMI_BUNDLES.md`](../../docs/BITYMI_BUNDLES.md) — full bake → `scene.nat2` → `.bitymi` → HF upload pipeline, including BC7 vs. ASTC, HD vs. lite, naming conventions, batch helpers (`build_bc7_bundles_fp16.py`, `build_astc_bundles_fp16.py`), and the single-scene variant template.
+
+**Halloumi-WS viewer (TS/WebGPU "WebSplatter")**: see [`docs/HALLOUMI_WS_VIEWER.md`](../../docs/HALLOUMI_WS_VIEWER.md) — the TypeScript viewer at `/home/nilkel/Projects/Halloumi-WS` (build with `npm run build`, dev with `npm run dev`). Covers the surfel buffer layout (32 B/Gauss), shader pipeline (surfel_cull → preprocess_2dgs → radix sort → tile_raster → display), bundle loader (BITYMI chunks), orbit-pivot logic (ray-disk intersection in `pickGaussAt`), and modifications vs. upstream WebSplatter (2DGS-only, BC7+ASTC, SV/SB color paths). Currently *not* deployed to bitymi-demos — the live viewer is still the Rust `Halloumi-web-splat` build; swap procedure in § 12 of the doc.
+
+**4090 benchmarking**: see [`docs/BENCH_4090.md`](../../docs/BENCH_4090.md) — full procedure to bench a baked model on `neel@10.176.128.69` (SSH key installed). Pipeline: `build_bench_bundle.py` locally → `rsync` to `~/nest-bench/bundles/<name>/` → `ssh ... bash -c '. miniforge3/.../conda.sh && conda activate bench && python bench_minimal.py ...'`. Returns PSNR/SSIM/LPIPS/FPS JSON. Uses cuda.Event timing (GPU-throughput).
+
+**Sherlock cluster (paper-scale A100 runs)**: see [`docs/SHERLOCK_CLUSTER.md`](../../docs/SHERLOCK_CLUSTER.md) — `z0051beu@sherlock01.ainet.local` (institution-internal — VPN required). SLURM scheduler with job arrays; partition `a100-4gpu-40gb`, account `rctcd82061`. Filesystem convention: bulk lives in `~/userdir/` (conda + projects + data), with `~/userdir/Projects/<repo>` mirroring local layout and `~/userdir/Projects/data/<dataset>/` for inputs. Modules: `gcc/13.2.0`, `cuda12.1/toolkit/12.1.0` (A100 sm_80 — do NOT clone 5090's cu128 env, rebuild CUDA extensions against the cluster's CUDA 12.1). Canonical SLURM template: `../beta-splatting/slurm_benchmark_mip360.sh`. Common auth failure mode (VSCode → password prompt loop) and recovery procedure documented in § 1.
+
 **Pipeline**:
 1. **Bake** (`diff_surfel_bake`): evaluate MLP at 8×8 UV grid per Gaussian → 48D SH residual per texel
 2. **Render** (`diff_surfel_bake_render`): forward-only 2DGS rasterizer, samples atlas via texture lookup

@@ -17,4 +17,8 @@
 #define BLOCK_X 16
 #define BLOCK_Y 16
 
+// FP16 per-Gaussian SH baseline color storage. See rgb_type.h for the
+// rgb_t typedef. (Defined in a separate header to avoid leaking NUM_CHANNELS
+// above into cub's includes via rasterizer_impl.h.)
+
 #endif

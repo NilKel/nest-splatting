@@ -55,6 +55,10 @@ def main():
                        help="Suffix for output filename")
     parser.add_argument("--iteration", type=int, default=-1,
                        help="Iteration to load (-1 for latest)")
+    parser.add_argument("--out_dir", type=str, default=None,
+                       help="If set, write outputs here (filename prefixed with model dir basename "
+                            "to disambiguate across runs). Otherwise writes back to each model's "
+                            "final_test_intersection/ dir.")
 
     args = parser.parse_args()
 
@@ -170,27 +174,30 @@ def main():
 
             print(f"  Intersection stats: min={min_count}, max={max_count}, mean={stats['mean']:.1f}")
 
-            # Save to intersection output dir
-            intersection_dir = os.path.join(model_path, "final_test_intersection")
-            os.makedirs(intersection_dir, exist_ok=True)
-
-            # Find existing index for this frame
-            existing_files = glob.glob(os.path.join(intersection_dir, f"*_{args.frame}_intersection.png"))
-            if existing_files:
-                # Extract index from existing file
-                basename = os.path.basename(existing_files[0])
-                idx = int(basename.split('_')[0])
+            # Pick output dir + filenames.
+            if args.out_dir is not None:
+                intersection_dir = args.out_dir
+                os.makedirs(intersection_dir, exist_ok=True)
+                prefix = os.path.basename(model_path.rstrip("/"))
+                output_name = f"{prefix}_{args.frame}_intersection{args.output_suffix}.png"
+                hist_name   = f"{prefix}_{args.frame}_histogram{args.output_suffix}.png"
             else:
-                idx = 0
-
-            output_name = f"{idx:03d}_{args.frame}_intersection{args.output_suffix}.png"
-            hist_name = f"{idx:03d}_{args.frame}_histogram{args.output_suffix}.png"
+                intersection_dir = os.path.join(model_path, "final_test_intersection")
+                os.makedirs(intersection_dir, exist_ok=True)
+                existing_files = glob.glob(os.path.join(intersection_dir, f"*_{args.frame}_intersection.png"))
+                if existing_files:
+                    basename = os.path.basename(existing_files[0])
+                    idx = int(basename.split('_')[0])
+                else:
+                    idx = 0
+                output_name = f"{idx:03d}_{args.frame}_intersection{args.output_suffix}.png"
+                hist_name   = f"{idx:03d}_{args.frame}_histogram{args.output_suffix}.png"
 
             save_img_u8(intersection_heatmap, os.path.join(intersection_dir, output_name))
             save_img_u8(histogram_img, os.path.join(intersection_dir, hist_name))
 
-            print(f"  Saved: {output_name}")
-            print(f"  Saved: {hist_name}")
+            print(f"  Saved: {os.path.join(intersection_dir, output_name)}")
+            print(f"  Saved: {os.path.join(intersection_dir, hist_name)}")
 
         except Exception as e:
             print(f"  Error: {e}")

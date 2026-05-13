@@ -165,7 +165,7 @@ RasterizeGaussiansCUDA(
     out_color = torch::full({C, H, W}, 0.0, float_opts);
   }
   
-  int out_dim = 3+3+1+1 + 3 + 3 + 1 + 1 + 1; // + w_square_sum
+  int out_dim = 3+3+1+1 + 3 + 3 + 1 + 1 + 1 + 1; // + w_square_sum + beta_sum (--w_lambda_perpix)
     if((has_dual_hashgrid && render_mode == 5) || (has_dual_hashgrid && render_mode == 2)) {  // surface_rgb or baseline_double mode
     // No extra channels needed - features are already in out_color
   }

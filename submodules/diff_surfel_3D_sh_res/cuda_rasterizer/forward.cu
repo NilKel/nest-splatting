@@ -552,10 +552,11 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float2* points_xy_image,
 	float* depths,
 	float* transMats,
-	float* rgb,
+	rgb_t* rgb,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
+	float4* conic_t,            // SnugBox conic cache (aabb_mode==5)
 	bool prefiltered,
 	const float* shapes,
 	const int kernel_type,
@@ -572,6 +573,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	radii_x[idx] = 0;
 	radii_y[idx] = 0;
 	tiles_touched[idx] = 0;
+	conic_t[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);  // default: rect AABB fallback
 
 	// Perform near culling, quit if outside.
 	float3 p_view;
@@ -606,9 +608,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 #endif
 
 	// Compute cutoff for bounding box
-	// aabb_mode: 0 = square (default), 1 = AdR cutoff, 2 = rectangular, 3 = AdR + rectangular, 4 = beta (fixed r=1)
+	// aabb_mode: 0 = square (default), 1 = AdR cutoff, 2 = rectangular, 3 = AdR + rectangular,
+	//            4 = beta (fixed r=1), 5 = AdR + rectangular + AccuTile ellipse cull
 	float cutoff;
-	bool use_adr_cutoff = (aabb_mode == 1 || aabb_mode == 3);  // modes 1 and 3 use AdR
+	bool use_adr_cutoff = (aabb_mode == 1 || aabb_mode == 3 || aabb_mode == 5);  // modes 1, 3, 5 use AdR
 	bool use_beta_cutoff = (aabb_mode == 4);  // mode 4: fixed r=1 for beta kernels
 	if (use_adr_cutoff && kernel_type == 3 && shapes != nullptr) {
 		// AdR: Adaptive bounding box based on opacity and beta
@@ -728,7 +731,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	uint2 rect_min, rect_max;
 	float radius;  // For output to radii array (max of x,y for compatibility)
 	int rx, ry;    // Separate X and Y radii
-	bool use_rect_aabb = (aabb_mode >= 2);  // modes 2 and 3 use rectangular AABB
+	bool use_rect_aabb = (aabb_mode >= 2);  // modes 2, 3, 4, 5 use rectangular AABB
 
 	if (use_rect_aabb) {
 		// Rectangular AABB: keep separate X and Y radii
@@ -759,16 +762,16 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	if (colors_precomp == nullptr || (render_mode & 0xFF) == 6) {
 		// SH mode: evaluate spherical harmonics to RGB
 		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
-		rgb[idx * C + 0] = result.x;
-		rgb[idx * C + 1] = result.y;
-		rgb[idx * C + 2] = result.z;
+		rgb[idx * C + 0] = FLOAT_TO_RGB(result.x);
+		rgb[idx * C + 1] = FLOAT_TO_RGB(result.y);
+		rgb[idx * C + 2] = FLOAT_TO_RGB(result.z);
 	}
 	else {
 		// Per-Gaussian features mode (cat, adaptive, etc.): copy precomputed features
 		// For empty colors_precomp (baseline hashgrid), skip this - rgb buffer won't be used
 		// Only copy if C matches expected dimension (otherwise it's a size mismatch)
 		for(int i = 0; i < C; i++){
-			rgb[idx * C + i] = colors_precomp[idx * C + i];
+			rgb[idx * C + i] = FLOAT_TO_RGB(colors_precomp[idx * C + i]);
 		}
 	}
 	
@@ -780,7 +783,33 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	radii[idx] = (int)radius;
 	points_xy_image[idx] = point_image;
 	normal_opacity[idx] = {normal.x, normal.y, normal.z, opacities[idx]};
-	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+
+	uint32_t rect_tile_count = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+
+	// SnugBox+AccuTile (aabb_mode==5): per-row ellipse intersection emits keys
+	// only for tiles the ellipse actually crosses. Counts here MUST equal the
+	// emit-phase count in duplicateWithKeys (see auxiliary.h — uses no-fusion
+	// FP intrinsics for bit-identicality across the two specializations).
+	if (aabb_mode == 5) {
+		float A_c, B_c, E_c, t_c;
+		float2 p_c;
+		if (compute_conic_from_transmat(T, cutoff, A_c, B_c, E_c, t_c, p_c)) {
+			uint32_t n_tiles_sb = duplicateToTilesTouched(
+				A_c, B_c, E_c, t_c, p_c, grid,
+				0, 0, 0.0f, nullptr, nullptr);
+			// AccuTile must be ≤ rect AABB. If not, the conic is near-degenerate
+			// (disc → 0⁻) and the scan inflated outside the rect — fall back.
+			if (n_tiles_sb > 0 && n_tiles_sb <= rect_tile_count) {
+				conic_t[idx] = make_float4(A_c, B_c, E_c, t_c);
+				// Use conic center so the emit-phase walk matches exactly.
+				points_xy_image[idx] = p_c;
+				tiles_touched[idx] = n_tiles_sb;
+				return;
+			}
+		}
+	}
+
+	tiles_touched[idx] = rect_tile_count;
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -1046,7 +1075,7 @@ renderCUDAsurfelForward(
 	const int* __restrict__ level_offsets_diffuse = nullptr,
 	const float* __restrict__ gridrange_diffuse = nullptr,
 	const int render_mode = 0,
-	const float* __restrict__ rgb = nullptr,
+	const rgb_t* __restrict__ rgb = nullptr,
 	const uint32_t max_intersections = 0,
 	const float* __restrict__ shapes = nullptr,
 	const int kernel_type = 0,
@@ -1137,7 +1166,8 @@ renderCUDAsurfelForward(
 	uint32_t render_number = 0;
 	float vis_appearance[3] = {0};
 	float overdraw_sum = 0.0f;  // Soft contributor count: sum of sigmoid(k*(w-t))
-	float w_square_sum = 0.0f;  // Sum of squared weights: sum(w_i^2) for weight_reg loss
+	float w_square_sum = 0.0f;  // Sum of squared weights: sum(w_i^2) for weight_reg
+	float beta_sum    = 0.0f;   // sum_i w_i * beta_i — per-pixel shape reg target (--w_lambda_perpix) loss
 
 #if RENDER_AXUTILITY
 	// render axutility ouput
@@ -1397,7 +1427,7 @@ renderCUDAsurfelForward(
 				// Load SH base color
 				int gauss_id = collected_id[j];
 				for (int ch = 0; ch < 3; ch++)
-					my_sh_color[ch] = rgb[gauss_id * 3 + ch];
+					my_sh_color[ch] = RGB_TO_FLOAT(rgb[gauss_id * 3 + ch]);
 
 				// Query hashgrid (up to 16D for 4 levels × 4D)
 				const int active_hashgrid_levels = (level >> 8) & 0xFF;
@@ -1705,6 +1735,13 @@ renderCUDAsurfelForward(
 		// Ideal surface: one Gaussian with w=1 → sum=1. Overdraw: multiple w<1 → sum<1.
 		w_square_sum += w * w;
 
+		// Per-pixel beta-mass accumulator: sum_i w_i * beta_i.
+		// Drives the --w_lambda_perpix shape reg (Python loss: (w_r * beta_sum).mean()).
+		// Note: we use collected_shapes[j].x (the primary shape — beta for beta/beta_scaled/
+		// general/flex kernels). Always computed (cheap); only gates gradient via the
+		// Python autograd path. Beta kernels only — for scalar Gaussian kernels shape=0.
+		beta_sum += w * collected_shapes[j].x;
+
 		// NOTE: max_intersections check moved earlier (before kernel computation)
 		// to cap total evaluations for benchmarking, not just valid intersections
 
@@ -1740,8 +1777,12 @@ renderCUDAsurfelForward(
 			// MyGs, now color calculation is in ngp part.
 
 			// Special handling for adaptive_cat_fast (mode 13): check weight BEFORE 3D intersection
-			// This allows skipping expensive intersection computation for Gaussian-only primitives
+			// This allows skipping expensive intersection computation for Gaussian-only primitives.
+			// NOTE: This path overloads `rgb` as a variable-width [N, total_dim+1] feature buffer
+			// (not [N,3] color). Incompatible with FP16_RGB (which assumes [N,3] colors). Gated out
+			// when FP16_RGB=1 — only modes 1/5/6 are supported in FP16-rgb mode.
 			const int base_mode = render_mode & 0xFF;
+#if !FP16_RGB
 			if (base_mode == 13) {
 				// adaptive_cat_fast: Skip 3D intersection for Gaussian-only primitives
 				const bool use_inference = (render_mode >> 8) & 0x1;
@@ -1866,10 +1907,18 @@ renderCUDAsurfelForward(
 				T = T * (1 - alpha);
 				continue;
 			}
+#endif  // !FP16_RGB (mode 13 adaptive_cat_fast)
 
 			if(level == 0){
-				for (int ch = 0; ch < CHANNELS; ch++)
-					C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
+				// SH-only fallback. Read from FP16 rgb (preprocessed) for the
+				// hashgrid-mode paths; features (colors_precomp) is FP32 for cat.
+				if (rgb != nullptr) {
+					for (int ch = 0; ch < CHANNELS; ch++)
+						C[ch] += RGB_TO_FLOAT(rgb[collected_id[j] * CHANNELS + ch]) * w;
+				} else {
+					for (int ch = 0; ch < CHANNELS; ch++)
+						C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
+				}
 			}
 			else{
 
@@ -1914,11 +1963,11 @@ renderCUDAsurfelForward(
 			 *   6. feat = SH_color + residual
 			 */
 
-			// 1. Load SH base color from preprocessing (rgb stores SH-evaluated 3D colors)
+			// 1. Load SH base color from preprocessing (rgb stores SH-evaluated 3D colors, FP16)
 			int gauss_id = collected_id[j];
 			float sh_color[3];
 			for (int ch = 0; ch < 3; ch++)
-				sh_color[ch] = rgb[gauss_id * 3 + ch];
+				sh_color[ch] = RGB_TO_FLOAT(rgb[gauss_id * 3 + ch]);
 
 			// Skip hash query when:
 			// - contribution w = T*alpha is too small (tail pixels), or
@@ -2050,7 +2099,7 @@ renderCUDAsurfelForward(
 			int gauss_id_6 = collected_id[j];
 			float sh_color_6[3];
 			for (int ch = 0; ch < 3; ch++)
-				sh_color_6[ch] = rgb[gauss_id_6 * 3 + ch];
+				sh_color_6[ch] = RGB_TO_FLOAT(rgb[gauss_id_6 * 3 + ch]);
 
 			// 2. Query hashgrid (same as case 5)
 			const int active_hashgrid_levels_6 = (level >> 8) & 0xFF;
@@ -2211,6 +2260,7 @@ renderCUDAsurfelForward(
 		out_others[pix_id + OVERDRAW_OFFSET * H * W] = overdraw_sum;
 		out_others[pix_id + MAXDEPTH_OFFSET * H * W] = max_depth;
 		out_others[pix_id + WSQUARE_OFFSET * H * W] = w_square_sum;
+		out_others[pix_id + BETA_SUM_OFFSET * H * W] = beta_sum;
 		// Per-pixel id of the max-weight Gaussian (for mini depth-reinit SH transfer).
 		// out_index is a separate int32 [H, W] buffer plumbed all the way to Python.
 		if (out_index != nullptr) out_index[pix_id] = max_idx;
@@ -2377,7 +2427,7 @@ void FORWARD::render(
 	uint32_t* intersection_count,
 	uint32_t max_intersections_per_pixel,
 	const float* viewdirs_enc,
-	const float* rgb_override,
+	const rgb_t* rgb_override,
 	const int* metric_map,
 	int* metric_counts)
 {
@@ -2388,9 +2438,9 @@ void FORWARD::render(
 		printf("diff_surfel_3D_16: Unsupported channel count %d (only C=3 supported)\n", C);
 		return;
 	}
-	// For mode 6 (3D_SH_cat): colors = DC SH, rgb_override = full SH eval
-	// For other modes: rgb = colors (same pointer)
-	const float* rgb_ptr = (rgb_override != nullptr) ? rgb_override : colors;
+	// FP16 SH baseline (geomState.rgb) — read by case 5 / case 6 inside the kernel.
+	// `colors` (FP32) carries colors_precomp / DC SH separately.
+	const rgb_t* rgb_ptr = rgb_override;
 
 	// WMMA forward disabled: 55KB shared memory (31KB static + 24KB dynamic) kills occupancy
 	// (1 block/SM vs 3 blocks/SM), and 7 __syncthreads per Gaussian adds overhead.
@@ -2426,10 +2476,11 @@ void FORWARD::preprocess(int P, int D, int M,
 	float2* means2D,
 	float* depths,
 	float* transMats,
-	float* rgb,
+	rgb_t* rgb,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
+	float4* conic_t,
 	bool prefiltered,
 	const float* shapes,
 	const int kernel_type,
@@ -2463,6 +2514,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		normal_opacity,
 		grid,
 		tiles_touched,
+		conic_t,
 		prefiltered,
 		shapes,
 		kernel_type,

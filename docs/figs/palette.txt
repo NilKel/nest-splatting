@@ -1,0 +1,72 @@
+Color palette reference (see palette.pdf / palette.png).
+
+Each swatch is a base color mixed with white at five saturation levels.
+Refer to a swatch by its number in chat (e.g. "use 4 for the feature blue").
+
+Base hex codes:
+  Blue     = #1F77B4   (matplotlib tab:blue)
+  Green    = #2CA02C   (matplotlib tab:green)
+  Orange   = #FF7F0E   (matplotlib tab:orange)
+  Red      = #D62728   (matplotlib tab:red)
+  Yellow   = #D6A700   (goldenrod, original)
+  Cadmium  = #FFC72C   (warm cadmium yellow)
+  Lemon    = #F4ED00   (cool lemon yellow)
+  Purple   = #9467BD   (matplotlib tab:purple)
+  Brown    = #8C564B   (matplotlib tab:brown)
+  Grey     = #7F7F7F   (matplotlib tab:gray)
+
+Column = saturation %. In TikZ this is `BaseColor!PCT!white`.
+  col 1 = 100%   col 2 = 70%   col 3 = 50%   col 4 = 30%   col 5 = 15%
+
+Index   Family    Pct%   TikZ
+-----   -------   ----   -------------------
+  1     Blue      100    cBlue
+  2     Blue       70    cBlue!70!white
+  3     Blue       50    cBlue!50!white
+  4     Blue       30    cBlue!30!white
+  5     Blue       15    cBlue!15!white
+  6     Green     100    cGreen
+  7     Green      70    cGreen!70!white
+  8     Green      50    cGreen!50!white
+  9     Green      30    cGreen!30!white
+ 10     Green      15    cGreen!15!white
+ 11     Orange    100    cOrange
+ 12     Orange     70    cOrange!70!white
+ 13     Orange     50    cOrange!50!white
+ 14     Orange     30    cOrange!30!white
+ 15     Orange     15    cOrange!15!white
+ 16     Red       100    cRed
+ 17     Red        70    cRed!70!white
+ 18     Red        50    cRed!50!white
+ 19     Red        30    cRed!30!white
+ 20     Red        15    cRed!15!white
+ 21     Yellow    100    cYellow
+ 22     Yellow     70    cYellow!70!white
+ 23     Yellow     50    cYellow!50!white
+ 24     Yellow     30    cYellow!30!white
+ 25     Yellow     15    cYellow!15!white
+ 26     Cadmium   100    cCadm
+ 27     Cadmium    70    cCadm!70!white
+ 28     Cadmium    50    cCadm!50!white
+ 29     Cadmium    30    cCadm!30!white
+ 30     Cadmium    15    cCadm!15!white
+ 31     Lemon     100    cLemon
+ 32     Lemon      70    cLemon!70!white
+ 33     Lemon      50    cLemon!50!white
+ 34     Lemon      30    cLemon!30!white
+ 35     Lemon      15    cLemon!15!white
+ 36     Purple    100    cPurple
+ 37     Purple     70    cPurple!70!white
+ 38     Purple     50    cPurple!50!white
+ 39     Purple     30    cPurple!30!white
+ 40     Purple     15    cPurple!15!white
+ 41     Brown     100    cBrown
+ 42     Brown      70    cBrown!70!white
+ 43     Brown      50    cBrown!50!white
+ 44     Brown      30    cBrown!30!white
+ 45     Brown      15    cBrown!15!white
+ 46     Grey      100    cGray
+ 47     Grey       70    cGray!70!white
+ 48     Grey       50    cGray!50!white
+ 49     Grey       30    cGray!30!white
+ 50     Grey       15    cGray!15!white

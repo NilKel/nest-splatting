@@ -32,7 +32,7 @@
 #define OVERDRAW_OFFSET 14
 #define MAXDEPTH_OFFSET 15  // Depth of max-contributing Gaussian per pixel
 #define WSQUARE_OFFSET 16   // Sum of squared weights: sum(w_i^2) for weight_reg
-#define DIFFUSE_RGB_OFFSET 17
+#define BETA_SUM_OFFSET 17  // Sum of w_i * beta_i per pixel (--w_lambda_perpix shape reg)
 // #define MEDIAN_WEIGHT_OFFSET 7
 
 // distortion helper macros
@@ -95,6 +95,217 @@ __forceinline__ __device__ void getRectXY(const float2 p, int radius_x, int radi
 		min(grid.x, max((int)0, (int)((p.x + radius_x + BLOCK_X - 1) / BLOCK_X))),
 		min(grid.y, max((int)0, (int)((p.y + radius_y + BLOCK_Y - 1) / BLOCK_Y)))
 	};
+}
+
+// =============================================================================
+// SnugBox / AccuTile (FastGS / Speedy-Splat port) — see auxiliary.h in
+// diff_surfel_bake_render for the full derivation. Summary:
+//   transMat T pulls screen px → surfel (u,v) via cross-product trick.
+//   surfel disk u²+v² ≤ k² becomes a quadratic Q(px,py) ≤ 0 in pixel coords,
+//   centered at ∇Q=0 we have A·dx² + 2B·dx·dy + E·dy² ≤ t.
+// processTiles walks the ellipse row-by-row, emitting only tiles it crosses.
+// computeEllipseIntersection uses round-to-nearest no-fusion intrinsics so
+// the count phase (in preprocessCUDA) and the emit phase (in duplicateWithKeys)
+// produce bit-identical tile counts regardless of NVCC's FMA-fusion choice.
+// =============================================================================
+
+__forceinline__ __device__ bool compute_conic_from_transmat(
+	const glm::mat3& T, const float cutoff,
+	float& A, float& B, float& E, float& t, float2& p)
+{
+	const float k_sq = cutoff * cutoff;
+	const glm::vec3 Tu = T[0];
+	const glm::vec3 Tv = T[1];
+	const glm::vec3 Tw = T[2];
+
+	const glm::vec3 n0 = glm::cross(Tv, Tw);
+	const glm::vec3 n1 = glm::cross(Tw, Tu);
+	const glm::vec3 n2 = glm::cross(Tu, Tv);
+
+	const float A_ = n0.x*n0.x + n0.y*n0.y - k_sq * n0.z*n0.z;
+	const float B_ = n0.x*n1.x + n0.y*n1.y - k_sq * n0.z*n1.z;
+	const float E_ = n1.x*n1.x + n1.y*n1.y - k_sq * n1.z*n1.z;
+	const float D_ = n0.x*n2.x + n0.y*n2.y - k_sq * n0.z*n2.z;
+	const float F_ = n1.x*n2.x + n1.y*n2.y - k_sq * n1.z*n2.z;
+
+	const float det = A_*E_ - B_*B_;
+	if (!(det > 0.0f) || !(A_ > 0.0f) || !(E_ > 0.0f)) return false;
+
+	p.x = (B_*F_ - E_*D_) / det;
+	p.y = (B_*D_ - A_*F_) / det;
+
+	const float cx_p = p.x*n0.x + p.y*n1.x + n2.x;
+	const float cy_p = p.x*n0.y + p.y*n1.y + n2.y;
+	const float cz_p = p.x*n0.z + p.y*n1.z + n2.z;
+	const float t_   = -(cx_p*cx_p + cy_p*cy_p - k_sq * cz_p*cz_p);
+	if (!(t_ > 0.0f)) return false;
+
+	A = A_; B = B_; E = E_; t = t_;
+	return true;
+}
+
+__forceinline__ __device__ float2 computeEllipseIntersection(
+	const float A, const float B, const float E,
+	const float disc, const float t, const float2 p,
+	const bool isY, const float coord)
+{
+	const float p_u = isY ? p.y : p.x;
+	const float p_v = isY ? p.x : p.y;
+	const float coeff = isY ? A : E;
+	const float h = __fadd_rn(coord, -p_u);
+	const float disc_h2 = __fmul_rn(__fmul_rn(disc, h), h);
+	const float t_coeff = __fmul_rn(t, coeff);
+	const float radicand = __fadd_rn(disc_h2, t_coeff);
+	const float sqrt_term = sqrtf(fmaxf(radicand, 0.0f));
+	const float neg_Bh = __fmul_rn(-B, h);
+	return {
+		__fadd_rn(__fdiv_rn(__fadd_rn(neg_Bh, -sqrt_term), coeff), p_v),
+		__fadd_rn(__fdiv_rn(__fadd_rn(neg_Bh,  sqrt_term), coeff), p_v)
+	};
+}
+
+// Scan-line walk along the ellipse boundary. Returns total tile count.
+// When gaussian_keys_unsorted/gaussian_values_unsorted are non-null, also emits
+// (tile_id<<32 | depth_bits) keys per touched tile — call sites in
+// duplicateWithKeys / duplicateWithKeysSorted (see rasterizer_impl.cu).
+// Both the count phase (in preprocessCUDA, nullptr buffers) and the emit phase
+// MUST produce bit-identical tile counts — see comment in computeEllipseIntersection.
+__device__ inline uint32_t processTiles(
+	const float A, const float B, const float E,
+	const float disc, const float t, const float2 p,
+	float2 bbox_min, float2 bbox_max,
+	float2 bbox_argmin, float2 bbox_argmax,
+	int2 rect_min, int2 rect_max,
+	const dim3 grid, const bool isY,
+	uint32_t idx, uint32_t off, float depth,
+	uint64_t* gaussian_keys_unsorted,
+	uint32_t* gaussian_values_unsorted,
+	bool emit_tile_only = false)
+{
+	const float BLOCK_U = isY ? (float)BLOCK_Y : (float)BLOCK_X;
+	const float BLOCK_V = isY ? (float)BLOCK_X : (float)BLOCK_Y;
+
+	if (isY) {
+		rect_min = {rect_min.y, rect_min.x};
+		rect_max = {rect_max.y, rect_max.x};
+		bbox_min = {bbox_min.y, bbox_min.x};
+		bbox_max = {bbox_max.y, bbox_max.x};
+		bbox_argmin = {bbox_argmin.y, bbox_argmin.x};
+		bbox_argmax = {bbox_argmax.y, bbox_argmax.x};
+	}
+
+	uint32_t tiles_count = 0;
+	float2 intersect_min_line, intersect_max_line;
+	float ellipse_min, ellipse_max;
+	float min_line, max_line;
+
+	intersect_max_line = {bbox_max.y, bbox_min.y};
+	min_line = __fmul_rn((float)rect_min.x, BLOCK_U);
+	if (bbox_min.x <= min_line) {
+		intersect_min_line = computeEllipseIntersection(
+			A, B, E, disc, t, p, isY, min_line);
+	} else {
+		intersect_min_line = intersect_max_line;
+	}
+
+	for (int u = rect_min.x; u < rect_max.x; ++u)
+	{
+		max_line = __fadd_rn(min_line, BLOCK_U);
+		if (max_line <= bbox_max.x) {
+			intersect_max_line = computeEllipseIntersection(
+				A, B, E, disc, t, p, isY, max_line);
+		}
+
+		if (min_line <= bbox_argmin.y && bbox_argmin.y < max_line) {
+			ellipse_min = bbox_min.y;
+		} else {
+			ellipse_min = fminf(intersect_min_line.x, intersect_max_line.x);
+		}
+
+		if (min_line <= bbox_argmax.y && bbox_argmax.y < max_line) {
+			ellipse_max = bbox_max.y;
+		} else {
+			ellipse_max = fmaxf(intersect_min_line.y, intersect_max_line.y);
+		}
+
+		const int min_tile_v = max(rect_min.y, min(rect_max.y, (int)__fdiv_rn(ellipse_min, BLOCK_V)));
+		const int max_tile_v = min(rect_max.y, max(rect_min.y, (int)__fadd_rn(__fdiv_rn(ellipse_max, BLOCK_V), 1.0f)));
+		tiles_count += (uint32_t)max(0, max_tile_v - min_tile_v);
+
+		if (gaussian_keys_unsorted != nullptr) {
+			for (int v = min_tile_v; v < max_tile_v; v++) {
+				uint64_t key = isY ? (u * grid.x + v) : (v * grid.x + u);
+				key <<= 32;
+				// emit_tile_only=true → leave low 32 bits zero (within-tile depth
+				// order guaranteed by caller iterating in depth-sorted order +
+				// stable sort). emit_tile_only=false → pack depth bits.
+				if (!emit_tile_only) key |= *((uint32_t*)&depth);
+				gaussian_keys_unsorted[off] = key;
+				gaussian_values_unsorted[off] = idx;
+				off++;
+			}
+		}
+
+		intersect_min_line = intersect_max_line;
+		min_line = max_line;
+	}
+	return tiles_count;
+}
+
+// Two-mode driver: compute ellipse bbox from (A, B, E, t, p) and either
+// count touched tiles (keys=nullptr) or emit (key, value) pairs.
+__device__ inline uint32_t duplicateToTilesTouched(
+	const float A, const float B, const float E,
+	const float t, const float2 p, const dim3 grid,
+	uint32_t idx, uint32_t off, float depth,
+	uint64_t* gaussian_keys_unsorted,
+	uint32_t* gaussian_values_unsorted,
+	bool emit_tile_only = false)
+{
+	const float disc = __fadd_rn(__fmul_rn(B, B), -__fmul_rn(A, E));
+	if (A <= 0.0f || E <= 0.0f || disc >= 0.0f || t <= 0.0f) return 0;
+
+	const float B2t = __fmul_rn(__fmul_rn(B, B), t);
+	const float x_term_sq = -__fdiv_rn(B2t, __fmul_rn(disc, A));
+	const float y_term_sq = -__fdiv_rn(B2t, __fmul_rn(disc, E));
+	if (x_term_sq < 0.0f || y_term_sq < 0.0f) return 0;
+	float x_term = sqrtf(x_term_sq);
+	float y_term = sqrtf(y_term_sq);
+	x_term = (B < 0.0f) ? x_term : -x_term;
+	y_term = (B < 0.0f) ? y_term : -y_term;
+
+	const float2 bbox_argmin = { p.y - y_term, p.x - x_term };
+	const float2 bbox_argmax = { p.y + y_term, p.x + x_term };
+	const float2 bbox_min = {
+		computeEllipseIntersection(A, B, E, disc, t, p, true, bbox_argmin.x).x,
+		computeEllipseIntersection(A, B, E, disc, t, p, false, bbox_argmin.y).x
+	};
+	const float2 bbox_max = {
+		computeEllipseIntersection(A, B, E, disc, t, p, true, bbox_argmax.x).y,
+		computeEllipseIntersection(A, B, E, disc, t, p, false, bbox_argmax.y).y
+	};
+
+	const int2 rect_min = {
+		max(0, min((int)grid.x, (int)__fdiv_rn(bbox_min.x, (float)BLOCK_X))),
+		max(0, min((int)grid.y, (int)__fdiv_rn(bbox_min.y, (float)BLOCK_Y)))
+	};
+	const int2 rect_max = {
+		max(0, min((int)grid.x, (int)__fadd_rn(__fdiv_rn(bbox_max.x, (float)BLOCK_X), 1.0f))),
+		max(0, min((int)grid.y, (int)__fadd_rn(__fdiv_rn(bbox_max.y, (float)BLOCK_Y), 1.0f)))
+	};
+
+	const int y_span = rect_max.y - rect_min.y;
+	const int x_span = rect_max.x - rect_min.x;
+	if (y_span * x_span == 0) return 0;
+
+	const bool isY = y_span < x_span;
+	return processTiles(
+		A, B, E, disc, t, p,
+		bbox_min, bbox_max, bbox_argmin, bbox_argmax,
+		rect_min, rect_max, grid, isY,
+		idx, off, depth,
+		gaussian_keys_unsorted, gaussian_values_unsorted,
+		emit_tile_only);
 }
 
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)
