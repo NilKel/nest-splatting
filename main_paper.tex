@@ -51,6 +51,11 @@
 %\documentclass[manuscript, screen, review]{acmart}
 %%
 %% \BibTeX command to typeset BibTeX logo in the docs
+\citestyle{acmauthoryear}
+
+% Metadata Information
+\acmJournal{TOG}
+
 \AtBeginDocument{%
   \providecommand\BibTeX{{%
     Bib\TeX}}}
@@ -81,8 +86,13 @@
 % Include other packages here, before hyperref.
 \usepackage{graphicx}
 \usepackage{booktabs}
-\usepackage{float} 
-\usepackage{placeins} 
+\usepackage{float}
+\usepackage{placeins}
+
+% Ranking-highlight macros used in result and ablation tables.
+\newcommand{\first}[1]{\cellcolor{red!25}\textbf{#1}}
+\newcommand{\second}[1]{\cellcolor{orange!25}\textbf{#1}}
+\newcommand{\third}[1]{\cellcolor{yellow!35}\textbf{#1}}
 % The "axessiblity" package can be found at: https://ctan.org/pkg/axessibility?lang=en
 
 %%
@@ -187,7 +197,7 @@
 \begin{abstract}
 Recent extensions of 3D Gaussian Splatting (3DGS) capture fine color details using hash‑grid–based appearance parameterization but incur high computational cost during fragment rendering.
 %in the  by explicitly modelling textures in a radiance field but remain computationally heavy during fragment processing. 
-We introduce a decoupled radiance representation that models low-frequency geometry and view dependent appearance features with 2D surfels while representing high-frequency textures via a view-independent spatial hash grid that is baked into a compact texture atlas. By including sparsity-enhancing optimizations that penalize semi-transparency and overdraw, our method aggressively prunes insignificant surfels and achieves significantly faster and sparser reconstructions than prior work. Exploiting geometric sparsity and efficient GPU texture mapping, our approach achieves up to a fivefold speedup over 3DGS while preserving state-of-the-art visual fidelity, enabling real-time 4K rendering at 60 FPS on consumer hardware.
+We introduce a decoupled radiance representation that models low-frequency geometry and view dependent appearance features with 2D surfels while representing high-frequency textures via a view-independent spatial hash grid that is baked into a compact texture atlas. By including sparsity-enhancing optimizations that penalize semi-transparency and per-primitive falloff, our method aggressively prunes insignificant surfels and achieves significantly faster and sparser reconstructions than prior work. Exploiting geometric sparsity and efficient GPU texture mapping, our approach achieves up to a fivefold speedup over 3DGS while preserving state-of-the-art visual fidelity, enabling real-time 4K rendering at 60 FPS on consumer hardware.
 
 
   % Recent extensions to differentiable scene representations methods
@@ -242,11 +252,18 @@ We introduce a decoupled radiance representation that models low-frequency geome
 
 
 \section{Introduction}
-Radiance field reconstruction for novel view synthesis (NVS) has moved toward explicit scene representations to achieve fast, high-quality rendering. These approaches generally fall into two categories. Grid-based methods, such as NeRF \cite{NN} and \Instant NGP \cite{NN}, model scenes using voxel and multiresolution hash grids to represent a continuous feature field that is sampled via ray-marching. Primitive-based methods, particularly 3D Gaussian Splatting (3DGS) \cite{NN}, model scenes using a sparse set of volumetric Gaussian splats, which can be efficiently rasterized on the GPU.  
+Radiance field reconstruction for novel view synthesis (NVS) has moved toward explicit scene representations to achieve fast, high-quality rendering. These approaches generally fall into two categories. Grid-based methods, such as NeRF \cite{NN} and \Instant NGP \cite{NN}, model scenes using voxel and multiresolution hash grids to represent a continuous feature field that is sampled via ray-marching. Primitive-based methods, particularly 3D Gaussian Splatting (3DGS) \cite{NN}, model scenes using a sparse set of volumetric Gaussian splats, which can be efficiently rasterized on the GPU.
 %By assigning a spatially constant feature to each Gaussian, 3DGS offers rapid rasterization compared to volumetric ray-marching.
 
-%Techniques like EAGLES \cite{NN} and Compressed 3DGS \cite{NN} apply post-training quantization to reduce the memory footprint. 
-Recent advances in world models can now generate 3DGS scenes directly from sparse image inputs, unlocking real-time, photorealistic 3D reconstruction for autonomous systems and AR/VR. However, without an efficient renderer, these generated models remain impractical for deployment on edge devices or in latency-sensitive applications due to high memory and compute demands. 
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{images/counter_texture_row.pdf}
+  \caption{Effect of the baked texture residual on the \emph{counter} scene. From left to right: ground truth, our renderer with the BC7 atlas disabled (SH/SV only), and the full pipeline with the atlas enabled. The atlas lookup adds only a small FPS cost while recovering several dB of PSNR.}
+  \label{fig:counter_texture_row}
+\end{figure*}
+
+%Techniques like EAGLES \cite{NN} and Compressed 3DGS \cite{NN} apply post-training quantization to reduce the memory footprint.
+Recent advances in world models can now generate 3DGS scenes directly from sparse image inputs, unlocking real-time, photorealistic 3D reconstruction for autonomous systems and AR/VR. However, without an efficient renderer, these generated models remain impractical for deployment on edge devices or in latency-sensitive applications due to high memory and compute demands.
 
 Techniques like EAGLES \cite{NN} and Compressed 3DGS \cite{NN} address this demand by applying post-training quantization on a given model to reduce the memory footprint. 
 Others have proposed variations of 3DGS to improve reconstruction efficiency, leading to fewer primitives, faster rendering, and reduced storage requirements.
@@ -270,7 +287,7 @@ In contrast, BBSplat \cite{NN} represents the scene with planar billboard primit
 In this work, we propose a novel approach for novel view synthesis that uses a single explicit, learnable RGB texture atlas, achieving up to NN× faster performance than 3DGS and up to MM× faster than BBSplat in low-primitive regimes. Our method combines per-primitive view-dependent colors with a view-independent spatial hash grid that serves as a texture residual, disentangling geometry from appearance and reducing primitive count. Due to its view-independence, the hash grid can be baked into a lightweight RGB texture atlas without perceptible loss in real-world scenarios. 
 %ering quality even when view dependence is explicitly enforced.
 
-Reading from a precomputed texture atlas eliminates neural representation query overhead, resulting in a pipeline that relies solely on fast 2D texture lookups while retaining high texture capacity. Leveraging the geometric sparsity of texture representations, we obtain a compact, high-quality textured surfel representation that renders significantly faster than unsparsified methods. For geometry, we employ 2D beta surfels \cite{NN}, which adapt to both sharp opaque surfaces and fuzzy volumetric content. We introduce a regularization term that gradually enforces flatness on the surfels during optimization, minimizing per-primitive falloff of appearance properties, thereby reducing overdraw during rasterization and further improving framerate.
+Reading from a precomputed texture atlas eliminates neural representation query overhead, resulting in a pipeline that relies solely on fast 2D texture lookups while retaining high texture capacity. Leveraging the geometric sparsity of texture representations, we obtain a compact, high-quality textured surfel representation that renders significantly faster than unsparsified methods. For geometry, we employ 2D Beta surfels \cite{NN}, which adapt to both sharp opaque surfaces and fuzzy volumetric content. We introduce a regularizer that flattens the per-primitive appearance falloff during optimization. As a side effect this reduces fragment overdraw during rasterization and further improves framerate.
 
 %Combining a sparse geometric base with a baked texture atlas, our method operates faster than existing texturing approaches and achieves higher rendering quality than geometric pruning techniques that rely solely on per-primitive features. We achieve state-of-the-art rendering speeds with high perceptual quality. %On standard consumer hardware, we demonstrate real-time 4K rendering of a 2 million Gaussians model at 60 FPS on a MacBook M3 Pro and real-time 720p rendering on a Samsung Galaxy S24 Ultra smartphone.
 %this specific formulation allows the hash grid output post-training. 
@@ -279,27 +296,31 @@ In summary, our contributions are:
 \begin{itemize}
 \item A view-independent neural field with sparsity optimization that produces a compact set of surfels with per-primitive appearance variations.
 \item A baking procedure that converts the optimized hash grid into an RGB texture atlas, leveraging native GPU texture sampling for high inference speeds.
-\item A flatness regularization technique that minimizes overdraw to maximize rendering performance.
+\item A falloff-reduction regularizer that flattens the per-primitive kernel for sparser geometry and lower fragment overdraw.
 \item An efficient, high quality novel view synthesis method achieving real-time 4K rendering at 60 FPS on a MacBook M3 Pro and 720p on a Samsung Galaxy S24 Ultra.
 \end{itemize}
 
 \section{Related Work}
-Novel view synthesis relies on modeling scene geometry and appearance from multi-view images. Early neural radiance fields parameterized scenes implicitly using multilayer perceptrons \cite{NeRF}, requiring dense volumetric sampling. Instant NGP accelerated this formulation by storing features in a multiresolution spatial hash grid. 3DGS shifted the paradigm toward explicit representations, modeling scenes as unstructured sets of volumetric ellipsoids. 
+
+\begin{figure*}[t!]
+  \centering
+  \includegraphics[width=\linewidth]{images/pipeline_full.pdf}
+  \caption{Method overview. During training, spherical color models capture per-surfel view-dependence, while spatial view-independent color is learned using a multiresolution hash grid. After training, hash grid values are stored in a texture atlas and used as a texture residual during inference.}
+  \label{fig:pipeline}
+\end{figure*}
+
+Novel view synthesis aims to generate unseen camera perspectives from a sparse set of input images by jointly modeling scene geometry and appearance. Early approaches, such as NeRF [1], parameterize scenes implicitly as continuous volumetric radiance fields using multilayer perceptrons (MLPs), which require dense sampling along each ray to render high-quality views. While effective, this paradigm incurs significant computational and memory costs. To accelerate rendering, Instant NGP [2] introduces a multiresolution spatial hash grid that stores trainable feature vectors, drastically reducing sampling overhead through efficient on-the-fly interpolation. More recently, 3D Gaussian Splatting (3DGS) [3] shifts the paradigm toward an explicit, rasterization-based representation, modeling scenes as unstructured sets of volumetric ellipsoids (Gaussians) that enable real-time rendering via differentiable tile-based splatting.
+%Novel view synthesis relies on modeling scene geometry and appearance from multi-view images. Early neural radiance fields parameterize scenes implicitly using multilayer perceptrons \cite{NeRF}, requiring dense volumetric sampling. Instant NGP accelerates this formulation by storing features in a multiresolution spatial hash grid. 3DGS shifts the paradigm toward explicit representations, modeling scenes as unstructured sets of volumetric ellipsoids. 
 %By projecting these primitives onto the image plane and alpha-blending them using hardware rasterization, 3DGS avoids ray-marching entirely, enabling high-fidelity, real-time rendering. 
-Subsequent research has extended this pipeline to improve geometric accuracy, reduce memory overhead, and capture high-frequency texture variations.
+Building on these foundational advances, subsequent research has aimed to improve geometric accuracy, reduce memory overhead, and capture high-frequency texture variations. 
+% Mip-NeRF [1] addresses aliasing by casting conical frustums instead of rays, enabling multi-scale rendering. NeRF++ [2] handles unbounded scenes via inverted sphere parameterization, while Ref-NeRF [3] disentangles geometry and appearance using reflective texture fields. For memory-efficient representations, Plenoxels [4] and DVGO [5] replace neural networks with sparse voxel grids, accelerating optimization without quality loss. To enhance high-frequency details, Fourier features [6] and Hash encoding (as in Instant NGP) have been refined in architectures like TensoRF [7], which factorizes 4D fields into compact tensor components. Concurrently, 3DGS variants have emerged: Mip-Splatting [8] mitigates aliasing through scale-aware regularization, Scaffold-GS [9] leverages anchor points for structural consistency, and GS-IR [10] incorporates inverse rendering to improve texture fidelity under novel lighting. Hybrid approaches, such as SuGaR [11] and Gaussian Splatting SLAM [12], further bridge explicit Gaussians with neural priors for real-time reconstruction in dynamic or unbounded environments, illustrating the ongoing diversification of the novel view synthesis landscape.
 
 \paragraph{\textbf{Primitive kernels}} 
-Standard 3DGS represents geometry using soft, unbounded 3D Gaussians, which often produces foggy and so-called bloated Gaussians which expand unnecessarily beyond the actual surface boundaries. To accurately reconstruct surfaces, several methods restrict or alter the primitive shape. 2D Gaussian Splatting (2DGS) flattens the ellipsoids into oriented planar disks, aligning them tightly with the scene geometry. Other approaches introduce rigid geometric bounds; Triangle Splatting and 3D Convex Splatting replace Gaussians with explicit polygonal or convex shapes to strictly constrain the rendering footprint. Deformable Beta kernels adaptively morph between soft volumetric blobs and hard-edged planar disks, providing the flexibility to model both sharp surfaces and fuzzy structures.
+Standard 3DGS represents geometry using soft, unbounded 3D Gaussians, which often produces foggy, bloated primitives that expand unnecessarily beyond the actual surface boundaries. To accurately reconstruct surfaces, several methods restrict or alter the primitive shape. 2D Gaussian Splatting (2DGS) flattens the ellipsoids into oriented planar disks, aligning them tightly with the scene geometry. Other approaches introduce rigid geometric bounds; Triangle Splatting and 3D Convex Splatting replace Gaussians with explicit polygonal or convex shapes to strictly constrain the rendering footprint. Deformable Beta kernels adaptively morph between soft volumetric blobs and hard-edged planar disks, providing the flexibility to model both sharp surfaces and fuzzy structures.
 
 \paragraph{\textbf{Spherical Feature Types}}
 % Optional to keep this and ablate on this
 Standard 3DGS models view-dependent appearance using Spherical Harmonics (SH). While SH is mathematically stable and well-suited for low-frequency diffuse colors, it is band-limited and struggles to represent sharp specular highlights without introducing ringing artifacts. To capture high-frequency reflections, several alternative bases have been proposed. Spherical Gaussians (SG) employ localized lobes to fit specularities but often suffer from unstable optimization. Spherical Betas (SB) extend this concept with bounded, asymmetric lobes, though they remain prone to ill-conditioned gradients. More recently, soft Spherical Voronoi (SV) representations partition the directional domain into learnable regions with smooth boundaries. This provides an explicit, stable parameterization that effectively captures both broad diffuse shifts and sharp specular reflections.
-\begin{figure*}[h]
-  \centering
-  \includegraphics[width=\linewidth]{images/pipeline_full.pdf}
-  \caption{Method overview. During training, spherical color models capture per-surfel view-dependence, while spatial view-independent color is learned using a multiresolution hash grid. After training, hash grid values are stored in a texture atlas and used as a texture residual during inference.}
-  \label{fig:overdraw_lambda_gamma}
-\end{figure*}
 
 \paragraph{\textbf{Sparsity Optimizations}} The default adaptive density control in 3DGS relies on positional gradients and opacity thresholds, routinely generating millions of redundant primitives. Sparsification methods aim to represent the scene using a minimal primitive count. MiniSplatting introduces intersection-preserving simplification to cull redundant elements. GaussianSpa and similar methods apply regularization or post-processing to consolidate primitives. FastGS replaces gradient-based heuristics with a multi-view consistency score, densifying and pruning Gaussians based on their direct contribution to photometric accuracy across training views. While these methods reduce the number of primitives, applying them to standard 3DGS forces the remaining primitives to fit high-frequency texture details, limiting the achievable sparsity and affecting texture reconstruction.
 
@@ -328,7 +349,7 @@ output into a compressed RGB texture atlas. This enables fast, per-fragment quer
 
 %Surfels \cite{pfister2000surfels} are two-dimensional primitives that represent 3D objects as a dense point collection rather than a connected polygon mesh.  
 3DGS \cite{kerbl_3d_2023} maps volumetric ellipsoids to the 2D image
-plane using EWA splatting \cite{zwicker2002}. 2DGS \cite{} flattens these volumetric ellipsoids into oriented planar disks, so-called surfels. We build upon this differentiable 2D surfel representation to model scene geometry accurately while maintaining rendering performance.
+plane using EWA splatting \cite{zwicker2002}. 2DGS \cite{} flattens these volumetric ellipsoids into oriented planar disks called surfels. We build upon this differentiable 2D surfel representation to model scene geometry accurately while maintaining rendering performance.
 
 Each surfel $i$ is parameterized by a position $\mu_i$, rotation $q_i$,
 two-dimensional scale $s_i$, and opacity $o_i$. The color $C$ of a pixel is computed
@@ -353,7 +374,7 @@ kernel with a Beta function using a learnable parameter $b$ to morph
 between a Gaussian distribution and an opaque, flat disk. We replace the
 Gaussian kernel used in 2DGS with this Beta kernel: 
 \begin{equation}
-\mathcal{B}(x;b) = (1-x)^{\beta{b}},\quad \beta(b)=4\sigma(b),\quad x \in [0,1],
+\mathcal{B}(x;b) = (1-x)^{\beta(b)},\quad \beta(b)=4\sigma(b),\quad x \in [0,1],
 b \in \mathbb{R}, \label{eq:beta-kernel} 
 \end{equation} 
 where $\sigma(\cdot)$ is
@@ -373,9 +394,7 @@ components: a per-primitive view-dependent color $f_{SV}(\mathbf{d})$,
 and a global view-independent residual
 $\boldsymbol{\rho}(\mathbf{x}) = f_\phi(E_\theta(\mathbf{x}))$ produced
 by a multiresolution hash grid $E_\theta$ and an MLP decoder $f_\phi$.
-A fixed scalar offset $b_{SV} = 0.5$ inside the inner activation lifts
-the view-dependent term off of zero, so that the residual has a non-zero
-neutral grey to ride on top of even before $f_{SV}$ has been trained.
+A fixed scalar offset $b_{SV} = 0.5$ inside the inner activation shifts the view-dependent term away from zero, providing a neutral gray baseline on which the residual can build even before $f_{SV}$ is trained.
 The total fragment color is evaluated as
 
 \begin{equation}
@@ -392,9 +411,16 @@ Since the color texture produces spatially varying outputs for each fragment loc
 
 \subsection{View-independent Surfel Texture}
 
-The texture mapped to a surfel contributes a color residual that is added to the surfels base and view-dependent color. In the taining pass, we represent this color residual with a multiresolution hash grid $E_\theta$ with a fixed-size feature table and a compact view-independent MLP decoder $f_\phi$. At each fragment location $\mathbf{x}$, we trilinearly interpolate features from each level of the hash grid, concatenate them, and pass them through the view-independent MLP. 
+The texture mapped to a surfel contributes a color residual that is added to the surfel's base and view-dependent color. In the training pass, we represent this color residual with a multiresolution hash grid $E_\theta$ with a fixed-size feature table and a compact view-independent MLP decoder $f_\phi$. At each fragment location $\mathbf{x}$, we trilinearly interpolate features from each level of the hash grid, concatenate them, and pass them through the view-independent MLP. 
 %This provides a color residual $f_\phi(E_\theta(\mathbf{x}))$ that is added to the per-primitive RGB color. 
 These residual values are unbounded, allowing negative and positive offsets. This increases representational capacity and reduces the burden on the surfels to fit base color variations, directly encouraging a sparser primitive count.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{images/train_4crop_offset.pdf}
+  \caption{Color decomposition using the \emph{train} scene. From left to right: the composited final image, the spherical Voronoi term $f_{SV}$, the positive part of the texture residual $\boldsymbol{\rho}$, and the negative part. The two residuals add high-frequency detail that the per-primitive SV term cannot represent.}
+  \label{fig:decomposition}
+\end{figure}
 
 \subsection{Texture Baking}
 Evaluating the spatial hash grid and MLP during rendering introduces a computational bottleneck. Therefore, after training the view-independent hash grid output is evaluated across each surfel and baked into a global RGB texture atlas for fast inference.
@@ -414,7 +440,7 @@ u = \frac{i + 0.5}{r_x} 2e - e, \quad v = \frac{j + 0.5}{r_y} 2e - e.
 \end{equation}
 This mapping prevents boundary seams by aligning the baked evaluation with the hardware bilinear sampler. The local coordinates are lifted to world space via the surfel tangent frame $\mathbf{R}$:
 \begin{equation}
-\mathbf{x} = \mathbf{p}_g + u s_{g,u} \mathbf{R}_{:,0} + v s_{g,v} \mathbf{R}_{:,1}. n
+\mathbf{x} = \mathbf{p}_g + u s_{g,u} \mathbf{R}_{:,0} + v s_{g,v} \mathbf{R}_{:,1}.
 \end{equation}
 The evaluated RGB vector $\boldsymbol{\rho}(\mathbf{x})$ is finally written to the atlas using a fused kernel that allocates one warp per texel row.
 
@@ -426,28 +452,48 @@ The evaluated RGB vector $\boldsymbol{\rho}(\mathbf{x})$ is finally written to t
 
 % During the forward pass, the total fragment color is the sum of the per-primitive view-dependent color and the per-fragment view-independent texture residual. The base color remains uniform across a single surfel's extent, while the multiresolution hash grid produces spatially varying outputs for each fragment location $\mathbf{x}$. This structural design enforces a clear inductive bias. Low-frequency details and view-dependent reflections are pushed into the per-surfel attributes, while high-frequency, view-independent details are absorbed by the hash grid. After training, the view-independent hash grid output is evaluated across each surfel and baked into a Block Compression (BC7) encoded RGB texture atlas for fast inference.
 
+\paragraph{\textbf{Quantization}}
+Instead of storing a dense FP16 RGB atlas, we apply Block Compression (BC7) to reduce the memory footprint. We compute a scalar range $[\mu - 6\sigma, \mu + 6\sigma]$ via bootstrap sampling and uniformly quantize the atlas with a single global $(\mathrm{offset}, \mathrm{scale})$ pair, written to the bake metadata and applied as a multiply-add per read operation by the rasterizer at inference. The data is padded to RGBA to match the $4 \times 4$ block layout of BC7. This format stores each block in 16 bytes, reducing the memory requirement to 1 byte per texel. As indicated by Table~\ref{tab:quantization}, no perceivable quality loss is introduced by quantization, yet a significant memory reduction is achieved.
+
+\begin{table}[h]
+\centering
+\caption{Atlas storage formats. Sizes denote bytes per texel and the resulting mean atlas size on the 18 Mip-NeRF 360 splits at $r_{\max}=64$.}
+\label{tab:quantization}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lccc}
+\toprule
+\textbf{Format} & \textbf{Bytes / texel} & \textbf{Mean atlas size} & \textbf{$\Delta$PSNR vs.\ neural} \\
+\midrule
+FP16 RGB (ref.) & 6 & $\sim$3.8 GB & --- \\
+uint8 RGBA & 4 & $\sim$2.6 GB & $\pm$0.01 dB \\
+\textbf{BC7 RGBA (ours)} & \textbf{1} & \textbf{$\sim$638 MB} & \textbf{$\pm$0.01 dB} \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
 \subsection{View-dependent Surfel Color}
 
-To capture view-dependent effects, each primitive utilizes a soft spherical Voronoi representation \cite{TODO_spherical_voronoi_citation}. This representation describes how space on a sphere is partitioned among a set of generator points, so called cites. Instead of using hard Voronoi cells with sharp boundaries, it defines smooth, differentiable transitions between regions with a continuous weighting function---often obtained via a softmax, radial basis functions, or differentiable distance weighting---so that every surface point has fractional membership in multiple generators.
+To capture view-dependent effects, each primitive utilizes a soft spherical Voronoi representation \cite{TODO_spherical_voronoi_citation}. This representation partitions the sphere among a set of generator points called sites. Instead of using hard Voronoi cells with sharp boundaries, it defines smooth, differentiable transitions between regions with a continuous weighting function---often obtained via a softmax, radial basis functions, or differentiable distance weighting---so that every surface point has fractional membership in multiple generators.
 The learnable regions with smooth boundaries provide an explicit and stable parameterization for reflections.
 
 Given a viewing direction $\mathbf{d}$, the view-dependent color proportion is evaluated
 as a weighted combination of per-site values: \begin{equation}
-f_{SV}(\mathbf{d}) = \sum_{k=1}^{K} w_k(\mathbf{d}) c_k, \text{where}
-\quad w_k(\mathbf{d}) = \frac{\exp(\tau_k s_k \cdot \mathbf{d})}{\sum_{k'=1}^{K}
-\exp(\tau_{k'} s_{k'} \cdot \mathbf{d})} \end{equation} Here, $K$ directional
+f_{SV}(\mathbf{d}) = \sum_{k=1}^{K} w_k(\mathbf{d})\, c_k,
+\quad w_k(\mathbf{d}) = \frac{\exp(\tau_k\, s_k \cdot \mathbf{d})}{\sum_{k'=1}^{K}
+\exp(\tau_{k'}\, s_{k'} \cdot \mathbf{d})}.
+\end{equation} Here, $K$ directional
 sites $s_k$ on the unit sphere store learnable color values $c_k$. The temperature
 parameters $\tau_k$ control the angular sharpness of the partition, allowing the
 model to fit both broad diffuse shifts and sharp specular highlights for each
-geometric element. A $\mathrm{ReLU}$ function is applied to the sum of this
-view-dependent offset and the base bias $\mathbf{b}$.
+geometric element. The mixture is offset by the fixed constant $b_{SV}=0.5$ and
+gated by the inner $\mathrm{ReLU}$ of Eq.~\ref{eq:color}.
 
 \subsection{Rendering}
 
-During inference we replace the neural renderer used during training to generate the hash grid with a forward-only 2D splatting rasterizer (\S\ref{sec:method_baking}). For each fragment within a surfel's footprint, the hardware texture unit samples the BC7 block at the fragment's UV with bilinear filtering. The dequantized residual $\hat{\boldsymbol{\rho}}$ is added to the per-primitive view-dependent feature inside the outer $\mathrm{ReLU}$ of Eq.~\ref{eq:color}, before $\alpha$-compositing.
+During inference we replace the neural renderer used during training to generate the hash grid with a forward-only 2D splatting rasterizer. For each fragment within a surfel's footprint, the hardware texture unit samples the BC7 block at the fragment's UV with bilinear filtering. The dequantized residual $\hat{\boldsymbol{\rho}}$ is added to the per-primitive view-dependent feature inside the outer $\mathrm{ReLU}$ of Eq.~\ref{eq:color}, before $\alpha$-compositing.
 
 \section{Optimization}
-The typical ADC optimization of 3DGS already converges to a comparatively low primitive count with our hybrid texture-based representation. To further enhance sparsity, we adopt the multi-view error-based optimization of FastGS \cite{TODO_fastgs_citation}. An even more aggressive primitive reduction is achieved by incorporating a regularizer considering the overdraw of primitives during rendering.  
+The typical ADC optimization of 3DGS already converges to a comparatively low primitive count with our hybrid texture-based representation. To further enhance sparsity, we adopt the multi-view error-based optimization of FastGS \cite{TODO_fastgs_citation}. An even more aggressive primitive reduction is achieved by incorporating a falloff regularizer on the Beta kernels.
 %reducing regularizer on our beta surfels to maximize rendering speed.
 Finally, we add a hybrid training strategy to mitigate the training-time bottlenecks of back-propagating into a multi-resolution hash-grid.
 
@@ -461,7 +507,7 @@ where $\mathcal{M}^j_{\text{mask}}$ is a binary mask indicating pixels with high
 \begin{figure}[h]
   \centering
   \includegraphics[width=\linewidth]{images/overdraw_reduction.pdf}
-  \caption{A heatmap visualization of per-pixel overdraw. As we increase the intensity of the Beta regularization, the overdraw reduces progressively with flatter kernels.}
+  \caption{Per-pixel overdraw heatmap. As the falloff regularizer strengthens, the kernels flatten and fragment overdraw drops.}
   \label{fig:overdraw_lambda_gamma}
 \end{figure}
 
@@ -474,114 +520,29 @@ where $\mathcal{M}^j_{\text{mask}}$ is a binary mask indicating pixels with high
 %   \Description{A woman and a girl in white dresses sit in an open car.}
 % \end{figure}
 
-\subsection{Overdraw Reduction}
+\subsection{Falloff Reduction}
 
-We add a per-pixel overdraw reduction loss that is balanced against the photometric error, using an adaptive weighting formulation derived from HiNeuS \cite{TODO_hineus_citation}. To minimize the spatial overlap of primitives, we apply an $L_1$ regularization on the surfels $\Beta$ parameter. This regularization is then conditioned on the local rendering accuracy to ensure that complex or poorly reconstructed regions retain enough flexibility to fit the geometry.
+While the multi-view error optimization above already prunes redundant
+primitives, each surviving Beta surfel can still spread photometric
+influence well beyond its geometric core through the soft tail of its
+kernel. We add a regularizer that gradually tightens this tail by
+pushing the per-primitive Beta parameter $\beta_i$ toward smaller,
+flatter values. To prevent the regularizer from disrupting the early
+training of soft Gaussian-like kernels, we gate it by the local
+photometric error: the term self-activates only where the reconstruction
+is already accurate, so flexible regions stay flexible while
+already-converged regions are pulled toward hard-edged disks.
 
-Given the rendered color $\mathbf{C}(p)$ and the ground truth color $\hat{\mathbf{C}}(p)$ at pixel $p$, we define an adaptive weight $\omega(p)$:
-\begin{equation}
-\omega(p) = \exp\big(-\gamma \|\mathbf{C}(p) - \hat{\mathbf{C}}(p)\|_1\big),
-\end{equation}
-where $\gamma$ controls the sensitivity to the photometric error. For each pixel, we compute an accumulated $\beta$ value, $\bar{\beta}(p) = \sum_{i \in \mathcal{N}_p} w_i(p) \beta_i$, using the standard $\alpha$-blending weights $w_i(p)$ of the overlapping surfels. The final overdraw reduction loss is the error-weighted mean across all pixels $P$:
-\begin{equation}
-\mathcal{L}_{\beta} = \frac{1}{|P|} \sum_{p \in P} \omega(p) \bar{\beta}(p).
-\end{equation}
-
-As the reconstruction converges, the overdraw reduction loss progressively pushes the Beta kernels on photometrically accurate pixels to be flatter with smaller $\Beta$ values. Moving from soft-tailed distributions to hard-edged kernels strictly bounds the spatial influence of each surfel, which directly reduces fragment overdraw.
-
-\subsection{Training Time}
-
-Because our overdraw reduction takes effect in later iterations, the rasterizer processes a high volume of fragments during the early training stages. Backpropagating through a multi-resolution hash grid and MLP at each fragment creates a heavy computational bottleneck during this period. We mitigate this overhead by implementing a periodic freezing schedule. After 5000 training iterations, we freeze the MLP and hash grid for nine out of every ten iterations. The spatial texture representation converges rapidly during the early stages of optimization. Freezing these parameters allows the geometric surfels to adjust their positions and fit the stable texture output at a much lower computational cost.
-
-
-% \subsection{Texture Baking and Inference}
-% \label{sec:method_baking}
-% Evaluating the spatial hash grid and Multi-Layer Perceptron (MLP) during rendering introduces a computational bottleneck. The MLP residual is view-independent, meaning its value at a world position is constant for all rays. This property allows us to precompute the per-primitive residual into a packed, hardware-compressed RGB atlas. This precomputation replaces neural queries per pixel with texture fetches that utilize the bilinear filtering hardware of the GPU.
-
-% Given a trained model of $N$ 2D surfels, each surfel $g$ carries a soft Spherical Voronoi representation with $K$ directional sites $\{(s_k, c_k, \tau_k)\}_{k=1}^{K}$ that produces a view-dependent RGB offset $f_{SV}(\mathbf{d})$. A global hash-grid encoder $E_\theta$ and a view-independent MLP $f_\phi : \mathbb{R}^d \to \mathbb{R}^{3}$ output an RGB residual $\boldsymbol{\rho}(\mathbf{x}) = f_\phi(E_\theta(\mathbf{x}))$ at a 3D position $\mathbf{x}$. The final color rendered at the world point $\mathbf{x}_g$ on surfel $g$ for view direction $\mathbf{d}$ is evaluated as:
-% \begin{equation}
-% \mathbf{c}(g, \mathbf{x}_g, \mathbf{d}) = \mathrm{ReLU}\Big(\mathrm{ReLU}\big(f_{SV}(\mathbf{d}) + b_{SV}\big) + \boldsymbol{\rho}(\mathbf{x}_g)\Big),
-% \label{eq:color}
-% \end{equation}
-% where $b_{SV}$ and $b_{res}$ are learnable biases. Because $\boldsymbol{\rho}$ does not depend on $\mathbf{d}$, we replace its run-time evaluation with a 2D texture lookup.
-
-
-% \begin{table*}[ht!]
-% \centering
-% \caption{\textbf{Quantitative Results.} Comparison grouped by approach: dense primitive-only methods, texture-based peers, speed/compactness-optimized methods (FastGS family), and ours. \emph{LPIPS$\cdot$N(M)} is the LPIPS score multiplied by primitive count in millions (lower is better) -- a perceptual cost-per-render-budget figure of merit.}
-% \label{tab:nvs_results}
-% \resizebox{\textwidth}{!}{
-% \begin{tabular}{l|ccccc|ccccc|ccccc}
-% \toprule
-% & \multicolumn{5}{c|}{\textbf{Tanks and Temples}} & \multicolumn{5}{c|}{\textbf{Mip-NeRF 360}} & \multicolumn{5}{c}{\textbf{Deep Blending}} \\
-% \textbf{Method} & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & Points$\downarrow$ & LPIPS$\cdot$N(M)$\downarrow$ & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & Points$\downarrow$ & LPIPS$\cdot$N(M)$\downarrow$ & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & Points$\downarrow$ & LPIPS$\cdot$N(M)$\downarrow$ \\
-% \midrule
-% 3DGS & 23.80 & 0.853 & 0.169 & 1.5M & 0.254 & 27.21 & 0.815 & 0.214 & 2.7M & 0.578 & 29.71 & \third{0.903} & \first{0.241} & 2.46M & 0.593 \\
-% 2DGS & 23.15 & 0.831 & 0.212 & 0.8M & 0.170 & 27.04 & 0.805 & 0.252 & 2.0M & 0.504 & - & - & - & - & - \\
-% Beta-Splatting (DBS) & \first{24.82} & \first{0.871} & \second{0.144} & 2.0M & 0.288 & \first{28.10} & \first{0.829} & \second{0.192} & 3.1M & 0.595 & - & - & - & - & - \\
-
-% \midrule
-% NeST-Splatting & 23.02 & 0.824 & 0.181 & 0.5M & 0.091 & 26.68 & 0.795 & 0.212 & 1.0M & 0.212 & - & - & - & - & - \\
-% Hybrid Latents (Gaussian) & - & - & - & - & - & 27.20 & 0.801 & \third{0.199} & 0.7M & 0.139 & - & - & - & - & - \\
-% Hybrid Latents (Beta) & - & - & - & - & - & 26.85 & 0.794 & 0.218 & \second{0.2M} & \second{0.044} & - & - & - & - & - \\
-% BBSplat & 23.83 & 0.854 & \third{0.147} & 0.4M & 0.059 & 26.98 & 0.783 & 0.231 & 0.4M & 0.092 & - & - & - & - & - \\
-% Nexels & 23.55 & 0.841 & 0.155 & 0.4M & 0.062 & 27.35 & 0.802 & 0.201 & 0.4M & 0.080 & - & - & - & - & - \\
-% \midrule
-% Mini-Splatting & 23.46 & 0.844 & 0.181 & \third{0.30M} & \third{0.054} & 27.32 & \second{0.821} & 0.217 & 0.53M & 0.115 & \third{29.99} & \second{0.907} & \third{0.244} & 0.56M & 0.137 \\
-% Taming-3DGS & \third{23.89} & 0.833 & 0.214 & 0.32M & 0.069 & 27.48 & 0.794 & 0.261 & 0.68M & 0.178 & 29.50 & 0.894 & 0.278 & \third{0.29M} & \third{0.081} \\
-% FastGS & \second{24.15} & 0.839 & 0.210 & \second{0.24M} & \second{0.050} & \third{27.56} & 0.797 & 0.261 & 0.40M & 0.104 & \second{30.03} & 0.901 & 0.270 & \second{0.22M} & \second{0.059} \\
-% FastGS-Big & \second{24.39} & \third{0.855} & 0.175 & 0.54M & 0.095 & \second{27.93} & \third{0.820} & 0.216 & 1.15M & 0.248 & \first{30.12} & \first{0.907} & \second{0.243} & 0.65M & 0.158 \\
-% \midrule
-% Ours & - & - & - & - & - & 27.18 & 0.783 & 0.244 & \third{213k} & \third{0.052} & - & - & - & - & - \\
-% Ours (overdraw) & \third{23.89} & 0.840 & 0.184 & \first{111k} & \first{0.020} & 26.75 & 0.770 & 0.253 & \first{141k} & \first{0.036} & 29.73 & 0.897 & 0.265 & \first{84k} & \first{0.022} \\
-% \bottomrule
-% \end{tabular}
-% }
-% \end{table*}
-
-
-% \newcommand{\first}[1]{\cellcolor{red!25}\textbf{#1}}
-% \newcommand{\second}[1]{\cellcolor{orange!25}\textbf{#1}}
-% \newcommand{\third}[1]{\cellcolor{yellow!35}\textbf{#1}}
-% \begin{table*}[ht!]
-% \centering
-% \caption{\textbf{Quantitative Results.} Comparison grouped by approach: dense primitive-only, texture-based peers, speed/compactness-optimized (FastGS family), and ours. \emph{LPIPS$\cdot$N(M)} is the LPIPS score multiplied by primitive count in millions (lower is better) -- a perceptual cost-per-render-budget figure of merit. \emph{PSNR/$\log_{10}\!$N} is a rate-distortion-style efficiency score (higher is better) expressing PSNR per decade of primitives.}
-% \label{tab:nvs_results}
-% \resizebox{\textwidth}{!}{
-% \begin{tabular}{l|cccccc|cccccc}
-% \toprule
-% & \multicolumn{6}{c|}{\textbf{Tanks and Temples}} & \multicolumn{6}{c}{\textbf{Mip-NeRF 360}} \\
-% \textbf{Method} & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & Points$\downarrow$ & LPIPS$\cdot$N(M)$\downarrow$ & PSNR/$\log$N$\uparrow$ & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & Points$\downarrow$ & LPIPS$\cdot$N(M)$\downarrow$ & PSNR/$\log$N$\uparrow$ \\
-% \midrule
-% 3DGS & 23.80 & 0.853 & 0.169 & 1.5M & 0.254 & 3.853 & 27.21 & 0.815 & 0.214 & 2.7M & 0.578 & 4.231 \\
-% 2DGS & 23.15 & 0.831 & 0.212 & 0.8M & 0.170 & 3.922 & 27.04 & 0.805 & 0.252 & 2.0M & 0.504 & 4.292 \\
-% Beta-Splatting (DBS) & \first{24.82} & \first{0.871} & \second{0.144} & 2.0M & 0.288 & 3.939 & \first{28.10} & \first{0.829} & \second{0.192} & 3.1M & 0.595 & 4.328 \\
-
-% \midrule
-% NeST-Splatting & 23.02 & 0.824 & 0.181 & 0.5M & 0.091 & 4.040 & 26.68 & 0.795 & 0.212 & 1.0M & 0.212 & 4.447 \\
-% % Hybrid Latents (Gaussian) & - & - & - & - & - & - & 27.20 & 0.801 & \third{0.199} & 0.7M & 0.139 & 4.653 \\
-% Hybrid Latents & 22.81 & 0.826 & 0.187 & 0.13M & - & - & 26.85 & 0.794 & 0.218 & \second{0.2M} & \second{0.044} & \third{5.066} \\
-% BBSplat & 23.83 & 0.854 & \third{0.147} & 0.4M & 0.059 & 4.254 & 26.98 & 0.783 & 0.231 & 0.4M & 0.092 & 4.816 \\
-% Nexels & 23.55 & 0.841 & 0.155 & 0.4M & 0.062 & 4.204 & 27.35 & 0.802 & 0.201 & 0.4M & 0.080 & 4.882 \\
-% % Nexels-low & 23.55 & 0.841 & 0.155 & 0.4M & 0.062 & 4.204 & 26.53 & 0.778 & 0.225 & 0.1M & 0.023 & 5.306 \\
-% \midrule
-% % Mini-Splatting & 23.46 & 0.844 & 0.181 & 0.30M & 0.054 & 4.282 & 27.32 & \second{0.821} & 0.217 & 0.53M & 0.115 & 4.773 \\
-% % Taming-3DGS & 23.89 & 0.833 & 0.214 & 0.32M & 0.069 & 4.340 & 27.48 & 0.794 & 0.261 & 0.68M & 0.178 & 4.712 \\
-% FastGS & \third{24.15} & 0.839 & 0.210 & \third{0.24M} & \third{0.050} & \third{4.489} & \third{27.56} & 0.797 & 0.261 & 0.40M & 0.104 & 4.920 \\
-% % FastGS-Big & \second{24.39} & \third{0.855} & 0.175 & 0.54M & 0.095 & 4.255 & \second{27.93} & \third{0.820} & 0.216 & 1.15M & 0.248 & 4.609 \\
-% \midrule
-% Ours & 24.14 & 0.852 & 0.157 & \second{0.15M} & \second{0.024} & \second{4.659} & 27.18 & 0.783 & 0.244 & \third{0.21M} & \third{0.052} & \second{5.101} \\
-% Ours (overdraw) & 23.86 & 0.844 & 0.164 & \first{0.11M} & \first{0.018} & \first{4.728} & 26.75 & 0.770 & 0.253 & \first{0.14M} & \first{0.036} & \first{5.195} \\
-% \bottomrule
-% \end{tabular}
-% }
-% \end{table*}
-\newcommand{\first}[1]{\cellcolor{red!25}\textbf{#1}}
-\newcommand{\second}[1]{\cellcolor{orange!25}\textbf{#1}}
-\newcommand{\third}[1]{\cellcolor{yellow!35}\textbf{#1}}
-\begin{table*}[ht!]
+\FloatBarrier
+\begin{table*}[!t]
 \centering
-\caption{\textbf{Quantitative Results.} Comparison grouped by approach: dense primitive-only, texture-based peers, speed/compactness-optimized (FastGS family), and ours. FPS measured on RTX 4090.}
+\caption{\textbf{Quantitative Results.} Comparison grouped by approach: dense
+primitive-only, texture-based peers, speed/compactness-optimized (FastGS
+family), and ours. \textbf{*} marks methods benchmarked on our RTX 4090 with
+\texttt{cuda.Event} timing (10 warm-up + 200 timed frames). FPS for the other
+baselines is taken from the respective publications and is not directly
+comparable in absolute terms; we keep the column to indicate the qualitative
+inference-cost regime each method occupies.}
 \label{tab:nvs_results}
 \resizebox{\textwidth}{!}{
 \begin{tabular}{l|ccccc|ccccc}
@@ -589,50 +550,70 @@ Because our overdraw reduction takes effect in later iterations, the rasterizer 
 & \multicolumn{5}{c|}{\textbf{Tanks and Temples}} & \multicolumn{5}{c}{\textbf{Mip-NeRF 360}} \\
 \textbf{Method} & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & Points$\downarrow$ & FPS$\uparrow$ & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & Points$\downarrow$ & FPS$\uparrow$ \\
 \midrule
-3DGS                 & 23.80 & 0.853 & 0.169 & 1.5M & \third{154} & 27.21 & 0.815 & 0.214 & 2.7M & \third{134} \\
-2DGS                 & 23.15 & 0.831 & 0.212 & 0.8M & 122 & 27.04 & 0.805 & 0.252 & 2.0M & 64 \\
-Beta-Splatting (DBS) & \first{24.82} & \first{0.871} & \second{0.144} & 2.0M & 150 & \first{28.10} & \first{0.829} & \second{0.192} & 3.1M & 123 \\
+3DGS                 & 23.80 & \third{0.853} & 0.169 & 1.5M & 154 & 27.21 & \second{0.815} & 0.214 & 2.7M & 134 \\
+2DGS                 & 23.15 & 0.831 & 0.212 & 0.8M & 122 & 27.04 & \third{0.805} & 0.252 & 2.0M & 64 \\
+Beta-Splatting (DBS) & \first{24.82} & \first{0.871} & \first{0.144} & 2.0M & 150 & \first{28.10} & \first{0.829} & \first{0.192} & 3.1M & 123 \\
 \midrule
-NeST-Splatting       & 23.02 & 0.824 & 0.181 & 0.5M & -   & 26.68 & 0.795 & 0.212 & 1.0M & 23 \\
-Hybrid Latents       & 22.81 & 0.826 & 0.187 & 0.13M & - & 26.85 & 0.794 & 0.218 & \second{0.2M} & - \\
-BBSplat              & 23.83 & 0.854 & \third{0.147} & 0.4M & 66 & 26.98 & 0.783 & 0.231 & 0.4M & 25 \\
-Nexels               & 23.55 & 0.841 & 0.155 & 0.4M & -   & 27.35 & 0.802 & 0.201 & 0.4M & 50 \\
+NeST-Splatting       & 23.02 & 0.824 & 0.181 & 0.5M & 30 & 26.68 & 0.795 & \third{0.212} & 1.0M & 23 \\
+Hybrid Latents       & 22.81 & 0.826 & 0.187 & \second{0.13M} & 50 & 26.85 & 0.794 & 0.218 & \second{0.2M} & 36 \\
+BBSplat              & 23.83 & \second{0.854} & \second{0.147} & 0.4M & 66 & 26.98 & 0.783 & 0.231 & 0.4M & 25 \\
+Nexels               & 23.55 & 0.841 & \third{0.155} & 0.4M & 70 & \third{27.35} & 0.802 & \second{0.201} & 0.4M & 50 \\
 \midrule
-FastGS               & \third{24.15} & 0.839 & 0.210 & \third{0.24M} & 1173 & \third{27.56} & 0.797 & 0.261 & 0.40M & 942 \\
+FastGS\textsuperscript{*}            & \second{24.15} & 0.839 & 0.210 & \third{0.24M} & \first{1173} & \second{27.56} & 0.797 & 0.261 & 0.40M & \first{942} \\
 \midrule
-Ours                 & 24.14 & 0.852 & 0.157 & \second{0.15M} & \second{648}  & 27.18 & 0.783 & 0.244 & \third{0.21M} & \second{319} \\
-Ours (overdraw)      & 23.86 & 0.844 & 0.164 & \first{0.11M}  & \first{1094} & 26.75 & 0.770 & 0.253 & \first{0.14M} & \first{664} \\
+Ours\textsuperscript{*}              & \third{24.14} & 0.852 & 0.157 & 0.15M & \third{648}  & 27.18 & 0.783 & 0.244 & \third{0.21M} & \third{319} \\
+Ours (falloff)\textsuperscript{*}    & 23.86 & 0.844 & 0.164 & \first{0.11M}  & \second{1094} & 26.75 & 0.770 & 0.253 & \first{0.14M} & \second{664} \\
 \bottomrule
 \end{tabular}
 }
 \end{table*}
 
-% \subsection{Adaptive Resolution Sizing}
-% To capture the spatial frequency of the underlying hash grid without wasting memory, we assign an anisotropic UV-grid resolution $\mathbf{r}_g = (r_x, r_y)$ to each surfel. The residual $\boldsymbol{\rho}(\mathbf{x}_g)$ is band-limited by the finest hash voxel of $E_\theta$. We use this limit to match the Nyquist rate of the hash grid along each tangent axis. For an axis $a \in \{u, v\}$, the resolution is computed as:
-% \begin{equation}
-% r_{g,a} = \mathrm{clamp}\left(2^{\lceil \log_2(4 e s_{g,a}/\delta) \rceil}, r_{\min}, r_{\max}\right),
-% \label{eq:nyquist}
-% \end{equation}
-% where $s_{g,a}$ is the surfel scale on tangent axis $a$, $e=4\sigma$ is the surfel UV extent, and $\delta$ is the finest hash voxel size. The factor of $4$ inside the logarithm combines the $2e$ UV span with the multiplier required for Nyquist sampling. We bound the resolution between $r_{\min}=4$ and $r_{\max}=64$. Allowing anisotropic dimensions saves approximately 30\% of the atlas area on long, thin surfels. We optionally cap $r_{g,a}$ by each surfel's maximum projected pixel extent across training views to avoid over-allocating memory for physically large but distant primitives.
+Given the rendered colour $\mathbf{C}(p)$ and the ground-truth
+$\hat{\mathbf{C}}(p)$ at pixel $p$, we define an adaptive weight
+\begin{equation}
+\omega(p) = \exp\!\big(-\gamma\, \|\mathbf{C}(p) - \hat{\mathbf{C}}(p)\|_1\big),
+\end{equation}
+following the HiNeuS error-weighting scheme~\cite{TODO_hineus_citation}.
+$\omega(p) \to 0$ on poorly reconstructed pixels and $\omega(p) \to 1$
+where the surfels already fit the ground truth. For each pixel we form
+an alpha-blended Beta value
+$\bar{\beta}(p) = \sum_{i \in \mathcal{N}_p} w_i(p)\, \beta_i$
+from the standard $\alpha$-blending weights $w_i(p)$ of the overlapping
+surfels; the falloff loss is the error-weighted mean across all
+pixels~$P$:
+\begin{equation}
+\mathcal{L}_{\beta} = \frac{1}{|P|} \sum_{p \in P} \omega(p)\, \bar{\beta}(p).
+\end{equation}
 
-% Once the resolutions are determined, we evaluate the hash grid and MLP across each surfel and pack the outputs into a global texture atlas. We quantize the atlas using Block Compression (BC7) to reduce the memory footprint. During inference we replace the neural renderer with a forward-only 2D
-% splatting rasterizer (\S\ref{sec:method_baking}). For each fragment within
-% a surfel's footprint, the hardware texture unit samples the BC7 block at
-% the fragment's UV with bilinear filtering and the dequantized residual
-% $\hat{\boldsymbol{\rho}}$ is added to the per-primitive view-dependent
-% feature inside the outer $\mathrm{ReLU}$ of Eq.~\ref{eq:color}, before
-% $\alpha$-compositing.
+Because $\omega$ scales with reconstruction quality, $\mathcal{L}_\beta$
+exerts negligible pressure during the volatile early-training stage, when
+the photometric loss dominates and $\omega \approx 0$ across most pixels,
+and ramps up automatically as the reconstruction converges and $\omega$
+saturates. This avoids any hand-tuned warm-up schedule.
+Once active, the loss pulls the kernel of each accurate surfel from a
+soft Gaussian-like tail toward a hard-edged uniform disk, bounding its
+spatial influence to its geometric extent. As a side benefit, the
+tightened kernels also reduce fragment overdraw during rasterization,
+which we exploit at inference time.
+
+\subsection{Training Time}
+
+Because the falloff regularizer self-activates only after the photometric reconstruction converges, the rasterizer processes a high volume of fragments during the early training stages. Backpropagating through a multi-resolution hash grid and MLP at each fragment creates a heavy computational bottleneck during this period. We mitigate this overhead by implementing a periodic freezing schedule. After 5000 training iterations, we freeze the MLP and hash grid for nine out of every ten iterations. The spatial texture representation converges rapidly during the early stages of optimization. Freezing these parameters allows the geometric surfels to adjust their positions and fit the stable texture output at a much lower computational cost.
+
+
+
+
 
 \section{Experiments}
 We evaluate our method on all scenes from the Mip-NeRF 360 dataset, along with two scenes from the Tanks and Temples \cite{NN} dataset. The comparison is against standard methods using only per-primitive appearance attributes, baselines using per-primitive textures, and FastGS as the sparsification optimization we used. We report PSNR, SSIM, LPIPS, primitive counts (N), and framerate(FPS). We benchmark all timings on an NVIDIA RTX 4090.
 
-% \FloatBarrier
 
 \subsection{Novel View Synthesis}
 We evaluate the photometric quality and representational efficiency of our reconstructions using the standard 3D Gaussian Splatting evaluation pipeline. For the Mip-NeRF 360 dataset, we evaluate on the downsampled images as specified by the dataset guidelines.
 
 Our method provides a high quality-to-point ratio compared to non-textured methods. The texture residual specifically improves the LPIPS metric by capturing high-frequency details that coarse geometric primitives miss. Compared to existing methods using per-primitive textures, we achieve similar sparsity and quality, but our baked representation enables significantly higher inference speed.
 
+Our method reduces primitive count by roughly 2× relative to FastGS at the cost of slightly lower fidelity in PSNR and slower rendering due to texture coordinate computation overhead. Nevertheless, despite its higher primitive count, FastGS frequently fails to reconstruct textures accurately on both foreground and background objects, as shown in the teaser and Figs.~\ref{fig:fastGSquality} and~\ref{fig:qualitative}.
 
 % \subsection{Rendering speed}
 % WRITEUP ABOUT INFERENCE SPEED TABLE
@@ -658,28 +639,27 @@ Our method provides a high quality-to-point ratio compared to non-textured metho
 % \end{table}
 
 
+\subsection{Ablation: Falloff Reduction}
+We evaluate the impact of our falloff regularization on the Beta surfels. We compare our unregularized method against two values of the falloff penalty. As a direct consequence of the regularizer, the soft tails of the Beta kernels tighten and fragment overdraw drops; Figure \ref{fig:overdraw_lambda_gamma} shows the resulting per-pixel intersection count as $\lambda$ increases.
 
-\subsection{Rendering Performance and Consumer Devices}
-We benchmark the rendering performance across varying hardware profiles to test deployment feasibility. The primary benchmarks are conducted on a desktop RTX 4090. To evaluate performance under strict hardware constraints, we also measure real-time playback on an Apple MacBook Pro M3 and a Samsung Galaxy S24 Ultra smartphone.
+Forcing the Beta kernels to adopt flatter profiles directly reduces the spatial volume of each primitive. This structural change strictly bounds the alpha-blending footprint, which in turn lowers fragment overdraw during rasterization. We make the regularization loss-informed as more Gaussian-like kernels are better for convergence, so the regularizer activates only after the model has trained a little.
 
-Relying on a baked texture atlas and a minimal set of geometric surfels allows our pipeline to operate at higher framerates than decoupled texturing baselines. We achieve high rendering quality compared to purely geometric sparsification techniques, maintaining real-time playback across desktop, laptop, and mobile environments.
-
-\subsection{Ablation: Overdraw Reduction}
-We evaluate the impact of our flatness regularization on the Beta surfels. We compare our unregularized method against two values of overdraw reduction. In Figure \ref{fig:overdraw_lambda_gamma} we display the number of intersections per pixel for increasing values of lambda.
-
-Forcing the Beta kernels to adopt flatter profiles directly reduces the spatial volume of each primitive. This structural change strictly bounds the alpha-blending footprint, minimizing fragment overdraw during rasterization. We make the regularization loss-informed as more Gaussian-like kernels are better for convergence and so the regularization activates after the model has trained a little.
-
-\begin{table}[ht!]
+\begin{table}[h]
 \centering
-\caption{\textbf{Ablation: overdraw regularization on Mip-NeRF 360 / garden.} All variants use SV-30thr with identical training and bake settings; only the overdraw-reduction loss differs. \emph{None}: no overdraw penalty. \emph{Naive}: constant penalty $\lambda \cdot \overline{\mathrm{overdraw}}$. \emph{Error-weighted} (ours): per-pixel $w(r) = \exp(-\gamma \cdot \mathrm{MSE}(r).\mathrm{detach}())$ so the penalty concentrates on already-converged pixels and avoids fighting reconstruction loss. Numbers are baked-renderer measurements on RTX 5090.}
-\label{tab:ablation_overdraw}
+\small
+\caption{\textbf{Falloff-regularization ablation (bicycle, SV).}
+Varying the error-weighted falloff penalty
+($w(r) = \exp(-\gamma \cdot \mathrm{MSE}(r))$) trades a small amount of
+photometric quality for a large reduction in primitive count and a near-2$\times$
+FPS gain. FPS measured on RTX 5090.}
+\label{tab:ablation_falloff}
 \begin{tabular}{l|ccccc}
 \toprule
-\textbf{Overdraw reg.} & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & N$\downarrow$ & FPS$\uparrow$ \\
+\textbf{Variant} & $N$ & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & FPS$\uparrow$ \\
 \midrule
-None ($\lambda=0$)               & \first{26.98}  & \first{0.823}  & \first{0.163}  & 242k          & 534 \\
-Naive (constant)                 & -              & -              & -              & -             & - \\
-Error-weighted (Ours)            & 26.65          & 0.814          & 0.173          & \first{156k}  & \first{1015} \\
+None ($\lambda=0$)                            & 259,561        & \first{24.14} & \first{0.690} & \first{0.282} & 384.6 \\
+$\lambda=0.001,\, \gamma=25$                  & 227,590        & 24.04         & 0.687         & 0.284         & 352.4 \\
+$\lambda=0.005,\, \gamma=25$ \emph{(default)} & \first{174,573}& 23.84         & 0.668         & 0.301         & \first{722.2} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -689,15 +669,42 @@ We assess the effect of different view-dependent feature representations on the 
 
 Improving the representational capacity of the per-primitive view-dependent features allows the optimization to fit the scene with fewer total primitives. Because the hash grid handles the high-frequency spatial texture, the choice of spherical feature primarily affects the sparsity of the geometric base rather than the final LPIPS score.
 
+\begin{table}[h]
+\centering
+\small
+\caption{\textbf{Per-primitive view-dependent feature ablation (bonsai).}
+We replace the spherical Voronoi (SV) head with spherical harmonics (SH,
+degree 3) and spherical betas (SB, $K{=}2$ lobes). SV gives the best
+reconstruction quality at virtually identical FPS to SB; SB is the most
+parameter-efficient. \emph{Params} counts render-useful per-primitive
+fields in the PLY (excluding stored-but-unused fields). FPS measured on
+RTX 5090.}
+\label{tab:ablation_spherical}
+\begin{tabular}{l|cccc}
+\toprule
+\textbf{Variant} & $N$ & PSNR$\uparrow$ & Params$\downarrow$ & FPS$\uparrow$ \\
+\midrule
+SH (deg 3)       & 117,082 & 30.88         & 6.91M         & 401.5 \\
+SV (K{=}7 sites) \emph{(ours)} & 112,748 & \first{31.94} & 6.7M         & 576.4 \\
+SB (K{=}2 lobes) & \first{111,859} & 31.09 & \first{2.91M} & \first{580.5} \\
+\bottomrule
+\end{tabular}
+\end{table}
 % ADD TABLE OF SH vs SB vs SV
     
-\section{Limitations}
-While our periodic training strategy for the hashMLP speeds up the training, it still has significant room for improvement and convergence analysis. The per-fragment hash-grid fw pass and backprop, especially when overdraw is high, are overheads that need to be managed as efficiently as possible to achieve competitive training times. We also need to explore a method for generating a compressed texture atlas. While the scenes in our evaluations have a significantly reduced number of Gaussians, the texture atlas would not scale well for much larger scenes. Since we already have a trained hash-grid positional encoding, we could explore a learned mapping to a fixed-size texture atlas. Finally, our implementation of Fast-GS could show much better performance with further tuning, and an exploration of all state-of-the-art sparsifying methods would be a good direction to pursue.
+\section{Limitations and Future Work}
+While our periodic hashMLP training strategy accelerates training, significant room remains for convergence analysis and performance optimization. The per-fragment hash-grid forward and backward passes—particularly under high overdraw—become a bottleneck that must be minimized to achieve competitive training times.
+
+The compressed texture atlas still demands substantial memory. In future work, we will explore generating a smaller atlas by leveraging the trained hash grid positional encoding, for instance via a learned mapping to a fixed-size atlas.
+
+Finally, accelerating texture coordinate computation is a key priority.
+%od for generating a compressed texture atlas. While the scenes in our evaluations have a significantly reduced number of Gaussians, the texture atlas would not scale well for much larger scenes. 
+%Since this grid exists already, we will explore a  
+%Finally, our implementation of Fast-GS could show much better performance with further tuning, and an exploration of all state-of-the-art sparsifying methods would be a good direction to pursue.
 
 
 \section{Conclusion}
-
-
+We introduce a texture-based method for novel view synthesis using 2D surfel splatting. During training, a neural hash grid captures view-independent appearance, which is then baked into a 2D color texture atlas for inference. Extensive experiments show that our approach achieves high inference speed and high-quality reconstruction with a low number of surfels. We demonstrate a superior quality-to-primitive ratio and rendering performance on par with the fastest existing methods, but with significantly higher fidelity.
 
 
 \begin{figure*}[h]
@@ -707,20 +714,21 @@ While our periodic training strategy for the hashMLP speeds up the training, it 
   \label{fig:qualitative}
 \end{figure*}
 
-\begin{figure*}[h]
-  \centering
-  \includegraphics[width=\linewidth]{images/qualitative_overlay.pdf}
-  \caption{Placeholder for qualitative results while I find the most representative ones for FastGS and BBSplat}
-  \label{fig:qualitative}
-\end{figure*}
-
 
 \begin{figure*}[h]
   \centering
-  \includegraphics[width=\linewidth]{images/bitymi_random_grid.pdf}
+  \includegraphics[width=\linewidth]{images/triple_zoomin_stacked.pdf}
   \caption{Placeholder for qualitative results while I find the most representative ones for FastGS and BBSplat}
-  \label{fig:qualitative}
+  \label{fig:qualitative_zoom}
 \end{figure*}
+
+% \begin{figure*}[h]
+%   \centering
+%   \includegraphics[width=\linewidth]{images/qualitative_overlay.pdf}
+%   \caption{Placeholder for qualitative results while I find the most representative ones for FastGS and BBSplat}
+%   \label{fig:qualitative}
+% \end{figure*}
+
 
 %%
 %% The acknowledgments section is defined using the "acks" environment
@@ -733,38 +741,6 @@ To Robert, for the bagels and explaining CMYK and color spaces.
 
 \newpage
 \section{Supplementary Material}
-
-\subsection{Atlas Generation and Packing}
-We pack the per-surfel grids into a global RGB texture atlas of dimensions $W \times H$ using a Shelf-First-Fit-Decreasing algorithm. Surfels are sorted descending by $r_y$, then $r_x$, and placed into the first available shelf. We fix $W=4096$ and grow $H$ greedily, rounding to a multiple of 64. We automatically increase $W$ if $H$ approaches the 65,536-row \texttt{cudaArray} limit.
-
-We evaluate the hash grid and MLP at the center of each texel. For a texel $(i,j)$ assigned to surfel $g$, we map to local coordinates using the texel-center convention:
-\begin{equation}
-u = \frac{i + 0.5}{r_x} 2e - e, \quad v = \frac{j + 0.5}{r_y} 2e - e.
-\end{equation}
-This mapping prevents boundary seams by aligning the baked evaluation with the hardware bilinear sampler. The local coordinates are lifted to world space via the surfel tangent frame $\mathbf{R}$:
-\begin{equation}
-\mathbf{x} = \mathbf{p}_g + u s_{g,u} \mathbf{R}_{:,0} + v s_{g,v} \mathbf{R}_{:,1}.
-\end{equation}
-The evaluated RGB vector $\boldsymbol{\rho}(\mathbf{x})$ is written to the atlas using a fused kernel that allocates one warp per texel row.
-
-\subsection{Quantization}
-Storing a dense FP16 RGB atlas requires 6 bytes per texel. We apply Block Compression (BC7) to reduce this footprint. We compute a scalar range $[\mu - 6\sigma, \mu + 6\sigma]$ via bootstrap sampling and uniformly quantize the atlas with a single global $(\mathrm{offset}, \mathrm{scale})$ pair, written to the bake metadata and applied as a per-load multiply-add by the rasterizer at inference. The data is padded to RGBA to match the $4 \times 4$ block layout of BC7. This format stores each block in 16 bytes, reducing the memory requirement to 1 byte per texel. Table~\ref{tab:quantization} compares the memory and quality impact of different formats.
-
-\begin{table}[h]
-\centering
-\caption{Atlas storage formats. Sizes denote bytes per texel and the resulting mean atlas size on the 18 Mip-NeRF 360 splits at $r_{\max}=64$.}
-\label{tab:quantization}
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{lccc}
-\toprule
-\textbf{Format} & \textbf{Bytes / texel} & \textbf{Mean atlas size} & \textbf{$\Delta$PSNR vs.\ neural} \\
-\midrule
-FP16 RGB (ref.) & 6 & $\sim$3.8 GB & --- \\
-uint8 RGBA & 4 & $\sim$2.6 GB & $\pm$0.01 dB \\
-\textbf{BC7 RGBA (ours)} & \textbf{1} & \textbf{$\sim$638 MB} & \textbf{$\pm$0.01 dB} \\
-\bottomrule
-\end{tabular}}
-\end{table}
 
 \subsection{Rasterization Optimizations}
 We incorporate architectural improvements from FastGS \cite{TODO_fastgs_citation}
@@ -780,6 +756,33 @@ the ellipse strictly overlaps.
 %%
 %% The next two lines define the bibliography style to be used, and
 %% the bibliography file.
+
+\subsection{Rendering Performance on Consumer Devices}
+% We benchmark the rendering performance across varying hardware profiles to test deployment feasibility. The primary benchmarks are conducted on a desktop RTX 4090.
+To further evaluate rendering performance under strict hardware constraints, we also measure novel view synthesis on an Apple MacBook Pro M3 and a Samsung Galaxy S24 Ultra smartphone (see Tab.~\ref{tab:platform_fps}).
+
+\begin{table}[h]
+\centering
+\small
+\caption{Cross-platform rendering performance (FPS) of our baked-atlas
+renderer on two Mip-NeRF~360 scenes. The same bundle (BC7 atlas + fused SV
+CUDA path on desktop; Metal / Vulkan port on mobile-class hardware) is
+loaded on each device; only the runtime backend differs.}
+\label{tab:platform_fps}
+\begin{tabular}{l@{\hspace{6pt}}rr@{\hspace{6pt}}rrr}
+\toprule
+Scene & Res. & $N$ & RTX 4090 & MBP M3 (18GB) & S24 Ultra \\
+\midrule
+counter & 1558$\times$1038 & 80,135  & 804.0  & 178.2 & 91.4 \\
+garden  & 1297$\times$840  & 156,216 & 951.8  & 254.3 & 117.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Exploiting texture mapping hardware and a minimal set of surfels allows our pipeline to operate at higher framerates than alternative approaches using textures or hash grids, at high rendering quality.
+%compared to purely geometric sparsification techniques, maintaining real-time playback across desktop, laptop, and mobile environments.
+
+
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{sample-base}
 

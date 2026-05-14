@@ -188,7 +188,10 @@
       "Bash(rsync -a /home/nilkel/Projects/nest-splatting/data/sherlock_ckpts/nexels/tnt_cap400000/ neel@10.176.128.69:~/nexels_runs/tnt_cap400000/)",
       "Bash(xargs -I{} du -sh {})",
       "Bash(git check-ignore *)",
-      "Bash(rm -v /home/nilkel/Projects/nest-splatting/*.zip 2>&1 *)"
+      "Bash(rm -v /home/nilkel/Projects/nest-splatting/*.zip 2>&1 *)",
+      "Bash(scp -q /tmp/slurm_indoor_fullres_array.sh sherlock01h:~/userdir/Projects/nest-splatting/slurm_indoor_fullres_array.sh)",
+      "WebFetch(domain:fastgs.github.io)",
+      "WebFetch(domain:sphericalvoronoi.github.io)"
     ],
     "additionalDirectories": [
       "/home/nilkel/Projects/Unbiased_Surfel/submodules/diff-surfel-rasterization",
