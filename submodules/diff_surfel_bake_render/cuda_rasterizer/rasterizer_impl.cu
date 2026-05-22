@@ -248,6 +248,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.rgb, P * 3, 128);   // FP16 — halves inner-loop fetch bandwidth
 	obtain(chunk, geom.sb_rgb, P * 3, 128); // SB per-Gaussian color (preprocessCUDA writes, renderBakedCUDA reads when sb_number>0)
 	obtain(chunk, geom.conic_t, P, 128);   // SnugBox conic — used when aabb_mode==2/5
+	obtain(chunk, geom.ewa_conic, P, 128); // mixed_3d untextured EWA conic (a,b,c,opacity)
 	// Legacy single-sort buffers.
 	obtain(chunk, geom.tiles_touched, P, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
@@ -338,7 +339,9 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* voronoi_sites,
 	const float* voronoi_tau,
 	const float* voronoi_colors,
-	const int voronoi_K)
+	const int voronoi_K,
+	const bool* is_textured,
+	const float* scaling_z)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -412,7 +415,10 @@ int CudaRasterizer::Rasterizer::forward(
 		// SB fused: preprocess writes per-Gauss RGB to geomState.sb_rgb; render reads it.
 		sb_params,
 		sb_number,
-		geomState.sb_rgb
+		geomState.sb_rgb,
+		is_textured,
+		scaling_z,
+		(scaling_z != nullptr) ? geomState.ewa_conic : nullptr
 	), debug)
 
 	int num_rendered = 0;
@@ -559,7 +565,9 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.sb_rgb,    // SB per-Gauss precomputed colors (filled by preprocess above)
 		atlas_tex_obj,
 		atlas_offset,
-		atlas_scale), debug)
+		atlas_scale,
+		is_textured,
+		(scaling_z != nullptr) ? geomState.ewa_conic : nullptr), debug)
 
 	return num_rendered;
 }

@@ -61,7 +61,12 @@ namespace FORWARD
 		// render kernel then reads from there instead of recomputing per-pixel.
 		const float* sb_params = nullptr,
 		const int sb_number = 0,
-		__half* sb_rgb_out = nullptr);
+		__half* sb_rgb_out = nullptr,
+		// `--method mixed_3d`: per-Gauss textured flag + activated 3rd-axis
+		// scale; ewa_conic scratch [P] (preprocess writes untextured rows).
+		const bool* is_textured = nullptr,
+		const float* scaling_z = nullptr,
+		float4* ewa_conic = nullptr);
 
 	void render(
 		const dim3 grid, dim3 block,
@@ -89,13 +94,18 @@ namespace FORWARD
 		const __half* sb_rgb_in = nullptr,
 		cudaTextureObject_t atlas_tex_obj = 0,
 		float atlas_offset = 0.0f,
-		float atlas_scale = 1.0f);
+		float atlas_scale = 1.0f,
+		// `--method mixed_3d`: per-Gauss textured flag + EWA conic [P].
+		const bool* is_textured = nullptr,
+		const float4* ewa_conic = nullptr);
 
 	// Device-global setters (mirror diff_surfel_3D_sh_res training-time setters).
 	void setActivationBias(float sh_bias, float res_bias);
 	void setCompactMult(float val);
 	// 0 = 3D_SH_res (default outer-ReLU). 1 = 3D_SH_add (separate ReLUs).
 	void setResidualMode(int mode);
+	// `--method mixed_3d --kernel2`: untextured-EWA kernel override (-1 = unset).
+	void setUntexKernel(int v);
 }
 
 #endif

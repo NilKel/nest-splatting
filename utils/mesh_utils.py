@@ -280,7 +280,14 @@ class GaussianExtractor(object):
         
         # coloring the mesh
         torch.cuda.empty_cache()
-        mesh = mesh.as_open3d
+        # Newer trimesh removed `.as_open3d`; convert vertices/faces manually.
+        if hasattr(mesh, "as_open3d"):
+            mesh = mesh.as_open3d
+        else:
+            _o3d = o3d.geometry.TriangleMesh()
+            _o3d.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices, dtype=np.float64))
+            _o3d.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.faces, dtype=np.int32))
+            mesh = _o3d
         print("texturing mesh ... ")
         _, rgbs = compute_unbounded_tsdf(torch.tensor(np.asarray(mesh.vertices)).float().cuda(), inv_contraction=None, voxel_size=voxel_size, return_rgb=True)
         mesh.vertex_colors = o3d.utility.Vector3dVector(rgbs.cpu().numpy())

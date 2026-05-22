@@ -58,6 +58,25 @@ except ImportError:
     _sh_res_rasterizer = None
     SH_RES_RASTERIZER_AVAILABLE = False
 
+# `--method mixed` library — fork of diff_surfel_3D_sh_res that will host
+# the diffuse-textured / specular-untextured per-Gauss kernel branch.
+# Currently identical to the 3D_SH_res renderer (CUDA branch is phase 2).
+try:
+    import diff_surfel_mixed as _mixed_rasterizer
+    MIXED_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _mixed_rasterizer = None
+    MIXED_RASTERIZER_AVAILABLE = False
+
+# `--method mixed_3d` library — like diff_surfel_mixed but the untextured half
+# renders as 3D ellipsoids (beta-splatting EWA, restricted beta_scaled kernel).
+try:
+    import diff_surfel_mixed_3d as _mixed_3d_rasterizer
+    MIXED_3D_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _mixed_3d_rasterizer = None
+    MIXED_3D_RASTERIZER_AVAILABLE = False
+
 # SH+residual 32-dim library (diff_surfel_3D_sh_32) — same as sh_res but 32-dim hidden MLP
 try:
     import diff_surfel_3D_sh_32 as _sh_32_rasterizer
@@ -893,6 +912,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_3D_direct_sh_tc_mode = ingp is not None and hasattr(ingp, 'is_3D_direct_sh_tc_mode') and ingp.is_3D_direct_sh_tc_mode
     # 3D_SH_res mode: per-Gaussian SH + tiny hash MLP residual (diff_surfel_3D_sh_res)
     is_3D_SH_res_mode = ingp is not None and hasattr(ingp, 'is_3D_SH_res_mode') and ingp.is_3D_SH_res_mode
+    # Default for the mixed[_3d]-only flags; only assigned for real inside the
+    # 3D_SH_res rasterizer-dispatch branch below. Without this default, calling
+    # render(ingp=None) (e.g. baseline auxiliary passes) hits an
+    # UnboundLocalError at the `if _is_mixed_3d:` site near line ~1821.
+    _is_mixed_3d = False
+    _is_mixed = False
     # 3D_SH_cat mode: per-Gaussian SH + hash+DC MLP residual (diff_surfel_3D_sh_res)
     is_3D_SH_cat_mode = ingp is not None and hasattr(ingp, 'is_3D_SH_cat_mode') and ingp.is_3D_SH_cat_mode
     # 3D_SH_32 mode: per-Gaussian SH + 32-dim hash MLP residual (diff_surfel_3D_sh_32)
@@ -1712,7 +1737,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if is_3D_SH_32_mode and SH_32_RASTERIZER_AVAILABLE:
         rasterizer = _sh_32_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
     elif (is_3D_SH_res_mode or is_3D_SH_cat_mode) and SH_RES_RASTERIZER_AVAILABLE:
-        rasterizer = _sh_res_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
+        # `--method mixed`: route through diff_surfel_mixed (the fork that has the
+        # per-Gauss textured/untextured CUDA branch). For all other 3D_SH_res / 3D_SH_cat
+        # runs use the original rasterizer (bit-identical to before).
+        _is_mixed_3d = ingp is not None and getattr(ingp, 'is_mixed_3d_mode', False) and MIXED_3D_RASTERIZER_AVAILABLE
+        _is_mixed = ingp is not None and getattr(ingp, 'is_mixed_mode', False) and MIXED_RASTERIZER_AVAILABLE
+        if _is_mixed_3d:
+            _rmod = _mixed_3d_rasterizer
+        elif _is_mixed:
+            _rmod = _mixed_rasterizer
+        else:
+            _rmod = _sh_res_rasterizer
+        rasterizer = _rmod.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
     elif is_3D_direct_sh_tc_mode and SH_TC_RASTERIZER_AVAILABLE:
         rasterizer = _sh_tc_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
     elif is_3D_direct_tc_mode and TC_RASTERIZER_AVAILABLE:
@@ -1782,6 +1818,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Bit 11: pixel-center convention (pixf = pix + 0.5, ndc2pix offset = W/2)
     if pixel_center:
         render_mode |= 0x800
+    # Bits [16..19]: `--method mixed_3d` `--kernel2` — kernel for the UNTEXTURED
+    # EWA half, overriding `kernel_type` for that half only. Encoded as
+    # (kernel_type2 + 1); a zero nibble means "unset" → untextured use
+    # kernel_type (byte-identical to before). mixed_3d-gated; render_mode is
+    # already threaded to every render kernel (fwd + bwd std/MODE-5), so no
+    # signature changes are needed. The textured half always uses kernel_type.
+    if _is_mixed_3d:
+        _k2s = getattr(pc, 'kernel_type2', None)
+        if _k2s is not None:
+            _KMAP2 = {'gaussian': 0, 'beta': 1, 'flex': 2,
+                      'general': 3, 'beta_scaled': 4, 'nexel': 5}
+            _kt2 = _KMAP2.get(_k2s, -1)
+            if _kt2 >= 0:
+                render_mode |= ((_kt2 + 1) << 16)
 
     # Build rasterizer kwargs
     rasterizer_kwargs = dict(
@@ -1806,10 +1856,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Other rasterizers (lean, fp16, etc.) still accept viewdirs_enc
     if viewdirs_enc is not None and not isinstance(rasterizer, GaussianRasterizer):
         rasterizer_kwargs['viewdirs_enc'] = viewdirs_enc
-    # FastGS: only diff_surfel_3D_sh_res accepts metric_map today. Detect by module.
+    # FastGS: only diff_surfel_3D_sh_res / diff_surfel_mixed accept metric_map.
     _rasterizer_mod = getattr(type(rasterizer), '__module__', '') or ''
-    if metric_map is not None and 'diff_surfel_3D_sh_res' in _rasterizer_mod:
+    if metric_map is not None and (
+            'diff_surfel_3D_sh_res' in _rasterizer_mod or 'diff_surfel_mixed' in _rasterizer_mod):
         rasterizer_kwargs['metric_map'] = metric_map
+    # `--method mixed[_3d]`: pass per-Gauss textured/untextured bool to the kernel.
+    # (`diff_surfel_mixed` substring also matches `diff_surfel_mixed_3d`.)
+    if 'diff_surfel_mixed' in _rasterizer_mod and hasattr(pc, '_is_textured') \
+            and pc._is_textured.numel() > 0 and pc._is_textured.shape[0] == pc.get_xyz.shape[0]:
+        rasterizer_kwargs['is_textured'] = pc._is_textured
+    # `--method mixed_3d`: untextured surfels render as 3D ellipsoids — pass the
+    # learnable 3rd axis as the ACTIVATED scale (exp), consistent with `scales`
+    # (= pc.get_scaling, also activated). Only the _3d submodule consumes it.
+    if 'diff_surfel_mixed_3d' in _rasterizer_mod and hasattr(pc, '_scaling_z') \
+            and pc._scaling_z.numel() > 0 and pc._scaling_z.shape[0] == pc.get_xyz.shape[0]:
+        rasterizer_kwargs['scaling_z'] = pc.get_scaling_z
     rasterizer_output = rasterizer(**rasterizer_kwargs)
     # Main rasterizer returns 7 values (with max_weight, accum_weights); other rasterizers (lean, fp16, etc.) return 8 (with intersection_buffer, intersection_count, geomBuffer)
     # diff_surfel_3D_sh_res additionally appends out_index (max-contrib id) and
@@ -1838,6 +1900,25 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         intersection_buffer = None
         intersection_count = None
         geomBuffer = None
+
+    # `--method mixed`: per-pixel ReLU on the final blended color. The CUDA kernel
+    # (residual_mode=2) leaves the per-Gauss feat signed (ReLU(SV)+residual, no
+    # per-Gauss clamp), so the blended pixel can go negative — clamp it here.
+    # PyTorch autograd handles the per-pixel ReLU gate for the backward pass, so
+    # dL_dpixel arrives at the rasterizer already correctly gated.
+    # Pre-clamp blended image. For `--method mixed[_3d]` the per-Gauss feat is
+    # signed (ReLU(SV)+residual), so the blended pixel can go negative; the
+    # final per-pixel ReLU below hides those negative regions. `render_raw`
+    # keeps the signed pre-ReLU image so decomposition viz can show the abs /
+    # signed residual magnitude (negative texture that the clamp would erase).
+    rendered_image_raw = rendered_image
+    # Per-pixel ReLU after blend: only applied for the deferred-clamp variants
+    # (`mixed_sep` / `mixed_3d_sep`, residual_mode=2). Bare `mixed`/`mixed_3d`
+    # use mode 0 (per-Gauss outer ReLU before the blend) — the blended pixel is
+    # already non-negative, so the relu would be a no-op and is skipped to
+    # match 3D_SH_res byte-for-byte.
+    if ingp is not None and getattr(ingp, 'is_mixed_deferred_relu_mode', False):
+        rendered_image = torch.relu(rendered_image)
 
     # 3D mode: Process intersection buffer through PyTorch pipeline
     # Recompute xyz from s_x,s_y → hash encode → gather features → MLP → SH → blend → eval
@@ -2461,6 +2542,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     rets =  {"render": rendered_image,
+            "render_raw": rendered_image_raw,  # pre-ReLU (signed) — mixed[_3d] decomposition viz
             "viewspace_points": means2D,
             "visibility_filter" : radii > 0,
             "radii": radii,

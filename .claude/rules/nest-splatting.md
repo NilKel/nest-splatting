@@ -12,6 +12,8 @@
 |---|---|---|
 | `diff-surfel-rasterization` | `submodules/diff-surfel-rasterization` | Original 2DGS rasterizer (modes 0/1) |
 | `diff_surfel_3D_sh_res` | `submodules/diff_surfel_3D_sh_res` | **Main training rasterizer** for 3D_SH_res |
+| `diff_surfel_mixed` | `submodules/diff_surfel_mixed` | `--method mixed` rasterizer (fork of `diff_surfel_3D_sh_res`) with the per-Gauss textured/untextured CUDA branch (untextured = 2DGS ray-splat, SV-only). |
+| `diff_surfel_mixed_3d` | `submodules/diff_surfel_mixed_3d` | `--method mixed_3d` rasterizer (fork of `diff_surfel_mixed`). Untextured surfels render as **EWA 3D ellipsoids** (FastGS-verbatim `computeCov3D`/`computeCov2D`/conic, eps2d=0.3) instead of 2DGS ray-splats. Textured half untouched. |
 | `diff_surfel_bake` | `submodules/diff_surfel_bake` | Bakes MLP residual into per-Gaussian SH atlas |
 | `diff_surfel_bake_render` | `submodules/diff_surfel_bake_render` | Forward-only renderer for baked atlas |
 | `gridencoder` | `gridencoder` | Python-side hash encoding (not used at inference) |
@@ -145,6 +147,144 @@ Goal: bake the MLP residual into static per-Gaussian SH textures for fast infere
 - `--mini1` — Mini-Splatting v1: repeated depth reinit (5k/10k/15k), longer densification (500→15000), simp1 at 15000 (keep 50%), simp2 at 20000. Auto-enables `--mini`.
 - `--minimc` — Sweep-based RJ-MCMC. Requires `--method 3D_SH_res`. Two events on separate intervals: depth reinit (every `--minimc_reinit_interval`, in-place via `reinitial_alive_inplace`) and sweep+cull+clone (every `--minimc_relocate_interval`). Tensor size is fixed; alive/dead split moves inside `cap_max`. See `gaussian_model.py` for `minimc_sweep_and_relocate`.
 - `--minispa` — chains mini v2 aggressive clone + silhouette-aware depth reinit at 2000 → GSpa Phase-2 ADMM (3000→25000) → hard prune.
+
+### `--method mixed` (textured/untextured split)
+- `--method mixed` — textured/untextured manifold split. Routes through the
+  **`diff_surfel_mixed`** rasterizer (a fork of `diff_surfel_3D_sh_res` with the per-Gauss
+  branch). Per-Gauss `_is_textured` bool tensor lives on `GaussianModel`; pre-split it's
+  all-True (or absent → nullptr in CUDA) and behavior is bit-identical to `--method 3D_SH_res`.
+  - **Textured** surfels: full 3D_SH_res — `ReLU(SV) + residual` (hash query + MLP), run's
+    chosen `--kernel`, full geometry + shape gradients.
+  - **Untextured** surfels: identical 2DGS ray-splat geometry + kernel, but the color path
+    is SV-only (`feat = ReLU(SV)`, no hash query, no MLP, no world-xyz reconstruction, no
+    MODE-5 GEMMs). Matches the reference `../2d-gaussian-splatting` lean path.
+  - Residual activation is **mode 2** (`args._residual_mode = 2`, `set_residual_mode(2)`):
+    `feat = ReLU(SV) + residual` (signed residual, NO per-Gauss outer ReLU); the per-pixel
+    ReLU on the final blended image is applied in Python (`torch.relu`, autograd-gated).
+- `--texsplit N` — iteration at which to split (default `-1` = disabled). At `N`,
+  `split_at_texsplit()` **duplicates** the live surfel set (no depth reinit — that shocked
+  a converged scene): textured copy (`_is_textured=True`) + untextured copy
+  (`_is_textured=False`), all per-Gauss tensors identical. Opacity = each surfel's trained
+  alpha scaled by `opacity_scale=0.5` (both copies); SV color untouched (`halve_baseline=False`).
+  Adam rebuilt via `training_setup(opt)`. PLY round-trip preserves `_is_textured` (column
+  only written when ≥1 untextured row, so older readers stay happy).
+- One-way inheritance via densification: textured parents → textured children; untextured
+  parents → untextured children. Mass conservation.
+- `--freeze_hash_iter`/`--freeze_hash_period` only throttle the **textured** hash/MLP path;
+  untextured surfels never touch hash/MLP and keep training every iter (decoupled).
+- tqdm shows `Points=<N>/<pct>%tex`; `training_log.txt` records the textured/untextured split.
+- **Baked pipeline support** (`benchmark_baked.py` / `render_baked.py` / `diff_surfel_bake_render`):
+  untextured surfels are folded into the **skip-texture** set in `bake_atlas` → zero atlas
+  rect → the bake-render kernel renders them SV-only (no atlas lookup, no residual) at no
+  atlas cost. `bake_meta.json` carries `residual_mode=2` (+ `mixed_textured`/`mixed_untextured`
+  counts); the kernel's `d_residual_mode==2` branch leaves the per-Gauss color signed and
+  the Python side re-applies the per-pixel `torch.relu` (`final_relu`). `_is_textured` is
+  kept aligned through bake-time pruning. No `is_textured` plumbing needed in the bake-render
+  CUDA kernel — the zero-rect geometry carries the signal.
+
+### `--method mixed_3d` (untextured = EWA 3D ellipsoids)
+- `--method mixed_3d` — same textured/untextured split as `--method mixed`, but
+  **untextured surfels render as 3D ellipsoids via EWA splatting** instead of
+  flat 2DGS ray-splats. Routes through the **`diff_surfel_mixed_3d`** submodule
+  (a fork of `diff_surfel_mixed`). `--method mixed` is unchanged and separate.
+  - **Textured** half: byte-identical to `--method mixed` (compute_transmat,
+    hash+MLP, residual_mode 2).
+  - **Untextured** half: a learnable 3rd scale axis `_scaling_z` (model-side,
+    `get_scaling_z = exp(_scaling_z)`, flattened init `log(0.05)+min(log sx,log sy)`
+    at split). The CUDA preprocess builds the world covariance from
+    `(sx, sy, sz)`+quat and projects it with **FastGS-verbatim** `computeCov3D`
+    / `computeCov2D` (quat layout (r,x,y,z), no quat normalization, eps2d=0.3
+    low-pass), inverts to a per-Gauss conic stored in `GeometryState.ewa_conic`,
+    radius `ceil(3·√maxλ)`. The render kernel computes the Mahalanobis
+    `m = a·dx² + 2b·dx·dy + c·dy²` and applies the run's `--kernel` (just like
+    the 2DGS path): `beta`/`beta_scaled` (kernel_type 1/4) → restricted-beta
+    `α = min(.99, opa·max(0,1−m/k²)^β)` (k²=9 for beta_scaled, compact support,
+    β = activated `get_shape` ∈ [0,5]); any other kernel → FastGS Gaussian
+    `α = min(.99, opa·exp(−0.5·m))`. SV/SH baseline color (no hash/MLP/Tu/Tv/Tw).
+    Verified vs analytic fields to FP16-rgb noise: Gaussian rel ~0.02%,
+    beta_scaled max|Δ|~1.7e-4 with compact support confirmed (0 beyond 3σ).
+- **`--kernel2 <kernel>`** — `mixed_3d` only: overrides `--kernel` for the
+  UNTEXTURED (EWA) half *only*; the textured half always uses `--kernel`.
+  Unset ⇒ untextured use `--kernel` (byte-identical to before). Canonical use:
+  `--kernel beta_scaled --kernel2 gaussian` → textured = 2D beta_scaled
+  surfels, untextured = Gaussian EWA ellipsoids. **Mechanism (no signature
+  plumbing):** the renderer packs `(kernel_type2+1)` into **`render_mode` bits
+  [16..19]** (mixed_3d-gated; zero nibble = unset); the 3 untextured-EWA CUDA
+  branches (fwd-render, bwd-std, bwd-MODE-5) decode
+  `ut_kt = nibble ? nibble−1 : kernel_type` and switch beta↔Gaussian on it
+  (textured stays on `kernel_type`). Bake path has no `render_mode`, so it
+  mirrors the `set_residual_mode` device-global idiom: `set_untex_kernel(int)`
+  → `d_untex_kernel` (-1=unset); `benchmark_baked.py` records
+  `bake_meta["kernel2"]` at bake and calls `set_untex_kernel` at render so
+  baked geometry matches training. **Verified:** forward decode bit-identical
+  both directions (`kt=4 +k2=gaussian == kt=0`; reverse `kt=0 +k2=beta == kt=4`;
+  unset == `kernel_type`); backward gradcheck exact with the k2 bit (std +
+  MODE-5 GEMM): means3D/opac/scales/scaling_z/rot/sh relmax ≤1e-2, cos=1.0.
+  Constraint: `--kernel2 beta*` needs `--kernel` also beta-family (per-Gauss
+  `_shape` is only passed when `pc.kernel_type` is beta-family); the documented
+  `beta_scaled`/`gaussian` combo is unaffected.
+- Plumbing: `scaling_z` (activated `pc.get_scaling_z`) flows
+  renderer → wrapper → binding → `Rasterizer::forward` → `FORWARD::preprocess`.
+  The render kernel only takes the EWA branch when **`scaling_z != nullptr`**
+  (rasterizer_impl gates `ewa_conic` to nullptr otherwise). So pre-`--texsplit`
+  (scaling_z empty) `mixed_3d` is byte-identical to `--method mixed`/`3D_SH_res`.
+- Split: `split_at_texsplit(make_scaling_z=True)` creates `_scaling_z` (it's
+  built only for `mixed_3d`; `mixed` leaves it empty).
+- **Backward: implemented + gradcheck-verified.** Untextured EWA VJP is the
+  FastGS-verbatim port (`ewa_backward_vjp` in `backward.cu`: conic→cov2D→cov3D
+  →scale/`scaling_z`/quat + proj→mean3D) wired through a self-contained branch
+  in the std render-backward (mirrors the per-pixel color/depth/alpha/normal/
+  dist/reg recurrence so cross-set occlusion grads stay correct), then
+  `preprocessCUDA`'s untextured-EWA branch. `dL_dscaling_z` is a new grad
+  output plumbed binding→`Rasterizer::backward`→`__init__.py` (the `scaling_z`
+  autograd slot). Numerical gradcheck (analytic vs central FD) is **exact**
+  (relmax ≤ 1e-2, cos = 1.0) for means3D, opacity, scales(sx,sy), `scaling_z`,
+  rotations, sh, and β-shape — both `--kernel` Gaussian (kt 0) and restricted
+  beta_scaled (kt 4). Implementation notes / gotchas:
+  - The conic-grad carrier reuses `dL_dtransMat[gid*9+0..2]` (untextured rows
+    never use transMat). Its **off-diagonal (b) channel drops the factor 2**
+    (`dL_dm·dx·dy`, not `2·dx·dy`) to match FastGS `computeCov2DCUDA`'s half
+    convention; the `dL_dmean2D` screen-grad keeps the full `2·dx·dy`.
+  - **Collaborative GEMM is ENABLED** (same as `mixed`/`3D_SH_res`). The
+    MODE-5 path has a block-uniform untextured-EWA branch (mirrors the std
+    EWA branch; `tex_j`+`ewa_conic` are per-Gauss uniform across all 256
+    threads → the whole block handles the untextured Gaussian and `continue`s,
+    uniformly skipping the GEMM — untextured has no MLP). Per-thread gating
+    uses `ok` flags, NOT `continue`, so no thread diverges before the
+    block-uniform `continue` (the next j iterates a `__syncthreads_count`
+    barrier). Verified: MODE-5 backward == std backward to float precision
+    (max|Δ|~1e-6, cos=1.0) on a mixed textured+untextured scene with the GEMM
+    exercised (nonzero MLP+hash) → cross-set recurrence handoff is correct and
+    textured surfels keep the tensor-core MLP backward (no speed regression).
+  - `preprocessCUDA` skips the 2DGS transMat VJP + the densify depth-hack for
+    untextured-EWA rows (keeps `computeColorFromSH` → dL_dsh); the EWA
+    `dL_dmean2D` from the render backward is the densification proxy.
+  - Depth-map / normal-map gradients are not backpropagated to untextured
+    geometry (simple-splat layer, normal≡0); the recurrence STATE is still
+    advanced so textured neighbours' depth/dist/normal grads stay correct.
+  - `beta_scaled` central-FD gradcheck degrades near the hard compact-support
+    edge (`m≥k²` cull flips edge pixels) — a FD-probe artifact, not a VJP
+    error (cos stays ≥0.98; β=2 + adequately-sized splats → relmax ≤1e-4).
+- **Baked pipeline: EWA-aware (forward-only port).** `diff_surfel_bake_render`
+  now renders untextured surfels as EWA 3D ellipsoids: the verified
+  `compute_ewa_conic` device fns + a conditional-geometry `preprocessCUDA`
+  (`if(!untex_ewa)` 2DGS / `else` EWA conic → rect-AABB binning, new
+  `GeometryState.ewa_conic`) + a self-contained untextured-EWA branch in
+  `renderBakedCUDA` (conic falloff + the **shared** SV/SH-baseline colour path
+  — untextured carry a zero atlas rect so colour is byte-identical to
+  `--method mixed` skip-texture; only geometry differs). `is_textured`/
+  `scaling_z` plumbed through forward.h/rasterizer.h/rasterizer_impl/
+  rasterize_points/`__init__.py`/`prepare_gaussian_inputs`; `benchmark_baked.py`
+  passes them and keeps `_scaling_z` in **both** bake-time prune lists (next to
+  `_is_textured`) so the PLY round-trip stays aligned. `diff_surfel_bake`
+  (atlas baker) unchanged — untextured fold into skip-texture (zero atlas
+  tiles); the residual is an xyz→INGP-MLP function, geometry-independent.
+  **`load_ply` fix**: the `scale_` filter excluded `scale_z` (it shared the
+  prefix with 2DGS `scale_0/1` → `int('z')` crash; latent because `--cold`
+  never reloads a PLY). **Verified**: garden `mixed_3d` (35k) baked BC7 =
+  **26.34 dB / 0.776 / 0.208 @ 1157 FPS vs neural 26.61 / 0.819 / 0.160 @
+  111 FPS — 10.4× speedup, −0.27 dB** (same bake-quant band as `--method
+  mixed`: −0.32 dB), confirming the EWA geometry bakes correctly.
 
 ### Other
 - `--init_ply PATH` — initialize Gaussians from external PLY

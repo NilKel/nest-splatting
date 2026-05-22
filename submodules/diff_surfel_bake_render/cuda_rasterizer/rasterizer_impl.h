@@ -47,6 +47,7 @@ namespace CudaRasterizer
 		// buffer is allocated but never written/read.
 		__half* sb_rgb;
 		float4* conic_t;        // SnugBox+AccuTile conic (A, B, E, t) — used when aabb_mode==2/5
+		float4* ewa_conic;      // `--method mixed_3d` per-Gauss EWA conic (a,b,c,opacity) for untextured rows
 
 		// Legacy single-sort path (sort_mode == 0).
 		uint32_t* point_offsets;

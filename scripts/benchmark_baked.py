@@ -268,12 +268,19 @@ def shelf_pack_atlas(resolutions, atlas_width=4096):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def precompute_atlas_quant_range(ingp, gaussians, uv_extent=4.0,
-                                  n_gaussians=2048, n_uvs_per_gaussian=4,
-                                  k_sigma=6.0):
-    """Pre-sample the MLP residual on a small Gaussian × UV subset to estimate
-    (offset, scale) for uint8 quantization. Returns (offset, scale) such that
-    `q = clamp((x - offset) / scale * 255, 0, 255)` is reversible via
-    `x ≈ q / 255 * scale + offset`.
+                                  n_gaussians=20000, n_uvs_per_gaussian=64,
+                                  margin=0.02, k_sigma=None):
+    """Estimate (offset, scale) for uint8/BC7 quantization of the MLP residual,
+    reversible via `x ≈ q/255 * scale + offset`.
+
+    Uses the EMPIRICAL [min, max] over a large Gaussian × UV sample (all
+    Gaussians up to `n_gaussians`, `n_uvs_per_gaussian` random UVs each in the
+    same [-uv_extent, uv_extent] domain the bake samples) plus a small relative
+    `margin`. This guarantees no residual peak is hard-clamped at bake time —
+    the old mean±6σ over ~8K texels clipped the heavy tails, and clamping the
+    bright residual peaks uniformly is exactly a dull-intensity bias (not a
+    structural one). Pass `k_sigma` (e.g. 6.0) to fall back to the legacy
+    mean±k·σ behaviour.
     """
     from utils.general_utils import build_rotation
     N = gaussians.get_xyz.shape[0]
@@ -284,7 +291,6 @@ def precompute_atlas_quant_range(ingp, gaussians, uv_extent=4.0,
     R = build_rotation(gaussians.get_rotation[sample_idx])
     R0, R1 = R[:, :, 0], R[:, :, 1]
 
-    # Random uvs in [-uv_extent, uv_extent] per Gaussian.
     uv = (torch.rand(K, n_uvs_per_gaussian, 2, device='cuda') * 2 - 1) * uv_extent
     xyz = (centers.unsqueeze(1)
            + uv[..., 0:1] * (scales[:, 0:1].unsqueeze(1) * R0.unsqueeze(1))
@@ -295,18 +301,46 @@ def precompute_atlas_quant_range(ingp, gaussians, uv_extent=4.0,
     hash_dim = ingp.mlp_fused_hash_dim
     mlp_input_padded = mlp[0].weight.shape[1]
 
-    hash_feat = ingp._encode_3D(xyz_flat)
-    mlp_input = torch.zeros(xyz_flat.shape[0], mlp_input_padded,
-                            device='cuda', dtype=torch.float16)
-    mlp_input[:, :hash_dim] = hash_feat[:, :hash_dim].to(torch.float16)
-    rgb_residual = mlp(mlp_input)[:, :3].to(torch.float32)
+    # Chunked forward — K·n_uvs can be ~1M+ rows at full sampling.
+    CH = 262144
+    lo = torch.tensor(float('inf'), device='cuda')
+    hi = torch.tensor(float('-inf'), device='cuda')
+    s1 = torch.zeros((), device='cuda'); s2 = torch.zeros((), device='cuda')
+    cnt = 0
+    for i in range(0, xyz_flat.shape[0], CH):
+        xb = xyz_flat[i:i + CH]
+        hf = ingp._encode_3D(xb)
+        mi = torch.zeros(xb.shape[0], mlp_input_padded, device='cuda', dtype=torch.float16)
+        mi[:, :hash_dim] = hf[:, :hash_dim].to(torch.float16)
+        rb = mlp(mi)[:, :3].to(torch.float32)
+        lo = torch.minimum(lo, rb.min()); hi = torch.maximum(hi, rb.max())
+        s1 += rb.sum(); s2 += (rb * rb).sum(); cnt += rb.numel()
 
-    mean = rgb_residual.mean().item()
-    std = rgb_residual.std().item()
-    offset = mean - k_sigma * std
-    scale = max(2.0 * k_sigma * std, 1e-6)
-    print(f"[BAKE] Pre-sampled MLP range over {K * n_uvs_per_gaussian:,} texels: "
-          f"mean={mean:.4f} std={std:.4f} → offset={offset:.4f} scale={scale:.4f}")
+    lo = lo.item(); hi = hi.item()
+    mean = (s1 / cnt).item()
+    std = max((s2 / cnt - mean * mean), 0.0) ** 0.5
+    n_tex = K * n_uvs_per_gaussian
+
+    if k_sigma is not None:
+        offset = mean - k_sigma * std
+        scale = max(2.0 * k_sigma * std, 1e-6)
+        print(f"[BAKE] (legacy k_sigma={k_sigma}) range over {n_tex:,} texels: "
+              f"mean={mean:.4f} std={std:.4f} → offset={offset:.4f} scale={scale:.4f}")
+        return offset, scale
+
+    span = max(hi - lo, 1e-6)
+    offset = lo - margin * span
+    scale = span * (1.0 + 2.0 * margin)
+    # How much the OLD mean±6σ range would have clipped, for visibility.
+    old_lo, old_hi = mean - 6.0 * std, mean + 6.0 * std
+    clip_frac = ((lo < old_lo) or (hi > old_hi))
+    print(f"[BAKE] Empirical residual range over {n_tex:,} texels: "
+          f"min={lo:.4f} max={hi:.4f} (mean={mean:.4f} std={std:.4f})")
+    print(f"[BAKE]   → offset={offset:.4f} scale={scale:.4f} "
+          f"(±{margin*100:.0f}% margin; spans full [min,max], no clamp)")
+    if clip_frac:
+        print(f"[BAKE]   NOTE old mean±6σ=[{old_lo:.4f},{old_hi:.4f}] would have "
+              f"clipped the true [{lo:.4f},{hi:.4f}] tails → dull-intensity bias.")
     return offset, scale
 
 
@@ -361,7 +395,11 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
                  '_sb_params', '_sg_directions', '_sg_sharpness_sg', '_sg_rgb',
                  '_sv_sites', '_sv_colors', '_sv_tau', '_sv_dc',
                  '_gamma', '_adaptive_features',
-                 '_adaptive_cat_weight', '_adaptive_zero_weight', '_gate_logits']
+                 '_adaptive_cat_weight', '_adaptive_zero_weight', '_gate_logits',
+                 # `--method mixed[_3d]`: keep the per-Gauss textured flag AND
+                 # the EWA 3rd-axis scale aligned through bake-time pruning
+                 # (else they desync from _xyz / each other).
+                 '_is_textured', '_scaling_z']
         n_total = keep_mask.shape[0]
         for attr in attrs:
             tensor = getattr(gaussians, attr, None)
@@ -533,6 +571,23 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
             print(f"[BAKE] (budget-mode=uniform) clamped max_res {max_res} -> {effective_max} "
                   f"to fit {atlas_budget_mb} MB")
             resolutions = resolutions.clamp(min=min_res, max=effective_max)
+
+    # `--method mixed`: untextured surfels have NO MLP residual to bake — they
+    # render SV-only (simple 2DGS). That is exactly the skip-texture (zero-rect)
+    # behavior, so fold ~_is_textured into the skip-texture mask. The bake-render
+    # kernel already treats a zero rect as "no atlas lookup → SV/SH baseline
+    # only", which IS the untextured render path. No kernel is_textured plumbing
+    # needed on the render side; the rect geometry carries the signal.
+    _it = getattr(gaussians, '_is_textured', None)
+    _n_now = gaussians.get_xyz.shape[0]
+    if _it is not None and _it.numel() == _n_now and not bool(_it.all()):
+        _untex = ~_it.to(resolutions.device)
+        if skip_texture_mask is None:
+            skip_texture_mask = _untex.clone()
+        else:
+            skip_texture_mask = skip_texture_mask | _untex
+        print(f"[BAKE] --method mixed: {int(_untex.sum()):,} untextured surfels "
+              f"→ zero-rect (SV-only, no residual baked)")
 
     # Apply skip-texture mask: zero out resolutions for low-contributors so
     # the shelf-packer assigns them no atlas pixels and the bake loop emits
@@ -841,7 +896,7 @@ def render_baked(viewpoint_camera, gaussian_pkg, background,
                  beta=0.0, sh_degree=3, aabb_mode=3, sort_mode=0,
                  atlas_texture=None, atlas_rects=None, atlas_width=0,
                  sb_params=None, sb_number=0,
-                 sv_state=None):
+                 sv_state=None, final_relu=False):
     """Render one view. `gaussian_pkg` is the dict from
     `prepare_gaussian_inputs(gaussians, ...)` — pre-activated tensors that are
     constant for the whole scene.
@@ -895,7 +950,16 @@ def render_baked(viewpoint_camera, gaussian_pkg, background,
         voronoi_tau=v_tau,
         voronoi_colors=v_colors,
         voronoi_K=v_K,
+        # `--method mixed_3d`: untextured surfels render as EWA 3D ellipsoids
+        # (FastGS conic). None ⇒ pure 2DGS bake (every other method unchanged).
+        is_textured=gaussian_pkg.get('is_textured'),
+        scaling_z=gaussian_pkg.get('scaling_z'),
     )
+    # `--method mixed` (residual_mode==2): the kernel emits a signed per-Gauss
+    # color (no per-Gauss outer ReLU); the ReLU is on the FINAL blended pixel,
+    # matching diff_surfel_mixed training (torch.relu on the rendered image).
+    if final_relu:
+        color = torch.relu(color)
     return color
 
 
@@ -904,7 +968,7 @@ def evaluate_baked(test_cameras, gaussians, bg_color, beta, kernel_type,
                    atlas_width=0, num_warmup=10, num_benchmark=100, save_dir=None,
                    aabb_mode=3, sort_mode=0,
                    sb_params=None, sb_number=0,
-                   sv_state=None):
+                   sv_state=None, final_relu=False):
     """Render all test views, compute metrics, benchmark FPS.
 
     `sv_state`: optional dict from `_make_sv_state` — activates the fused
@@ -921,7 +985,7 @@ def evaluate_baked(test_cameras, gaussians, bg_color, beta, kernel_type,
                   atlas_width=atlas_width, aabb_mode=aabb_mode, sort_mode=sort_mode,
                   sb_params=sb_params, sb_number=sb_number,
                   sh_degree=gaussians.active_sh_degree,
-                  sv_state=sv_state)
+                  sv_state=sv_state, final_relu=final_relu)
 
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
@@ -1102,6 +1166,7 @@ def main():
         gaussians.base_opacity = cfg.surfel.tg_base_alpha
         if hasattr(args, 'kernel'):
             gaussians.kernel_type = args.kernel
+        gaussians.kernel_type2 = getattr(args, 'kernel2', None)
 
         # Prune dead Gaussians — must prune EVERY per-Gaussian tensor so save_ply
         # doesn't see a size mismatch. Optional banks (SB/SG/SV/flex_beta/etc.)
@@ -1119,7 +1184,12 @@ def main():
                          '_sv_sites', '_sv_colors', '_sv_tau', '_sv_dc',
                          '_gamma', '_adaptive_features',
                          '_adaptive_cat_weight', '_adaptive_zero_weight',
-                         '_gate_logits']:
+                         '_gate_logits',
+                         # `--method mixed[_3d]`: keep the per-Gauss textured
+                         # flag AND the EWA 3rd-axis scale aligned through the
+                         # dead-Gaussian prune, else save_ply's is_textured /
+                         # scale_z columns desync from _xyz.
+                         '_is_textured', '_scaling_z']:
                 tensor = getattr(gaussians, attr, None)
                 if tensor is not None and tensor.numel() > 0 and tensor.shape[0] == valid_mask.shape[0]:
                     setattr(gaussians, attr, tensor[valid_mask.to(tensor.device)])
@@ -1160,6 +1230,10 @@ def main():
             bake_dtype=bargs.bake_dtype)
         bake_meta["iteration"] = iteration
         bake_meta["kernel"] = getattr(args, 'kernel', 'gaussian')
+        # `--method mixed_3d --kernel2`: untextured-EWA kernel override (None ⇒
+        # untextured used --kernel). The bake-render kernel reads this via
+        # set_untex_kernel() so baked geometry matches training.
+        bake_meta["kernel2"] = getattr(args, 'kernel2', None)
         bake_meta["sh_degree"] = 3
 
         # --- Training-time config snapshot: activation biases + Compact Box ---
@@ -1174,9 +1248,36 @@ def main():
         bake_meta["feature_mode"] = _feature_mode_train
         bake_meta["sb_number"] = 0
         bake_meta["sb_params_file"] = None
-        # 0 = 3D_SH_res (default outer ReLU). 1 = 3D_SH_add (separate ReLUs).
-        # Captured from training args._residual_mode (set in train.py training()).
-        bake_meta["residual_mode"] = int(getattr(args, '_residual_mode', 0))
+        # Override the legacy hardcoded `"method": "3D_SH_res"` in the bake-atlas
+        # default meta with the actual training method, so mixed / mixed_3d
+        # round-trip correctly in bake_meta + downstream consumers.
+        bake_meta["method"] = getattr(args, 'method', bake_meta.get("method", "3D_SH_res"))
+        # Derive from args.method, mirroring train.py exactly:
+        #   3D_SH_add                       → 1  (separate ReLUs)
+        #   mixed_sep / mixed_3d_sep        → 2  (signed per-Gauss residual;
+        #                                         per-pixel ReLU re-applied
+        #                                         in Python at render time —
+        #                                         see render_baked /
+        #                                         evaluate_baked final_relu)
+        #   everything else, incl. plain
+        #     3D_SH_res / mixed / mixed_3d → 0  (per-Gauss outer ReLU in the
+        #                                         kernel; NO per-pixel ReLU)
+        _method_train = getattr(args, 'method', '')
+        if _method_train == "3D_SH_add":
+            _rm = 1
+        elif _method_train in ("mixed_sep", "mixed_3d_sep"):
+            _rm = 2
+        else:
+            _rm = 0
+        bake_meta["residual_mode"] = _rm
+        # `--method mixed`: record the textured/untextured split so the bake is
+        # self-describing. Untextured surfels were folded into the skip-texture
+        # (zero-rect) set in bake_atlas → they render SV-only at no atlas cost.
+        _it_bm = getattr(gaussians, '_is_textured', None)
+        if _it_bm is not None and _it_bm.numel() == gaussians.get_xyz.shape[0]:
+            _tex_bm = int(_it_bm.sum().item())
+            bake_meta["mixed_textured"] = _tex_bm
+            bake_meta["mixed_untextured"] = int(_it_bm.numel()) - _tex_bm
 
         # Save
         os.makedirs(output_dir, exist_ok=True)
@@ -1276,6 +1377,7 @@ def main():
     gaussians.base_opacity = cfg.surfel.tg_base_alpha
     if hasattr(args, 'kernel'):
         gaussians.kernel_type = args.kernel
+    gaussians.kernel_type2 = getattr(args, 'kernel2', None)
 
     kernel_map = {'gaussian': 0, 'beta': 1, 'flex': 2, 'general': 3, 'beta_scaled': 4}
     kernel_type = kernel_map.get(getattr(args, 'kernel', 'gaussian'), 0)
@@ -1348,14 +1450,22 @@ def main():
     _sh_bias = float(bake_meta_render.get("sh_bias", getattr(args, 'activation_bias', [0.5, 0.0])[0]))
     _res_bias = float(bake_meta_render.get("res_bias", getattr(args, 'activation_bias', [0.5, 0.0])[1]))
     _compact_mult = float(bake_meta_render.get("compact_mult", 1.0))
-    from diff_surfel_bake_render import set_activation_bias, set_compact_mult, set_residual_mode
+    from diff_surfel_bake_render import (set_activation_bias, set_compact_mult,
+                                         set_residual_mode, set_untex_kernel)
     set_activation_bias(_sh_bias, _res_bias)
     set_compact_mult(_compact_mult)
     # 0 = 3D_SH_res outer ReLU; 1 = 3D_SH_add separate ReLUs. Default 0 if absent.
     _residual_mode = int(bake_meta_render.get("residual_mode", 0))
     set_residual_mode(_residual_mode)
+    # `--method mixed_3d --kernel2`: kernel for the UNTEXTURED EWA half. Recorded
+    # in bake_meta at bake time; -1 (unset) → untextured use the run's --kernel.
+    _kmap2 = {'gaussian': 0, 'beta': 1, 'flex': 2, 'general': 3, 'beta_scaled': 4, 'nexel': 5}
+    _k2_str = bake_meta_render.get("kernel2", None)
+    _untex_kt = _kmap2.get(_k2_str, -1) if _k2_str else -1
+    set_untex_kernel(_untex_kt)
     print(f"[RENDER] set_activation_bias(sh={_sh_bias}, res={_res_bias})  "
-          f"set_compact_mult({_compact_mult})  set_residual_mode({_residual_mode})")
+          f"set_compact_mult({_compact_mult})  set_residual_mode({_residual_mode})  "
+          f"set_untex_kernel({_untex_kt}{' = '+_k2_str if _k2_str else ''})")
 
     # SB params (only present if training used --feature beta).
     sb_params = None
@@ -1414,7 +1524,7 @@ def main():
         num_warmup=bargs.num_warmup, num_benchmark=bargs.num_benchmark,
         save_dir=sh_save_dir, aabb_mode=bargs.aabb_mode, sort_mode=bargs.sort_mode,
         sb_params=sb_params, sb_number=sb_number,
-        sv_state=sv_state)
+        sv_state=sv_state, final_relu=(_residual_mode == 2))
 
     # --- SH + Atlas residual ---
     atlas_save_dir = os.path.join(render_dir, "sh_atlas")
@@ -1426,7 +1536,7 @@ def main():
         num_warmup=bargs.num_warmup, num_benchmark=bargs.num_benchmark,
         save_dir=atlas_save_dir, aabb_mode=bargs.aabb_mode, sort_mode=bargs.sort_mode,
         sb_params=sb_params, sb_number=sb_number,
-        sv_state=sv_state)
+        sv_state=sv_state, final_relu=(_residual_mode == 2))
 
     # =====================================================================
     # 4. Summary

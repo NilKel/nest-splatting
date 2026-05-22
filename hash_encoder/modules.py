@@ -89,7 +89,22 @@ class INGP(nn.Module):
         # Store args for 3D_SH_TC mode (TC WMMA MLP → 48D SH coefs, diff_surfel_3D_sh)
         self.is_3D_direct_sh_tc_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_TC"
         # Store args for 3D_SH_res mode (per-Gaussian SH + tiny hash MLP residual, diff_surfel_3D_sh_res)
-        self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_res"
+        # `--method mixed` is treated as 3D_SH_res at the INGP level (same hashgrid + MLP architecture).
+        # The mixed-specific behavior (per-Gauss textured/untextured split) lives in the renderer + train loop.
+        self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method in ("3D_SH_res", "mixed", "mixed_3d")
+        # `--method mixed[_3d]`: textured/untextured manifold split. INGP-level
+        # behavior is identical to 3D_SH_res; the split lives in renderer + train.
+        # is_mixed_mode covers BOTH variants (shared color/relu/grad plumbing);
+        # is_mixed_3d_mode additionally selects the diff_surfel_mixed_3d rasterizer
+        # (untextured surfels are 3D ellipsoids w/ beta-splatting EWA).
+        self.is_mixed_mode = args is not None and hasattr(args, 'method') and args.method in ("mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep")
+        self.is_mixed_3d_mode = args is not None and hasattr(args, 'method') and args.method in ("mixed_3d", "mixed_3d_sep")
+        # The "_sep" variants keep the legacy mixed mode-2 behavior (signed
+        # residual + deferred per-pixel ReLU after blend). Bare `mixed`/`mixed_3d`
+        # now use mode 0 (per-Gauss outer ReLU, same as 3D_SH_res). Gate the
+        # renderer's post-blend torch.relu on this flag so the no-op isn't
+        # applied for mode-0 mixed runs.
+        self.is_mixed_deferred_relu_mode = args is not None and hasattr(args, 'method') and args.method in ("mixed_sep", "mixed_3d_sep")
         # Store args for 3D_SH_cat mode (per-Gaussian SH + hash+DC MLP residual, diff_surfel_3D_sh_res)
         self.is_3D_SH_cat_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_cat"
         # Store args for 3D_SH_32 mode (per-Gaussian SH + 32-dim hash MLP residual, diff_surfel_3D_sh_32)
@@ -106,11 +121,18 @@ class INGP(nn.Module):
         self.method = args.method if args is not None and hasattr(args, 'method') else "baseline"
         self.is_baseline_mode = (self.method == "baseline")
 
-        # Auto-enable disable_c2f for all methods except baseline
-        # Baseline is the only method that benefits from coarse-to-fine scheduling
-        explicit_disable_c2f = args is not None and hasattr(args, 'disable_c2f') and args.disable_c2f
-        self.disable_c2f = explicit_disable_c2f or (not self.is_baseline_mode)
-        # self.disable_c2f = explicit_disable_c2f
+        # c2f is controlled purely by the --disable_c2f flag (default True =
+        # c2f OFF, which is the long-standing behavior for non-baseline
+        # methods). Previously this line force-OR'd `(not is_baseline_mode)`,
+        # which made the flag a silent no-op for 3D_SH_res/cat/etc. Now the
+        # flag is honored for every method. Baseline mode ignores this value
+        # anyway — build_encoding's `if self.is_baseline_mode:` branch always
+        # reads the yaml coarse2fine schedule regardless of self.disable_c2f.
+        # Fallback when args is absent: True (c2f off — the safe prior default).
+        if args is not None and hasattr(args, 'disable_c2f'):
+            self.disable_c2f = bool(args.disable_c2f)
+        else:
+            self.disable_c2f = True
         
         # Store args for diffuse mode configuration (per-Gaussian RGB, no viewdir, no hashgrid)
         self.is_diffuse_mode = args is not None and hasattr(args, 'method') and args.method == "diffuse"
@@ -944,8 +966,9 @@ class INGP(nn.Module):
             encoding_dim = cfg_encoding.hashgrid.dim * cfg_encoding.levels
 
         self.level_mask = cfg_encoding.coarse2fine.enabled
-        # Override C2F for non-baseline methods (baseline always uses C2F from config)
-        # disable_c2f is auto-set for all non-baseline methods in __init__
+        # self.disable_c2f comes straight from the --disable_c2f flag
+        # (default True = c2f off). Baseline ignores it (its own branch
+        # below always reads the yaml coarse2fine schedule).
         if self.is_baseline_mode:
             # Baseline mode: always respect config, ignore disable_c2f flag
             print(f'If coarse2fine : {self.level_mask} (baseline mode)')
@@ -1065,10 +1088,10 @@ class INGP(nn.Module):
         elif self.is_3D_direct_fused_mode:
             # 3D_SH_res / 3D_SH_cat: progressive C2F for multi-level hash grids.
             # Coarsest hash level always on, add one finer level every 2k iters.
-            # Gated on self.disable_c2f (auto-True for non-baseline in __init__ →
-            # effectively off by default; flip the auto-True logic at line ~112 to
-            # experiment with C2F here). Other fused modes (3D_direct_lean, etc.):
-            # all levels active.
+            # Gated on self.disable_c2f (from --disable_c2f, default True →
+            # off by default; pass `--disable_c2f false` to enable the ramp
+            # here). Needs hashgrid_levels > 1 (--hybrid_levels < 5). Other
+            # fused modes (3D_direct_lean, etc.): all levels active.
             if ((self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode)
                     and self.hashgrid_levels > 1 and not self.disable_c2f):
                 c2f_step = 2000

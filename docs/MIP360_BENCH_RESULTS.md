@@ -1,5 +1,11 @@
 # mip-360 Baked-Atlas Bench Results
 
+> This is the **exhaustive per-config 5090 sweep** (all SB/SV configs, full
+> per-scene tables, fused-path validations). For the hardware-headed 5090
+> summary that parallels the 4090 doc, see
+> [`5090_BENCH_RESULTS.md`](5090_BENCH_RESULTS.md); the 4090 counterpart is
+> [`4090_BENCH_RESULTS.md`](4090_BENCH_RESULTS.md). All numbers below are 5090.
+
 All benches: `--max_res 64 --atlas_budget_mb 8192 --aabb_mode 5 --bake_dtype bc7`.
 Numbers are baked SH+atlas (`baked_sh_atlas` field of benchmark_results.json).
 Atlas size is BC7 on disk. Neural row is the training-time renderer.

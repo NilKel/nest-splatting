@@ -63,7 +63,11 @@ namespace CudaRasterizer
 			const float* voronoi_sites = nullptr,
 			const float* voronoi_tau = nullptr,
 			const float* voronoi_colors = nullptr,
-			const int voronoi_K = 0);
+			const int voronoi_K = 0,
+			// `--method mixed_3d`: per-Gauss textured flag + activated 3rd-axis
+			// scale. nullptr scaling_z → pure 2DGS bake (unchanged).
+			const bool* is_textured = nullptr,
+			const float* scaling_z = nullptr);
 	};
 };
 

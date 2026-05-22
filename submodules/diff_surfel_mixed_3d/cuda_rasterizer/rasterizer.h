@@ -1,0 +1,161 @@
+/*
+ * Copyright (C) 2023, Inria
+ * GRAPHDECO research group, https://team.inria.fr/graphdeco
+ * All rights reserved.
+ *
+ * This software is free for non-commercial, research and evaluation use 
+ * under the terms of the LICENSE.md file.
+ *
+ * For inquiries contact  george.drettakis@inria.fr
+ */
+
+#ifndef CUDA_RASTERIZER_H_INCLUDED
+#define CUDA_RASTERIZER_H_INCLUDED
+
+#include <vector>
+#include <functional>
+#include <cstdint>
+#include <cuda_fp16.h>
+
+namespace CudaRasterizer
+{
+	class Rasterizer
+	{
+	public:
+
+		static void markVisible(
+			int P,
+			float* means3D,
+			float* viewmatrix,
+			float* projmatrix,
+			bool* present);
+
+		static int forward(
+			std::function<char* (size_t)> geometryBuffer,
+			std::function<char* (size_t)> binningBuffer,
+			std::function<char* (size_t)> imageBuffer,
+			const int P, int D, int M,
+			const float* background,
+			const int width, int height,
+			uint32_t c_dim, uint32_t level, uint32_t l_dim, float l_scale, uint32_t Base,
+			bool align_corners, uint32_t interp,
+			const bool if_contract, const bool record_transmittance,
+			const float* means3D,
+			const float* shs,
+			const float* colors_precomp,
+			const float* opacities,
+			const float* scales,
+			const float scale_modifier,
+			const float* rotations,
+			const float* transMat_precomp,
+			const float* homotrans,
+			const float* ap_level,
+			const __half* hash_features,
+			const int* level_offsets,
+			const float* gridrange,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const float* cam_pos,
+			const float tan_fovx, float tan_fovy,
+			const bool prefiltered,
+			float* out_color,
+			float* out_others,
+			int* out_index,
+			int* radii = nullptr,
+			float* cover_pixels = nullptr,
+			float* trans_avg = nullptr,
+			bool debug = false,
+			const float beta = 0.0,
+			const uint32_t D_diffuse = 0,
+			const float* hash_features_diffuse = nullptr,
+			const int* level_offsets_diffuse = nullptr,
+			const float* gridrange_diffuse = nullptr,
+			const int render_mode = 0,
+			const uint32_t max_intersections = 0,
+			const float* shapes = nullptr,
+			const int kernel_type = 0,
+			const int aabb_mode = 0,
+			const float aa = 0.0f,
+			const float aa_threshold = 0.01f,
+			// 3D mode intersection buffer outputs
+			float* intersection_buffer = nullptr,
+			uint32_t* intersection_count = nullptr,
+			uint32_t max_intersections_per_pixel = 0,
+			// FastGS VCD/VCP counter (see forward.h)
+			const int* metric_map = nullptr,
+			int* metric_counts = nullptr,
+			// `--method mixed` per-Gauss bool flag [P] (nullptr → all-textured behavior).
+			const bool* is_textured = nullptr,
+			// `--method mixed_3d` per-Gauss activated 3rd-axis scale [P]
+			// (nullptr → untextured keep 2DGS ray-splat geometry).
+			const float* scaling_z = nullptr);
+
+		static void backward(
+			const int P, int D, int M, int R,
+			const float* background,
+			const int width, int height,
+			uint32_t c_dim, uint32_t level, uint32_t l_dim, float l_scale, uint32_t Base,
+			bool align_corners, uint32_t interp,
+			const bool if_contract,
+			const float* means3D,
+			const float* shs,
+			const float* colors_precomp,
+			const float* scales,
+			const float scale_modifier,
+			const float* rotations,
+			const float* transMat_precomp,
+			const float* homotrans,
+			const float* ap_level,
+			const __half* hash_features,
+			const int* level_offsets,
+			const float* gridrange,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const float* campos,
+			const float tan_fovx, float tan_fovy,
+			const float* other_maps,
+			const int* out_index,
+			const int* radii,
+			char* geom_buffer,
+			char* binning_buffer,
+			char* image_buffer,
+			const float* dL_dpix,
+			const float* dL_depths,
+			float* dL_dfeatures,
+			float* dL_dmean2D,
+			float* dL_dnormal,
+			float* dL_dopacity,
+			float* dL_dcolor,
+			float* dL_dmean3D,
+			float* dL_dtransMat,
+			float* dL_dhomoMat,
+			float* dL_dsh,
+			float* dL_dscale,
+			float* dL_drot,
+			float* dL_gradsum,
+			bool debug,
+			const float beta,
+			const uint32_t D_diffuse = 0,
+			const float* hash_features_diffuse = nullptr,
+			const int* level_offsets_diffuse = nullptr,
+			const float* gridrange_diffuse = nullptr,
+			float* dL_dfeatures_diffuse = nullptr,
+			const int render_mode = 0,
+			const float* shapes = nullptr,
+			const int kernel_type = 0,
+			float* dL_dshapes = nullptr,
+			const bool detach_hash_grad = false,
+			// MLP gradient outputs for 3D_SH_res (render_mode=5, bias-free, all [16×16])
+			float* dL_dmlp_W1 = nullptr,
+			float* dL_dmlp_W2 = nullptr,
+			float* dL_dmlp_W3 = nullptr,
+			// `--method mixed` per-Gauss bool flag [P] (nullptr → all-textured behavior).
+			const bool* is_textured = nullptr,
+			// `--method mixed_3d`: activated 3rd-axis scale [P] (input) +
+			// dL/d(scaling_z) [P] (output). nullptr → pure mixed/2DGS path.
+			const float* scaling_z = nullptr,
+			float* dL_dscaling_z = nullptr);
+	};
+};
+
+#endif

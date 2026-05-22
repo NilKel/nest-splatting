@@ -102,7 +102,7 @@ def render_baked(viewpoint_camera, gaussians, pipe, background,
                  atlas_texture=None, atlas_rects=None, atlas_width=0,
                  aabb_mode=3,
                  sb_params=None, sb_number=0,
-                 sv_eval=None):
+                 sv_eval=None, final_relu=False):
     """Render using diff_surfel_bake_render submodule (SH + residual textures).
 
     `sv_eval`: optional `(viewpoint_camera) -> fake_shs` callback. When set
@@ -161,6 +161,11 @@ def render_baked(viewpoint_camera, gaussians, pipe, background,
         sb_number=sb_number,
     )
 
+    # `--method mixed` (residual_mode==2): per-pixel ReLU on the FINAL blended
+    # color (the kernel emits signed per-Gauss color), matching training.
+    if final_relu:
+        color = torch.relu(color)
+
     return {"render": color}
 
 
@@ -169,7 +174,7 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                   atlas_texture=None, atlas_rects=None, atlas_width=0,
                   aabb_mode=3,
                   sb_params=None, sb_number=0,
-                  sv_eval=None):
+                  sv_eval=None, final_relu=False):
     """Render all test views, compute metrics, benchmark FPS. Save images to save_dir.
 
     `sv_eval`: optional callback `(camera) -> fake_shs` for --feature SV models;
@@ -189,7 +194,7 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                                  aabb_mode=aabb_mode,
                                  sb_params=sb_params,
                                  sb_number=sb_number,
-                                 sv_eval=sv_eval)
+                                 sv_eval=sv_eval, final_relu=final_relu)
             rendered = result["render"]
             gt = cam.original_image[:3].cuda()
 
@@ -213,7 +218,7 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                             aabb_mode=aabb_mode,
                             sb_params=sb_params,
                             sb_number=sb_number,
-                            sv_eval=sv_eval)
+                            sv_eval=sv_eval, final_relu=final_relu)
         torch.cuda.synchronize()
 
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_benchmark)]
@@ -230,7 +235,7 @@ def evaluate_mode(test_cameras, gaussians, bg_color, beta, kernel_type,
                             aabb_mode=aabb_mode,
                             sb_params=sb_params,
                             sb_number=sb_number,
-                            sv_eval=sv_eval)
+                            sv_eval=sv_eval, final_relu=final_relu)
             ends[i].record()
         torch.cuda.synchronize()
         times_ms = [starts[i].elapsed_time(ends[i]) for i in range(num_benchmark)]
@@ -293,6 +298,7 @@ def main():
     kernel_name = getattr(args, 'kernel', 'gaussian')
     if hasattr(args, 'kernel'):
         gaussians.kernel_type = kernel_name
+    gaussians.kernel_type2 = getattr(args, 'kernel2', None)
     kernel_map = {'gaussian': 0, 'beta': 1, 'flex': 2, 'general': 3, 'beta_scaled': 4}
     kernel_type = kernel_map.get(kernel_name, 0)
 
@@ -314,7 +320,8 @@ def main():
         texture_mode = "shared"
 
     # Call the CUDA device-global setters so the baked kernel matches training.
-    from diff_surfel_bake_render import set_activation_bias, set_compact_mult, set_residual_mode
+    from diff_surfel_bake_render import (set_activation_bias, set_compact_mult,
+                                         set_residual_mode, set_untex_kernel)
     _sh_bias = float(bake_meta.get("sh_bias", getattr(args, 'activation_bias', [0.5, 0.0])[0]))
     _res_bias = float(bake_meta.get("res_bias", getattr(args, 'activation_bias', [0.5, 0.0])[1]))
     _compact_mult = float(bake_meta.get("compact_mult", 1.0))
@@ -322,8 +329,16 @@ def main():
     set_activation_bias(_sh_bias, _res_bias)
     set_compact_mult(_compact_mult)
     set_residual_mode(_residual_mode)
+    # `--method mixed_3d --kernel2` override: bake_meta records the training-time
+    # `args.kernel2`; if absent (older checkpoint / non-mixed_3d) fall back to -1
+    # which disables the override and uses kernel_type for the untextured EWA half.
+    _kmap2 = {'gaussian': 0, 'beta': 1, 'flex': 2, 'general': 3, 'beta_scaled': 4, 'nexel': 5}
+    _k2_str = bake_meta.get("kernel2", None) or getattr(args, 'kernel2', None)
+    _untex_kt = _kmap2.get(_k2_str, -1) if _k2_str else -1
+    set_untex_kernel(_untex_kt)
     print(f"[RENDER] set_activation_bias(sh={_sh_bias}, res={_res_bias})  "
-          f"set_compact_mult({_compact_mult})  set_residual_mode({_residual_mode})")
+          f"set_compact_mult({_compact_mult})  set_residual_mode({_residual_mode})  "
+          f"set_untex_kernel({_untex_kt}{' = '+_k2_str if _k2_str else ''})")
 
     # Load textures based on mode
     residual_textures = None
@@ -439,6 +454,7 @@ def main():
         sb_params=sb_params,
         sb_number=sb_number,
         sv_eval=sv_eval_cb,
+        final_relu=(_residual_mode == 2),
     )
     all_metrics["sh_only"] = sh_metrics
     print(f"  PSNR: {sh_metrics['psnr']:.2f} dB  |  SSIM: {sh_metrics['ssim']:.4f}  |  "
@@ -463,6 +479,7 @@ def main():
             sb_params=sb_params,
             sb_number=sb_number,
             sv_eval=sv_eval_cb,
+            final_relu=(_residual_mode == 2),
         )
         all_metrics[mode_name] = res_metrics
         print(f"  PSNR: {res_metrics['psnr']:.2f} dB  |  SSIM: {res_metrics['ssim']:.4f}  |  "

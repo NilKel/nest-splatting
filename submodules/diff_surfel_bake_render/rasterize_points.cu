@@ -323,7 +323,11 @@ RasterizeGaussiansCUDA(
 	// Persistent caller-owned outputs (Python pre-allocates and reuses).
 	torch::Tensor out_color,
 	torch::Tensor radii,
-	const int sort_mode)
+	const int sort_mode,
+	// `--method mixed_3d`: per-Gauss textured flag [P] + activated 3rd-axis
+	// scale [P]. Empty tensors → pure 2DGS bake (unchanged).
+	const torch::Tensor& is_textured,
+	const torch::Tensor& scaling_z)
 {
 	if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
 		AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -438,6 +442,12 @@ RasterizeGaussiansCUDA(
 		const int voronoi_K_eff =
 			(voronoi_sites_ptr && voronoi_tau_ptr && voronoi_colors_ptr) ? voronoi_K : 0;
 
+		// `--method mixed_3d`: empty → nullptr → pure 2DGS bake (unchanged).
+		const bool* is_textured_ptr = (is_textured.numel() > 0)
+			? is_textured.contiguous().data<bool>() : nullptr;
+		const float* scaling_z_ptr = (scaling_z.numel() > 0)
+			? scaling_z.contiguous().data<float>() : nullptr;
+
 		// Camera matrices (viewmatrix / projmatrix) come from PyTorch with a
 		// transpose applied — they're strided views, NOT contiguous. The
 		// kernel assumes row-major dense layout, so .contiguous() is required.
@@ -482,7 +492,9 @@ RasterizeGaussiansCUDA(
 			voronoi_sites_ptr,
 			voronoi_tau_ptr,
 			voronoi_colors_ptr,
-			voronoi_K_eff);
+			voronoi_K_eff,
+			is_textured_ptr,
+			scaling_z_ptr);
 	}
 
 	return std::make_tuple(geomBuffer, binningBuffer, imgBuffer);
@@ -499,6 +511,10 @@ void SetCompactMultBakeCUDA(float val) {
 
 void SetResidualModeBakeCUDA(int mode) {
 	FORWARD::setResidualMode(mode);
+}
+
+void SetUntexKernelBakeCUDA(int v) {
+	FORWARD::setUntexKernel(v);
 }
 
 torch::Tensor markVisible(

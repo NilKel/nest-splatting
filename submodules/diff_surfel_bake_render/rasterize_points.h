@@ -58,12 +58,17 @@ RasterizeGaussiansCUDA(
 	// Persistent caller-owned outputs (Python pre-allocates and reuses).
 	torch::Tensor out_color,
 	torch::Tensor radii,
-	const int sort_mode = 0);                // 0 = legacy 64-bit single sort, 1 = FastGS two-stage
+	const int sort_mode = 0,                 // 0 = legacy 64-bit single sort, 1 = FastGS two-stage
+	// `--method mixed_3d`: per-Gauss textured flag [P] + activated 3rd-axis
+	// scale [P]. Empty → pure 2DGS bake (unchanged).
+	const torch::Tensor& is_textured = torch::Tensor(),
+	const torch::Tensor& scaling_z = torch::Tensor());
 
 // Device-global setters mirroring training-time setters.
 void SetActivationBiasBakeCUDA(float sh_bias, float res_bias);
 void SetCompactMultBakeCUDA(float val);
 void SetResidualModeBakeCUDA(int mode);
+void SetUntexKernelBakeCUDA(int v);
 
 // BC7 atlas (Phase 2). Pass empty tensor + zeros to clear.
 void SetAtlasBC7CUDA(torch::Tensor bc7_bytes, int W, int H, float offset, float scale);

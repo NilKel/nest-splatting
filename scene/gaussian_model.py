@@ -129,6 +129,10 @@ class GaussianModel:
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
         self._scaling = torch.empty(0)
+        # `--method mixed`: learnable 3rd ellipsoid axis (log-scale) for the
+        # untextured half, which renders as a 3D ellipsoid (beta-splatting EWA).
+        # Empty for non-mixed runs. Textured surfels ignore it (stay 2DGS).
+        self._scaling_z = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
@@ -143,6 +147,12 @@ class GaussianModel:
         self.base_opacity = 0.0
         self._appearance_level = torch.empty(0)
         self.feat_gradient_accum = torch.empty(0)
+
+        # `--method mixed` per-Gauss textured/untextured flag. All-True before
+        # `--texsplit` fires (kernel branch falls through to textured path,
+        # bit-identical to 3D_SH_res). Old PLYs without this column default
+        # to all-True on load.
+        self._is_textured = torch.empty(0, dtype=torch.bool)
 
         # --minimc: per-Gaussian photometric error + pixel-ownership accumulators.
         # See train loop for per-step scatter_add. Lifecycle mirrors xyz_gradient_accum.
@@ -366,6 +376,13 @@ class GaussianModel:
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling) #.clamp(max=1)
+
+    @property
+    def get_scaling_z(self):
+        """`--method mixed` 3rd ellipsoid axis (activated). Empty when unused."""
+        if self._scaling_z.numel() == 0:
+            return self._scaling_z
+        return self.scaling_activation(self._scaling_z)
     
     @property
     def get_rotation(self):
@@ -542,6 +559,8 @@ class GaussianModel:
         init_level = 24
         ap_level = init_level * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
         self._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
+        # `--method mixed`: start all-textured (kernel branch falls through to textured path).
+        self._is_textured = torch.ones(self.get_xyz.shape[0], dtype=torch.bool, device="cuda")
         
         # Initialize per-Gaussian features for cat mode, 3D mode, and 3D_direct mode
         # Dimension = hybrid_levels * per_level_dim (default: 3 * 4 = 12)
@@ -803,6 +822,8 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         # CRITICAL: ap_level must be 24, NOT 0. See hashgrid.h: max_level = min(ap_level, L).
         self._appearance_level = nn.Parameter(torch.ones(pts.shape[0], 1, device="cuda").float() * 24, requires_grad=False)
+        # `--method mixed`: start all-textured (matches 3D_SH_res until `--texsplit`).
+        self._is_textured = torch.ones(pts.shape[0], dtype=torch.bool, device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
@@ -947,6 +968,13 @@ class GaussianModel:
             if self._shape.requires_grad:
                 l.append({'params': [self._shape], 'lr': 0.001, "name": "shape"})
 
+        # `--method mixed`: 3rd ellipsoid axis (untextured 3D-ellipsoid path).
+        # Same LR as the 2D scaling so it can "unflatten" at a comparable rate.
+        if hasattr(self, '_scaling_z') and self._scaling_z.numel() > 0 \
+                and self._scaling_z.requires_grad:
+            l.append({'params': [self._scaling_z], 'lr': training_args.scaling_lr,
+                      "name": "scaling_z"})
+
         # Add flex kernel per-Gaussian beta parameter (if present)
         if hasattr(self, '_flex_beta') and self._flex_beta.numel() > 0:
             l.append({'params': [self._flex_beta], 'lr': training_args.opacity_lr, "name": "flex_beta"})
@@ -1051,6 +1079,14 @@ class GaussianModel:
         # Appearance level (which hash-grid levels are active per Gaussian)
         if hasattr(self, '_appearance_level') and self._appearance_level.numel() > 0:
             l.append('ap_level')
+        # `--method mixed` per-Gauss textured/untextured flag (saved as f4 like the rest;
+        # value is 0.0 or 1.0). Only emitted once the split has happened (i.e. there's at
+        # least one untextured Gaussian); otherwise omitted so older readers stay happy.
+        if hasattr(self, '_is_textured') and self._is_textured.numel() > 0 and not bool(self._is_textured.all()):
+            l.append('is_textured')
+        # `--method mixed` 3rd ellipsoid axis (log-scale). Only emitted post-split.
+        if hasattr(self, '_scaling_z') and self._scaling_z.numel() > 0:
+            l.append('scale_z')
         return l
 
     def save_ply(self, path):
@@ -1117,6 +1153,13 @@ class GaussianModel:
         if hasattr(self, '_appearance_level') and self._appearance_level.numel() > 0:
             ap_level = self._appearance_level.detach().cpu().numpy()
             attr_list.append(ap_level)
+        # `--method mixed`: save is_textured (only when there's at least one untextured row)
+        if hasattr(self, '_is_textured') and self._is_textured.numel() > 0 and not bool(self._is_textured.all()):
+            is_tex = self._is_textured.detach().cpu().float().numpy().reshape(-1, 1)
+            attr_list.append(is_tex)
+        # `--method mixed` 3rd ellipsoid axis (raw log-scale)
+        if hasattr(self, '_scaling_z') and self._scaling_z.numel() > 0:
+            attr_list.append(self._scaling_z.detach().cpu().numpy().reshape(-1, 1))
 
         attributes = np.concatenate(attr_list, axis=1)
         elements[:] = list(map(tuple, attributes))
@@ -1171,7 +1214,11 @@ class GaussianModel:
         _per_channel = (len(extra_f_names) // 3)
         features_extra = features_extra.reshape((features_extra.shape[0], 3, _per_channel))
 
-        scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
+        # NOTE: exclude `scale_z` — that's the `--method mixed_3d` EWA 3rd-axis
+        # (read separately below). It shares the `scale_` prefix with the 2DGS
+        # `scale_0/scale_1` but is non-numeric, so it must not enter this sort.
+        scale_names = [p.name for p in plydata.elements[0].properties
+                       if p.name.startswith("scale_") and p.name != "scale_z"]
         scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
         scales = np.zeros((xyz.shape[0], len(scale_names)))
         for idx, attr_name in enumerate(scale_names):
@@ -1226,6 +1273,23 @@ class GaussianModel:
             init_level = 6
             ap_level = init_level * torch.ones((self.get_xyz.shape[0], 1), device="cuda").float()
             self._appearance_level = nn.Parameter(ap_level.requires_grad_(True))
+
+        # `--method mixed` per-Gauss flag. Default all-True when the column is
+        # absent (older PLYs / pre-split). Stored as f4 in the PLY (0.0/1.0).
+        if "is_textured" in ply_props:
+            is_tex_np = np.asarray(plydata.elements[0]["is_textured"])
+            self._is_textured = torch.tensor(is_tex_np > 0.5, dtype=torch.bool, device="cuda")
+        else:
+            self._is_textured = torch.ones(xyz.shape[0], dtype=torch.bool, device="cuda")
+
+        # `--method mixed` 3rd ellipsoid axis (raw log-scale). Absent on
+        # pre-split / non-mixed PLYs → empty (untextured 3D path inactive).
+        if "scale_z" in ply_props:
+            sz_np = np.asarray(plydata.elements[0]["scale_z"])[..., np.newaxis]
+            self._scaling_z = nn.Parameter(
+                torch.tensor(sz_np, dtype=torch.float, device="cuda").requires_grad_(True))
+        else:
+            self._scaling_z = torch.empty(0, device="cuda")
 
         # Load beta kernel shape parameter (if present in PLY)
         if "shape" in ply_props:
@@ -1440,6 +1504,8 @@ class GaussianModel:
         elif hasattr(self, '_shape') and self._shape.numel() > 0:
             # Handle frozen shape parameter (not in optimizer) - prune manually
             self._shape = nn.Parameter(self._shape.data[valid_points_mask].clone(), requires_grad=False)
+        if "scaling_z" in optimizable_tensors:
+            self._scaling_z = optimizable_tensors["scaling_z"]
         if "flex_beta" in optimizable_tensors:
             self._flex_beta = optimizable_tensors["flex_beta"]
         # --feature beta: sb params go through the optimizer pruner like any other param.
@@ -1467,6 +1533,10 @@ class GaussianModel:
         if getattr(self, '_sv_mask', None) is not None and \
            self._sv_mask.shape[0] == valid_points_mask.shape[0]:
             self._sv_mask = self._sv_mask[valid_points_mask]
+
+        # `--method mixed` per-Gauss bool flag; non-optimizable buffer.
+        if self._is_textured.numel() > 0 and self._is_textured.shape[0] == valid_points_mask.shape[0]:
+            self._is_textured = self._is_textured[valid_points_mask]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
@@ -1523,7 +1593,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level=None, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None, new_adaptive_zero_weight=None, new_gate_logits=None, new_shape=None, new_flex_beta=None, new_sb_params=None, new_sg_directions=None, new_sg_sharpness=None, new_sg_rgb=None, new_sv_sites=None, new_sv_colors=None, new_sv_dc=None, new_sv_tau=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level=None, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None, new_adaptive_zero_weight=None, new_gate_logits=None, new_shape=None, new_flex_beta=None, new_sb_params=None, new_sg_directions=None, new_sg_sharpness=None, new_sg_rgb=None, new_sv_sites=None, new_sv_colors=None, new_sv_dc=None, new_sv_tau=None, new_is_textured=None, new_scaling_z=None):
         # CRITICAL: ap_level defaults to 24 (all hash levels active).
         # ap_level=0 silently disables hash encoding — see hashgrid.h: max_level = min(ap_level, L).
         if new_ap_level is None:
@@ -1557,6 +1627,10 @@ class GaussianModel:
         # Add adaptive_gate parameter
         if new_gate_logits is not None and hasattr(self, '_gate_logits') and self._gate_logits.numel() > 0:
             d["gate_logits"] = new_gate_logits
+
+        # `--method mixed` 3rd ellipsoid axis (children inherit parent's z)
+        if new_scaling_z is not None and hasattr(self, '_scaling_z') and self._scaling_z.numel() > 0:
+            d["scaling_z"] = new_scaling_z
 
         # Add beta kernel shape parameter
         if new_shape is not None and hasattr(self, '_shape') and self._shape.numel() > 0:
@@ -1608,6 +1682,8 @@ class GaussianModel:
             self._adaptive_zero_weight = optimizable_tensors["adaptive_zero_weight"]
         if "gate_logits" in optimizable_tensors:
             self._gate_logits = optimizable_tensors["gate_logits"]
+        if "scaling_z" in optimizable_tensors:
+            self._scaling_z = optimizable_tensors["scaling_z"]
         if "shape" in optimizable_tensors:
             self._shape = optimizable_tensors["shape"]
         elif new_shape is not None and hasattr(self, '_shape') and self._shape.numel() > 0:
@@ -1638,6 +1714,13 @@ class GaussianModel:
         # so a regen here keeps it in lock-step with the (possibly grown) tensor.
         if getattr(self, '_sv_mask', None) is not None:
             self.update_sites_mask()
+
+        # `--method mixed` bool flag: non-optimizable, concat directly.
+        # Children inherit parent's textured/untextured class (mass conservation).
+        if self._is_textured.numel() > 0:
+            if new_is_textured is None:
+                new_is_textured = torch.ones(new_xyz.shape[0], dtype=torch.bool, device=self._is_textured.device)
+            self._is_textured = torch.cat([self._is_textured, new_is_textured.to(self._is_textured.device)], dim=0)
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -1767,7 +1850,15 @@ class GaussianModel:
             if hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
                 new_sv_dc = self._sv_dc[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions, new_sg_sharpness_split, new_sg_rgb_split, new_sv_sites, new_sv_colors, new_sv_dc, new_sv_tau=new_sv_tau)
+        # `--method mixed`: children inherit parent's textured/untextured class
+        new_is_textured = None
+        if self._is_textured.numel() > 0 and self._is_textured.shape[0] == selected_pts_mask.shape[0]:
+            new_is_textured = self._is_textured[selected_pts_mask].repeat(N)
+        new_scaling_z = None
+        if self._scaling_z.numel() > 0 and self._scaling_z.shape[0] == selected_pts_mask.shape[0]:
+            new_scaling_z = self._scaling_z[selected_pts_mask].repeat(N, 1)
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions, new_sg_sharpness_split, new_sg_rgb_split, new_sv_sites, new_sv_colors, new_sv_dc, new_sv_tau=new_sv_tau, new_is_textured=new_is_textured, new_scaling_z=new_scaling_z)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -1867,7 +1958,15 @@ class GaussianModel:
             if hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
                 new_sv_dc_c = self._sv_dc[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions_c, new_sg_sharpness_c, new_sg_rgb_c, new_sv_sites_c, new_sv_colors_c, new_sv_dc_c, new_sv_tau=new_sv_tau_c)
+        # `--method mixed`: children inherit parent's textured/untextured class
+        new_is_textured_c = None
+        if self._is_textured.numel() > 0 and self._is_textured.shape[0] == selected_pts_mask.shape[0]:
+            new_is_textured_c = self._is_textured[selected_pts_mask]
+        new_scaling_z_c = None
+        if self._scaling_z.numel() > 0 and self._scaling_z.shape[0] == selected_pts_mask.shape[0]:
+            new_scaling_z_c = self._scaling_z[selected_pts_mask]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions_c, new_sg_sharpness_c, new_sg_rgb_c, new_sv_sites_c, new_sv_colors_c, new_sv_dc_c, new_sv_tau=new_sv_tau_c, new_is_textured=new_is_textured_c, new_scaling_z=new_scaling_z_c)
 
     def _clone_by_mask_fastgs(self, selected_pts_mask):
         """Clone Gaussians flagged by ``selected_pts_mask`` (bool, [N]).
@@ -1948,6 +2047,13 @@ class GaussianModel:
             if hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
                 new_sv_dc_c = self._sv_dc[selected_pts_mask]
 
+        new_is_textured_c = None
+        if self._is_textured.numel() > 0 and self._is_textured.shape[0] == selected_pts_mask.shape[0]:
+            new_is_textured_c = self._is_textured[selected_pts_mask]
+        new_scaling_z_c = None
+        if self._scaling_z.numel() > 0 and self._scaling_z.shape[0] == selected_pts_mask.shape[0]:
+            new_scaling_z_c = self._scaling_z[selected_pts_mask]
+
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacities,
             new_scaling, new_rotation, new_ap_level, new_gaussian_features,
@@ -1955,7 +2061,8 @@ class GaussianModel:
             new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta,
             new_sb_params, new_sg_directions_c, new_sg_sharpness_c,
             new_sg_rgb_c, new_sv_sites_c, new_sv_colors_c, new_sv_dc_c,
-            new_sv_tau=new_sv_tau_c)
+            new_sv_tau=new_sv_tau_c, new_is_textured=new_is_textured_c,
+            new_scaling_z=new_scaling_z_c)
         return num_new
 
     def _split_by_mask_fastgs(self, selected_pts_mask, N=2):
@@ -2044,6 +2151,13 @@ class GaussianModel:
             if hasattr(self, '_sv_dc') and self._sv_dc.numel() > 0:
                 new_sv_dc = self._sv_dc[selected_pts_mask].repeat(N, 1)
 
+        new_is_textured_split = None
+        if self._is_textured.numel() > 0 and self._is_textured.shape[0] == selected_pts_mask.shape[0]:
+            new_is_textured_split = self._is_textured[selected_pts_mask].repeat(N)
+        new_scaling_z_split = None
+        if self._scaling_z.numel() > 0 and self._scaling_z.shape[0] == selected_pts_mask.shape[0]:
+            new_scaling_z_split = self._scaling_z[selected_pts_mask].repeat(N, 1)
+
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacity,
             new_scaling, new_rotation, new_ap_level, new_gaussian_features,
@@ -2051,7 +2165,8 @@ class GaussianModel:
             new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta,
             new_sb_params, new_sg_directions, new_sg_sharpness_split,
             new_sg_rgb_split, new_sv_sites, new_sv_colors, new_sv_dc,
-            new_sv_tau=new_sv_tau)
+            new_sv_tau=new_sv_tau, new_is_textured=new_is_textured_split,
+            new_scaling_z=new_scaling_z_split)
 
         # Prune the parents (children inherit at the tail of the tensor).
         prune_filter = torch.cat((
@@ -2308,6 +2423,7 @@ class GaussianModel:
             elif name == "f_rest": self._features_rest = param
             elif name == "opacity": self._opacity = param
             elif name == "scaling": self._scaling = param
+            elif name == "scaling_z": self._scaling_z = param
             elif name == "rotation": self._rotation = param
             elif name == "ap_level": self._appearance_level = param
             elif name == "gaussian_features": self._gaussian_features = param
@@ -4138,6 +4254,13 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self._appearance_level = nn.Parameter(ap_levels.requires_grad_(False))
+        # `--method mixed`: depth-reinit resets the full set, so this is conceptually
+        # fresh-textured. Resize the bool buffer to match; drop the 3rd ellipsoid
+        # axis (no untextured surfels after a full reinit).
+        if self._is_textured.numel() > 0 or hasattr(self, '_is_textured'):
+            self._is_textured = torch.ones(M, dtype=torch.bool, device=self._xyz.device)
+        if hasattr(self, '_scaling_z') and self._scaling_z.numel() > 0:
+            self._scaling_z = torch.empty(0, device=self._xyz.device)
 
         # Reset per-gaussian features if they exist
         if hasattr(self, '_gaussian_features') and self._gaussian_features.numel() > 0:
@@ -4206,3 +4329,147 @@ class GaussianModel:
             self.minimc_win_count = torch.zeros(M, 1, device="cuda")
 
         self.mini_factor_culling = None
+
+    @torch.no_grad()
+    def split_at_texsplit(self, depth_dict=None, opacity_scale=0.5,
+                           halve_baseline=False, make_scaling_z=False,
+                           tex_opacity_scale=None, untex_opacity_scale=None):
+        """`--method mixed` one-shot textured/untextured manifold split.
+
+        Pure DUPLICATION of the live surfel set (no depth reinit — that was too
+        much of a shock to a partially-converged scene):
+
+        - **Textured half** (first N): exact copy, `_is_textured=True`. Renders
+          SV baseline + hashgrid/MLP residual.
+        - **Untextured half** (second N): exact copy, `_is_textured=False`.
+          Renders SV baseline ONLY (simple-2DGS path, no hash/MLP).
+
+        Every per-Gauss tensor (xyz, scale, rot, SH/SV/SB/SG params, ap_level,
+        kernel shape, …) is just `cat([t, t])`. The only change is opacity:
+        each surfel's TRAINED alpha is scaled by ``opacity_scale`` (default 0.5)
+        and that halved value is used for BOTH copies — so the two stacked
+        copies composite back to ≈ the original brightness without touching the
+        SV/SH baseline color. `_is_textured` is set. `depth_dict` is accepted
+        for signature compatibility but ignored.
+
+        `halve_baseline=True` additionally applies a bias-correct 0.5× to the
+        SV/SH baseline color (kept off by default — opacity scaling alone is
+        the preferred compensation, leaves the spherical color untouched).
+
+        After this returns, the caller MUST call ``self.training_setup(opt)`` to
+        rebuild Adam state for the doubled tensor. Densify accumulators are
+        zeroed here.
+        """
+        device = self._xyz.device
+        N = int(self._xyz.shape[0])
+
+        # Snapshot the TRAINED opacity (logit space) before the duplication loop
+        # overwrites self._opacity. Used to derive the scaled-alpha logit below.
+        _orig_opacity_logit = self._opacity.detach().clone()  # [N, 1]
+
+        # Every optimizable per-Gauss Parameter is duplicated row-for-row:
+        # textured copy first, untextured copy second.
+        _PARAM_NAMES = [
+            '_xyz', '_features_dc', '_features_rest', '_scaling', '_rotation',
+            '_opacity', '_appearance_level',
+            '_gaussian_features', '_gamma', '_adaptive_features',
+            '_adaptive_cat_weight', '_adaptive_zero_weight', '_gate_logits',
+            '_flex_beta', '_shape',
+            '_sb_params', '_sg_directions', '_sg_sharpness_sg', '_sg_rgb',
+            '_sv_sites', '_sv_colors', '_sv_tau', '_sv_dc',
+        ]
+        for name in _PARAM_NAMES:
+            t = getattr(self, name, None)
+            if t is None or (hasattr(t, 'numel') and t.numel() == 0):
+                continue
+            req = bool(t.requires_grad) if hasattr(t, 'requires_grad') else False
+            dup = torch.cat([t.detach().clone(), t.detach().clone()], dim=0)
+            setattr(self, name, nn.Parameter(dup.requires_grad_(req)))
+
+        # Opacity: scale each surfel's TRAINED alpha by per-half scale factors.
+        # Default (both unset): `opacity_scale` (0.5) on BOTH halves — original
+        # symmetric behaviour where two stacked copies at α/2 composite back to
+        # ≈ the original contribution.
+        # When `tex_opacity_scale`/`untex_opacity_scale` are explicit (e.g.
+        # 0.8/0.2 for a textured-heavy split), each half gets its own scaled
+        # logit, biasing photometric/regularizer gradients toward the
+        # higher-α half while leaving the SV/SH baseline color untouched.
+        _ts = float(tex_opacity_scale)   if tex_opacity_scale   is not None else float(opacity_scale)
+        _us = float(untex_opacity_scale) if untex_opacity_scale is not None else float(opacity_scale)
+        _old_alpha = torch.sigmoid(_orig_opacity_logit)                          # [N,1]
+        _tex_alpha   = (_old_alpha * _ts).clamp_(1e-6, 1.0 - 1e-6)
+        _untex_alpha = (_old_alpha * _us).clamp_(1e-6, 1.0 - 1e-6)
+        _tex_logit   = torch.log(_tex_alpha   / (1.0 - _tex_alpha))
+        _untex_logit = torch.log(_untex_alpha / (1.0 - _untex_alpha))
+        op = torch.cat([_tex_logit, _untex_logit], dim=0).to(device)             # [2N,1]
+        self._opacity = nn.Parameter(op.requires_grad_(True))
+        print(f"[TEXSPLIT] opacity scales — textured={_ts:.3f} untextured={_us:.3f}")
+
+        # `_is_textured`: textured half first, untextured half second.
+        is_tex = torch.zeros(2 * N, dtype=torch.bool, device=device)
+        is_tex[:N] = True
+        self._is_textured = is_tex
+
+        # `--method mixed` 3rd ellipsoid axis. Untextured surfels render as 3D
+        # ellipsoids (beta-splatting EWA); init FLATTENED so they start ≈ the
+        # 2D surfel they were duplicated from, but learnable so they can
+        # "unflatten". scale_z = FLAT_FRAC · min(scale_x, scale_y); in log-space
+        # (`scaling_activation = exp`): _scaling_z = log(FLAT_FRAC) + min(sx, sy).
+        # Textured rows get a harmless placeholder (the kernel ignores _scaling_z
+        # for textured — they stay 2DGS surfels). One [2N,1] optimizer param.
+        if make_scaling_z:
+            FLAT_FRAC = 0.05
+            _sxy_min = torch.min(self._scaling[:, :2], dim=1, keepdim=True).values  # [2N,1] log
+            sz = float(np.log(FLAT_FRAC)) + _sxy_min                                # [2N,1] log
+            self._scaling_z = nn.Parameter(sz.detach().contiguous().requires_grad_(True))
+        else:
+            # Plain `--method mixed`: stay 2D — no 3rd ellipsoid axis.
+            self._scaling_z = torch.empty(0, device=device)
+
+        # Duplicating surfels at the same location ~doubles the per-pixel baseline
+        # contribution after alpha-compositing. Halve the per-Gauss baseline color
+        # on the FULL (2N) set so two halved copies ≈ one original.
+        #
+        # The transform is exact (not approximate) and bias-correct, because:
+        #   - SV: rendered = relu(Σ W·sv_colors + [sv_dc] + 0.5), ΣW = 1 (softmax).
+        #     relu(0.5·x) = 0.5·relu(x), so scaling the pre-bias arg by 0.5 halves
+        #     the rendered color. Fold the 0.5·0.5 bias shift into sv_colors (ΣW=1)
+        #     or into sv_dc when present.
+        #   - SH: rendered_base = relu(SH_C0·DC + 0.5) + Σ higher-order. Same relu
+        #     identity for the DC term; higher-order SH is linear → plain 0.5×.
+        if halve_baseline:
+            _SH_C0 = 0.28209479177387814
+            sv_c = getattr(self, '_sv_colors', None)
+            if sv_c is not None and sv_c.numel() > 0:
+                sv_dc = getattr(self, '_sv_dc', None)
+                if sv_dc is not None and sv_dc.numel() > 0:
+                    self._sv_colors.data.mul_(0.5)
+                    self._sv_dc.data.mul_(0.5).add_(-0.25)
+                else:
+                    self._sv_colors.data.mul_(0.5).add_(-0.25)
+            else:
+                # SH baseline path (default --feature sh).
+                if self._features_dc.numel() > 0:
+                    self._features_dc.data.mul_(0.5).add_(-0.25 / _SH_C0)
+                if self._features_rest.numel() > 0:
+                    self._features_rest.data.mul_(0.5)
+            print("[TEXSPLIT] halved per-Gauss baseline color (bias-correct) to "
+                  "compensate for duplicate-stack doubling")
+
+        # SV per-site eval mask: derivable from _sv_colors; invalidate → lazy regen.
+        if getattr(self, '_sv_mask', None) is not None:
+            self._sv_mask = None
+
+        # Reset accumulators (row count doubled; Adam rebuilt by caller).
+        new_total = 2 * N
+        self.xyz_gradient_accum = torch.zeros(new_total, 1, device=device)
+        self.xyz_gradient_accum_abs = torch.zeros(new_total, 1, device=device)
+        self.feat_gradient_accum = torch.zeros(new_total, 1, device=device)
+        self.denom = torch.zeros(new_total, 1, device=device)
+        self.max_radii2D = torch.zeros(new_total, device=device)
+        if self.minimc_error_accum.numel() > 0:
+            self.minimc_error_accum = torch.zeros(new_total, 1, device=device)
+            self.minimc_win_count = torch.zeros(new_total, 1, device=device)
+        self.mini_factor_culling = None
+
+        print(f"[TEXSPLIT] duplicate split: {N} textured + {N} untextured = {new_total} total")

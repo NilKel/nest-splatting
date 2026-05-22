@@ -84,6 +84,7 @@ def rasterize_gaussians(
     atlas_texture=None, atlas_rects=None, atlas_width=0,
     sb_params=None, sb_number=0,
     voronoi_sites=None, voronoi_tau=None, voronoi_colors=None, voronoi_K=0,
+    is_textured=None, scaling_z=None,
 ):
     return _RasterizeGaussians.apply(
         means3D, sh, colors_precomp, opacities,
@@ -92,6 +93,7 @@ def rasterize_gaussians(
         atlas_texture, atlas_rects, atlas_width,
         sb_params, sb_number,
         voronoi_sites, voronoi_tau, voronoi_colors, voronoi_K,
+        is_textured, scaling_z,
     )
 
 
@@ -104,6 +106,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         atlas_texture, atlas_rects, atlas_width,
         sb_params, sb_number,
         voronoi_sites, voronoi_tau, voronoi_colors, voronoi_K,
+        is_textured, scaling_z,
     ):
         device = means3D.device
 
@@ -124,6 +127,11 @@ class _RasterizeGaussians(torch.autograd.Function):
             voronoi_tau = _empty(device, 'f32', torch.float32)
         if voronoi_colors is None:
             voronoi_colors = _empty(device, 'f32', torch.float32)
+        # `--method mixed_3d`: empty → nullptr → pure 2DGS bake (unchanged).
+        if is_textured is None:
+            is_textured = torch.empty(0, dtype=torch.bool, device=device)
+        if scaling_z is None:
+            scaling_z = _empty(device, 'f32', torch.float32)
 
         scratch = _scratch_buffers(device)
         H = settings.image_height
@@ -170,6 +178,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             out_color,
             radii,
             settings.sort_mode,
+            is_textured,
+            scaling_z,
         )
 
         scratch['geom'], scratch['binning'], scratch['img'] = _C.rasterize_gaussians(*args)
@@ -213,6 +223,8 @@ class GaussianRasterizer(nn.Module):
                 # computeColorFromVoronoi directly.
                 voronoi_sites=None, voronoi_tau=None, voronoi_colors=None,
                 voronoi_K=0,
+                # `--method mixed_3d`: per-Gauss textured flag + activated 3rd-axis.
+                is_textured=None, scaling_z=None,
                 # Backward-compat: old callers passed `means2D` / `residual_textures`,
                 # both unused now. Accept silently.
                 means2D=None, residual_textures=None):
@@ -239,6 +251,7 @@ class GaussianRasterizer(nn.Module):
             atlas_texture, atlas_rects, atlas_width,
             sb_params, sb_number,
             voronoi_sites, voronoi_tau, voronoi_colors, voronoi_K,
+            is_textured, scaling_z,
         )
 
 
@@ -273,6 +286,14 @@ def prepare_gaussian_inputs(gaussians, sh_degree=3, kernel_type=0):
         shapes = gaussians.get_shape.contiguous()
     pkg['shapes'] = shapes
     pkg['kernel_type'] = kernel_type
+    # `--method mixed_3d`: per-Gauss textured flag + activated 3rd-axis scale.
+    # Only present on models trained with mixed_3d (post `--texsplit`); absent
+    # ⇒ left None ⇒ pure 2DGS bake (unchanged for every other method).
+    it = getattr(gaussians, '_is_textured', None)
+    sz = getattr(gaussians, '_scaling_z', None)
+    if (it is not None and it.numel() > 0 and sz is not None and sz.numel() > 0):
+        pkg['is_textured'] = it.contiguous().bool()
+        pkg['scaling_z'] = gaussians.get_scaling_z.contiguous()
     return pkg
 
 
@@ -326,6 +347,13 @@ def set_compact_mult(val=1.0):
 def set_residual_mode(mode=0):
     """0 = 3D_SH_res outer ReLU (default). 1 = 3D_SH_add separate ReLUs."""
     _C.set_residual_mode(int(mode))
+
+
+def set_untex_kernel(v=-1):
+    """`--method mixed_3d --kernel2`: kernel int for the UNTEXTURED EWA half
+    (gaussian=0, beta=1, flex=2, general=3, beta_scaled=4, nexel=5). -1 = unset
+    → untextured use the run's --kernel. Mirrors set_residual_mode."""
+    _C.set_untex_kernel(int(v))
 
 
 def clear_atlas_cache():
