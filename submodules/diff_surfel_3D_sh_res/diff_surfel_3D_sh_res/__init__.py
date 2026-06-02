@@ -685,6 +685,15 @@ def set_residual_mode(mode=0):
     Patches both forward and backward device globals — call once at startup."""
     _C.set_residual_mode(int(mode))
 
+
+def set_ste_relu(v=0):
+    """`--ste`: straight-through estimator on the per-Gauss outer ReLU.
+    Affects backward only — mode 0 (3D_SH_res / mixed[_3d]) clamp gate is
+    bypassed: gradient = 1 even where the forward activation was clamped to 0.
+    Lets the MLP/hashgrid keep receiving signal at clamped pixels.
+    v=1 enables; v=0 disables (default, exact gradient)."""
+    _C.set_ste_relu(int(v))
+
 def set_anti_alias(factor=0.0, focal=1.0):
     """Set Nexels-style hash-grid anti-aliasing down-weighting.
     factor=0 disables AA. factor=1.0 matches Nexels' grid_threshold_factor=1.0

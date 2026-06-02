@@ -213,6 +213,16 @@ class _RasterizeGaussians(torch.autograd.Function):
             features_diffuse, offsets_diffuse, gridrange_diffuse, \
             depth, out_index, radii, sh, geomBuffer, binningBuffer, imgBuffer, shapes, is_textured, scaling_z)
 
+        # `--l2` (mixed_3d only): expose a second image-output slot that's
+        # numerically a clone of `color` but a separate autograd-graph node.
+        # When --l2 is OFF (default), consumers ignore this slot → autograd
+        # passes None for its upstream grad in backward, and we convert that
+        # to nullptr in the CUDA call → byte-identical to pre-flag behavior.
+        # When --l2 is ON, the renderer wires `color` to L1+SSIM(image_tex, gt)
+        # and `color_untex` to L2(image_untex, gt); the kernel routes per-Gauss
+        # using is_textured to pick between the two upstream image gradients.
+        color_untex = color.clone()
+
         # if raster_settings.record_transmittance :
         # Return geomBuffer for use by 3D mode backward (transMat access).
         # Also surface out_index ([H, W] int32, per-pixel id of the max-weight contributor)
@@ -220,10 +230,10 @@ class _RasterizeGaussians(torch.autograd.Function):
         # avoid disturbing existing positional unpacks elsewhere.
         # metric_counts (FastGS VCD/VCP) also appended at the end; [P] int32, zeros
         # when metric_map wasn't provided.
-        return color, radii, depth, transmittance_avg, pixels, intersection_buffer, intersection_count, geomBuffer, out_index, metric_counts
+        return color, radii, depth, transmittance_avg, pixels, intersection_buffer, intersection_count, geomBuffer, out_index, metric_counts, color_untex
 
     @staticmethod
-    def backward(ctx, grad_out_color, grad_radii, grad_depth, grad_0, grad_1, grad_intersection_buffer, grad_intersection_count, grad_geomBuffer, grad_out_index, grad_metric_counts):
+    def backward(ctx, grad_out_color, grad_radii, grad_depth, grad_0, grad_1, grad_intersection_buffer, grad_intersection_count, grad_geomBuffer, grad_out_index, grad_metric_counts, grad_out_color_untex):
 
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -239,6 +249,25 @@ class _RasterizeGaussians(torch.autograd.Function):
         colors_precomp, means3D, scales, rotations, cov3Ds_precomp, homotrans, ap_level, features, offsets, gridrange, \
             features_diffuse, offsets_diffuse, gridrange_diffuse, \
             depth, out_index, radii, sh, geomBuffer, binningBuffer, imgBuffer, shapes, is_textured, scaling_z = ctx.saved_tensors
+
+        # `--l2` (mixed_3d only): per-Gauss image-grad routing. The second
+        # image-output slot (`color_untex`) gets an upstream grad iff the
+        # caller actually wired a loss to it. PyTorch passes a ZEROS tensor
+        # (not None) for unused outputs of a Function, so we detect "no L2
+        # consumer" by checking if the gradient is non-trivial. Zeros →
+        # pass empty tensor → CUDA sees nullptr → kernel reverts to single-
+        # loss behavior, byte-identical to pre-flag. Real grad → CUDA routes
+        # per-Gauss using is_textured.
+        # The edge case where the user IS using L2 but the L2-leg gradient
+        # is literally all zeros falls back to single-loss for that iter —
+        # equivalent (the L2 leg contributes nothing either way).
+        _has_l2_grad = (grad_out_color_untex is not None
+                        and grad_out_color_untex.is_floating_point()
+                        and bool(grad_out_color_untex.abs().sum().item() > 0))
+        if _has_l2_grad:
+            grad_out_color_untex_pass = grad_out_color_untex
+        else:
+            grad_out_color_untex_pass = torch.empty(0, dtype=grad_out_color.dtype, device=grad_out_color.device)
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
@@ -261,6 +290,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.tanfovx,
                 raster_settings.tanfovy,
                 grad_out_color,
+                grad_out_color_untex_pass,
                 grad_depth,
                 sh,
                 raster_settings.sh_degree,
@@ -716,6 +746,13 @@ def set_residual_mode(mode=0):
        1 = 3D_SH_add:           color = ReLU(SH+sh_bias) + ReLU(residual + res_bias)
     Patches both forward and backward device globals — call once at startup."""
     _C.set_residual_mode(int(mode))
+
+
+def set_ste_relu(v=0):
+    """`--ste`: straight-through estimator on the per-Gauss outer ReLU (mode 0).
+    Backward only — gradient = 1 even at clamped activations so the MLP / hash
+    keeps receiving signal at clamped pixels. v=1 enables; v=0 = default."""
+    _C.set_ste_relu(int(v))
 
 def set_anti_alias(factor=0.0, focal=1.0):
     """Set Nexels-style hash-grid anti-aliasing down-weighting.

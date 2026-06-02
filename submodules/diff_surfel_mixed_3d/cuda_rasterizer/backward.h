@@ -49,6 +49,9 @@ namespace BACKWARD
 		const float* final_Ts,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
+		// `--l2` (mixed_3d only): per-Gauss image-grad routing. nullptr →
+		// every Gauss uses `dL_dpixels` (byte-identical to pre-flag).
+		const float* dL_dpixels_untex,
 		const float* dL_depths,
 		float* dL_dfeatures,
 		float* dL_dtransMat,
@@ -91,6 +94,8 @@ namespace BACKWARD
 	void setResBias(float val);
 	// 0 = 3D_SH_res (stacked outer ReLU), 1 = 3D_SH_add (separate ReLUs).
 	void setResidualMode(int mode);
+	// `--ste`: straight-through estimator on the per-Gauss outer ReLU.
+	void setSteRelu(int v);
 	void setAaKernelSize(float val);
 	// Periodic-freeze flag: when true, the mode 5 backward skips all
 	// hash/MLP gradient work (weight-grad GEMMs, input-chain backprop,

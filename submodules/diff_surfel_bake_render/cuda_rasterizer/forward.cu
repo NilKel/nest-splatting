@@ -31,6 +31,34 @@ __device__ int d_residual_mode = 0;
 // from bake_meta["kernel2"] via set_untex_kernel(), mirroring d_residual_mode.
 __device__ int d_untex_kernel = -1;
 
+// ----------------------------------------------------------------------------
+// RVQ atlas decode globals — set from Python via SetAtlasRVQCUDA(). When
+// `d_rvq_codebooks` is non-null, the atlas-sample step in renderBakedCUDA
+// does an L-stage codebook lookup instead of a tex2D / FP16-gather. Indices
+// are stored surfel-major so block_id = surfel_offsets[g] + bv·(w/B) + bu.
+// ----------------------------------------------------------------------------
+__device__ const __half*  d_rvq_codebooks      = nullptr;   // [L, K, B*B*3] FP16
+__device__ const uint8_t* d_rvq_indices        = nullptr;   // [L, N_used] uint8 (K ≤ 256)
+__device__ const int64_t* d_rvq_surfel_offsets = nullptr;   // [N_gauss + 1] cumulative used-block count
+__device__ int  d_rvq_L = 0;
+__device__ int  d_rvq_K = 0;
+__device__ int  d_rvq_B = 4;
+__device__ unsigned long long d_rvq_N_used = 0;
+__device__ float d_rvq_scale  = 1.0f;     // codebook is in atlas-residual float space; no extra scale
+__device__ float d_rvq_offset = 0.0f;
+__device__ int  d_rvq_bilinear = 1;       // 1 = 4-tap bilinear, 0 = nearest (4× fewer reads)
+__device__ int  d_rvq_use_shared_cb = 0;  // 1 = load codebook to dynamic __shared__ per block
+__device__ cudaTextureObject_t d_rvq_cb_tex  = 0;  // 1-channel FP16 texture, length L*K*B*B*3
+__device__ cudaTextureObject_t d_rvq_idx_tex = 0;  // 1-channel uint8 texture, length L*N_used
+__device__ int  d_rvq_use_tex_cb  = 0;
+__device__ int  d_rvq_use_tex_idx = 0;
+__device__ float d_rvq_cb_dq_scale  = 1.0f;
+__device__ float d_rvq_cb_dq_offset = 0.0f;
+
+// Host-side dynamic shared size set by SetAtlasRVQUseSharedCBCUDA. Used at
+// kernel-launch time in FORWARD::render. Defined later in this TU.
+extern size_t g_rvq_shared_bytes;
+
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color. Forward-only baked
 // path: no `clamped` tracking (no backward pass that needs it).
@@ -554,10 +582,23 @@ __global__ void preprocessCUDA(int P, int D, int M,
 			float k = (kernel_type == 4) ? 3.0f : 1.0f;
 			float r_lp_typical = sqrtf(2.0f * logf(127.5f));
 			cutoff = fmaxf(k * 1.1f, r_lp_typical);
+		} else if (!is_beta_kernel) {
+			// Gaussian kernel + any binning mode (2/5 in practice): opacity-aware
+			// cutoff = √(2·log(255·α)). The visible iso-line for α·exp(-ρ²/2) at
+			// the 1/255 floor. For α=1 this is ~3.33; α=0.5 ~3.0; α=0.1 ~2.5.
+			// Replaces the prior fixed 4.0 fallback which was binning ~50% more
+			// tiles than necessary for Gaussian bakes (room_gauss was the
+			// triggering case — 169 k all-textured Gausses at fixed 4σ).
+			float opacity_val = opacities[idx];
+			if (opacity_val < (1.0f / 255.0f)) return;
+			float log_term = logf(255.0f * opacity_val);
+			cutoff = (log_term > 0.0f) ? sqrtf(2.0f * log_term) : 0.1f;
+			cutoff = fminf(cutoff, 4.0f);
 		} else {
-			// Mode 0 (square) / mode 2 (rect) with ANY kernel: fixed 4σ (2DGS default).
-			// The prior "is_beta_kernel → 3.3" fallback was wrong here — training uses 4.0
-			// for these modes regardless of kernel.
+			// Mode 0 (square) / mode 2 (rect) + beta_scaled: fixed 4σ (2DGS
+			// default). Training uses 4.0 for these modes; the bake-render
+			// must match to avoid multiplicative dimming (~16 % at mode=2
+			// + beta_scaled was observed when this was 3.3).
 			cutoff = 4.0f;
 		}
 
@@ -818,6 +859,18 @@ renderBakedCUDA(
 	__shared__ bool collected_is_textured[BLOCK_SIZE];   // `--method mixed_3d`
 	__shared__ float4 collected_ewa_conic[BLOCK_SIZE];   // `--method mixed_3d`
 
+	// Dynamic shared for the RVQ codebook (only used when d_rvq_use_shared_cb).
+	// Sized at launch: L * K * B*B*3 * sizeof(__half). Placed AFTER the static
+	// __shared__ arrays in the SM's shared-memory region.
+	extern __shared__ __half rvq_cb_shared[];
+	if (d_rvq_use_shared_cb && d_rvq_codebooks != nullptr) {
+		const int cb_size = d_rvq_L * d_rvq_K * d_rvq_B * d_rvq_B * 3;
+		for (int i = block.thread_rank(); i < cb_size; i += BLOCK_SIZE) {
+			rvq_cb_shared[i] = d_rvq_codebooks[i];
+		}
+	}
+	block.sync();
+
 	float T = 1.0f;
 	float C[3] = { 0 };
 
@@ -1036,7 +1089,112 @@ renderBakedCUDA(
 				au = fmaxf(u0_px, fminf(u0_px + u_span - 1.001f, au));
 				av = fmaxf(v0_px, fminf(v0_px + v_span - 1.001f, av));
 
-				if (atlas_tex_obj != 0) {
+				if (d_rvq_codebooks != nullptr && !d_rvq_bilinear) {
+					// RVQ NEAREST — single block lookup, L codebook reads.
+					const int B = d_rvq_B;
+					const int bw_g = (int)u_span / B;
+					const int u0i = (int)u0_px;
+					const int v0i = (int)v0_px;
+					const long long surfel_base = d_rvq_surfel_offsets[gauss_id];
+					const int code_stride = B * B * 3;
+					const long long N_used = (long long)d_rvq_N_used;
+					const __half* cb_base = d_rvq_use_shared_cb ? rvq_cb_shared : d_rvq_codebooks;
+
+					int local_u = (int)floorf(au) - u0i;
+					int local_v = (int)floorf(av) - v0i;
+					local_u = max(0, min(local_u, (int)u_span - 1));
+					local_v = max(0, min(local_v, (int)v_span - 1));
+					int bu_l = local_u / B;
+					int bv_l = local_v / B;
+					int intra_u = local_u - bu_l * B;
+					int intra_v = local_v - bv_l * B;
+					long long bid = surfel_base + (long long)bv_l * bw_g + bu_l;
+					int intra_idx = intra_v * B + intra_u;
+
+					float r = 0.f, g_ = 0.f, b = 0.f;
+					#pragma unroll
+					for (int l = 0; l < 4; ++l) {
+						if (l >= d_rvq_L) break;
+						int code = (int)d_rvq_indices[(long long)l * N_used + bid];
+						const __half* cw = cb_base
+							+ ((long long)l * d_rvq_K + code) * code_stride
+							+ intra_idx * 3;
+						r  += __half2float(cw[0]);
+						g_ += __half2float(cw[1]);
+						b  += __half2float(cw[2]);
+					}
+					feat[0] += r; feat[1] += g_; feat[2] += b;
+				} else if (d_rvq_codebooks != nullptr) {
+					// RVQ atlas — L-stage codebook lookup + sum, with 4-tap
+					// bilinear over neighbouring 4×4 blocks. Indices are
+					// in surfel-major order: block_id = surfel_offsets[g]
+					// + bv·(w/B) + bu. This is what the WGSL fragment
+					// shader will do; benchmarking the real frame cost.
+					const int B = d_rvq_B;
+					const int bw_g = (int)u_span / B;          // blocks per row in this surfel
+					const int bh_g = (int)v_span / B;
+					const int u0i = (int)u0_px;
+					const int v0i = (int)v0_px;
+					const long long surfel_base = d_rvq_surfel_offsets[gauss_id];
+					const int code_stride = B * B * 3;         // bytes per codeword (== 48)
+					const long long N_used = (long long)d_rvq_N_used;
+					const __half* cb_base = d_rvq_use_shared_cb ? rvq_cb_shared : d_rvq_codebooks;
+
+					const int use_tex_cb = d_rvq_use_tex_cb;
+					const cudaTextureObject_t cb_tex2d = d_rvq_cb_tex;
+					const float dq_s = d_rvq_cb_dq_scale;
+					const float dq_o = d_rvq_cb_dq_offset;
+
+					auto sample_at = [&](float au_in, float av_in, float* rgb) {
+						int local_u = (int)floorf(au_in) - u0i;
+						int local_v = (int)floorf(av_in) - v0i;
+						local_u = max(0, min(local_u, (int)u_span - 1));
+						local_v = max(0, min(local_v, (int)v_span - 1));
+						int bu_l = local_u / B;
+						int bv_l = local_v / B;
+						int intra_u = local_u - bu_l * B;
+						int intra_v = local_v - bv_l * B;
+						long long bid = surfel_base + (long long)bv_l * bw_g + bu_l;
+						int intra_idx = intra_v * B + intra_u;
+						float r = 0.f, g_ = 0.f, b = 0.f;
+						#pragma unroll
+						for (int l = 0; l < 4; ++l) {
+							if (l >= d_rvq_L) break;
+							int code = (int)d_rvq_indices[(long long)l * N_used + bid];
+							if (use_tex_cb) {
+								// 2D uint8-RGBA codebook texture, codeword at
+								// (code*B + intra_u, l*B + intra_v).
+								float4 rgba = tex2D<float4>(cb_tex2d,
+									(float)(code * B + intra_u) + 0.5f,
+									(float)(l    * B + intra_v) + 0.5f);
+								r  += rgba.x * dq_s + dq_o;
+								g_ += rgba.y * dq_s + dq_o;
+								b  += rgba.z * dq_s + dq_o;
+							} else {
+								const __half* cw = cb_base
+									+ ((long long)l * d_rvq_K + code) * code_stride
+									+ intra_idx * 3;
+								r  += __half2float(cw[0]);
+								g_ += __half2float(cw[1]);
+								b  += __half2float(cw[2]);
+							}
+						}
+						rgb[0] = r; rgb[1] = g_; rgb[2] = b;
+					};
+					float au0_f = floorf(au); float av0_f = floorf(av);
+					float fu = au - au0_f; float fv = av - av0_f;
+					float c00[3], c01[3], c10[3], c11[3];
+					sample_at(au0_f,       av0_f,       c00);
+					sample_at(au0_f + 1.f, av0_f,       c01);
+					sample_at(au0_f,       av0_f + 1.f, c10);
+					sample_at(au0_f + 1.f, av0_f + 1.f, c11);
+					#pragma unroll
+					for (int ch = 0; ch < 3; ++ch) {
+						float top = c00[ch] * (1 - fu) + c01[ch] * fu;
+						float bot = c10[ch] * (1 - fu) + c11[ch] * fu;
+						feat[ch] += top * (1 - fv) + bot * fv;
+					}
+				} else if (atlas_tex_obj != 0) {
 					// Hardware bilinear via texture unit. cudaReadModeNormalizedFloat
 					// returns uint8 as [0, 1]; dequantize via `*scale + offset`.
 					// +0.5 is the pixel-center offset for cudaFilterModeLinear.
@@ -1146,7 +1304,10 @@ void FORWARD::render(
 	const bool* is_textured,
 	const float4* ewa_conic)
 {
-	renderBakedCUDA<<<grid, block>>>(
+	// Optional dynamic shared for RVQ codebook (set via setRVQSharedBytes
+	// helper before this launch). 0 = no dyn shared. `::` forces global
+	// scope so we don't accidentally resolve to FORWARD::g_rvq_shared_bytes.
+	renderBakedCUDA<<<grid, block, ::g_rvq_shared_bytes>>>(
 		ranges, point_list, beta, W, H,
 		points_xy_image, features, transMats, depths, normal_opacity,
 		bg_color, out_color,
@@ -1157,6 +1318,11 @@ void FORWARD::render(
 		atlas_offset, atlas_scale,
 		is_textured, ewa_conic, depths);
 }
+
+// Host-side cached RVQ shared-codebook byte count. Set by SetAtlasRVQCUDA in
+// rasterize_points.cu. Used by FORWARD::render to size the dynamic shared
+// memory at kernel launch.
+size_t g_rvq_shared_bytes = 0;
 
 // Device-global setters (mirror training-time setters in diff_surfel_3D_sh_res).
 __global__ void setBakeActivationBiasKernel(float sh, float res) {
@@ -1180,6 +1346,85 @@ void FORWARD::setResidualMode(int mode) {
 __global__ void setBakeUntexKernelKernel(int v) { d_untex_kernel = v; }
 void FORWARD::setUntexKernel(int v) {
 	setBakeUntexKernelKernel<<<1, 1>>>(v);
+}
+
+__global__ void setAtlasRVQKernel(
+	const __half* cb, const uint8_t* idx, const int64_t* off,
+	int L, int K, int B, unsigned long long N_used
+) {
+	d_rvq_codebooks      = cb;
+	d_rvq_indices        = idx;
+	d_rvq_surfel_offsets = off;
+	d_rvq_L = L; d_rvq_K = K; d_rvq_B = B;
+	d_rvq_N_used = N_used;
+}
+void FORWARD::setAtlasRVQ(
+	const __half* codebooks, const uint8_t* indices, const int64_t* surfel_offsets,
+	int L, int K, int B, unsigned long long N_used
+) {
+	setAtlasRVQKernel<<<1, 1>>>(codebooks, indices, surfel_offsets, L, K, B, N_used);
+}
+
+__global__ void clearAtlasRVQKernel() {
+	d_rvq_codebooks      = nullptr;
+	d_rvq_indices        = nullptr;
+	d_rvq_surfel_offsets = nullptr;
+	d_rvq_L = 0; d_rvq_K = 0; d_rvq_N_used = 0;
+}
+void FORWARD::clearAtlasRVQ() { clearAtlasRVQKernel<<<1, 1>>>(); }
+
+__global__ void setAtlasRVQBilinearKernel(int v) { d_rvq_bilinear = v; }
+void FORWARD::setAtlasRVQBilinear(int v) { setAtlasRVQBilinearKernel<<<1, 1>>>(v); }
+
+__global__ void setRVQUseSharedCBKernel(int v) { d_rvq_use_shared_cb = v; }
+void FORWARD::setAtlasRVQUseSharedCB(int v) { setRVQUseSharedCBKernel<<<1, 1>>>(v); }
+
+__global__ void setRVQTexKernel(cudaTextureObject_t cb, cudaTextureObject_t idx,
+                                 int use_cb, int use_idx) {
+	d_rvq_cb_tex  = cb;
+	d_rvq_idx_tex = idx;
+	d_rvq_use_tex_cb  = use_cb;
+	d_rvq_use_tex_idx = use_idx;
+}
+void FORWARD::setAtlasRVQTex(cudaTextureObject_t cb, cudaTextureObject_t idx,
+                              int use_cb, int use_idx) {
+	setRVQTexKernel<<<1, 1>>>(cb, idx, use_cb, use_idx);
+}
+
+__global__ void setRVQCBDequantKernel(float s, float o) {
+	d_rvq_cb_dq_scale  = s;
+	d_rvq_cb_dq_offset = o;
+}
+void FORWARD::setAtlasRVQCBDequant(float scale, float offset) {
+	setRVQCBDequantKernel<<<1, 1>>>(scale, offset);
+}
+
+bool FORWARD::optInRVQShared(int bytes) {
+	// First check the device limit. Returns the maximum opt-in shared/block.
+	int dev = 0; cudaGetDevice(&dev);
+	int max_opt_in = 0;
+	cudaDeviceGetAttribute(&max_opt_in, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+	if (bytes > max_opt_in) {
+		printf("[BAKE_RENDER] requested %d B shared > device max %d B per block; "
+		       "cannot opt in\n", bytes, max_opt_in);
+		return false;
+	}
+	// Pass the kernel by name (CUDA-standard); the function-template-instance
+	// is uniquely identified by its symbol.
+	cudaError_t err = cudaFuncSetAttribute(
+		renderBakedCUDA,
+		cudaFuncAttributeMaxDynamicSharedMemorySize,
+		bytes);
+	if (err != cudaSuccess) {
+		printf("[BAKE_RENDER] cudaFuncSetAttribute MaxDynamicSharedMemorySize=%d "
+		       "failed: %s (device max opt-in = %d B)\n",
+		       bytes, cudaGetErrorString(err), max_opt_in);
+		cudaGetLastError();        // clear the sticky error
+		return false;
+	}
+	printf("[BAKE_RENDER] opt-in MaxDynamicSharedMemorySize=%d B (device max=%d B)\n",
+	       bytes, max_opt_in);
+	return true;
 }
 
 void FORWARD::preprocess(int P, int D, int M,

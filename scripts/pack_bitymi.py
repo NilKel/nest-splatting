@@ -43,8 +43,9 @@ KIND_NPZ     = 1
 KIND_CAMERAS = 2
 KIND_NAT2    = 3
 KIND_NATL    = 4
+KIND_BPLY    = 5   # 8-bit Min-Max compressed PLY (see scripts/compress_baked_ply.py)
 KIND_NAMES = {KIND_PLY: "ply", KIND_NPZ: "npz", KIND_CAMERAS: "cameras",
-              KIND_NAT2: "nat2", KIND_NATL: "natl"}
+              KIND_NAT2: "nat2", KIND_NATL: "natl", KIND_BPLY: "bply"}
 
 HEADER_FIXED = 8 + 4   # magic + num_chunks
 ENTRY_SIZE   = 4 + 8 + 8  # kind + offset + size
@@ -63,6 +64,8 @@ def detect_atlas_kind(path: Path) -> int:
 def detect_pc_kind(path: Path, data: bytes) -> int:
     if path.suffix.lower() == ".npz":
         return KIND_NPZ
+    if data[:4] == b"BPLY" or path.suffix.lower() == ".bply":
+        return KIND_BPLY
     if data[:3] == b"ply":
         return KIND_PLY
     if path.suffix.lower() == ".ply":

@@ -18,4 +18,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "After this call, all renders sample from the BC7 cudaArray directly.");
   m.def("clear_atlas_bc7", &ClearAtlasBC7CUDA,
         "Clear BC7 atlas — reverts to FP16/uint8 path on next render.");
+  m.def("set_atlas_rvq", &SetAtlasRVQCUDA,
+        "Install RVQ atlas (codebooks FP16, indices uint8 surfel-major, "
+        "surfel_offsets int64 cumulative). Next render uses per-fragment "
+        "codebook decode.");
+  m.def("clear_atlas_rvq", &ClearAtlasRVQCUDA,
+        "Clear RVQ atlas — reverts to BC7/uint8/FP16 path on next render.");
+  m.def("set_atlas_rvq_bilinear", &SetAtlasRVQBilinearCUDA,
+        "True = 4-tap bilinear (default, matches BC7 quality). "
+        "False = nearest-neighbour (~4× fewer codebook reads, "
+        "atlas-PSNR drops ~2 dB).");
+  m.def("set_atlas_rvq_use_shared_cb", &SetAtlasRVQUseSharedCBCUDA,
+        "True = load codebook into __shared__ at kernel start (faster reads, "
+        "may reduce occupancy). False (default) = read codebook from global.");
+  m.def("set_atlas_rvq_use_tex_cb", &SetAtlasRVQUseTexCBCUDA,
+        "True = read codebook via cudaTextureObject (separate cache from L1, "
+        "FP16→FP32 done by texture unit). False (default) = read from global.");
+  m.def("set_atlas_rvq_use_tex_idx", &SetAtlasRVQUseTexIdxCUDA,
+        "True = read indices via cudaTextureObject (uint8). False (default) "
+        "= read from global memory.");
 }

@@ -1,0 +1,401 @@
+"""
+Baked rendering submodule — forward-only 2DGS rasterizer + atlas residual.
+
+Inference-only: no backward, no densification gradients. All fixed-shape
+buffers are cached at module level and reused frame-to-frame.
+
+Atlas mode is the only supported residual path. The legacy per-Gaussian
+8×8 shared `residual_textures` and the 48D-SH residual code paths are gone.
+
+Usage:
+    from diff_surfel_bake_render_rvq_tex import GaussianRasterizationSettings, GaussianRasterizer
+
+    settings = GaussianRasterizationSettings(...)
+    rasterizer = GaussianRasterizer(settings)
+    color, radii = rasterizer(
+        means3D=..., opacities=..., shs=...,
+        scales=..., rotations=...,
+        atlas_texture=..., atlas_rects=..., atlas_width=4096,
+    )
+
+    # Pre-activated tensors fast-path (skip Python property accessors per frame):
+    pkg = prepare_gaussian_inputs(gaussians, sh_degree=3, kernel_type=kernel_type)
+    color, _ = rasterizer(**pkg, atlas_texture=..., atlas_rects=..., atlas_width=...)
+"""
+
+from typing import NamedTuple
+import torch.nn as nn
+import torch
+from . import _C
+
+# ---------------------------------------------------------------------------
+# Persistent buffer caches.
+# ---------------------------------------------------------------------------
+_scratch_cache = {}     # (device,) -> {'geom', 'binning', 'img'} uint8 scratch buffers
+_radii_cache = {}       # (device,) -> int32[P]
+_out_color_cache = {}   # (device, H, W) -> float32[3, H, W]
+_empty_cache = {}       # (device, dtype_key) -> empty tensor singleton
+
+
+def _scratch_buffers(device):
+    key = str(device)
+    if key not in _scratch_cache:
+        dev = torch.device(device)
+        _scratch_cache[key] = {
+            'geom': torch.empty(0, dtype=torch.uint8, device=dev),
+            'binning': torch.empty(0, dtype=torch.uint8, device=dev),
+            'img': torch.empty(0, dtype=torch.uint8, device=dev),
+        }
+    return _scratch_cache[key]
+
+
+def _get_radii(device, P):
+    key = str(device)
+    buf = _radii_cache.get(key)
+    if buf is None or buf.numel() < P:
+        buf = torch.empty(P, dtype=torch.int32, device=device)
+        _radii_cache[key] = buf
+    return buf
+
+
+def _get_out_color(device, H, W):
+    key = (str(device), int(H), int(W))
+    buf = _out_color_cache.get(key)
+    if buf is None:
+        # Zero-init once; the kernel overwrites every inside pixel each frame.
+        buf = torch.zeros(3, H, W, dtype=torch.float32, device=device)
+        _out_color_cache[key] = buf
+    return buf
+
+
+def _empty(device, dtype_key, dtype):
+    key = (str(device), dtype_key)
+    t = _empty_cache.get(key)
+    if t is None:
+        t = torch.empty(0, dtype=dtype, device=device)
+        _empty_cache[key] = t
+    return t
+
+
+def rasterize_gaussians(
+    means3D, sh, colors_precomp, opacities,
+    scales, rotations, settings,
+    shapes=None, kernel_type=0,
+    atlas_texture=None, atlas_rects=None, atlas_width=0,
+    sb_params=None, sb_number=0,
+    voronoi_sites=None, voronoi_tau=None, voronoi_colors=None, voronoi_K=0,
+    is_textured=None, scaling_z=None,
+):
+    return _RasterizeGaussians.apply(
+        means3D, sh, colors_precomp, opacities,
+        scales, rotations, settings,
+        shapes, kernel_type,
+        atlas_texture, atlas_rects, atlas_width,
+        sb_params, sb_number,
+        voronoi_sites, voronoi_tau, voronoi_colors, voronoi_K,
+        is_textured, scaling_z,
+    )
+
+
+class _RasterizeGaussians(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, means3D, sh, colors_precomp, opacities,
+        scales, rotations, settings,
+        shapes, kernel_type,
+        atlas_texture, atlas_rects, atlas_width,
+        sb_params, sb_number,
+        voronoi_sites, voronoi_tau, voronoi_colors, voronoi_K,
+        is_textured, scaling_z,
+    ):
+        device = means3D.device
+
+        # Optional tensors → cached empty singletons.
+        if shapes is None:
+            shapes = _empty(device, 'f32', torch.float32)
+        if atlas_texture is None:
+            atlas_texture = _empty(device, 'f16', torch.float16)
+        if atlas_rects is None:
+            atlas_rects = _empty(device, 'f32', torch.float32)
+        if sb_params is None:
+            sb_params = _empty(device, 'f32', torch.float32)
+        # Voronoi (--feature SV): all three required together; voronoi_K==0
+        # disables and falls through to SH path.
+        if voronoi_sites is None:
+            voronoi_sites = _empty(device, 'f32', torch.float32)
+        if voronoi_tau is None:
+            voronoi_tau = _empty(device, 'f32', torch.float32)
+        if voronoi_colors is None:
+            voronoi_colors = _empty(device, 'f32', torch.float32)
+        # `--method mixed_3d`: empty → nullptr → pure 2DGS bake (unchanged).
+        if is_textured is None:
+            is_textured = torch.empty(0, dtype=torch.bool, device=device)
+        if scaling_z is None:
+            scaling_z = _empty(device, 'f32', torch.float32)
+
+        scratch = _scratch_buffers(device)
+        H = settings.image_height
+        W = settings.image_width
+        P = means3D.shape[0]
+        out_color = _get_out_color(device, H, W)
+        radii = _get_radii(device, P)
+
+        args = (
+            settings.bg,
+            means3D,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            settings.scale_modifier,
+            settings.viewmatrix,
+            settings.projmatrix,
+            settings.tanfovx,
+            settings.tanfovy,
+            H,
+            W,
+            sh,
+            settings.sh_degree,
+            settings.campos,
+            settings.prefiltered,
+            settings.debug,
+            settings.beta,
+            shapes,
+            kernel_type,
+            atlas_texture,
+            atlas_rects,
+            atlas_width,
+            settings.aabb_mode,
+            sb_params,
+            sb_number,
+            voronoi_sites,
+            voronoi_tau,
+            voronoi_colors,
+            voronoi_K,
+            scratch['geom'],
+            scratch['binning'],
+            scratch['img'],
+            out_color,
+            radii,
+            settings.sort_mode,
+            is_textured,
+            scaling_z,
+        )
+
+        scratch['geom'], scratch['binning'], scratch['img'] = _C.rasterize_gaussians(*args)
+        return out_color, radii
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        raise NotImplementedError("Baked rendering is inference-only, no backward pass")
+
+
+class GaussianRasterizationSettings(NamedTuple):
+    image_height: int
+    image_width: int
+    tanfovx: float
+    tanfovy: float
+    bg: torch.Tensor
+    scale_modifier: float
+    viewmatrix: torch.Tensor
+    projmatrix: torch.Tensor
+    sh_degree: int
+    campos: torch.Tensor
+    prefiltered: bool
+    debug: bool
+    beta: float
+    aabb_mode: int = 3  # 0=square, 1=square+AdR, 2=rect, 3=rect+AdR
+    sort_mode: int = 0  # 0=legacy 64-bit single sort, 1=FastGS two-stage (32-bit depth + 32-bit tile)
+
+
+class GaussianRasterizer(nn.Module):
+    def __init__(self, raster_settings):
+        super().__init__()
+        self.raster_settings = raster_settings
+
+    def forward(self, means3D, opacities, shs=None, colors_precomp=None,
+                scales=None, rotations=None, shapes=None, kernel_type=0,
+                atlas_texture=None, atlas_rects=None, atlas_width=0,
+                sb_params=None, sb_number=0,
+                # --feature SV fused-CUDA path: pre-activated SV state.
+                # Pass all three populated tensors + voronoi_K>0 to skip the
+                # SH/fake-SH-DC roundtrip and let preprocessCUDA call
+                # computeColorFromVoronoi directly.
+                voronoi_sites=None, voronoi_tau=None, voronoi_colors=None,
+                voronoi_K=0,
+                # `--method mixed_3d`: per-Gauss textured flag + activated 3rd-axis.
+                is_textured=None, scaling_z=None,
+                # Backward-compat: old callers passed `means2D` / `residual_textures`,
+                # both unused now. Accept silently.
+                means2D=None, residual_textures=None):
+
+        settings = self.raster_settings
+        device = means3D.device
+
+        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+            raise Exception('Provide exactly one of either SHs or precomputed colors!')
+
+        if shs is None:
+            shs = _empty(device, 'f32', torch.float32)
+        if colors_precomp is None:
+            colors_precomp = _empty(device, 'f32', torch.float32)
+        if scales is None:
+            scales = _empty(device, 'f32', torch.float32)
+        if rotations is None:
+            rotations = _empty(device, 'f32', torch.float32)
+
+        return rasterize_gaussians(
+            means3D, shs, colors_precomp, opacities,
+            scales, rotations, settings,
+            shapes, kernel_type,
+            atlas_texture, atlas_rects, atlas_width,
+            sb_params, sb_number,
+            voronoi_sites, voronoi_tau, voronoi_colors, voronoi_K,
+            is_textured, scaling_z,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pre-activation helper.
+# Property accessors on a GaussianModel apply activations (exp, sigmoid,
+# quat-normalize, etc.) every time they're called. For inference these are
+# CONSTANT — call once after load_ply() and reuse the activated tensors
+# directly instead of paying the activation cost per frame.
+# ---------------------------------------------------------------------------
+def prepare_gaussian_inputs(gaussians, sh_degree=3, kernel_type=0):
+    """Snapshot post-activation tensors from a GaussianModel for fast inference.
+
+    Returns a dict with:
+      means3D, opacities, scales, rotations, shs, shapes (or None),
+      sb_params (flat [N*K*6] or None), sb_number (int).
+
+    All tensors are made `.contiguous()` so the C++ side can skip the per-call
+    contiguity check. Pass the dict as **kwargs to `GaussianRasterizer.forward`.
+    """
+    pkg = {
+        'means3D':    gaussians.get_xyz.contiguous(),
+        'opacities':  gaussians.get_opacity.contiguous(),
+        'scales':     gaussians.get_scaling.contiguous(),
+        'rotations':  gaussians.get_rotation.contiguous(),
+        'shs':        gaussians.get_features.contiguous(),
+    }
+    # Beta-kernel shapes (only when actually using a beta variant).
+    shapes = None
+    if kernel_type > 0 and hasattr(gaussians, '_shape') \
+       and gaussians._shape is not None and gaussians._shape.numel() > 0:
+        shapes = gaussians.get_shape.contiguous()
+    pkg['shapes'] = shapes
+    pkg['kernel_type'] = kernel_type
+    # `--method mixed_3d`: per-Gauss textured flag + activated 3rd-axis scale.
+    # Only present on models trained with mixed_3d (post `--texsplit`); absent
+    # ⇒ left None ⇒ pure 2DGS bake (unchanged for every other method).
+    it = getattr(gaussians, '_is_textured', None)
+    sz = getattr(gaussians, '_scaling_z', None)
+    if (it is not None and it.numel() > 0 and sz is not None and sz.numel() > 0):
+        pkg['is_textured'] = it.contiguous().bool()
+        pkg['scaling_z'] = gaussians.get_scaling_z.contiguous()
+    return pkg
+
+
+# ---------------------------------------------------------------------------
+# Cached rasterizer: one GaussianRasterizer instance per (H, W). Settings
+# tuple is rebuilt per frame (cheap), but the wrapper nn.Module is reused.
+# Works for interactive renderers where camera changes per frame.
+# ---------------------------------------------------------------------------
+_rasterizer_cache = {}  # (H, W, sh_degree, beta, aabb_mode) -> GaussianRasterizer
+
+
+def get_rasterizer(image_height, image_width, tanfovx, tanfovy, bg,
+                   viewmatrix, projmatrix, campos,
+                   sh_degree=3, beta=0.0, aabb_mode=3, sort_mode=0,
+                   scale_modifier=1.0, prefiltered=False, debug=False):
+    """Build (or reuse) a GaussianRasterizer with fresh per-frame camera params.
+
+    `sort_mode`: 0 = legacy 64-bit single sort, 1 = FastGS two-stage sort.
+    The `nn.Module` wrapper is cached keyed by (H, W, sh_degree, beta, aabb_mode, sort_mode).
+    The settings NamedTuple is rebuilt every call (microsecond-cheap) so
+    viewmatrix / projmatrix / campos / tanfov can change per frame.
+    """
+    key = (int(image_height), int(image_width), int(sh_degree),
+           float(beta), int(aabb_mode), int(sort_mode))
+    settings = GaussianRasterizationSettings(
+        image_height=image_height, image_width=image_width,
+        tanfovx=tanfovx, tanfovy=tanfovy,
+        bg=bg, scale_modifier=scale_modifier,
+        viewmatrix=viewmatrix, projmatrix=projmatrix,
+        sh_degree=sh_degree, campos=campos,
+        prefiltered=prefiltered, debug=debug,
+        beta=beta, aabb_mode=aabb_mode, sort_mode=sort_mode,
+    )
+    rasterizer = _rasterizer_cache.get(key)
+    if rasterizer is None:
+        rasterizer = GaussianRasterizer(raster_settings=settings)
+        _rasterizer_cache[key] = rasterizer
+    else:
+        rasterizer.raster_settings = settings
+    return rasterizer
+
+
+def set_activation_bias(sh_bias=0.5, res_bias=0.0):
+    _C.set_activation_bias(float(sh_bias), float(res_bias))
+
+
+def set_compact_mult(val=1.0):
+    _C.set_compact_mult(float(val))
+
+
+def set_residual_mode(mode=0):
+    """0 = 3D_SH_res outer ReLU (default). 1 = 3D_SH_add separate ReLUs."""
+    _C.set_residual_mode(int(mode))
+
+
+def set_untex_kernel(v=-1):
+    """`--method mixed_3d --kernel2`: kernel int for the UNTEXTURED EWA half
+    (gaussian=0, beta=1, flex=2, general=3, beta_scaled=4, nexel=5). -1 = unset
+    → untextured use the run's --kernel. Mirrors set_residual_mode."""
+    _C.set_untex_kernel(int(v))
+
+
+def set_atlas_rvq(codebooks_fp16, indices_u8, surfel_offsets_i64,
+                  block_size=4, atlas_scale=1.0, atlas_offset=0.0):
+    """Install an RVQ-decoded atlas. The render kernel does an L-stage
+    codebook lookup at each atlas-sample site using global-memory reads
+    (no texture-cache redirect, no shared-codebook, no toggles).
+
+    Args:
+        codebooks_fp16: [L, K, B*B*3] FP16.
+        indices_u8:     [L, N_used] uint8 surfel-major.
+        surfel_offsets_i64: [N_gauss + 1] int64 cumulative used-block count.
+        block_size:     pixels per side (default 4).
+        atlas_scale, atlas_offset: unused in this fork (kept for signature
+            parity with the texture-path fork)."""
+    _C.set_atlas_rvq(codebooks_fp16, indices_u8, surfel_offsets_i64,
+                     int(block_size), float(atlas_scale), float(atlas_offset))
+
+
+def clear_atlas_rvq():
+    _C.clear_atlas_rvq()
+
+
+# Toggle stubs removed in this RVQ-only fork — no BC7, no uint8/half4 atlas
+# texture cache, no shared / texture codebook variants. Kept as no-ops so
+# downstream scripts that import them (notably benchmark_baked.py) work
+# unchanged when the module is aliased over `diff_surfel_bake_render`.
+def clear_atlas_cache():  pass
+def set_atlas_use_uint8(val=True):  pass
+def set_use_atlas_tex_object(val=True):  pass
+def set_atlas_bc7(bc7_bytes_tensor, W, H, offset, scale):  pass
+def clear_atlas_bc7():  pass
+def set_atlas_rvq_bilinear(val=True):  pass         # this fork is always bilinear
+def set_atlas_rvq_use_shared_cb(val=True):  pass
+def set_atlas_rvq_use_tex_cb(val=True):  pass
+def set_atlas_rvq_use_tex_idx(val=True):  pass
+
+
+def clear_buffer_cache():
+    """Release all cached scratch / output / radii / rasterizer buffers."""
+    _scratch_cache.clear()
+    _radii_cache.clear()
+    _out_color_cache.clear()
+    _empty_cache.clear()
+    _rasterizer_cache.clear()

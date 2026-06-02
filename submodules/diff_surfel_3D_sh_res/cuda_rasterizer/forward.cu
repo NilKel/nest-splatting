@@ -51,6 +51,11 @@ __device__ float d_weight_reg_lambda = 0.0f;
 // Default: sh_bias=0.5, res_bias=0.5 (standard 3DGS gray init + residual offset)
 // For decomposition: sh_only sets res_bias=-999 (ReLU clamps to 0), tex_only sets sh_bias=-999
 __device__ int d_residual_mode = 0;
+// `--ste`: straight-through estimator on the outer per-Gauss ReLU. Only the
+// backward consumes this; the forward globally mirrors the value so a single
+// host setter pair (FORWARD::setSteRelu + BACKWARD::setSteRelu) stays
+// consistent with how every other tunable is wired.
+__device__ int d_ste_relu_fwd = 0;
 __device__ float d_sh_bias = 0.5f;
 // Nexels-style anti-aliasing d_aa_factor / d_aa_focal are now declared in hashgrid.h
 // (per-TU static __device__). Setters below update this TU's copy.
@@ -1519,6 +1524,9 @@ renderCUDAsurfelForward(
 			// Activation is selected by d_residual_mode (see top of file):
 			//   0 (3D_SH_res): feat = ReLU(ReLU(SH+sh_bias) + residual + res_bias)
 			//   1 (3D_SH_add): feat = ReLU(SH+sh_bias) + ReLU(residual + res_bias)
+			//   2 (3D_SH_res_sep): feat = ReLU(SH+sh_bias) + (residual + res_bias)
+			//                      signed residual, no per-Gauss ReLU. Per-pixel ReLU
+			//                      on the final blended color is applied in Python.
 			if (active) {
 				for (int ch = 0; ch < ORIG_OUTPUT_DIM; ch++) {
 					float residual = smem_fw_float[tid * TC_OUTPUT_DIM + ch];
@@ -1526,6 +1534,9 @@ renderCUDAsurfelForward(
 					if (d_residual_mode == 1) {
 						// my_sh_color is already ReLU(SH+sh_bias) from computeColorFromSH.
 						feat_ch = my_sh_color[ch] + fmaxf(0.0f, residual + d_res_bias);
+					} else if (d_residual_mode == 2) {
+						// 3D_SH_res_sep: signed residual, no per-Gauss ReLU.
+						feat_ch = my_sh_color[ch] + residual + d_res_bias;
 					} else {
 						feat_ch = fmaxf(0.0f, my_sh_color[ch] + residual + d_res_bias);
 					}
@@ -2075,12 +2086,15 @@ renderCUDAsurfelForward(
 				mlp_input, residual, h1, h2, false,  // false = identity (no sigmoid)
 				smem_mlp_W1, smem_mlp_W2, smem_mlp_W3);
 
-			// Activation: d_residual_mode selects 3D_SH_res (0) vs 3D_SH_add (1).
+			// Activation: d_residual_mode selects 3D_SH_res (0) / 3D_SH_add (1) / 3D_SH_res_sep (2).
 			// sh_color is already ReLU(SH+sh_bias) from computeColorFromSH (inner ReLU).
 			for (int ch = 0; ch < 3; ch++) {
 				if (d_residual_mode == 1) {
 					// 3D_SH_add: separate ReLUs on each branch.
 					feat[ch] = sh_color[ch] + fmaxf(0.0f, residual[ch] + d_res_bias);
+				} else if (d_residual_mode == 2) {
+					// 3D_SH_res_sep: signed residual, no per-Gauss ReLU.
+					feat[ch] = sh_color[ch] + residual[ch] + d_res_bias;
 				} else {
 					// 3D_SH_res: single outer ReLU on the sum.
 					feat[ch] = fmaxf(0.0f, sh_color[ch] + residual[ch] + d_res_bias);
@@ -2350,6 +2364,12 @@ void FORWARD::setActivationBias(float sh_bias, float res_bias) {
 __global__ void setResidualModeFwdKernel(int v) { d_residual_mode = v; }
 void FORWARD::setResidualMode(int mode) {
 	setResidualModeFwdKernel<<<1, 1>>>(mode);
+}
+
+// `--ste`: straight-through estimator on the outer per-Gauss ReLU.
+__global__ void setSteReluFwdKernel(int v) { d_ste_relu_fwd = v; }
+void FORWARD::setSteRelu(int v) {
+	setSteReluFwdKernel<<<1, 1>>>(v);
 }
 
 // Set anti-aliasing params (Nexels-style hash-grid down-weighting)

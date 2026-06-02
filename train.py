@@ -36,7 +36,7 @@ if "--unbiased" in sys.argv:
 import torch
 import torch.nn as nn
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, ssim_map
 from optimizing_spa import OptimizingSpa
 from gaussian_renderer import render, network_gui
 import traceback
@@ -149,7 +149,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # (added separately) to opt into the mode-2 deferred-clamp variant.
     if args.method == "3D_SH_add":
         args._residual_mode = 1
-    elif args.method in ("mixed_sep", "mixed_3d_sep"):
+    elif args.method in ("mixed_sep", "mixed_3d_sep", "3D_SH_res_sep"):
         args._residual_mode = 2
     else:
         # 3D_SH_res, mixed, mixed_3d, baseline, others → mode 0.
@@ -160,10 +160,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # `diff_surfel_mixed` device globals. This avoids touching every call site.
     # Lazy `from X import Y` re-reads the module attribute each call, so the
     # monkey-patch propagates as long as we patch BEFORE the first import.
-    if args.method in ("mixed", "mixed_3d"):
+    if args.method in ("mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"):
         try:
             import diff_surfel_3D_sh_res as _ds_orig
-            if args.method == "mixed_3d":
+            if args.method in ("mixed_3d", "mixed_3d_sep"):
                 import diff_surfel_mixed_3d as _ds_mirror
             else:
                 import diff_surfel_mixed as _ds_mirror
@@ -172,7 +172,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 'set_overdraw_lambda', 'set_weight_reg_lambda',
                 'set_activation_bias', 'set_residual_mode', 'set_anti_alias',
                 'set_compact_mult', 'set_aa_kernel_size', 'set_skip_mlp_grad',
-                'set_depth_sort',
+                'set_depth_sort', 'set_ste_relu',
             )
             for _name in _MIRRORED_SETTERS:
                 if not hasattr(_ds_orig, _name) or not hasattr(_ds_mirror, _name):
@@ -190,7 +190,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     # --decomp: only the diff_surfel_3D_sh_res rasterizer exposes the sh_only /
     # tex_only decompose_mode paths needed to split the supervision.
-    if getattr(args, 'decomp', False) and args.method not in ("3D_SH_res", "3D_SH_add"):
+    if getattr(args, 'decomp', False) and args.method not in ("3D_SH_res", "3D_SH_res_sep", "3D_SH_add"):
         raise RuntimeError(
             f"--decomp requires --method 3D_SH_res or 3D_SH_add; got --method {args.method}. "
             f"Other rasterizers don't expose the sh_only/tex_only decompose path."
@@ -199,7 +199,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # render — no decompose_mode dependency. Gated to 3D_SH_res here only because
     # the cache plumbing (Scene.__init__) is tied to the same code path. Could be
     # relaxed if needed.
-    if getattr(args, 'blurprog', False) and args.method not in ("3D_SH_res", "3D_SH_add"):
+    if getattr(args, 'blurprog', False) and args.method not in ("3D_SH_res", "3D_SH_res_sep", "3D_SH_add"):
         raise RuntimeError(
             f"--blurprog requires --method 3D_SH_res or 3D_SH_add; got --method {args.method}."
         )
@@ -333,7 +333,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 args.cap_max = max(args.cap_max, n_gs)
             gaussians._appearance_level = nn.Parameter(
                 torch.ones(n_gs, 1, device="cuda") * 24, requires_grad=False)
-            if hasattr(args, 'method') and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"]:
+            if hasattr(args, 'method') and args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"]:
                 gaussians._gaussian_feat_dim = 0
                 gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             gaussians.max_radii2D = torch.zeros(n_gs, device="cuda")
@@ -680,7 +680,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"[3D_SH_32 MODE] Hash levels: {num_levels}, {per_level_dim}D per level")
             print(f"[3D_SH_32 MODE] MLP: 32D → 32D → 32D → 3D (RGB residual, identity)")
 
-        elif args.method in ("3D_SH_res", "mixed", "mixed_3d"):
+        elif args.method in ("3D_SH_res", "3D_SH_res_sep", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"):
             # 3D_SH_res / mixed: per-Gaussian SH + tiny hash MLP residual
             # No per-Gaussian features needed — standard SH handles per-Gaussian appearance
             # SH is kept from warmup checkpoint (or point cloud init) — not reinitialized
@@ -879,7 +879,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Load optimizer state from warmup checkpoint
         # Skip if method/kernel adds new params not in saved state (they train from scratch)
         # Also skip if param group counts don't match (checkpoint from different config)
-        skip_methods = ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat", "3D_SH_32"]
+        skip_methods = ["cat", "adaptive", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32"]
         if args.method not in skip_methods and args.kernel == "gaussian":
             ckpt_groups = len(ckpt['optimizer_state']['param_groups'])
             cur_groups = len(gaussians.optimizer.param_groups)
@@ -943,7 +943,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torch.ones(n_gs, 1, device="cuda") * 24, requires_grad=False)
 
             # Re-initialize per-Gaussian features for the target method
-            if hasattr(args, 'method') and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"]:
+            if hasattr(args, 'method') and args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"]:
                 gaussians._gaussian_feat_dim = 0
                 gaussians._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             elif hasattr(args, 'method') and args.method in ["cat"] and hasattr(args, 'hybrid_levels'):
@@ -1085,7 +1085,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             shared_ckpt_data = None
 
     # FastGS Compact Box: set the Mahalanobis² multiplier + auto-enable AdR+rect AABB.
-    if args.fastgs and args.method in ("3D_SH_res", "mixed", "mixed_3d"):
+    if args.fastgs and args.method in ("3D_SH_res", "3D_SH_res_sep", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"):
         from diff_surfel_3D_sh_res import set_compact_mult
         set_compact_mult(args.fastgs_mult)
         if args.aabb == "2dgs":
@@ -1096,7 +1096,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f"[FASTGS] Compact Box: mult={args.fastgs_mult} (cutoff = sqrt(2·log(opacity·255)·mult), paper default 0.5)")
 
     # Set hash query transmittance threshold (skip hash+MLP when T < threshold)
-    if args.contribution_thresh > 0.0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"]:
+    if args.contribution_thresh > 0.0 and args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"]:
         if args.method == "3D_SH_32":
             from diff_surfel_3D_sh_32 import set_contrib_thresh
         else:
@@ -1104,7 +1104,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         set_contrib_thresh(args.contribution_thresh)
         print(f"[CONTRIB_THRESH] Skipping hash query when w = T*alpha < {args.contribution_thresh}")
 
-    if args.count_thresh > 0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"]:
+    if args.count_thresh > 0 and args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"]:
         if args.method == "3D_SH_32":
             from diff_surfel_3D_sh_32 import set_count_thresh
         else:
@@ -1112,7 +1112,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         set_count_thresh(args.count_thresh)
         print(f"[COUNT_THRESH] Skipping hash query after {args.count_thresh} contributing Gaussians per pixel")
 
-    if args.overdraw_reg > 0.0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"]:
+    if args.overdraw_reg > 0.0 and args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"]:
         if args.method == "3D_SH_32":
             from diff_surfel_3D_sh_32 import set_overdraw_lambda
         else:
@@ -1120,7 +1120,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         set_overdraw_lambda(args.overdraw_reg)
         print(f"[OVERDRAW_REG] Overdraw regularization lambda = {args.overdraw_reg}")
 
-    if args.weight_reg > 0.0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"]:
+    if args.weight_reg > 0.0 and args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"]:
         if args.method == "3D_SH_32":
             from diff_surfel_3D_sh_32 import set_weight_reg_lambda
         else:
@@ -1128,7 +1128,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         set_weight_reg_lambda(args.weight_reg)
         print(f"[WEIGHT_REG] Weight-squared regularization lambda = {args.weight_reg} (CUDA gradient)")
 
-    if args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"]:
+    if args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"]:
         if args.method == "3D_SH_32":
             from diff_surfel_3D_sh_32 import set_activation_bias
         else:
@@ -1145,7 +1145,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # monkey-patch installed at startup.
         _rm = getattr(args, '_residual_mode', 0)
         if _rm in (1, 2) and args.method in (
-                "3D_SH_res", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"):
+                "3D_SH_res", "3D_SH_res_sep", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"):
             from diff_surfel_3D_sh_res import set_residual_mode
             set_residual_mode(_rm)
             _desc = ("3D_SH_add: separate outer ReLUs" if _rm == 1 else
@@ -1153,7 +1153,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"[RESIDUAL_MODE] mode={_rm} ({_desc})")
         # No print for mode 0 — that's the default and matches 3D_SH_res.
 
-    if args.depth_sort and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"]:
+        # `--ste`: SIGN-AWARE straight-through. Two paths, same gate logic:
+        #   - Mode 0 (3D_SH_res / mixed / mixed_3d): per-Gauss outer ReLU
+        #     gradient gates in CUDA (d_ste_relu). The mirror propagates to
+        #     diff_surfel_mixed_3d for mixed-family methods.
+        #   - Mode 2 (mixed_sep / mixed_3d_sep): per-pixel ReLU after blend,
+        #     switched torch.relu → STERelu in the Python renderer via
+        #     ingp.is_ste_relu (set in INGP.__init__).
+        # Same flag enables both; the relevant path is selected by mode.
+        if getattr(args, 'ste', False):
+            from diff_surfel_3D_sh_res import set_ste_relu
+            set_ste_relu(1)
+            _rm_now = getattr(args, '_residual_mode', 0)
+            _ste_site = ("per-pixel ReLU after blend (renderer torch.relu→STERelu)"
+                         if _rm_now == 2 else
+                         "per-Gauss outer ReLU in CUDA backward (d_ste_relu)")
+            print(f"[STE_RELU] enabled (sign-aware) — gradient pass at clamped "
+                  f"pixels gated to dL/dpixel < 0 (release-clamp direction). "
+                  f"Active at: {_ste_site}.")
+
+    if args.depth_sort and args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"]:
         if args.method == "3D_SH_32":
             from diff_surfel_3D_sh_32 import set_depth_sort
         else:
@@ -1176,12 +1195,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"[UNBIASED] WARNING: set_converge_threshold not available ({_e}); "
                   f"falling back to compiled default 1.0")
 
-    if args.aa_2dgs > 0.0 and args.method in ("3D_SH_res", "mixed", "mixed_3d"):
+    if args.aa_2dgs > 0.0 and args.method in ("3D_SH_res", "3D_SH_res_sep", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"):
         from diff_surfel_3D_sh_res import set_aa_kernel_size
         set_aa_kernel_size(args.aa_2dgs)
         print(f"[AA-2DGS] Jacobian mip-filter kernel σ = {args.aa_2dgs} (3D_SH_res standard Gaussian path)")
     elif args.aa_2dgs > 0.0:
         raise RuntimeError(f"--aa_2dgs is only supported for --method 3D_SH_res, got {args.method}")
+
+    # `--l2` / `--l1`: mixed_3d-only per-Gauss loss split (mutually exclusive).
+    # Validate at setup so a misuse fails loudly with a clear message rather
+    # than silently routing every pixel through L1+SSIM (which would look like
+    # "the flag did nothing").
+    if getattr(args, 'l2', False) and getattr(args, 'l1', False):
+        raise RuntimeError("--l1 and --l2 are mutually exclusive: both reroute the untex Gauss "
+                           "leg, just to different loss functions. Pick one.")
+    if getattr(args, 'l2', False) or getattr(args, 'l1', False):
+        _untex_loss_name = "l1" if getattr(args, 'l1', False) else "l2"
+        if args.method not in ("mixed_3d", "mixed_3d_sep"):
+            raise RuntimeError(
+                f"--{_untex_loss_name} only applies to --method mixed_3d or mixed_3d_sep, "
+                f"got {args.method}. It splits the photometric loss with per-Gauss routing in the "
+                f"rasterizer backward (textured → L1+SSIM, untextured → {_untex_loss_name.upper()}), "
+                f"which needs the per-Gauss _is_textured flag those methods carry.")
+        print(f"[LOSS-SPLIT] Photometric loss: TEXTURED Gauss params receive L1+SSIM gradient, "
+              f"UNTEXTURED Gauss params receive {_untex_loss_name.upper()} gradient. Routing "
+              f"happens per-Gauss inside the rasterizer backward (one forward, one backward "
+              f"through the kernel).")
 
     # Initialize learnable skybox for background modeling
     skybox = None
@@ -1305,7 +1344,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "sv_sites", "sv_colors",                          # Spherical Voronoi
             }
             _FP_SCHEDULED = {"sv_sites"}
-            _FP_HAS_BIAS = args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"]
+            _FP_HAS_BIAS = args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"]
             if iteration <= args.freeze_prim:
                 for pg in gaussians.optimizer.param_groups:
                     name = pg.get("name")
@@ -1380,12 +1419,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if ingp is not None:
             # 3D_SH_res warmup: disable hash/MLP for first N iterations
-            if args.res_warmup > 0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"] and iteration < args.res_warmup:
+            if args.res_warmup > 0 and args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"] and iteration < args.res_warmup:
                 ingp.hashgrid_disabled = True
                 optim_ngp = False
                 optim_gaussian = True
             else:
-                if args.res_warmup > 0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"] and iteration == args.res_warmup:
+                if args.res_warmup > 0 and args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"] and iteration == args.res_warmup:
                     ingp.hashgrid_disabled = False
                     tqdm.write(f"[3D_SH_RES] Enabling hash/MLP residual at iteration {iteration}")
 
@@ -1404,7 +1443,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             #               and keep the INGP optimizer.step running so the MLP updates.
             #               Hash table sees ~zero gradient, Adam moments decay slightly,
             #               weights effectively don't move.
-            _freeze_methods = ("3D_SH_res", "cat", "mixed", "mixed_3d")
+            _freeze_methods = ("3D_SH_res", "3D_SH_res_sep", "cat", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep")
             if (args.freeze_hash_iter > 0 and iteration >= args.freeze_hash_iter
                     and args.method in _freeze_methods):
                 period = max(1, int(args.freeze_hash_period))
@@ -1415,7 +1454,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 current_skip = getattr(ingp, '_skip_mlp_grad', None)
                 if current_skip != desired_skip:
                     try:
-                        if args.method in ("3D_SH_res", "mixed", "mixed_3d"):
+                        if args.method in ("3D_SH_res", "3D_SH_res_sep", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"):
                             from diff_surfel_3D_sh_res import set_skip_mlp_grad
                         else:  # cat
                             from diff_surfel_rasterization import set_skip_mlp_grad
@@ -1434,7 +1473,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # 3D_SH_res: skip whole INGP optimizer on freeze iters (freezes MLP too).
                 # cat: keep INGP optimizer stepping so the shared MLP decoder updates;
                 # CUDA-side zero gradient already freezes the hash table.
-                if args.method in ("3D_SH_res", "mixed", "mixed_3d"):
+                if args.method in ("3D_SH_res", "3D_SH_res_sep", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"):
                     optim_ngp = should_train
                 # else: leave optim_ngp at its default (True) for cat.
 
@@ -1507,7 +1546,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         active_bg_hashgrid = bg_hashgrid if (bg_hashgrid is not None and iteration >= bg_start_iter) else None
 
         # Debug: verify SH is zero on first iteration for 3D_SH_res
-        if iteration == first_iter + 1 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"]:
+        if iteration == first_iter + 1 and args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"]:
             dc_norm = gaussians._features_dc.data.abs().max().item()
             # `_features_rest` is shape [N, 0, 3] under --feature beta (we drop
             # higher-order SH there). max() on an empty tensor needs special-casing.
@@ -1525,7 +1564,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # iteration == args.texsplit (>0). Pure duplication of the live surfel set
         # — textured copy + untextured copy (no depth reinit; that shocked a
         # partially-converged scene). Adam is rebuilt for the doubled tensor.
-        if args.method in ("mixed", "mixed_3d") and args.texsplit > 0 and iteration == args.texsplit:
+        if args.method in ("mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep") and args.texsplit > 0 and iteration == args.texsplit:
             _n_before = gaussians.get_xyz.shape[0]
             print(f"[TEXSPLIT] iter={iteration}: duplicating {_n_before} surfels → "
                   f"{_n_before} textured + {_n_before} untextured")
@@ -1538,7 +1577,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if _untex_frac < 0.0:
                     _untex_frac = 1.0 - _tex_frac
                 gaussians.split_at_texsplit(
-                    make_scaling_z=(args.method == "mixed_3d"),
+                    make_scaling_z=(args.method in ("mixed_3d", "mixed_3d_sep")),
                     tex_opacity_scale=_tex_frac,
                     untex_opacity_scale=_untex_frac)
                 gaussians.training_setup(opt)
@@ -1664,8 +1703,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tqdm.write(f"[BLURPROG iter={iteration}] t={t_prog:.3f}, α={_alpha:.3f} "
                            f"(α=0 → gt_low, α=1 → gt)")
 
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        # `--l2` / `--l1` (mixed_3d[_sep] only): per-Gauss loss routing via the
+        # rasterizer's dual image-output. `image` and `image_untex` are
+        # numerically identical (both = the full blended render) but they
+        # are SEPARATE autograd nodes in the rasterizer Function's graph.
+        # The Function's backward receives two upstream image gradients and
+        # routes them per-Gauss inside the CUDA kernel based on the
+        # `is_textured` flag — textured Gauss accumulate gradient from
+        # `dL/d image_tex` (L1+SSIM), untextured Gauss accumulate from
+        # `dL/d image_untex` (L2 or L1 depending on flag). Pre-`--texsplit`
+        # (no untextured rows) or when neither flag is set → kernel reverts
+        # to single-loss behavior, byte-identical to default.
+        _split_untex_loss = (
+            'l2' if getattr(args, 'l2', False)
+            else 'l1' if getattr(args, 'l1', False)
+            else None
+        )
+        _split_active = (_split_untex_loss is not None
+                         and args.method in ("mixed_3d", "mixed_3d_sep")
+                         and render_pkg.get('render_untex', None) is not None
+                         and hasattr(gaussians, '_is_textured')
+                         and gaussians._is_textured.numel() == gaussians.get_xyz.shape[0]
+                         and bool((~gaussians._is_textured).any().item()))
+        if _split_active:
+            image_untex = render_pkg['render_untex']
+            Ll1 = l1_loss(image, gt_image)
+            if _split_untex_loss == 'l2':
+                L_untex = ((image_untex - gt_image) ** 2).mean()
+            else:  # 'l1'
+                L_untex = (image_untex - gt_image).abs().mean()
+            loss = ((1.0 - opt.lambda_dssim) * Ll1
+                    + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+                    + L_untex)
+        else:
+            Ll1 = l1_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
         # --decomp: supervise the structure branch against the guided-filter low-freq
         # image, and the hashgrid-MLP residual against the high-freq residual.
@@ -1955,7 +2027,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # photometric counterforce — without this mask the regularizer
             # would drag those (rendering-inert) values toward 0 every step.
             _shape_vals = gaussians.get_shape
-            if (args.method in ("mixed", "mixed_3d") and hasattr(gaussians, '_is_textured')
+            if (args.method in ("mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep") and hasattr(gaussians, '_is_textured')
                     and gaussians._is_textured.numel() == _shape_vals.numel()):
                 _shape_vals = _shape_vals[gaussians._is_textured]
             if _shape_vals.numel() == 0:
@@ -2045,7 +2117,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # --weight_reg: CUDA backward handles gradient with fixed lambda
         # --w_weight_reg: dynamically adjusts CUDA lambda based on mean reconstruction error
         #   High error → low lambda (relax regularization), low error → full lambda
-        if args.w_weight_reg > 0.0 and args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"]:
+        if args.w_weight_reg > 0.0 and args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"]:
             avg_mse = ((image - gt_image) ** 2).mean().detach().item()
             effective_lambda = args.w_weight_reg * float(np.exp(-args.w_weight_gamma * avg_mse))
             if args.method == "3D_SH_32":
@@ -2174,7 +2246,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if args.mcmc or args.mcmc_deficit or args.mcmc_fps or args.minimc:
                     n_alive = (gaussians.get_opacity > 0.005).sum().item()
                     points_str = f"{int(n_alive)}/{len(gaussians.get_xyz)}"
-                elif args.method in ("mixed", "mixed_3d"):
+                elif args.method in ("mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"):
                     # Total points / % textured (rest are untextured simple-2DGS).
                     _n = len(gaussians.get_xyz)
                     _it = getattr(gaussians, '_is_textured', None)
@@ -3552,7 +3624,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # of the textured half), untextured-spherical (SV baseline of the
                 # untextured half). Per-half isolation via a temporary opacity mask
                 # (untextured/textured opacity → ~0), restored in a finally block.
-                if args.method in ("mixed", "mixed_3d") and ingp is not None and not getattr(ingp, 'hashgrid_disabled', False):
+                if args.method in ("mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep") and ingp is not None and not getattr(ingp, 'hashgrid_disabled', False):
                     with torch.no_grad():
                         _is_tex = getattr(gaussians, '_is_textured', None)
                         _Np = gaussians.get_xyz.shape[0]
@@ -3611,7 +3683,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 # Save decomposed renders for 3D_SH_res and 3D_SH_cat modes (SH-only and texture-only)
                 # All renders done atomically with the same model state (post-optimizer-step)
-                elif args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"] and ingp is not None and not getattr(ingp, 'hashgrid_disabled', False):
+                elif args.method in ["3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32"] and ingp is not None and not getattr(ingp, 'hashgrid_disabled', False):
                     # Full render (consistent with decomposition renders below)
                     with torch.no_grad():
                         render_pkg_full = render(viewpoint_cam, gaussians, pipe, current_bg, ingp=ingp,
@@ -3999,7 +4071,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration, 
         f.write("=" * 50 + "\n\n")
 
         f.write(f"Method: {args.method}\n")
-        if args.method in ["cat", "cat_dropout", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
+        if args.method in ["cat", "cat_dropout", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_res_sep", "3D_SH_cat", "3D_SH_32"]:
             f.write(f"Hybrid Levels: {args.hybrid_levels}\n")
             if args.method == "cat_dropout":
                 f.write(f"Dropout Lambda: {args.dropout_lambda}\n")
@@ -4032,7 +4104,7 @@ def save_training_log(scene, gaussians, ingp, pipe, args, cfg_model, iteration, 
         if args.mcmc or args.mcmc_deficit or args.mcmc_fps:
             f.write(f"  (MCMC: only alive Gaussians counted)\n")
         # `--method mixed`: textured (SV + hash/MLP) vs untextured (SV-only 2DGS) split
-        if args.method in ("mixed", "mixed_3d"):
+        if args.method in ("mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"):
             _it = getattr(gaussians, '_is_textured', None)
             if _it is not None and _it.numel() == num_gaussians and num_gaussians > 0:
                 _tex = int(_it.sum().item())
@@ -4954,7 +5026,7 @@ if __name__ == "__main__":
     
     # Method argument - baseline, cat, cat_dropout, adaptive, adaptive_add, adaptive_cat, adaptive_zero, adaptive_gate, diffuse, specular, diffuse_ngp, diffuse_offset, hybrid_SH, hybrid_SH_raw, hybrid_SH_post, or residual_hybrid
     parser.add_argument("--method", type=str, default="baseline",
-                        choices=["baseline", "2dgs", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_add", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d"],
+                        choices=["baseline", "2dgs", "cat", "cat_dropout", "adaptive", "adaptive_add", "adaptive_cat", "adaptive_zero", "adaptive_gate", "diffuse", "specular", "diffuse_ngp", "diffuse_offset", "hybrid_SH", "hybrid_SH_raw", "hybrid_SH_post", "residual_hybrid", "3D", "3D_direct", "3D_direct_fused", "3D_direct_lean", "3D_direct_fp16", "3D_direct_TC", "3D_SH_TC", "3D_SH_res", "3D_SH_res_sep", "3D_SH_add", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep"],
                         help="Rendering method: 'baseline' (default NeST), 'cat' (hybrid per-Gaussian + hashgrid), 'cat_dropout' (cat with hash dropout during training - use --dropout_lambda), 'adaptive' (learnable per-Gaussian blend), 'adaptive_add' (weighted sum of per-Gaussian and hashgrid features), 'adaptive_cat' (cat with learnable binary blend weights - trains smooth, infers binary), 'adaptive_zero' (cat with weighted hash vs zeros - w=0 skips hash query), 'adaptive_gate' (VQ-AD style gating: soft→STE→hard, L1 regularization toward zeros), 'diffuse' (SH degree 0, no viewdir), 'specular' (full 2DGS with SH), 'diffuse_ngp' (diffuse SH + hashgrid on unprojected depth), 'diffuse_offset' (diffuse SH as xyz offset for hashgrid query), 'hybrid_SH' (activate separately then add: SH→RGB+0.5+clamp + hashgrid→sigmoid, then add+clamp), 'hybrid_SH_raw' (add raw then activate: SH→raw + hashgrid→raw, then sigmoid), 'hybrid_SH_post' (DEPRECATED), 'residual_hybrid' (per-Gaussian SH RGB + hashgrid MLP residual), '3D' (intersection-based SH rendering), '3D_direct' (intersection-based RGB MLP), or '3D_direct_fused' (fused in-kernel MLP, no intersection buffer)")
     parser.add_argument("--hybrid_levels", type=int, default=5,
                         help="Number of coarse levels to replace with per-Gaussian features (cat mode only)")
@@ -4981,6 +5053,16 @@ if __name__ == "__main__":
                         help="Regularization weight for adaptive mode to encourage per-Gaussian features")
     parser.add_argument("--freeze_mlp", action="store_true",
                         help="Freeze MLP weights (random init or from --freeze_mlp_from). Only hashgrid learns. Skips MLP weight gradient computation in CUDA.")
+    parser.add_argument("--ste", action="store_true",
+                        help="SIGN-AWARE straight-through estimator on the per-Gauss outer ReLU "
+                             "(mode 0 / 3D_SH_res + mixed[_3d]). At clamped pixels (pre ≤ 0), "
+                             "gradient is allowed to flow ONLY when dL/dpixel < 0 — i.e. loss "
+                             "wants the channel HIGHER, so pushing the residual up will release "
+                             "the clamp and reduce loss. When dL/dpixel ≥ 0 at a clamped pixel, "
+                             "gradient would just push residual deeper negative (forward stays "
+                             "clamped, loss unchanged), so it's gated to zero. This avoids the "
+                             "deep-negative-runaway divergence of naive STE. Forward unchanged. "
+                             "Default off.")
     parser.add_argument("--freeze_hash_iter", type=int, default=0,
                         help="Start periodic hash+MLP freeze at this iteration. 0 = never "
                              "freeze (default). Once active, the 3D_SH_res backward skips all "
@@ -5250,6 +5332,25 @@ if __name__ == "__main__":
                              "primitives, overriding --kernel for that half. Unset → untextured use "
                              "--kernel (current behavior). E.g. `--kernel beta_scaled --kernel2 gaussian` "
                              "→ textured = 2D beta_scaled surfels, untextured = Gaussian EWA ellipsoids.")
+    parser.add_argument("--l2", action="store_true",
+                        help="`--method mixed_3d[_sep]` only: per-GAUSS photometric-loss routing in the "
+                             "rasterizer backward. One forward pass; the kernel returns two image-output "
+                             "slots (numerically identical, separate autograd nodes). Python wires "
+                             "L1+SSIM(image_tex, gt) to slot 0 and L2(image_untex, gt) to slot 1; the "
+                             "backward receives two upstream image gradients and routes them per Gauss "
+                             "inside CUDA (textured Gauss accumulate from slot 0's grad, untextured "
+                             "from slot 1's grad). No double-render, no detach trickery. Hash weights "
+                             "and MLP only flow textured signal (they're never queried for untex). "
+                             "Pre-texsplit (no untextured rows) → all-textured kernel path → L2 leg "
+                             "contributes nothing → byte-identical to default L1+SSIM loss. "
+                             "Mutually exclusive with --l1.")
+    parser.add_argument("--l1", action="store_true",
+                        help="`--method mixed_3d[_sep]` only: same per-Gauss CUDA routing as --l2, but "
+                             "the untex leg uses L1 instead of L2 (textured Gauss still get L1+SSIM). "
+                             "Untex Gauss therefore receive a uniformly-scaled error signal rather than "
+                             "an error² that amplifies outliers — useful when the untex/EWA half is "
+                             "modelling smooth volumetric background where L2 over-penalises edges. "
+                             "Mutually exclusive with --l2.")
     parser.add_argument("--freeze_beta", type=float, default=None,
                         help="Freeze beta kernel shape to a fixed value (e.g., 3.0 for semisoft). Disables shape optimization.")
     parser.add_argument("--grads", type=str, default="vanilla",
@@ -5806,7 +5907,7 @@ if __name__ == "__main__":
     # is SH (no per-Gauss hash split), so users naturally think in terms of "how many
     # hash levels". Translate hash_levels → hybrid_levels for the rest of the pipeline.
     if args.hash_levels >= 0:
-        if args.method not in ("3D_SH_res", "3D_SH_cat"):
+        if args.method not in ("3D_SH_res", "3D_SH_res_sep", "3D_SH_cat"):
             raise ValueError(
                 f"--hash_levels is only supported with --method 3D_SH_res or 3D_SH_cat (got --method {args.method}). "
                 f"For other methods use --hybrid_levels."

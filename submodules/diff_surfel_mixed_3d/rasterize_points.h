@@ -92,6 +92,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const float tan_fovx,
 	const float tan_fovy,
 	const torch::Tensor& dL_dout_color,
+	// `--l2` (mixed_3d only): per-Gauss image-grad routing. Empty tensor → nullptr.
+	const torch::Tensor& dL_dout_color_untex,
 	const torch::Tensor& dL_dout_others,
 	const torch::Tensor& sh,
 	const int degree,
@@ -227,6 +229,9 @@ void SetActivationBiasCUDA(float sh_bias, float res_bias);
 //   0 = 3D_SH_res (default): color = ReLU(ReLU(SH+sh_bias) + residual + res_bias)
 //   1 = 3D_SH_add:           color = ReLU(SH+sh_bias) + ReLU(residual + res_bias)
 void SetResidualModeCUDA(int mode);
+
+// `--ste`: straight-through estimator on per-Gauss outer ReLU (mode 0).
+void SetSteReluCUDA(int v);
 
 // Set Nexels-style anti-aliasing params (hash-grid down-weighting)
 void SetAntiAliasCUDA(float factor, float focal);

@@ -327,6 +327,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const float tan_fovx,
 	const float tan_fovy,
 	const torch::Tensor& dL_dout_color,
+	// `--l2` (mixed_3d only): per-Gauss image-grad routing. Empty tensor →
+	// nullptr → every Gauss reads `dL_dout_color` (byte-identical to pre-flag).
+	const torch::Tensor& dL_dout_color_untex,
 	const torch::Tensor& dL_dout_others,
 	const torch::Tensor& sh,
 	const int degree,
@@ -510,6 +513,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
 	  dL_dout_color.contiguous().data<float>(),
+	  // `--l2` per-Gauss routing: pass nullptr for the empty-tensor default so
+	  // the kernel reverts to single-loss behavior.
+	  (dL_dout_color_untex.numel() > 0)
+		  ? dL_dout_color_untex.contiguous().data<float>()
+		  : nullptr,
 	  dL_dout_others.contiguous().data<float>(),
 	  dL_dfeatures.contiguous().data<float>(),
 	  dL_dmeans2D.contiguous().data<float>(),
@@ -904,6 +912,12 @@ void SetActivationBiasCUDA(float sh_bias, float res_bias) {
 void SetResidualModeCUDA(int mode) {
     FORWARD::setResidualMode(mode);
     BACKWARD::setResidualMode(mode);
+}
+
+// `--ste`: straight-through estimator on the per-Gauss outer ReLU.
+void SetSteReluCUDA(int v) {
+    FORWARD::setSteRelu(v);
+    BACKWARD::setSteRelu(v);
 }
 
 void SetAntiAliasCUDA(float factor, float focal) {

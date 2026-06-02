@@ -27,6 +27,13 @@ __device__ int d_count_thresh_bw = 0;
 __device__ float d_overdraw_lambda_bw = 0.0f;
 __device__ float d_weight_reg_lambda_bw = 0.0f;  // Weight-squared reg: -lambda * 2 * w * T per Gaussian
 __device__ float d_res_bias = 0.5f;  // Residual activation bias: ReLU(residual + d_res_bias)
+// d_ste_relu: straight-through estimator for the per-Gauss outer ReLU
+// (mode 0). When 1, the backward ignores the clamp gate — gradient passes
+// through as identity even at activations the forward clamped to zero. Lets
+// the MLP/hashgrid keep receiving signal at clamped pixels so it can learn
+// to emit residuals that don't blow past the SV-zero. Default 0 (off → exact
+// gradient). Inner SH ReLU is unaffected.
+__device__ int d_ste_relu = 0;
 // d_residual_mode: 0 = 3D_SH_res (stacked outer ReLU), 1 = 3D_SH_add (separate ReLUs).
 // Mirrors forward.cu — the backward gradient routing differs between the two modes.
 __device__ int d_residual_mode = 0;
@@ -1295,13 +1302,31 @@ renderCUDAsurfelBackward(
 					//                  (residual + res_bias > 0); SH path is
 					//                  ungated here (SH's inner ReLU lives
 					//                  upstream in preprocessCUDA).
+					//   2 (3D_SH_res_sep): signed residual, no per-Gauss ReLU.
+					//                  Both gates = 1.0; per-pixel ReLU's clamp
+					//                  is handled by the Python wrapper, so
+					//                  dL_dpixel already arrives correctly gated.
 					#pragma unroll
 					for (int o = 0; o < ORIG_OUTPUT_DIM; o++) {
 						float gate_res;
 						if (d_residual_mode == 1) {
 							gate_res = (my_residual[o] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						} else if (d_residual_mode == 2) {
+							gate_res = 1.0f;
 						} else {
-							gate_res = (sh_color[o] + my_residual[o] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+							// `--ste`: SIGN-AWARE straight-through on the outer
+							// ReLU. At clamped pixels (pre ≤ 0), gradient passes
+							// ONLY when dL/dpixel < 0 — i.e. the loss wants this
+							// channel HIGHER → pushing the residual up will
+							// eventually release the clamp and reduce loss.
+							// When dL/dpixel ≥ 0 at a clamped pixel, gradient
+							// would push pre even more negative for no loss
+							// improvement (forward stays clamped) and just drift
+							// parameters; gate it to 0. This eliminates the
+							// deep-negative-runaway pathology of naive STE.
+							gate_res = ((sh_color[o] + my_residual[o] + d_res_bias > 0.0f) ||
+							            (d_ste_relu && dL_dpixel[o] < 0.0f))
+							           ? 1.0f : 0.0f;
 						}
 						my_dL_dz3[o] = dL_dpixel[o] * w * gate_res;
 					}
@@ -1309,11 +1334,15 @@ renderCUDAsurfelBackward(
 
 					for (int ch = 0; ch < 3; ch++) {
 						float gate_sh;
-						if (d_residual_mode == 1) {
-							// SH always passes the outer activation in add mode.
+						if (d_residual_mode == 1 || d_residual_mode == 2) {
+							// SH always passes (mode 1: outer ReLU on residual only;
+							// mode 2: no per-Gauss ReLU; SH's inner ReLU is upstream).
 							gate_sh = 1.0f;
 						} else {
-							gate_sh = (sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+							// `--ste` sign-aware (see gate_res above).
+							gate_sh = ((sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ||
+							           (d_ste_relu && dL_dpixel[ch] < 0.0f))
+							          ? 1.0f : 0.0f;
 						}
 						acc_dL_dcolors[ch] += dL_dpixel[ch] * w * gate_sh;
 					}
@@ -1478,6 +1507,8 @@ renderCUDAsurfelBackward(
 						sh_color_recomp[ch] = RGB_TO_FLOAT(colors[global_id * 3 + ch]);
 						if (d_residual_mode == 1) {
 							feat[ch] = sh_color_recomp[ch] + fmaxf(0.0f, my_residual[ch] + d_res_bias);
+						} else if (d_residual_mode == 2) {
+							feat[ch] = sh_color_recomp[ch] + my_residual[ch] + d_res_bias;
 						} else {
 							feat[ch] = fmaxf(0.0f, sh_color_recomp[ch] + my_residual[ch] + d_res_bias);
 						}
@@ -2146,6 +2177,8 @@ renderCUDAsurfelBackward(
 
 				// d_residual_mode = 0: feat = ReLU( ReLU(SH+sh_bias) + residual + res_bias )
 				// d_residual_mode = 1: feat = ReLU(SH+sh_bias) + ReLU(residual + res_bias)
+				// d_residual_mode = 2: feat = ReLU(SH+sh_bias) + (residual + res_bias)
+				//                       [3D_SH_res_sep; per-pixel ReLU lives in Python]
 				// SH's own inner ReLU is handled upstream in preprocessCUDA (clamped[]).
 				float sh_color_bw[3];
 				for (int c = 0; c < 3; c++)
@@ -2158,8 +2191,19 @@ renderCUDAsurfelBackward(
 					if (d_residual_mode == 1) {
 						gate_res = (residual[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
 						gate_sh = 1.0f;
+					} else if (d_residual_mode == 2) {
+						// 3D_SH_res_sep: no per-Gauss ReLU; both gates open.
+						gate_res = 1.0f;
+						gate_sh = 1.0f;
 					} else {
-						float g = (sh_color_bw[c] + residual[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						// `--ste` sign-aware: STE pass only when loss wants this
+						// channel HIGHER at the clamped pixel (dL_dchannels < 0
+						// → release-clamp direction). See MODE-5 site for full
+						// explanation. dL_dchannels[c] is the per-channel pixel
+						// gradient in scope here.
+						float g = ((sh_color_bw[c] + residual[c] + d_res_bias > 0.0f) ||
+						           (d_ste_relu && dL_dchannels[c] < 0.0f))
+						          ? 1.0f : 0.0f;
 						gate_res = g;
 						gate_sh = g;
 					}
@@ -2282,6 +2326,8 @@ renderCUDAsurfelBackward(
 					float sh_c = RGB_TO_FLOAT(colors[global_id * 3 + ch]);
 					if (d_residual_mode == 1)
 						feat[ch] = sh_c + fmaxf(0.0f, residual[ch] + d_res_bias);
+					else if (d_residual_mode == 2)
+						feat[ch] = sh_c + residual[ch] + d_res_bias;
 					else
 						feat[ch] = fmaxf(0.0f, sh_c + residual[ch] + d_res_bias);
 				}
@@ -2365,7 +2411,10 @@ renderCUDAsurfelBackward(
 						gate_res = (residual_6[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
 						gate_sh = 1.0f;
 					} else {
-						float g = (sh_color_bw_6[c] + residual_6[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						// `--ste` sign-aware: see case-5 site above.
+						float g = ((sh_color_bw_6[c] + residual_6[c] + d_res_bias > 0.0f) ||
+						           (d_ste_relu && dL_dchannels[c] < 0.0f))
+						          ? 1.0f : 0.0f;
 						gate_res = g;
 						gate_sh = g;
 					}
@@ -3221,6 +3270,12 @@ void BACKWARD::setResBias(float val) {
 __global__ void setResidualModeBwKernel(int v) { d_residual_mode = v; }
 void BACKWARD::setResidualMode(int mode) {
 	setResidualModeBwKernel<<<1, 1>>>(mode);
+}
+
+// `--ste`: straight-through estimator on the outer ReLU (mode 0 only).
+__global__ void setSteReluBwKernel(int v) { d_ste_relu = v; }
+void BACKWARD::setSteRelu(int v) {
+	setSteReluBwKernel<<<1, 1>>>(v);
 }
 
 __global__ void setAaKernelSizeBwKernel(float val) { d_aa_kernel_size = val; }

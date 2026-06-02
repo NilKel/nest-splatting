@@ -73,6 +73,8 @@ Goal: bake the MLP residual into static per-Gaussian SH textures for fast infere
 
 **4090 benchmarking**: see [`docs/BENCH_4090.md`](../../docs/BENCH_4090.md) — full procedure to bench a baked model on `neel@10.176.128.69` (SSH key installed). Pipeline: `build_bench_bundle.py` locally → `rsync` to `~/nest-bench/bundles/<name>/` → `ssh ... bash -c '. miniforge3/.../conda.sh && conda activate bench && python bench_minimal.py ...'`. Returns PSNR/SSIM/LPIPS/FPS JSON. Uses cuda.Event timing (GPU-throughput).
 
+**Video → 3DGS training dataset**: see [`docs/VIDEO_TO_SPLAT_PIPELINE.md`](../../docs/VIDEO_TO_SPLAT_PIPELINE.md) — one-shot wrapper `scripts/video_to_dataset.sh <video> <out> [fps]` that runs ffmpeg + COLMAP (via `/home/nilkel/Projects/video-3d-reconstruction-gsplat/colmap_undistorted_sfm_export.sh`) and restructures output into the nest-splatting `--source` layout (`images/`, `images_2/`, `images_4/`, `sparse/0/`). Defaults to CPU SIFT (`--disable_gpu`) since GPU SIFT needs an OpenGL context — set `USE_GPU=1` under `xvfb-run` or with `$DISPLAY` to opt in. Idempotent (each stage skips if its output exists). Sequential matcher (right for video; switch to `--exhaustive` inside the wrapper for unordered photo sets).
+
 **Sherlock cluster (paper-scale A100 runs)**: see [`docs/SHERLOCK_CLUSTER.md`](../../docs/SHERLOCK_CLUSTER.md) — `z0051beu@sherlock01.ainet.local` (institution-internal — VPN required). SLURM scheduler with job arrays; partition `a100-4gpu-40gb`, account `rctcd82061`. Filesystem convention: bulk lives in `~/userdir/` (conda + projects + data), with `~/userdir/Projects/<repo>` mirroring local layout and `~/userdir/Projects/data/<dataset>/` for inputs. Modules: `gcc/13.2.0`, `cuda12.1/toolkit/12.1.0` (A100 sm_80 — do NOT clone 5090's cu128 env, rebuild CUDA extensions against the cluster's CUDA 12.1). Canonical SLURM template: `../beta-splatting/slurm_benchmark_mip360.sh`. Common auth failure mode (VSCode → password prompt loop) and recovery procedure documented in § 1.
 
 **Pipeline**:
@@ -203,6 +205,44 @@ Goal: bake the MLP residual into static per-Gaussian SH textures for fast infere
     `α = min(.99, opa·exp(−0.5·m))`. SV/SH baseline color (no hash/MLP/Tu/Tv/Tw).
     Verified vs analytic fields to FP16-rgb noise: Gaussian rel ~0.02%,
     beta_scaled max|Δ|~1.7e-4 with compact support confirmed (0 beyond 3σ).
+- **`--l2`** / **`--l1`** (mutually exclusive) — `mixed_3d[_sep]` only:
+  **per-Gauss** photometric-loss routing in the rasterizer backward. *Not*
+  per-pixel attribution. The rasterizer Function returns two image-output
+  slots (numerically identical, separate autograd nodes); Python wires
+  `(1-λ_dssim)·L1(slot_0, gt) + λ_dssim·(1-SSIM(slot_0, gt))` to slot 0
+  (`image_tex`) and the untex loss to slot 1 (`image_untex`):
+  `--l2` → `mean((slot_1 - gt)²)`, `--l1` → `mean(|slot_1 - gt|)`. `--l1`
+  is the right choice when the untex/EWA half is modelling smooth
+  volumetric background where L2 over-penalises edges.
+  The Function's backward receives two upstream image gradients and the
+  CUDA kernel routes them per Gauss inside `renderCUDAsurfelBackward`:
+  textured Gauss accumulate `dL/dxyz`, `dL/dscale`, `dL/dopacity`, `dL/dfeat`
+  using `dL_dpixels` (slot 0's grad); untextured Gauss accumulate using
+  `dL_dpixels_untex` (slot 1's grad). One forward, one backward — no
+  double-render, no detach trickery, no per-pixel `max_contrib_idx`
+  attribution. Mechanism (CUDA, in-place mode):
+  - Kernel signature gains an optional `const float* dL_dpixels_untex`
+    threaded through `BACKWARD::render` → `Rasterizer::backward` →
+    `RasterizeGaussiansBackwardCUDA`. Empty tensor at the binding → nullptr
+    in CUDA → kernel reverts to single-loss behavior (byte-identical to
+    pre-flag).
+  - At the per-pixel load, both `dL_dpixel_tex[C]` and `dL_dpixel_untex[C]`
+    are populated (untex mirrors tex when the second array is null).
+  - After `tex_j`/`tex_bw` is read per Gauss in the inner loop (both std and
+    MODE-5 collab paths), a local `const float* const dL_dpixel = tex_j ? dL_dpixel_tex : dL_dpixel_untex;`
+    shadows the outer arrays. All downstream `dL_dpixel[ch]` references
+    resolve to the routed pointer without any further code changes.
+  - Python detects the no-L2 case by checking `grad_out_color_untex.abs().sum() == 0`
+    (PyTorch passes a zeros tensor for unused autograd outputs, not None),
+    and passes an empty tensor → nullptr to bypass routing.
+  - Hash weights and MLP only flow textured signal (they're never queried
+    for untextured Gauss in the existing kernel branches). Geometry that
+    affects the alpha cascade (xyz/scale/rot/opacity) receives the routed
+    per-Gauss image gradient at every pixel where that Gauss contributed.
+  Pre-`--texsplit` (no untextured rows) → kernel's all-textured fast path →
+  L2 leg contributes nothing → byte-identical to default L1+SSIM loss.
+  Fails loudly at setup if paired with a non-mixed_3d method.
+
 - **`--kernel2 <kernel>`** — `mixed_3d` only: overrides `--kernel` for the
   UNTEXTURED (EWA) half *only*; the textured half always uses `--kernel`.
   Unset ⇒ untextured use `--kernel` (byte-identical to before). Canonical use:

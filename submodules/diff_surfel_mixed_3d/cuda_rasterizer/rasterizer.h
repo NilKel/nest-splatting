@@ -120,6 +120,9 @@ namespace CudaRasterizer
 			char* binning_buffer,
 			char* image_buffer,
 			const float* dL_dpix,
+			// `--l2` (mixed_3d only): per-Gauss image-grad routing. nullptr →
+			// every Gauss uses `dL_dpix` (byte-identical to pre-flag).
+			const float* dL_dpix_untex,
 			const float* dL_depths,
 			float* dL_dfeatures,
 			float* dL_dmean2D,

@@ -375,6 +375,58 @@ def clear_atlas_bc7():
     _C.clear_atlas_bc7()
 
 
+def set_atlas_rvq(codebooks_fp16, indices_u8, surfel_offsets_i64,
+                  block_size=4, atlas_scale=1.0, atlas_offset=0.0):
+    """Install an RVQ-decoded atlas. The render kernel will do an L-stage
+    codebook lookup at each atlas-sample site instead of tex2D / FP16-gather.
+
+    Args:
+        codebooks_fp16: [L, K, B*B*3] FP16 — L codebooks of K codewords each;
+                        each codeword is a flat B×B RGB block.
+        indices_u8:     [L, N_used] uint8 — surfel-major (block_id =
+                        surfel_offsets[g] + bv·(w/B) + bu).
+        surfel_offsets_i64: [N_gauss + 1] int64 cumulative used-block count.
+        block_size:     pixels per side (default 4 = BC7-native).
+        atlas_scale, atlas_offset: dequant params for the uint8-RGBA
+            2D codebook texture (used when set_atlas_rvq_use_tex_cb(True)).
+            Pass the SAME values used by the atlas itself.
+
+    All tensors must be CUDA + contiguous. K must fit in uint8 (≤ 256).
+    Call clear_atlas_rvq() to revert to BC7/uint8 path."""
+    _C.set_atlas_rvq(codebooks_fp16, indices_u8, surfel_offsets_i64,
+                     int(block_size), float(atlas_scale), float(atlas_offset))
+
+
+def clear_atlas_rvq():
+    _C.clear_atlas_rvq()
+
+
+def set_atlas_rvq_bilinear(val=True):
+    """Toggle RVQ atlas sampling between 4-tap bilinear (True, default) and
+    nearest (False). Nearest is ~4× fewer codebook reads but loses ~2 dB
+    atlas fidelity vs bilinear."""
+    _C.set_atlas_rvq_bilinear(bool(val))
+
+
+def set_atlas_rvq_use_shared_cb(val=True):
+    """Load the codebook into __shared__ at kernel start instead of reading
+    from global. Faster per-fragment codebook reads, may reduce occupancy
+    due to higher shared-memory pressure. Must be called AFTER set_atlas_rvq()."""
+    _C.set_atlas_rvq_use_shared_cb(bool(val))
+
+
+def set_atlas_rvq_use_tex_cb(val=True):
+    """Read RVQ codebook via cudaTextureObject (separate read-only cache, hw
+    FP16→FP32 conversion). Toggle is sticky across renders."""
+    _C.set_atlas_rvq_use_tex_cb(bool(val))
+
+
+def set_atlas_rvq_use_tex_idx(val=True):
+    """Read RVQ indices via cudaTextureObject (separate cache, useful when
+    the 56-MB index stream evicts L2)."""
+    _C.set_atlas_rvq_use_tex_idx(bool(val))
+
+
 def set_use_atlas_tex_object(val=True):
     _C.set_use_atlas_tex_object(bool(val))
 

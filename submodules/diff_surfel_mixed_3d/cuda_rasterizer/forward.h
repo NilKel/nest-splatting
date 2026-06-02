@@ -142,6 +142,8 @@ namespace FORWARD
 	// 0 = 3D_SH_res (stacked: ReLU(ReLU(SH+bias)+residual+bias), default).
 	// 1 = 3D_SH_add (separate: ReLU(SH+bias) + ReLU(residual+bias)).
 	void setResidualMode(int mode);
+	// `--ste`: straight-through estimator on the per-Gauss outer ReLU.
+	void setSteRelu(int v);
 
 	// Set Nexels-style anti-aliasing params for hash-grid down-weighting.
 	// factor=0 disables AA. Typical factor=1.0, focal=max(fx,fy).

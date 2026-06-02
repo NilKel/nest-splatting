@@ -27,6 +27,10 @@ __device__ int d_count_thresh_bw = 0;
 __device__ float d_overdraw_lambda_bw = 0.0f;
 __device__ float d_weight_reg_lambda_bw = 0.0f;  // Weight-squared reg: -lambda * 2 * w * T per Gaussian
 __device__ float d_res_bias = 0.5f;  // Residual activation bias: ReLU(residual + d_res_bias)
+// d_ste_relu: straight-through estimator on the per-Gauss outer ReLU
+// (mode 0). When 1, backward bypasses the clamp gate → gradient passes as
+// identity even at clamped activations. Default 0 = exact gradient.
+__device__ int d_ste_relu = 0;
 // d_residual_mode: 0 = 3D_SH_res (stacked outer ReLU), 1 = 3D_SH_add (separate ReLUs).
 // Mirrors forward.cu — the backward gradient routing differs between the two modes.
 __device__ int d_residual_mode = 0;
@@ -428,7 +432,16 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
-	float dL_dpixel[C];
+	// Dead-code declarations kept in sync with renderCUDAsurfelBackward to
+	// match the renamed load loop above. renderCUDA itself is not launched.
+	float dL_dpixel_tex[C];
+	float dL_dpixel_untex[C];
+	// Alias so the unused renderCUDA body (which still references `dL_dpixel`)
+	// compiles. Resolves to the tex array — no semantic change for dead code.
+	float* const dL_dpixel = dL_dpixel_tex;
+	// `--l2` is not plumbed into the unused kernel; pinning to nullptr makes the
+	// shared load loop's `dL_dpixels_untex != nullptr` check fold to false.
+	const float* const dL_dpixels_untex = nullptr;
 
 #if RENDER_AXUTILITY
 	float dL_dreg;
@@ -460,19 +473,28 @@ renderCUDA(
 	const float final_D = inside ? final_Ts[pix_id + H * W] : 0;
 	const float final_D2 = inside ? final_Ts[pix_id + 2 * H * W] : 0;
 	const float final_A = 1 - T_final;
-	// `--method mixed_3d`: T_tex (textured-only transmittance) is stored by
-	// the forward in slot 3. final_A_tex excludes EWA occlusion → used in the
-	// textured dist-gradient sites below so untex Gaussians don't bias the
-	// dL_dweight / dL_dmd reduction. For non-mixed runs (no untex) T_tex == T
-	// so final_A_tex == final_A and the substitution is a no-op.
-	const float T_tex_final = inside ? final_Ts[pix_id + 3 * H * W] : 1.0f;
-	const float final_A_tex = 1 - T_tex_final;
+	// `--method mixed_3d`: slot 3 holds A_tex — the explicit textured-only
+	// running sum of w_j = α_j · T_full_j (NOT 1 - T_tex). The 2DGS distortion
+	// identity L_dist = Σ w_i (m_i² A − 2 m_i M1 + M2) requires A, M1, M2 all
+	// to be partial sums over the same subset; for textured-only we must
+	// accumulate A explicitly because `1 - T_tex ≠ Σ_textured w` when EWA
+	// absorbers are interleaved (they scale subsequent w's via T_full but
+	// don't move T_tex). For non-mixed runs (no untex) A_tex telescopes to
+	// 1 - T, so this is a no-op there.
+	const float final_A_tex = inside ? final_Ts[pix_id + 3 * H * W] : 0.0f;
 	float last_dL_dT = 0;
 #endif
 
 	if (inside){
-		for (int i = 0; i < C; i++)
-			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+		for (int i = 0; i < C; i++) {
+			dL_dpixel_tex[i] = dL_dpixels[i * H * W + pix_id];
+			// When dL_dpixels_untex is unset (no --l2), mirror tex so the per-
+			// Gauss selector below resolves to the same array regardless of
+			// is_textured — kernel becomes byte-identical to pre-flag behavior.
+			dL_dpixel_untex[i] = (dL_dpixels_untex != nullptr)
+				? dL_dpixels_untex[i * H * W + pix_id]
+				: dL_dpixel_tex[i];
+		}
 	}
 
 	float last_alpha = 0;
@@ -716,6 +738,10 @@ renderCUDAsurfelBackward(
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	// `--l2` (mixed_3d only): per-Gauss image-grad routing — when non-null,
+	// untextured Gauss read this array instead of `dL_dpixels`. nullptr →
+	// every Gauss reads from `dL_dpixels` (byte-identical to pre-flag).
+	const float* __restrict__ dL_dpixels_untex,
 	const float* __restrict__ dL_depths,
 	float * __restrict__ dL_dfeatures,
 	float * __restrict__ dL_dtransMat,
@@ -829,9 +855,16 @@ renderCUDAsurfelBackward(
 	// Gaussian is known from each pixel from the forward.
 	uint32_t contributor = toDo;
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
-	
+
 	float accum_rec[C] = { 0 };
-	float dL_dpixel[C];
+	// `--l2` (mixed_3d only): per-Gauss image-gradient routing. Two upstream
+	// image gradients (one per loss); the per-Gauss `dL_dpixel` pointer set
+	// inside each inner-loop iteration picks tex- vs untex-grad array based on
+	// the Gauss's `is_textured` flag. When dL_dpixels_untex == nullptr (default,
+	// no --l2), `dL_dpixel_untex` is initialised from `dL_dpixels` too so the
+	// per-Gauss selector is a no-op — byte-identical to the pre-flag behavior.
+	float dL_dpixel_tex[C];
+	float dL_dpixel_untex[C];
 
 #if RENDER_AXUTILITY
 	float dL_dreg;
@@ -935,19 +968,28 @@ renderCUDAsurfelBackward(
 	const float final_D = inside ? final_Ts[pix_id + H * W] : 0;
 	const float final_D2 = inside ? final_Ts[pix_id + 2 * H * W] : 0;
 	const float final_A = 1 - T_final;
-	// `--method mixed_3d`: T_tex (textured-only transmittance) is stored by
-	// the forward in slot 3. final_A_tex excludes EWA occlusion → used in the
-	// textured dist-gradient sites below so untex Gaussians don't bias the
-	// dL_dweight / dL_dmd reduction. For non-mixed runs (no untex) T_tex == T
-	// so final_A_tex == final_A and the substitution is a no-op.
-	const float T_tex_final = inside ? final_Ts[pix_id + 3 * H * W] : 1.0f;
-	const float final_A_tex = 1 - T_tex_final;
+	// `--method mixed_3d`: slot 3 holds A_tex — the explicit textured-only
+	// running sum of w_j = α_j · T_full_j (NOT 1 - T_tex). The 2DGS distortion
+	// identity L_dist = Σ w_i (m_i² A − 2 m_i M1 + M2) requires A, M1, M2 all
+	// to be partial sums over the same subset; for textured-only we must
+	// accumulate A explicitly because `1 - T_tex ≠ Σ_textured w` when EWA
+	// absorbers are interleaved (they scale subsequent w's via T_full but
+	// don't move T_tex). For non-mixed runs (no untex) A_tex telescopes to
+	// 1 - T, so this is a no-op there.
+	const float final_A_tex = inside ? final_Ts[pix_id + 3 * H * W] : 0.0f;
 	float last_dL_dT = 0;
 #endif
 
 	if (inside){
-		for (int i = 0; i < C; i++)
-			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+		for (int i = 0; i < C; i++) {
+			dL_dpixel_tex[i] = dL_dpixels[i * H * W + pix_id];
+			// When dL_dpixels_untex is unset (no --l2), mirror tex so the per-
+			// Gauss selector below resolves to the same array regardless of
+			// is_textured — kernel becomes byte-identical to pre-flag behavior.
+			dL_dpixel_untex[i] = (dL_dpixels_untex != nullptr)
+				? dL_dpixels_untex[i * H * W + pix_id]
+				: dL_dpixel_tex[i];
+		}
 	}
 
 	float last_alpha = 0;
@@ -1144,6 +1186,12 @@ renderCUDAsurfelBackward(
 				// in the block since it's per-Gaussian, not per-pixel. Safe to branch
 				// on without breaking warp-uniformity of collective GEMMs.
 				const bool tex_j = collected_is_textured_bw[j];
+				// `--l2`: per-Gauss image-grad routing. When no L2 split is active,
+				// `dL_dpixel_untex` was mirrored from `dL_dpixel_tex` at load time, so
+				// this selector resolves to the same array for every Gauss →
+				// byte-identical to pre-flag behavior. Block-uniform branch (tex_j
+				// is per-Gauss, all threads in the block see the same value).
+				const float* const dL_dpixel = tex_j ? dL_dpixel_tex : dL_dpixel_untex;
 
 				// ============================================================
 				// `--method mixed_3d` — UNTEXTURED EWA backward, MODE-5 path.
@@ -1208,24 +1256,30 @@ renderCUDAsurfelBackward(
 						}
 #if RENDER_AXUTILITY
 						const float c_d = depths[gid_e];
-						const float m_d = far_n / (far_n - near_n) * (1 - near_n / c_d);
-						// `--method mixed_3d`: untextured EWA Gaussians skipped the
-						// distortion accumulation in the forward kernel — match here
-						// by leaving dL_dweight=0 (no dist gradient propagation).
-						// `last_dL_dT` still relaxes per (1-alpha_e) so subsequent
-						// textured contributors see the right running state.
+						// `--method mixed_3d`: EWA Gaussians are DETACHED from the
+						// normal-consistency loss (--lambda_normal / --w_normal).
+						// Forward keeps them in D (so surf_normal = depth_to_normal(D)
+						// sees the full depth) and in the recurrence state (so
+						// textured contributors get correct dL_dalpha via their own
+						// (c_d_tex - accum_depth_rec) terms), but EWA's own dL_dalpha
+						// does NOT pick up the depth/normal grads:
+						//   • skip dL_dalpha += (c_d - accum_depth_rec) * dL_ddepth
+						//   • skip dL_dalpha += (0 - accum_normal_rec) * dL_dnormal2D
+						// Distortion is already skipped (dL_dweight = 0). Color and
+						// mask (dL_dpixel / dL_daccum) grads still flow into EWA so
+						// it keeps being optimized for photometric + opacity tasks.
 						float dL_dweight = 0.0f;
 						dL_dalpha += dL_dweight - last_dL_dT;
 						last_dL_dT = dL_dweight * alpha_e + (1 - alpha_e) * last_dL_dT;
 						accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
 						last_depth = c_d;
-						dL_dalpha += (c_d - accum_depth_rec) * dL_ddepth;
+						// EWA detached from depth loss (see comment above).
 						accum_alpha_rec = last_alpha * 1.0 + (1.f - last_alpha) * accum_alpha_rec;
 						dL_dalpha += (1 - accum_alpha_rec) * dL_daccum;
 						for (int ch = 0; ch < 3; ch++) {
 							accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
 							last_normal[ch] = 0.0f;
-							dL_dalpha += (0.0f - accum_normal_rec[ch]) * dL_dnormal2D[ch];
+							// EWA detached from normal loss (see comment above).
 						}
 #endif
 						dL_dalpha *= T;
@@ -1480,7 +1534,15 @@ renderCUDAsurfelBackward(
 						} else if (d_residual_mode == 2) {
 							gate_res = 1.0f;
 						} else {
-							gate_res = (sh_color[o] + my_residual[o] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+							// `--ste`: SIGN-AWARE STE on the outer ReLU. Gradient
+							// passes at clamped pixels ONLY when dL/dpixel < 0
+							// (i.e. loss wants channel HIGHER → release-clamp
+							// direction). Eliminates the deep-negative runaway
+							// of naive STE. See diff_surfel_3D_sh_res for the
+							// full reasoning.
+							gate_res = ((sh_color[o] + my_residual[o] + d_res_bias > 0.0f) ||
+							            (d_ste_relu && dL_dpixel[o] < 0.0f))
+							           ? 1.0f : 0.0f;
 						}
 						my_dL_dz3[o] = dL_dpixel[o] * w * gate_res;
 					}
@@ -1493,7 +1555,10 @@ renderCUDAsurfelBackward(
 							// mode 2: no ReLU; SH's inner ReLU is upstream).
 							gate_sh = 1.0f;
 						} else {
-							gate_sh = (sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+							// `--ste` sign-aware (see gate_res above).
+							gate_sh = ((sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ||
+							           (d_ste_relu && dL_dpixel[ch] < 0.0f))
+							          ? 1.0f : 0.0f;
 						}
 						acc_dL_dcolors[ch] += dL_dpixel[ch] * w * gate_sh;
 					}
@@ -2056,6 +2121,9 @@ const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A_tex - final_D) * dL_dre
 			// geometry as textured/2DGS. They differ ONLY in the color path
 			// (skip hash/MLP — gated below). The splat shape IS rho3d.
 			const bool tex_bw = collected_is_textured_bw[j];
+			// `--l2`: per-Gauss image-grad routing — see MODE-5 site above for
+			// the rationale and the no-op behavior when --l2 is inactive.
+			const float* const dL_dpixel = tex_bw ? dL_dpixel_tex : dL_dpixel_untex;
 
 			// ============================================================
 			// `--method mixed_3d` — UNTEXTURED EWA 3D-ellipsoid backward.
@@ -2121,29 +2189,35 @@ const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A_tex - final_D) * dL_dre
 
 #if RENDER_AXUTILITY
 				const float c_d = depths[gid_e];          // camera-space z (forward used this)
-				const float m_d = far_n / (far_n - near_n) * (1 - near_n / c_d);
-				// `--method mixed_3d`: untextured EWA does NOT contribute to forward
-				// distortion → no gradient from dL_dreg here. Keep the last_dL_dT
-				// recurrence so the running state stays consistent for subsequent
-				// textured contributors that still receive dist grad.
+				// `--method mixed_3d`: EWA Gaussians are DETACHED from the
+				// normal-consistency loss (--lambda_normal / --w_normal).
+				// Forward keeps them in D (so surf_normal = depth_to_normal(D)
+				// sees the full depth) and in the recurrence state (so textured
+				// contributors get correct dL_dalpha via their own
+				// (c_d_tex - accum_depth_rec) terms), but EWA's own dL_dalpha
+				// does NOT pick up the depth/normal grads:
+				//   • skip dL_dalpha += (c_d - accum_depth_rec) * dL_ddepth
+				//   • skip dL_dalpha += (0 - accum_normal_rec) * dL_dnormal2D
+				// Distortion is already skipped (dL_dweight = 0). Color and
+				// mask (dL_dpixel / dL_daccum) grads still flow into EWA so
+				// it keeps being optimized for photometric + opacity tasks.
 				float dL_dweight = 0.0f;
 				dL_dalpha += dL_dweight - last_dL_dT;
 				last_dL_dT = dL_dweight * alpha_e + (1 - alpha_e) * last_dL_dT;
 
 				accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
 				last_depth = c_d;
-				dL_dalpha += (c_d - accum_depth_rec) * dL_ddepth;
+				// EWA detached from depth loss (see comment above).
 
 				accum_alpha_rec = last_alpha * 1.0 + (1.f - last_alpha) * accum_alpha_rec;
 				dL_dalpha += (1 - accum_alpha_rec) * dL_daccum;
 
 				// untextured surfel normal ≡ 0 (forward set N += 0). Advance the
-				// recurrence state so textured neighbours stay consistent; the
-				// untextured row contributes (0 - accum_normal_rec)·dL_dnormal2D.
+				// recurrence state so textured neighbours stay consistent; EWA
+				// detached from normal loss (no dL_dalpha contribution here).
 				for (int ch = 0; ch < 3; ch++) {
 					accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
 					last_normal[ch] = 0.0f;
-					dL_dalpha += (0.0f - accum_normal_rec[ch]) * dL_dnormal2D[ch];
 				}
 #endif
 
@@ -2543,7 +2617,12 @@ const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A_tex - final_D) * dL_dre
 						gate_res = 1.0f;
 						gate_sh = 1.0f;
 					} else {
-						float g = (sh_color_bw[c] + residual[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						// `--ste` sign-aware: STE pass only when loss wants this
+						// channel HIGHER at the clamped pixel (dL_dchannels < 0
+						// → release-clamp direction).
+						float g = ((sh_color_bw[c] + residual[c] + d_res_bias > 0.0f) ||
+						           (d_ste_relu && dL_dchannels[c] < 0.0f))
+						          ? 1.0f : 0.0f;
 						gate_res = g;
 						gate_sh = g;
 					}
@@ -2751,7 +2830,10 @@ const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A_tex - final_D) * dL_dre
 						gate_res = (residual_6[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
 						gate_sh = 1.0f;
 					} else {
-						float g = (sh_color_bw_6[c] + residual_6[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						// `--ste` sign-aware: see case-5 site above.
+						float g = ((sh_color_bw_6[c] + residual_6[c] + d_res_bias > 0.0f) ||
+						           (d_ste_relu && dL_dchannels[c] < 0.0f))
+						          ? 1.0f : 0.0f;
 						gate_res = g;
 						gate_sh = g;
 					}
@@ -3811,6 +3893,12 @@ void BACKWARD::setResidualMode(int mode) {
 	setResidualModeBwKernel<<<1, 1>>>(mode);
 }
 
+// `--ste`: straight-through estimator on the per-Gauss outer ReLU (mode 0 only).
+__global__ void setSteReluBwKernel(int v) { d_ste_relu = v; }
+void BACKWARD::setSteRelu(int v) {
+	setSteReluBwKernel<<<1, 1>>>(v);
+}
+
 __global__ void setAaKernelSizeBwKernel(float val) { d_aa_kernel_size = val; }
 void BACKWARD::setAaKernelSize(float val) {
 	setAaKernelSizeBwKernel<<<1, 1>>>(val);
@@ -3910,6 +3998,7 @@ void BACKWARD::render(
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const float* dL_dpixels_untex,
 	const float* dL_depths,
 	float* dL_dfeatures,
 	float * dL_dtransMat,
@@ -4026,7 +4115,7 @@ void BACKWARD::render(
 	renderCUDAsurfelBackward<3, 0> <<<grid, block, smem_size>>>(
 			ranges, point_list, beta, W, H, level, l_dim, l_scale, Base, align_corners, interp, if_contract, scales, focal_x, focal_y, other_maps, out_index, bg_color,
 			means2D, normal_opacity, transMats, homotrans, ap_level, hash_features, level_offsets, gridrange, colors, depths, final_Ts, n_contrib,
-			dL_dpixels, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
+			dL_dpixels, dL_dpixels_untex, dL_depths, dL_dfeatures, dL_dtransMat, dL_dhomoMat, dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors, dL_gradsum, cam_pos,
 			hash_features_diffuse, level_offsets_diffuse, gridrange_diffuse, dL_dfeatures_diffuse, adjusted_render_mode, shapes, kernel_type, dL_dshapes, detach_hash_grad,
 			dL_dmlp_W1, dL_dmlp_W2, dL_dmlp_W3,
 			mlp_W1_ptr, mlp_W2_ptr, mlp_W3_ptr,

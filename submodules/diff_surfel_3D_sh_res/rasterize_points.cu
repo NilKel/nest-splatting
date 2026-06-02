@@ -878,6 +878,12 @@ void SetResidualModeCUDA(int mode) {
     BACKWARD::setResidualMode(mode);
 }
 
+// `--ste`: straight-through estimator on the per-Gauss outer ReLU.
+void SetSteReluCUDA(int v) {
+    FORWARD::setSteRelu(v);
+    BACKWARD::setSteRelu(v);
+}
+
 void SetAntiAliasCUDA(float factor, float focal) {
     FORWARD::setAntiAlias(factor, focal);
 }

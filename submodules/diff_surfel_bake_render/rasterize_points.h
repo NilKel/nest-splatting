@@ -74,6 +74,22 @@ void SetUntexKernelBakeCUDA(int v);
 void SetAtlasBC7CUDA(torch::Tensor bc7_bytes, int W, int H, float offset, float scale);
 void ClearAtlasBC7CUDA();
 
+// RVQ atlas — codebooks + surfel-major indices + per-surfel cumulative
+// block-offset. After this, render kernel does L-stage codebook decode
+// at each atlas-sample site. Call SetAtlasRVQCUDA with empty tensors or
+// ClearAtlasRVQCUDA() to revert.
+void SetAtlasRVQCUDA(torch::Tensor codebooks_fp16,
+                     torch::Tensor indices_u8,
+                     torch::Tensor surfel_offsets_i64,
+                     int B,
+                     float atlas_scale,
+                     float atlas_offset);
+void ClearAtlasRVQCUDA();
+void SetAtlasRVQBilinearCUDA(bool val);
+void SetAtlasRVQUseSharedCBCUDA(bool val);
+void SetAtlasRVQUseTexCBCUDA(bool val);
+void SetAtlasRVQUseTexIdxCUDA(bool val);
+
 // Frees the cached cudaArrays + cudaTextureObjects for all atlases seen so far.
 void ClearAtlasCacheCUDA();
 

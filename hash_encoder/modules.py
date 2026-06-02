@@ -91,7 +91,7 @@ class INGP(nn.Module):
         # Store args for 3D_SH_res mode (per-Gaussian SH + tiny hash MLP residual, diff_surfel_3D_sh_res)
         # `--method mixed` is treated as 3D_SH_res at the INGP level (same hashgrid + MLP architecture).
         # The mixed-specific behavior (per-Gauss textured/untextured split) lives in the renderer + train loop.
-        self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method in ("3D_SH_res", "mixed", "mixed_3d")
+        self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method in ("3D_SH_res", "3D_SH_res_sep", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep")
         # `--method mixed[_3d]`: textured/untextured manifold split. INGP-level
         # behavior is identical to 3D_SH_res; the split lives in renderer + train.
         # is_mixed_mode covers BOTH variants (shared color/relu/grad plumbing);
@@ -104,7 +104,18 @@ class INGP(nn.Module):
         # now use mode 0 (per-Gauss outer ReLU, same as 3D_SH_res). Gate the
         # renderer's post-blend torch.relu on this flag so the no-op isn't
         # applied for mode-0 mixed runs.
-        self.is_mixed_deferred_relu_mode = args is not None and hasattr(args, 'method') and args.method in ("mixed_sep", "mixed_3d_sep")
+        # Per-pixel ReLU after blend (in Python). True for any "_sep" variant:
+        # the per-Gauss outer ReLU is replaced by a single per-pixel clamp.
+        # Includes `3D_SH_res_sep` — non-mixed homogeneous variant that just
+        # swaps the activation site (per-Gauss → per-pixel) without any
+        # textured/untextured split or EWA.
+        self.is_mixed_deferred_relu_mode = args is not None and hasattr(args, 'method') and args.method in ("mixed_sep", "mixed_3d_sep", "3D_SH_res_sep")
+        # `--ste`: sign-aware straight-through ReLU. In mode 0 it gates the
+        # per-Gauss outer ReLU's backward (CUDA-side d_ste_relu); in mode 2
+        # (mixed_*_sep) it switches the renderer's post-blend torch.relu →
+        # STERelu (gaussian_renderer/__init__.py). Flag is read at the
+        # renderer's per-pixel clamp site and at CUDA setup in train.py.
+        self.is_ste_relu = args is not None and hasattr(args, 'ste') and args.ste
         # Store args for 3D_SH_cat mode (per-Gaussian SH + hash+DC MLP residual, diff_surfel_3D_sh_res)
         self.is_3D_SH_cat_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_cat"
         # Store args for 3D_SH_32 mode (per-Gaussian SH + 32-dim hash MLP residual, diff_surfel_3D_sh_32)

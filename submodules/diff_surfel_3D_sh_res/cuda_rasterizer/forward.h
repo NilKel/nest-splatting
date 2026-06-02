@@ -132,6 +132,11 @@ namespace FORWARD
 	// 1 = 3D_SH_add (separate: ReLU(SH+bias) + ReLU(residual+bias)).
 	void setResidualMode(int mode);
 
+	// `--ste`: straight-through estimator on the per-Gauss outer ReLU
+	// (mode 0 only). When v=1, backward bypasses the clamp gate so the
+	// MLP/hashgrid keeps receiving gradient at clamped activations. Default 0.
+	void setSteRelu(int v);
+
 	// Set Nexels-style anti-aliasing params for hash-grid down-weighting.
 	// factor=0 disables AA. Typical factor=1.0, focal=max(fx,fy).
 	void setAntiAlias(float factor, float focal);

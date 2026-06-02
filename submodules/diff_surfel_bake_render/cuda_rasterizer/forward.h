@@ -106,6 +106,32 @@ namespace FORWARD
 	void setResidualMode(int mode);
 	// `--method mixed_3d --kernel2`: untextured-EWA kernel override (-1 = unset).
 	void setUntexKernel(int v);
+
+	// RVQ atlas decode: install codebooks + surfel-major indices + per-surfel
+	// block-offset cumulative count. When set, the render kernel does an
+	// L-stage codebook lookup at each fragment instead of tex2D / FP16-gather.
+	// Pass nullptrs or call clearAtlasRVQ() to revert to the BC7/FP16 path.
+	void setAtlasRVQ(const __half* codebooks, const uint8_t* indices,
+	                 const int64_t* surfel_offsets,
+	                 int L, int K, int B, unsigned long long N_used);
+	void clearAtlasRVQ();
+	// 1 = 4-tap bilinear (default), 0 = nearest (~4× fewer codebook reads).
+	void setAtlasRVQBilinear(int v);
+	// 1 = load codebook to dynamic __shared__ at kernel start (faster reads,
+	// reduces occupancy if codebook is big). Caller must also set the
+	// per-launch dynamic-shared byte count via setAtlasRVQSharedBytes.
+	void setAtlasRVQUseSharedCB(int v);
+	// Opt-in to > 48 KB dynamic shared for the render kernel. Returns true
+	// on success, false if the device doesn't support `bytes` shared/block.
+	bool optInRVQShared(int bytes);
+	// Install codebook + indices texture objects + bool toggles for whether
+	// to use the texture or fall back to global. Tex object handles are
+	// owned by the caller (rasterize_points.cu).
+	void setAtlasRVQTex(cudaTextureObject_t cb, cudaTextureObject_t idx,
+	                    int use_cb, int use_idx);
+	// Dequant params for the uint8 codebook texture. Codewords share the
+	// atlas's atlas_scale/atlas_offset (same float space).
+	void setAtlasRVQCBDequant(float scale, float offset);
 }
 
 #endif

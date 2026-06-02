@@ -218,6 +218,10 @@ void SetActivationBiasCUDA(float sh_bias, float res_bias);
 //   1 = 3D_SH_add:           color = ReLU(SH+sh_bias) + ReLU(residual + res_bias)
 void SetResidualModeCUDA(int mode);
 
+// `--ste`: straight-through estimator on per-Gauss outer ReLU (mode 0).
+// 1 = backward bypasses the clamp gate; 0 = exact gradient (default).
+void SetSteReluCUDA(int v);
+
 // Set Nexels-style anti-aliasing params (hash-grid down-weighting)
 void SetAntiAliasCUDA(float factor, float focal);
 

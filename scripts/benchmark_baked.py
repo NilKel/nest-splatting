@@ -92,7 +92,8 @@ def quat_to_rotcols(quats):
 # ---------------------------------------------------------------------------
 # Adaptive resolution
 # ---------------------------------------------------------------------------
-def compute_adaptive_resolution(scales, cell_size, uv_extent=4.0, max_res=64, min_res=4):
+def compute_adaptive_resolution(scales, cell_size, uv_extent=4.0, max_res=64, min_res=4,
+                                 large_gauss_cap=None):
     """Per-axis Nyquist resolution: each surfel gets (res_x, res_y) where each
     axis is sized by its own scale (not the larger axis). Saves atlas texels on
     anisotropic surfels (edges, hair) without losing fidelity.
@@ -101,12 +102,29 @@ def compute_adaptive_resolution(scales, cell_size, uv_extent=4.0, max_res=64, mi
     NOTE: This is the *encoding-Nyquist* path — each surfel sized to capture
     the finest hashgrid spatial frequency. See `compute_view_aware_resolution`
     for the *viewing-Nyquist* alternative, which is typically much smaller.
+
+    `large_gauss_cap` (int, optional): scale-aware lite cap. Surfels whose
+    natural per-axis res WOULD have been clamped at `max_res` (the visually-
+    large blobs whose footprint covers many screen pixels) get clamped at
+    `large_gauss_cap` instead. Each affected axis shrinks by `(cap/max_res)`
+    linearly → `(cap/max_res)²` area, on the rects that dominate the atlas.
+    Leaves the small / detail-carrying surfels at their natural res. Use for
+    a real "lite" tier that targets the biggest bytes, not a blunt global
+    `--max_res` halving.
     """
     # scales is [N, 2] for 2DGS surfels — column 0 = sx, column 1 = sy.
     n_cells = 2.0 * uv_extent * scales / cell_size           # [N, 2]
     nyquist_samples = 2.0 * n_cells                          # [N, 2]
     log2_res = torch.ceil(torch.log2(nyquist_samples.clamp(min=1.0)))
     resolutions = (2.0 ** log2_res).int()
+    if large_gauss_cap is not None and large_gauss_cap < max_res:
+        # Per-axis: an axis is "saturated" (naturally exceeds max_res) iff its
+        # uncapped resolution > max_res. Saturated axes get the tighter cap;
+        # unsaturated axes are unchanged. Keeps small surfels at full fidelity
+        # while squeezing the 64×64 blob bucket that dominates the atlas.
+        saturated = resolutions > max_res                       # [N, 2] bool
+        cap_t = torch.full_like(resolutions, int(large_gauss_cap))
+        resolutions = torch.where(saturated, cap_t, resolutions)
     return resolutions.clamp(min=min_res, max=max_res)       # [N, 2]
 
 
@@ -352,7 +370,8 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
                importance_render_args=None,
                budget_mode="uniform",
                importance_for_budget=None,
-               bake_dtype="fp16"):
+               bake_dtype="fp16",
+               large_gauss_cap=None):
     """Bake hash MLP residual into a CPU-resident atlas. Returns (atlas_cpu, atlas_rects, meta).
 
     Resolution selection:
@@ -464,7 +483,8 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
     # resolutions is [N, 2] = (res_x, res_y).
     res_hash = compute_adaptive_resolution(
         gaussians.get_scaling, cell_size, uv_extent=uv_extent,
-        max_res=max_res, min_res=min_res)
+        max_res=max_res, min_res=min_res,
+        large_gauss_cap=large_gauss_cap)
     if view_aware:
         if train_cameras is None:
             raise RuntimeError("--view_aware_res requires train_cameras to be passed.")
@@ -1049,6 +1069,13 @@ def main():
     parser.add_argument("--uv_extent", type=float, default=4.0)
     parser.add_argument("--max_res", type=int, default=128)
     parser.add_argument("--min_res", type=int, default=4)
+    parser.add_argument("--large_gauss_cap", type=int, default=-1,
+                        help="Scale-aware lite cap: any per-axis rect that "
+                             "would have been clamped at --max_res gets "
+                             "clamped at this value instead. Leaves the "
+                             "small/detail-carrying surfels at full res; "
+                             "only squeezes the visually-large blobs that "
+                             "dominate the atlas. -1 ⇒ disabled.")
     parser.add_argument("--atlas_width", type=int, default=4096)
     parser.add_argument("--atlas_budget_mb", type=int, default=2048,
                         help="Max atlas size in MB (FP16). Resolutions auto-shrink to fit.")
@@ -1057,6 +1084,26 @@ def main():
     parser.add_argument("--num_benchmark", type=int, default=100)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--skip_bake", action="store_true", help="Skip baking, use existing atlas")
+    parser.add_argument("--rvq", action="store_true",
+                        help="Use the RVQ atlas decoder. Loads "
+                             "vq/{codebooks,indices,block_meta}.pt from the "
+                             "bake_dir and installs via set_atlas_rvq() — the "
+                             "render kernel does per-fragment codebook decode "
+                             "instead of tex2D / BC7.")
+    parser.add_argument("--rvq_nearest", action="store_true",
+                        help="With --rvq, sample with nearest neighbour "
+                             "(~4× fewer codebook reads, ~−2 dB atlas PSNR).")
+    parser.add_argument("--rvq_shared_cb", action="store_true",
+                        help="With --rvq, load codebook into __shared__ at "
+                             "kernel start (faster lookup, lower occupancy).")
+    parser.add_argument("--rvq_tex_cb", action="store_true",
+                        help="With --rvq, read codebook via cudaTextureObject.")
+    parser.add_argument("--rvq_tex_idx", action="store_true",
+                        help="With --rvq, read indices via cudaTextureObject.")
+    parser.add_argument("--bply", type=str, default=None,
+                        help="Optional: path to a .bply (compressed PLY). "
+                             "Decompressed to a temp .ply before rendering. "
+                             "Use to bench the 'RVQply' combo (8-bit PLY + RVQ atlas).")
     parser.add_argument("--aabb_mode", type=int, default=3,
                         help="AABB mode: 0=square, 1=square+AdR, 2=rect, 3=rect+AdR (default: 3)")
     parser.add_argument("--sort_mode", type=int, default=0,
@@ -1227,7 +1274,8 @@ def main():
             skip_texture_thresh=bargs.bake_skip_texture_thresh,
             importance_render_args=importance_render_args,
             budget_mode=bargs.bake_budget_mode,
-            bake_dtype=bargs.bake_dtype)
+            bake_dtype=bargs.bake_dtype,
+            large_gauss_cap=(bargs.large_gauss_cap if bargs.large_gauss_cap > 0 else None))
         bake_meta["iteration"] = iteration
         bake_meta["kernel"] = getattr(args, 'kernel', 'gaussian')
         # `--method mixed_3d --kernel2`: untextured-EWA kernel override (None ⇒
@@ -1372,6 +1420,19 @@ def main():
 
     gaussians = GaussianModel(dataset.sh_degree)
     baked_ply = os.path.join(output_dir, "baked.ply")
+    # --bply: decompress the 8-bit .bply into a temp .ply, use that instead.
+    if bargs.bply is not None:
+        rt_ply = os.path.join(output_dir, "baked_bply_roundtrip.ply")
+        if not os.path.exists(rt_ply) or os.path.getmtime(bargs.bply) > os.path.getmtime(rt_ply):
+            import subprocess
+            print(f"[BPLY] decompressing {bargs.bply} → {rt_ply}")
+            subprocess.run([
+                sys.executable,
+                os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "decompress_baked_bply.py"),
+                "--input", bargs.bply, "--output", rt_ply,
+            ], check=True)
+        baked_ply = rt_ply
     gaussians.load_ply(baked_ply)
     gaussians.active_sh_degree = 3
     gaussians.base_opacity = cfg.surfel.tg_base_alpha
@@ -1403,10 +1464,31 @@ def main():
         with open(meta_path) as f:
             bake_meta_render = json.load(f)
 
+    # RVQ path: install codebooks + indices, skip BC7 entirely. Takes
+    # precedence when --rvq is set.
+    if bargs.rvq:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from bench_rvq_render_lib import install_rvq_atlas
+        from diff_surfel_bake_render import (set_atlas_rvq_bilinear,
+                                              set_atlas_rvq_use_shared_cb,
+                                              set_atlas_rvq_use_tex_cb,
+                                              set_atlas_rvq_use_tex_idx)
+        install_rvq_atlas(output_dir, device='cuda')
+        set_atlas_rvq_bilinear(not bargs.rvq_nearest)
+        set_atlas_rvq_use_shared_cb(bargs.rvq_shared_cb)
+        set_atlas_rvq_use_tex_cb(bargs.rvq_tex_cb)
+        set_atlas_rvq_use_tex_idx(bargs.rvq_tex_idx)
+        print(f"[RENDER] RVQ sampling: "
+              f"{'nearest' if bargs.rvq_nearest else 'bilinear'}, "
+              f"shared_cb={'on' if bargs.rvq_shared_cb else 'off'}, "
+              f"tex_cb={'on' if bargs.rvq_tex_cb else 'off'}, "
+              f"tex_idx={'on' if bargs.rvq_tex_idx else 'off'}")
+        # Placeholder atlas tensor (kernel ignores it when RVQ is installed).
+        atlas_tex = torch.zeros(1, 1, 3, dtype=torch.float16, device='cuda')
+        bc7_file = None
     # BC7 fast path: when bake produced a `.bc7` file, install it on the
     # device and skip the FP16/uint8 atlas upload entirely.
-    bc7_file = bake_meta_render.get("atlas_bc7_file")
-    if bc7_file is not None:
+    elif (bc7_file := bake_meta_render.get("atlas_bc7_file")) is not None:
         bc7_path = os.path.join(output_dir, bc7_file)
         with open(bc7_path, "rb") as f:
             bc7_bytes = f.read()

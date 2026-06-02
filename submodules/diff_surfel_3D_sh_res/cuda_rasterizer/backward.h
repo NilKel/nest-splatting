@@ -84,6 +84,10 @@ namespace BACKWARD
 	void setResBias(float val);
 	// 0 = 3D_SH_res (stacked outer ReLU), 1 = 3D_SH_add (separate ReLUs).
 	void setResidualMode(int mode);
+	// `--ste`: straight-through estimator on the per-Gauss outer ReLU.
+	// 1 = backward bypasses the clamp gate (gradient = 1 even at clamped
+	// activations); 0 = exact gradient (default).
+	void setSteRelu(int v);
 	void setAaKernelSize(float val);
 	// Periodic-freeze flag: when true, the mode 5 backward skips all
 	// hash/MLP gradient work (weight-grad GEMMs, input-chain backprop,

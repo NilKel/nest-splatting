@@ -51,6 +51,9 @@ __device__ float d_weight_reg_lambda = 0.0f;
 // Default: sh_bias=0.5, res_bias=0.5 (standard 3DGS gray init + residual offset)
 // For decomposition: sh_only sets res_bias=-999 (ReLU clamps to 0), tex_only sets sh_bias=-999
 __device__ int d_residual_mode = 0;
+// `--ste`: straight-through estimator on the outer per-Gauss ReLU. Only the
+// backward consumes this; mirrored here for setter symmetry.
+__device__ int d_ste_relu_fwd = 0;
 __device__ float d_sh_bias = 0.5f;
 // Nexels-style anti-aliasing d_aa_factor / d_aa_focal are now declared in hashgrid.h
 // (per-TU static __device__). Setters below update this TU's copy.
@@ -1384,13 +1387,14 @@ renderCUDAsurfelForward(
 
 	// Initialize helper variables
 	float T = 1.0f;
-	// `--method mixed_3d`: T_tex is a parallel transmittance over textured
-	// contributors only. The dist regulariser uses A_tex = 1 - T_tex so the
-	// alpha-coupling sees just the textured beta-surfel layer (no EWA
-	// occlusion). The untex EWA branch leaves T_tex untouched; the textured
-	// 2DGS branch multiplies it by (1 - alpha) alongside T. Persisted to
-	// final_T slot 3 for the backward to read.
-	float T_tex = 1.0f;
+	// `--method mixed_3d`: A_tex is the explicit running sum of textured
+	// weights w_j = alpha_j * T_full_j (so the 2DGS distortion identity
+	// L_dist = Σ w_i (m_i² A − 2 m_i M1 + M2) holds with A, M1, M2 all
+	// summed over the same textured subset). Initialised to 0 here; the
+	// EWA branch never touches it; the textured branch accumulates inside
+	// the distortion block alongside M1/M2. Persisted to final_T slot 3
+	// for the backward to read directly (no 1 − x flip).
+	float A_tex = 0.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
@@ -1865,15 +1869,13 @@ renderCUDAsurfelForward(
 				if (w_e > max_w) { max_w = w_e; max_depth = depth_e; max_idx = gid_e; }
 				{
 					// `--method mixed_3d`: untextured EWA Gaussians do NOT contribute to
-					// the per-pixel depth-distortion accumulator (distortion, M1, M2).
-					// This keeps the --lambda_dist / --w_dist loss strictly textured-
-					// only at the gradient level — `rend_dist` is built from textured
-					// surfels alone, so its backward only sends gradients to textured
-					// rows. The two backward EWA branches (MODE-5 + std) likewise skip
-					// the dL_dweight += (...) * dL_dreg term in symmetric fashion.
-					// Depth accumulator D and median_depth still get the untex
-					// contribution because expected/median depth maps need full
-					// visibility for downstream consumers (TSDF mesh extraction, etc.).
+					// the per-pixel depth-distortion accumulator (distortion, M1, M2,
+					// A_tex). Distortion stays tex-only at the gradient level — the
+					// backward EWA branches mirror by leaving dL_dweight=0.
+					// Depth accumulator D and median_depth DO get the EWA contribution
+					// because the depth-derived normal (used by --lambda_normal) needs
+					// the full rendered depth, and downstream consumers (TSDF mesh
+					// extraction) also expect the full-visibility depth map.
 					D  += depth_e * w_e;
 					if (T > 0.5f) { median_depth = depth_e; median_contributor = contributor; }
 					// untextured 3D ellipsoid: no 2DGS surfel normal → 0 normal contribution
@@ -2098,14 +2100,16 @@ renderCUDAsurfelForward(
 
 			// Render depth distortion map
 			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
-			// `--method mixed_3d`: A uses T_tex (textured-only transmittance) so
-			// untextured EWA occlusion is excluded from the dist alpha-coupling.
-			// M1/M2 are already textured-only (we skipped their EWA updates in
-			// the EWA branch).
-			float A = 1 - T_tex;
+			// `--method mixed_3d`: A_tex is the explicit textured-only running
+			// sum of w (NOT 1 - T_tex). With interleaved EWA absorbers, the
+			// identity 1 - Π(1-α) = Σ α·T only holds when every absorber in the
+			// chain contributes to A; since EWA Gaussians DON'T contribute, we
+			// must track A_tex by explicit accumulation to keep the distortion
+			// identity self-consistent across A, M1, M2 (all over textured subset).
 			float m = far_n / (far_n - near_n) * (1 - near_n / depth);
-			distortion += (m * m * A + M2 - 2 * m * M1) * w;
+			distortion += (m * m * A_tex + M2 - 2 * m * M1) * w;
 			D  += depth * w;
+			A_tex += w;
 			M1 += m * w;
 			M2 += m * m * w;
 
@@ -2586,10 +2590,8 @@ renderCUDAsurfelForward(
 			}
 
 			T = test_T;
-			// `--method mixed_3d`: T_tex is the textured-only transmittance. Only
-			// updated here (textured 2DGS branch); the untex EWA branch above
-			// leaves it untouched.
-			T_tex *= (1.0f - alpha);
+			// A_tex (textured-only weight sum) was already incremented inside the
+			// distortion block above — no per-alpha update needed here.
 
 			// Keep track of last range entry to update this pixel.
 			last_contributor = contributor;
@@ -2618,10 +2620,11 @@ renderCUDAsurfelForward(
 		n_contrib[pix_id + H * W] = median_contributor;
 		final_T[pix_id + H * W] = M1;
 		final_T[pix_id + 2 * H * W] = M2;
-		// `--method mixed_3d`: slot 3 = T_tex (textured-only transmittance).
-		// Backward reads it as final_T_tex and uses final_A_tex = 1 - final_T_tex
-		// in the textured dist-gradient sites.
-		final_T[pix_id + 3 * H * W] = T_tex;
+		// `--method mixed_3d`: slot 3 = A_tex (textured-only running weight sum).
+		// Backward reads it directly as final_A_tex (no 1 − x flip) for the
+		// textured dist-gradient sites. See A_tex comment at top of kernel for
+		// why this differs from 1 - T_tex when EWA absorbers are interleaved.
+		final_T[pix_id + 3 * H * W] = A_tex;
 		out_others[pix_id + DEPTH_OFFSET * H * W] = D;
 		out_others[pix_id + ALPHA_OFFSET * H * W] = 1 - T;
 		for (int ch=0; ch<3; ch++) out_others[pix_id + (NORMAL_OFFSET+ch) * H * W] = N[ch];
@@ -2729,6 +2732,12 @@ void FORWARD::setActivationBias(float sh_bias, float res_bias) {
 __global__ void setResidualModeFwdKernel(int v) { d_residual_mode = v; }
 void FORWARD::setResidualMode(int mode) {
 	setResidualModeFwdKernel<<<1, 1>>>(mode);
+}
+
+// `--ste`: straight-through estimator on the per-Gauss outer ReLU.
+__global__ void setSteReluFwdKernel(int v) { d_ste_relu_fwd = v; }
+void FORWARD::setSteRelu(int v) {
+	setSteReluFwdKernel<<<1, 1>>>(v);
 }
 
 // Set anti-aliasing params (Nexels-style hash-grid down-weighting)

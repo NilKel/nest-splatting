@@ -106,6 +106,40 @@ import time
 from utils.general_utils import MEM_PRINT
 
 
+class STERelu(torch.autograd.Function):
+    """`--ste`: SIGN-AWARE straight-through ReLU for `--method mixed[_3d]_sep`.
+
+    Forward: standard ReLU (identical to `torch.relu`).
+
+    Backward: gradient passes where
+      - `x > 0`  (the normal "non-clamped" case), OR
+      - `x ≤ 0` AND `grad_out < 0`  (loss wants this pixel HIGHER → pushing
+        the residual up will release the clamp and reduce loss).
+
+    The asymmetric gate eliminates the "wasted gradient pushing parameters
+    deeper negative at clamped pixels" pathology of naive STE — at a clamped
+    pixel where `grad_out ≥ 0` the gate is 0, since pushing residual further
+    negative wouldn't change the forward (still clamped) but would drift
+    parameters with no loss feedback.
+
+    Used in mode 2 (`mixed_sep` / `mixed_3d_sep`) where the per-pixel ReLU
+    after blend is what's killing gradient. Mode-0's per-Gauss STE has a
+    parallel CUDA-side implementation (`d_ste_relu` in backward.cu).
+    """
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return torch.relu(x)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (x,) = ctx.saved_tensors
+        # Pass where forward was unclamped (x > 0), OR at clamped pixels where
+        # the gradient would push toward release (grad_out < 0).
+        gate = (x > 0) | (grad_out < 0)
+        return grad_out * gate.to(grad_out.dtype)
+
+
 # --feature beta: spherical-beta directional color function.
 # Per-Gaussian view-dependent RGB:
 #     C(v) = sum_i softplus(rgb_i) * max(0, dot(mu_i, v))^(4 * exp(beta))
@@ -1880,7 +1914,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     accum_weights_buf = None
     max_contrib_idx = None
     metric_counts = None
-    if len(rasterizer_output) == 10:
+    # `--l2` (mixed_3d only): the rasterizer surfaces a second image-output
+    # slot (`rendered_image_untex`) — a clone of `rendered_image` but a
+    # separate autograd node so the backward can receive two upstream image
+    # gradients (one per loss) and route per-Gauss inside CUDA.
+    rendered_image_untex = None
+    if len(rasterizer_output) == 11:
+        rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer, max_contrib_idx, metric_counts, rendered_image_untex = rasterizer_output
+    elif len(rasterizer_output) == 10:
         rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer, max_contrib_idx, metric_counts = rasterizer_output
     elif len(rasterizer_output) == 9:
         rendered_image, radii, allmap, transmittance_avg, num_covered_pixels, intersection_buffer, intersection_count, geomBuffer, max_contrib_idx = rasterizer_output
@@ -1917,8 +1958,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # use mode 0 (per-Gauss outer ReLU before the blend) — the blended pixel is
     # already non-negative, so the relu would be a no-op and is skipped to
     # match 3D_SH_res byte-for-byte.
+    # `--ste`: when enabled AND in deferred-clamp mode, use sign-aware
+    # straight-through ReLU instead of the plain torch.relu — gradient also
+    # flows at clamped pixels where grad_out < 0 (release-clamp direction),
+    # rescuing the "many texture queries miss gradient at clamped pixels" case.
     if ingp is not None and getattr(ingp, 'is_mixed_deferred_relu_mode', False):
-        rendered_image = torch.relu(rendered_image)
+        if getattr(ingp, 'is_ste_relu', False):
+            rendered_image = STERelu.apply(rendered_image)
+        else:
+            rendered_image = torch.relu(rendered_image)
 
     # 3D mode: Process intersection buffer through PyTorch pipeline
     # Recompute xyz from s_x,s_y → hash encode → gather features → MLP → SH → blend → eval
@@ -2585,6 +2633,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             # pixels (metric_map==1) this Gaussian contributed to above alpha=1/255.
             # Only populated by diff_surfel_3D_sh_res when metric_map was provided.
             'metric_counts': metric_counts,
+            # `--l2` (mixed_3d): second image output (clone of `render`, separate
+            # autograd node). Wire L2(image_untex, gt) here so the rasterizer's
+            # backward receives two upstream image gradients and routes them
+            # per-Gauss inside CUDA (textured Gauss → L1+SSIM grad, untextured
+            # → L2 grad). None when --l2 is off or when not using mixed_3d.
+            'render_untex': rendered_image_untex,
     })
     
     # Add diffuse_ngp mode separate RGB outputs

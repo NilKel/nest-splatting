@@ -31,6 +31,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_activation_bias", &SetActivationBiasCUDA);
   m.def("set_residual_mode", &SetResidualModeCUDA,
         "0 = 3D_SH_res outer ReLU (default). 1 = 3D_SH_add separate ReLUs.");
+  m.def("set_ste_relu", &SetSteReluCUDA,
+        "`--ste`: straight-through estimator on the per-Gauss outer ReLU "
+        "(mode 0). 1 = backward identity even at clamped activations. "
+        "0 = exact gradient (default).");
   m.def("set_anti_alias", &SetAntiAliasCUDA);
   m.def("set_compact_mult", &SetCompactMultCUDA);
   m.def("set_aa_kernel_size", &SetAaKernelSizeCUDA);
