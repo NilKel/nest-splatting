@@ -223,6 +223,9 @@ void SetActivationBiasCUDA(float sh_bias, float res_bias);
 //   1 = 3D_SH_add:           color = ReLU(SH+sh_bias) + ReLU(residual + res_bias)
 void SetResidualModeCUDA(int mode);
 
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss activation (mode 0).
+void SetLruSlopeCUDA(float v);
+
 // Set Nexels-style anti-aliasing params (hash-grid down-weighting)
 void SetAntiAliasCUDA(float factor, float focal);
 

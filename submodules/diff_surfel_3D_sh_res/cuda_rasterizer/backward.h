@@ -88,6 +88,18 @@ namespace BACKWARD
 	// 1 = backward bypasses the clamp gate (gradient = 1 even at clamped
 	// activations); 0 = exact gradient (default).
 	void setSteRelu(int v);
+
+	// `--detach_res_shape_grad`: when 1, the per-Gauss alpha/shape gradient is
+	// driven by the SV (SH base) color only — the MLP residual is detached from
+	// the shape gradient. Forward unchanged. 0 = default (residual in shape grad).
+	void setDetachResShapeGrad(int v);
+
+	// `--lru`: leaky-ReLU slope α for the outer per-Gauss ReLU (mode 0 only).
+	// α == 0 (default) reduces to standard ReLU. α > 0 lets negative
+	// activations contribute scaled-by-α gradient — non-zero feedback at
+	// clamped sites without the deep-negative runaway risk of naive STE.
+	void setLruSlope(float v);
+
 	void setAaKernelSize(float val);
 	// Periodic-freeze flag: when true, the mode 5 backward skips all
 	// hash/MLP gradient work (weight-grad GEMMs, input-chain backprop,

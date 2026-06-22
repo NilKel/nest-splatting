@@ -47,7 +47,10 @@ Usage:
 
 import argparse
 import json
+import math
 import struct
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -56,12 +59,21 @@ import torch
 
 KERNEL_MAP = {"gaussian": 0, "beta": 1, "flex": 2, "general": 3, "beta_scaled": 4}
 
-ATLAS_FORMAT_FP16_RGB   = 0
-ATLAS_FORMAT_UINT8_RGBA = 1
-ATLAS_FORMAT_BC7        = 2
-ATLAS_FORMAT_RVQ        = 4   # post-hoc RVQ codebook + indices (decoded → uint8 atlas)
-ATLAS_FORMAT_RVQ_PAIRED = 5   # paired-RVQ (L=4 → L=2, K²=65536), uint8 codebook 2D texture
-                              # — direct fragment-shader decode, no atlas reconstruction
+ATLAS_FORMAT_FP16_RGB       = 0
+ATLAS_FORMAT_UINT8_RGBA     = 1
+ATLAS_FORMAT_BC7            = 2
+ATLAS_FORMAT_RVQ            = 4   # post-hoc RVQ codebook + indices (decoded → uint8 atlas)
+ATLAS_FORMAT_RVQ_PAIRED     = 5   # paired-RVQ (L=4 → L=2, K²=65536), uint8 codebook 2D texture
+                                  # — direct fragment-shader decode, no atlas reconstruction
+ATLAS_FORMAT_RVQ_PAIRED_BC7 = 6   # paired-RVQ with BC7-compressed codebook texture
+                                  # (typeB). Saves ~6 MB of GPU mem on codebook and lets the
+                                  # mobile hw decode unit handle the per-fragment dequant.
+ATLAS_FORMAT_BC7_CODEBOOK   = 7   # BC7 atlas, but the atlas is stored on disk as a small
+                                  # codebook of unique BC7 blocks (K codewords, 16 B each)
+                                  # + per-block uint16 index (typeD). Loader gathers the
+                                  # full BC7 byte stream at load time; renderer is then
+                                  # bit-identical to the raw BC7 path (1 hw bilinear /
+                                  # fragment). Lossy due to K-means but small download.
 
 # texture_2d_array layer height for BC7 atlases. Capped at 8192 because
 # Android Adreno/Mali typically expose max_texture_dimension_2d=8192 to WebGPU,
@@ -102,6 +114,48 @@ def _load_meta(meta_path: Path):
         "atlas_bc7_padded_h": int(meta.get("atlas_bc7_padded_h", 0)),
         "atlas_bc7_padded_w": int(meta.get("atlas_bc7_padded_w", 0)),
     }
+
+
+# Mobile / WebGPU baseline maxTextureDimension2D. Atlases wider than this need
+# column sharding (the loader splits the BC7 byte stream into
+# n_cols × n_layers slices of a texture_2d_array).
+MAX_COL_W_BC7 = 8192
+
+
+def _find_column_cuts(rects_np, atlas_w, max_col_w=MAX_COL_W_BC7, align=4):
+    """Width-axis analog of `_find_layer_cuts`. Returns [0, c_1, …, atlas_w]
+    such that no rect spans a cut, each (cuts[i+1] - cuts[i]) ≤ max_col_w,
+    and cuts are 4-aligned. Raises if no safe cut exists.
+
+    A "safe" cut at X means no rect has u0 < X < u0+w — i.e. every rect lies
+    fully inside one column. Atlas packers typically leave gaps along x at
+    row boundaries (rects packed within rows), so cuts exist for most bakes;
+    a tightly-packed atlas with no gaps would have to be re-baked.
+    """
+    import bisect
+    if atlas_w <= max_col_w:
+        return [0, int(atlas_w)]
+
+    opens  = sorted(rects_np[:, 0].astype(int).tolist())
+    closes = sorted((rects_np[:, 0] + rects_np[:, 2]).astype(int).tolist())
+
+    def is_safe(X):
+        return bisect.bisect_left(opens, X) == bisect.bisect_right(closes, X)
+
+    cuts = [0]
+    while cuts[-1] + max_col_w < atlas_w:
+        target = ((cuts[-1] + max_col_w) // align) * align
+        X = target
+        while X > cuts[-1] and not is_safe(X):
+            X -= align
+        if X <= cuts[-1]:
+            raise RuntimeError(
+                f"No safe column cut between {cuts[-1]} and {target} "
+                f"(re-bake with packer that limits atlas_width ≤ {max_col_w})."
+            )
+        cuts.append(int(X))
+    cuts.append(int(atlas_w))
+    return cuts
 
 
 def _find_layer_cuts(rects_np, atlas_h, max_layer_h=LAYER_H_BC7, align=4):
@@ -310,7 +364,8 @@ def _reorder_indices_surfel_major(indices_row_major: np.ndarray,
 
 def _export_rvq_paired(baked: Path, output_path: str | None, kernel_type: int,
                         meta: dict, atlas_rects_np: np.ndarray, N: int,
-                        legacy_natl: bool) -> None:
+                        legacy_natl: bool, bc7_codebook: bool = False,
+                        vq_subdir: str = "vq") -> None:
     """Paired-RVQ path — collapses L=4 RVQ stages into L=2 pair codebooks
     (K²=65536 entries each, K=256). Emits NAT2 atlas_format=5 with a uint8
     2D codebook image and surfel-major uint32 packed indices. The viewer
@@ -342,7 +397,7 @@ def _export_rvq_paired(baked: Path, output_path: str | None, kernel_type: int,
     if legacy_natl:
         raise SystemExit("--legacy-natl is FP16 RGB only; not compatible with RVQ paired.")
 
-    vq_dir = baked / "vq"
+    vq_dir = baked / vq_subdir
     cb_path = vq_dir / "codebooks.pt"
     ix_path = vq_dir / "indices.pt"
     bm_path = vq_dir / "block_meta.pt"
@@ -356,9 +411,15 @@ def _export_rvq_paired(baked: Path, output_path: str | None, kernel_type: int,
 
     L, K, D = codebooks.shape
     B = int(block_meta["block"])
-    if L != 4 or B != 4:
-        raise SystemExit(f"paired-RVQ requires L=4, B=4 (got L={L}, B={B}). "
+    if L != 4:
+        raise SystemExit(f"paired-RVQ requires L=4 (got L={L}). "
                          "Re-bake VQ with the canonical config.")
+    # B used to be hardcoded at 4; typeC (and any other variant) just needs
+    # B to be a multiple of 4 so the BC7 block grid (when bc7_codebook=True)
+    # aligns with the codeword tile grid.
+    if bc7_codebook and B % 4 != 0:
+        raise SystemExit(f"--rvq-paired-bc7 requires B % 4 == 0 (got B={B}); BC7's 4×4 "
+                         "block grid must align with codeword-tile boundaries.")
     if D != B * B * 3:
         raise SystemExit(f"codebook dim {D} != block_size²·3 = {B*B*3}")
     n_used_blocks = int(block_meta["n_used_blocks"])
@@ -433,13 +494,36 @@ def _export_rvq_paired(baked: Path, output_path: str | None, kernel_type: int,
     if output_path is None:
         output_path = str(baked / "scene.nat2")
 
+    # ---- Codebook bytes ----
+    # Default: uint8 RGBA (typeA). With bc7_codebook=True: BC7-compress the
+    # codebook image (typeB) — same 1024×2048 4-aligned grid that the typeA
+    # codebook uses, so BC7's 4×4-block boundaries land exactly on codeword
+    # boundaries. Saves ~6 MB of GPU memory (8 MB → 2 MB) and lets the
+    # hardware decompression unit handle the per-fragment dequant.
+    if bc7_codebook:
+        import bc7encoder
+        # bc7encoder expects HxWx4 uint8 RGBA. pair_image_rgba is already in
+        # that shape (alpha unused / zero). uber_level=1 = fast preset.
+        cb_image_bytes = bc7encoder.encode_image_rgba(
+            pair_image_rgba, uber_level=1, perceptual=False)
+        codebook_format = ATLAS_FORMAT_RVQ_PAIRED_BC7
+        # Sanity: BC7 = 16 bytes per 4×4 block. Wp × Hp / 16 * 16.
+        expected_cb_bytes = (Wp // 4) * (Hp // 4) * 16
+        if len(cb_image_bytes) != expected_cb_bytes:
+            raise SystemExit(
+                f"BC7 codebook size {len(cb_image_bytes)} != expected "
+                f"{expected_cb_bytes} for {Wp}×{Hp}")
+    else:
+        cb_image_bytes = pair_image_rgba.tobytes()
+        codebook_format = ATLAS_FORMAT_RVQ_PAIRED
+
     # NAT2 top-level header. layer_h and atlas dims kept for parser
     # consistency (rects carry global v0; layer_cuts split them into local).
     # n_layers is set to layer_cuts.size-1 just like the BC7 path.
     header = struct.pack(
         "<IIIIIfIIfffIffII",
         W, H, 4, kernel_type,
-        N, meta["uv_extent"], sb_number, ATLAS_FORMAT_RVQ_PAIRED,
+        N, meta["uv_extent"], sb_number, codebook_format,
         meta["sh_bias"], meta["res_bias"], meta["compact_mult"], LAYER_H_BC7,
         meta["atlas_scale"], meta["atlas_offset"], n_layers, 0,
     )
@@ -459,7 +543,6 @@ def _export_rvq_paired(baked: Path, output_path: str | None, kernel_type: int,
     pair_dequant_bytes = pair_scale.tobytes() + pair_offset.tobytes()  # 16 B
     assert len(pair_dequant_bytes) == 16
 
-    cb_image_bytes = pair_image_rgba.tobytes()
     packed_bytes   = packed.astype(np.uint32).tobytes()
     offsets_bytes  = surfel_offsets.astype(np.uint32).tobytes()
 
@@ -476,13 +559,204 @@ def _export_rvq_paired(baked: Path, output_path: str | None, kernel_type: int,
         f.write(sb_bytes)
 
     size_mb = Path(output_path).stat().st_size / 1e6
-    print(f"[NAT2 RVQ-PAIRED] {W}x{H}, {n_layers} layers, {N} rects, "
+    cb_kind = "BC7" if bc7_codebook else "rgba8"
+    print(f"[NAT2 RVQ-PAIRED{'_BC7' if bc7_codebook else ''}] {W}x{H}, {n_layers} layers, {N} rects, "
           f"K_orig={K}, B={B}, N_used={packed.size:,}, "
-          f"codebook image {Wp}x{Hp} rgba8 ({len(cb_image_bytes)/1024/1024:.1f} MB), "
+          f"codebook image {Wp}x{Hp} {cb_kind} ({len(cb_image_bytes)/1024/1024:.1f} MB), "
           f"packed indices ({len(packed_bytes)/1024/1024:.1f} MB), "
           f"surfel_offsets ({len(offsets_bytes)/1024/1024:.2f} MB), "
           f"pair_scale={pair_scale.tolist()}, pair_offset={pair_offset.tolist()} "
           f"→ {output_path} ({size_mb:.1f} MB)")
+
+
+def _export_bc7_codebook(baked: Path, output_path: str | None, kernel_type: int,
+                          meta: dict, atlas_rects_np: np.ndarray, N: int,
+                          legacy_natl: bool, K: int = 65536) -> None:
+    """typeD: BC7 codebook + uint16 per-block indices.
+
+    Pipeline:
+      1. Single-stage K-means on the atlas's 4×4 RGB blocks (~14.7M for room
+         at 4352×54272). Produces K centroid RGB tiles.
+      2. Each centroid is re-encoded as one BC7 4×4 block (16 B per codeword).
+         Codebook = K × 16 bytes.
+      3. Each ACTUAL atlas block (all N_blocks_total of them, not just
+         used-by-a-rect ones — the full 2D grid) gets a uint16 index into
+         the codebook (K ≤ 65535).
+      4. NAT2 atlas_format=7 emits codebook + indices + the standard
+         layer_cuts + atlas_rects header so the loader can reconstruct the
+         BC7 byte stream into a `texture_2d_array<bc7-rgba-unorm>` exactly
+         like the raw-BC7 path.
+
+    Bundle math (room Jac, N_total = 14.76M, K=65536):
+      codebook =  K*16 = 1 MB
+      indices  = N*2  = 29.5 MB
+      total    = ~30 MB on the NAT2 chunk (vs 225 MB raw BC7 — 7× shrink).
+
+    PSNR cost (atlas-space): ~3 dB vs raw BC7 at K=65536 (38-39 dB).
+    """
+    if legacy_natl:
+        raise SystemExit("--legacy-natl is FP16 RGB only; not compatible with BC7-codebook.")
+    if K > 65536:
+        raise SystemExit(f"--bc7-codebook-K must be ≤ 65536 (uint16 indices fit [0, 65535]); got K={K}")
+    try:
+        import bc7encoder
+    except ImportError:
+        raise SystemExit("bc7encoder not installed (build from submodules/bc7enc_lib).")
+    sys.path.insert(0, str(Path(__file__).parent))
+    from vq_bake import kmeans_chunked
+
+    # ---- Load atlas as uint8 RGB ----
+    # Repack pipeline may emit a raw-bytes sidecar (atlas_texture.u8.bin +
+    # atlas_texture.u8.shape) instead of a .pt to dodge an iostream bug in
+    # torch.save on multi-GB tensors. Prefer the raw sidecar if present.
+    bin_path = baked / "atlas_texture.u8.bin"
+    shape_path = baked / "atlas_texture.u8.shape"
+    if bin_path.exists() and shape_path.exists():
+        H, W, C = [int(x) for x in shape_path.read_text().strip().split(",")]
+        atlas_u8 = torch.from_numpy(np.fromfile(bin_path, dtype=np.uint8).reshape(H, W, C)).cuda()
+    else:
+        atlas_u8 = torch.load(baked / "atlas_texture.pt", map_location='cuda', weights_only=False)
+        if atlas_u8.dim() == 3 and atlas_u8.shape[2] == 4:
+            atlas_u8 = atlas_u8[..., :3]
+    H, W, C = atlas_u8.shape
+    if C != 3:
+        raise SystemExit(f"atlas_texture.pt must be HxWx3 uint8 (got C={C})")
+    if H % 4 != 0 or W % 4 != 0:
+        raise SystemExit(f"atlas dims must be 4-aligned for BC7 (got {W}×{H})")
+    a_scale = float(meta["atlas_scale"]); a_off = float(meta["atlas_offset"])
+    print(f"[BC7-CB] atlas {H}×{W}×3 uint8; running K={K} K-means on 4×4 RGB blocks "
+          f"(N_blocks = {(H//4)*(W//4):,})")
+
+    # ---- Build N×48 FP32 block vectors ----
+    atlas_f = atlas_u8.float() / 255.0 * a_scale + a_off
+    del atlas_u8
+    B = 4
+    blocks = atlas_f.unfold(0, B, B).unfold(1, B, B).permute(0, 1, 3, 4, 2).contiguous()
+    del atlas_f
+    torch.cuda.empty_cache()
+    Hb, Wb = blocks.shape[0], blocks.shape[1]
+    N_total = Hb * Wb
+    X = blocks.reshape(N_total, B*B*3).contiguous()
+    del blocks
+    torch.cuda.empty_cache()
+    D = X.shape[1]
+
+    # ---- K-means: subsample for fit, then assign over the full set ----
+    SUBSAMPLE = min(N_total, 1_500_000)
+    g = torch.Generator(device='cuda').manual_seed(0)
+    perm = torch.randperm(N_total, generator=g, device='cuda')[:SUBSAMPLE]
+    X_fit = X[perm]
+    print(f"[BC7-CB] K-means fit on {SUBSAMPLE:,} subsample (15 iters)…")
+    t0 = time.time()
+    # Conservative chunk for the distance matrix (target ~1.5 GB).
+    target_dist_bytes = int(1.5 * 1024**3)
+    chunk = max(1000, min(2_000_000, target_dist_bytes // (K * 4)))
+    cb = kmeans_chunked(X_fit, K, iters=15, dist_chunk=chunk)
+    print(f"  fit done in {time.time()-t0:.1f}s")
+    del X_fit, perm
+
+    # Full assign + final SE for PSNR + collect indices.
+    print(f"[BC7-CB] assigning all {N_total:,} blocks…")
+    t1 = time.time()
+    indices = torch.empty(N_total, dtype=torch.int32, device='cuda')   # need uint16 at end
+    cn2 = (cb * cb).sum(1)
+    se = 0.0
+    for s in range(0, N_total, chunk):
+        e = min(s + chunk, N_total)
+        d = -2.0 * (X[s:e] @ cb.T) + cn2.unsqueeze(0)
+        ass = d.argmin(1)
+        indices[s:e] = ass.to(torch.int32)
+        recon = cb[ass]
+        se += (recon - X[s:e]).pow(2).sum().item()
+        del d, ass, recon
+    psnr = -10.0 * math.log10(max(se / (N_total * D), 1e-20))
+    print(f"  assign done in {time.time()-t1:.1f}s; atlas-space PSNR = {psnr:.2f} dB")
+
+    # ---- BC7-encode the K codewords ----
+    # Quantize centroids back to uint8 RGB (re-applying the same scale/offset
+    # transform in reverse). bc7encoder wants HxWx4 RGBA; lay codewords out as
+    # K rows of 4 px (vertically stacked 4×4 blocks).
+    cb_rgb_f = cb.clamp(a_off, a_off + a_scale)        # within atlas range
+    cb_rgb_u8 = ((cb_rgb_f - a_off) / a_scale * 255.0 + 0.5).clamp(0, 255).byte()
+    cb_rgb_u8 = cb_rgb_u8.reshape(K, B, B, 3).cpu().numpy()
+    cb_rgba_u8 = np.zeros((K, B, B, 4), dtype=np.uint8)
+    cb_rgba_u8[..., :3] = cb_rgb_u8
+    cb_rgba_u8[..., 3] = 255
+    # Reshape to a (K*B) × B × 4 image so each row block is one codeword.
+    cb_image = cb_rgba_u8.reshape(K*B, B, 4)
+    print(f"[BC7-CB] BC7-encoding {K} codewords → {K*16/1024:.1f} KB…")
+    t2 = time.time()
+    cb_bc7 = bc7encoder.encode_image_rgba(cb_image, uber_level=1, perceptual=False)
+    print(f"  encode done in {time.time()-t2:.1f}s ({len(cb_bc7)} bytes)")
+    if len(cb_bc7) != K * 16:
+        raise SystemExit(f"BC7 codebook size {len(cb_bc7)} != expected {K * 16}")
+
+    # ---- Pack indices as uint16 row-major over blocks (block-row-major) ----
+    indices_u16 = indices.to(torch.int32).cpu().numpy().astype(np.uint16)
+    del X, cb, cn2, indices
+    torch.cuda.empty_cache()
+
+    # Layer cuts (height-axis split) — same as the raw-BC7 path.
+    cuts = _find_layer_cuts(atlas_rects_np, H, LAYER_H_BC7, align=4)
+    n_layers = len(cuts) - 1
+    # Column cuts (width-axis split) — required when atlas_width > 8192 so
+    # the loader can build a texture_2d_array whose per-slice width fits
+    # WebGPU's `maxTextureDimension2D=8192` minimum. n_cols=1 ⇒ no sharding,
+    # column_cuts not emitted (backward compat with the un-sharded format).
+    col_cuts = _find_column_cuts(atlas_rects_np, W, MAX_COL_W_BC7, align=4)
+    n_cols = len(col_cuts) - 1
+
+    sb_number, sb_bytes = _load_sb(baked, N)
+    if output_path is None:
+        output_path = str(baked / "scene.nat2")
+
+    # NAT2 header: previously the 16th word ("_pad") was reserved 0. Reuse
+    # it to carry n_cols when sharding. Loaders that don't know about width
+    # sharding read 0 ⇒ legacy single-column behavior.
+    header = struct.pack(
+        "<IIIIIfIIfffIffII",
+        W, H, 4, kernel_type,
+        N, meta["uv_extent"], sb_number, ATLAS_FORMAT_BC7_CODEBOOK,
+        meta["sh_bias"], meta["res_bias"], meta["compact_mult"], LAYER_H_BC7,
+        meta["atlas_scale"], meta["atlas_offset"], n_layers,
+        n_cols if n_cols > 1 else 0,
+    )
+    assert len(header) == 64
+
+    # BC7-CB sub-header (24 B; matches RVQP's 24 B header shape).
+    bccb_subheader = struct.pack(
+        "<4sIIIII",
+        b"BCCB",
+        1,                    # version
+        K,
+        Hb,                   # n_block_rows  (= H / 4)
+        Wb,                   # n_block_cols  (= W / 4)
+        N_total,              # sanity
+    )
+    assert len(bccb_subheader) == 24
+
+    with open(output_path, "wb") as f:
+        f.write(b"NAT2")
+        f.write(header)
+        f.write(struct.pack(f"<{n_layers + 1}I", *cuts))
+        # column_cuts only when sharding is in play. Legacy un-sharded
+        # bundles skip this and stay byte-for-byte identical to the
+        # original (pre-sharding) format=7 emission.
+        if n_cols > 1:
+            f.write(struct.pack(f"<{n_cols + 1}I", *col_cuts))
+        f.write(atlas_rects_np.tobytes())
+        f.write(bccb_subheader)
+        f.write(cb_bc7)
+        f.write(indices_u16.tobytes())
+        f.write(sb_bytes)
+
+    size_mb = Path(output_path).stat().st_size / 1e6
+    shard_info = f"{n_cols}×{n_layers} shards ({n_cols * n_layers} slices)" if n_cols > 1 else f"{n_layers} layers (1 col)"
+    print(f"[NAT2 BC7-CODEBOOK] {W}x{H}, {shard_info}, {N} rects, "
+          f"K={K}, N_blocks={N_total:,}, "
+          f"codebook {len(cb_bc7)/1024:.0f} KB, "
+          f"indices {len(indices_u16.tobytes())/1024/1024:.1f} MB, "
+          f"atlas-PSNR {psnr:.2f} dB → {output_path} ({size_mb:.1f} MB)")
 
 
 def _load_sb(baked: Path, N: int) -> tuple[int, bytes]:
@@ -583,7 +857,9 @@ def _export_bc7(baked: Path, output_path: str | None, kernel_type: int,
 
 def export_nat2(baked_dir: str, output_path: str | None = None,
                 kernel_type: int | None = None, legacy_natl: bool = False,
-                rvq: bool = False, rvq_paired: bool = False):
+                rvq: bool = False, rvq_paired: bool = False,
+                rvq_paired_bc7: bool = False, vq_subdir: str = "vq",
+                bc7_codebook: bool = False, bc7_codebook_K: int = 65536):
     baked = Path(baked_dir)
 
     atlas_rects = torch.load(baked / "atlas_rects.pt", map_location="cpu")
@@ -598,10 +874,18 @@ def export_nat2(baked_dir: str, output_path: str | None = None,
 
     atlas_format_str = meta["atlas_format"]
 
-    # ---- RVQ-PAIRED path: format=5, fragment-shader-side decode ----
-    if rvq_paired:
+    # ---- BC7-CODEBOOK path: format=7 (typeD — single-stage VQ + BC7 gather) ----
+    if bc7_codebook:
+        return _export_bc7_codebook(baked, output_path, kernel_type, meta,
+                                     atlas_rects_np, N, legacy_natl,
+                                     K=bc7_codebook_K)
+
+    # ---- RVQ-PAIRED path: format=5 (uint8 codebook) / format=6 (BC7) ----
+    if rvq_paired or rvq_paired_bc7:
         return _export_rvq_paired(baked, output_path, kernel_type, meta,
-                                   atlas_rects_np, N, legacy_natl)
+                                   atlas_rects_np, N, legacy_natl,
+                                   bc7_codebook=rvq_paired_bc7,
+                                   vq_subdir=vq_subdir)
 
     # ---- RVQ path: vq/{codebooks,indices,block_meta}.pt are the source ----
     if rvq:
@@ -713,6 +997,29 @@ if __name__ == "__main__":
                         help="Emit NAT2 with atlas_format=5 (paired-RVQ: L=4→L=2 collapsed "
                              "codebooks, K²=65536, uint8 2D texture; surfel-major uint32 "
                              "packed indices — for fragment-shader-side decode in the WGSL viewer)")
+    parser.add_argument("--rvq-paired-bc7", action="store_true",
+                        help="Emit NAT2 with atlas_format=6 (paired-RVQ + BC7-encoded codebook "
+                             "texture — typeB). Saves ~6 MB of GPU memory on the codebook and "
+                             "moves the per-fragment dequant onto the hw BC7 decode unit. "
+                             "Requires bc7encoder.")
+    parser.add_argument("--vq-subdir", type=str, default="vq",
+                        help="Subdirectory under baked_dir holding codebooks.pt / "
+                             "indices.pt / block_meta.pt (default 'vq'). Use e.g. 'vq_b8' "
+                             "to point at a B=8 VQ-bake side-by-side with the default B=4.")
+    parser.add_argument("--bc7-codebook", action="store_true",
+                        help="Emit NAT2 with atlas_format=7 (typeD — single-stage K-means "
+                             "on 4×4 RGB blocks → BC7-encoded codebook + uint16 per-block "
+                             "indices). Loader gathers the BC7 byte stream at load; renderer "
+                             "uses the raw BC7 path (1 hw bilinear / fragment).")
+    parser.add_argument("--bc7-codebook-K", type=int, default=65536,
+                        help="K-means K for --bc7-codebook (default 65536; must be ≤ 65535 "
+                             "for uint16 indices — but K=65536 is allowed via the unsigned "
+                             "wraparound to index 0 in practice; use ≤ 65535 to be safe).")
     args = parser.parse_args()
+    if args.bc7_codebook_K > 65536:
+        raise SystemExit(f"--bc7-codebook-K must be ≤ 65536 (got {args.bc7_codebook_K})")
     export_nat2(args.baked_dir, args.output, args.kernel_type,
-                args.legacy_natl, args.rvq, args.rvq_paired)
+                args.legacy_natl, args.rvq, args.rvq_paired, args.rvq_paired_bc7,
+                vq_subdir=args.vq_subdir,
+                bc7_codebook=args.bc7_codebook,
+                bc7_codebook_K=args.bc7_codebook_K)

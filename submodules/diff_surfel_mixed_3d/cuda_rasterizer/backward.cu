@@ -31,10 +31,19 @@ __device__ float d_res_bias = 0.5f;  // Residual activation bias: ReLU(residual 
 // (mode 0). When 1, backward bypasses the clamp gate → gradient passes as
 // identity even at clamped activations. Default 0 = exact gradient.
 __device__ int d_ste_relu = 0;
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss ReLU (mode 0). Backward
+// uses this as the gate value at clamped sites (pre ≤ 0): α = 0 (default) →
+// standard ReLU. α > 0 → grad scaled by α at clamped sites. STE overrides LRU
+// at clamped sites where dL/dpixel < 0 (release-clamp direction).
+__device__ float d_lru_slope = 0.0f;
 // d_residual_mode: 0 = 3D_SH_res (stacked outer ReLU), 1 = 3D_SH_add (separate ReLUs).
 // Mirrors forward.cu — the backward gradient routing differs between the two modes.
 __device__ int d_residual_mode = 0;
 __device__ float d_aa_kernel_size = 0.0f;  // AA-2DGS Jacobian mip filter σ (0 = off)
+// `--method res_3d_paired`: backward mirror of the forward gate. When 1,
+// kernel forces sh_color = 0 for textured Gauss in BOTH the MLP-grad path
+// (gate_sh / dL_dcolors) and the α-grad feat-recompute. Default 0 = unchanged.
+__device__ int d_textured_bias_gate = 0;
 // Periodic-freeze flag for the mode 5 (3D_SH_res) backward. When true, the
 // kernel skips EVERYTHING hash/MLP-gradient-related: the 3 weight-grad WMMA
 // GEMMs, the scalar W^T input-chain backprop (Phase 2/3/4), the
@@ -1512,10 +1521,13 @@ renderCUDAsurfelBackward(
 					MlpWeights smem_mlp = {smem_mlp_W1, smem_mlp_W2, smem_mlp_W3};
 					mlp_forward_inline(my_input, my_residual, my_h1_post, my_h2_post, false, smem_mlp);
 
-					// 3. Load SH base color and compute feat = SH + residual
+					// 3. Load SH base color and compute feat = SH + residual.
+					// `--method res_3d_paired` per-Gauss bias gate (mirror of forward):
+					// textured carriers force sh_color = 0.
 					float sh_color[3];
 					for (int ch = 0; ch < 3; ch++)
-						sh_color[ch] = RGB_TO_FLOAT(colors[global_id * 3 + ch]);
+						sh_color[ch] = (d_textured_bias_gate && tex_j) ? 0.0f
+						                                                : RGB_TO_FLOAT(colors[global_id * 3 + ch]);
 
 					// Activation gates depend on d_residual_mode (see forward.cu):
 					//   0 (3D_SH_res): outer ReLU gates BOTH branches together.
@@ -1542,7 +1554,7 @@ renderCUDAsurfelBackward(
 							// full reasoning.
 							gate_res = ((sh_color[o] + my_residual[o] + d_res_bias > 0.0f) ||
 							            (d_ste_relu && dL_dpixel[o] < 0.0f))
-							           ? 1.0f : 0.0f;
+							           ? 1.0f : d_lru_slope;  // `--lru` α (0 = std ReLU)
 						}
 						my_dL_dz3[o] = dL_dpixel[o] * w * gate_res;
 					}
@@ -1558,7 +1570,7 @@ renderCUDAsurfelBackward(
 							// `--ste` sign-aware (see gate_res above).
 							gate_sh = ((sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ||
 							           (d_ste_relu && dL_dpixel[ch] < 0.0f))
-							          ? 1.0f : 0.0f;
+							          ? 1.0f : d_lru_slope;  // `--lru` α (0 = std ReLU)
 						}
 						acc_dL_dcolors[ch] += dL_dpixel[ch] * w * gate_sh;
 					}
@@ -1731,7 +1743,9 @@ renderCUDAsurfelBackward(
 					float feat[C];
 					float sh_color_recomp[3];
 					for (int ch = 0; ch < 3; ch++) {
-						sh_color_recomp[ch] = RGB_TO_FLOAT(colors[global_id * 3 + ch]);
+						// `--method res_3d_paired` bias gate (mirror of forward).
+						sh_color_recomp[ch] = (d_textured_bias_gate && tex_j) ? 0.0f
+						                                                       : RGB_TO_FLOAT(colors[global_id * 3 + ch]);
 						if (!tex_j) {
 							feat[ch] = sh_color_recomp[ch];
 						} else if (d_residual_mode == 1) {
@@ -2601,9 +2615,11 @@ const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A_tex - final_D) * dL_dre
 				// d_residual_mode = 1: feat = ReLU(SH+sh_bias) + ReLU(residual + res_bias)
 				// d_residual_mode = 2: feat = ReLU(SH+sh_bias) + (residual + res_bias)    [mixed; per-pixel ReLU in Python]
 				// SH's own inner ReLU is handled upstream in preprocessCUDA (clamped[]).
+				// `--method res_3d_paired` bias gate (mirror of forward).
 				float sh_color_bw[3];
 				for (int c = 0; c < 3; c++)
-					sh_color_bw[c] = RGB_TO_FLOAT(colors[global_id * 3 + c]);
+					sh_color_bw[c] = (d_textured_bias_gate && tex_bw) ? 0.0f
+					                                                  : RGB_TO_FLOAT(colors[global_id * 3 + c]);
 
 				float dL_drgb[3];     // grad flowing into residual (MLP) path
 				float dL_drgb_sh[3];  // grad flowing into SH path
@@ -2622,7 +2638,7 @@ const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A_tex - final_D) * dL_dre
 						// → release-clamp direction).
 						float g = ((sh_color_bw[c] + residual[c] + d_res_bias > 0.0f) ||
 						           (d_ste_relu && dL_dchannels[c] < 0.0f))
-						          ? 1.0f : 0.0f;
+						          ? 1.0f : d_lru_slope;  // `--lru` α (0 = std ReLU)
 						gate_res = g;
 						gate_sh = g;
 					}
@@ -2741,8 +2757,10 @@ const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A_tex - final_D) * dL_dre
 				}
 
 				// 8. Set feat for alpha gradient (matches forward activation).
+				// `--method res_3d_paired` bias gate (mirror of forward).
 				for (int ch = 0; ch < C; ch++) {
-					float sh_c = RGB_TO_FLOAT(colors[global_id * 3 + ch]);
+					float sh_c = (d_textured_bias_gate && tex_bw) ? 0.0f
+					                                              : RGB_TO_FLOAT(colors[global_id * 3 + ch]);
 					if (d_residual_mode == 1)
 						feat[ch] = sh_c + fmaxf(0.0f, residual[ch] + d_res_bias);
 					else if (d_residual_mode == 2)
@@ -2833,7 +2851,7 @@ const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A_tex - final_D) * dL_dre
 						// `--ste` sign-aware: see case-5 site above.
 						float g = ((sh_color_bw_6[c] + residual_6[c] + d_res_bias > 0.0f) ||
 						           (d_ste_relu && dL_dchannels[c] < 0.0f))
-						          ? 1.0f : 0.0f;
+						          ? 1.0f : d_lru_slope;  // `--lru` α (0 = std ReLU)
 						gate_res = g;
 						gate_sh = g;
 					}
@@ -3897,6 +3915,18 @@ void BACKWARD::setResidualMode(int mode) {
 __global__ void setSteReluBwKernel(int v) { d_ste_relu = v; }
 void BACKWARD::setSteRelu(int v) {
 	setSteReluBwKernel<<<1, 1>>>(v);
+}
+
+// `--method res_3d_paired`: per-Gauss bias gate (backward mirror).
+__global__ void setTexturedBiasGateBwKernel(int v) { d_textured_bias_gate = v; }
+void BACKWARD::setTexturedBiasGate(int v) {
+	setTexturedBiasGateBwKernel<<<1, 1>>>(v);
+}
+
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss ReLU (mode 0 only).
+__global__ void setLruSlopeBwKernel(float v) { d_lru_slope = v; }
+void BACKWARD::setLruSlope(float v) {
+	setLruSlopeBwKernel<<<1, 1>>>(v);
 }
 
 __global__ void setAaKernelSizeBwKernel(float val) { d_aa_kernel_size = val; }

@@ -884,6 +884,18 @@ void SetSteReluCUDA(int v) {
     BACKWARD::setSteRelu(v);
 }
 
+// `--detach_res_shape_grad`: backward-only (no FORWARD counterpart) — the
+// alpha/shape gradient is driven by SV only, residual detached.
+void SetDetachResShapeGradCUDA(int v) {
+    BACKWARD::setDetachResShapeGrad(v);
+}
+
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss activation (mode 0).
+void SetLruSlopeCUDA(float v) {
+    FORWARD::setLruSlope(v);
+    BACKWARD::setLruSlope(v);
+}
+
 void SetAntiAliasCUDA(float factor, float focal) {
     FORWARD::setAntiAlias(factor, focal);
 }

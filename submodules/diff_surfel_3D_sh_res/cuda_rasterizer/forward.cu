@@ -56,6 +56,10 @@ __device__ int d_residual_mode = 0;
 // host setter pair (FORWARD::setSteRelu + BACKWARD::setSteRelu) stays
 // consistent with how every other tunable is wired.
 __device__ int d_ste_relu_fwd = 0;
+// `--lru`: leaky-ReLU slope for the outer per-Gauss activation (mode 0). 0.0f
+// → standard ReLU (off). Positive slope α → `feat = (pre > 0) ? pre : α*pre`.
+// Forward reads this in the activation; backward mirrors via d_lru_slope below.
+__device__ float d_lru_slope = 0.0f;
 __device__ float d_sh_bias = 0.5f;
 // Nexels-style anti-aliasing d_aa_factor / d_aa_focal are now declared in hashgrid.h
 // (per-TU static __device__). Setters below update this TU's copy.
@@ -618,6 +622,15 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float cutoff;
 	bool use_adr_cutoff = (aabb_mode == 1 || aabb_mode == 3 || aabb_mode == 5);  // modes 1, 3, 5 use AdR
 	bool use_beta_cutoff = (aabb_mode == 4);  // mode 4: fixed r=1 for beta kernels
+	// `--aabb snugbox` (mode 5) + beta/beta_scaled (kernel_type 1/4): skip
+	// the AdR pow/log per Gauss — beta is compact-support (r ≤ k), so the
+	// fixed-k cutoff is already tight. AccuTile binning is gated separately
+	// on `aabb_mode == 5` downstream, so we still get the per-row ellipse
+	// intersection benefit. Net: less preprocess work, same tile coverage.
+	if (aabb_mode == 5 && (kernel_type == 1 || kernel_type == 4)) {
+		use_adr_cutoff = false;
+		use_beta_cutoff = true;
+	}
 	if (use_adr_cutoff && kernel_type == 3 && shapes != nullptr) {
 		// AdR: Adaptive bounding box based on opacity and beta
 		// For general kernel (kernel_type=3), the kernel is exp(-0.5 * (r²)^(β/2))
@@ -1538,7 +1551,10 @@ renderCUDAsurfelForward(
 						// 3D_SH_res_sep: signed residual, no per-Gauss ReLU.
 						feat_ch = my_sh_color[ch] + residual + d_res_bias;
 					} else {
-						feat_ch = fmaxf(0.0f, my_sh_color[ch] + residual + d_res_bias);
+						// `--lru`: leaky ReLU at the outer activation. d_lru_slope == 0.0
+						// (default) → standard ReLU. Positive α → feat = (pre>0)?pre:α·pre.
+						const float _pre = my_sh_color[ch] + residual + d_res_bias;
+						feat_ch = (_pre > 0.0f) ? _pre : d_lru_slope * _pre;
 					}
 					C[ch] += feat_ch * my_w;
 				}
@@ -2097,7 +2113,10 @@ renderCUDAsurfelForward(
 					feat[ch] = sh_color[ch] + residual[ch] + d_res_bias;
 				} else {
 					// 3D_SH_res: single outer ReLU on the sum.
-					feat[ch] = fmaxf(0.0f, sh_color[ch] + residual[ch] + d_res_bias);
+					// `--lru`: leaky ReLU. d_lru_slope == 0.0 (default) → standard
+					// ReLU; positive α → feat = (pre>0)?pre:α·pre.
+					const float _pre = sh_color[ch] + residual[ch] + d_res_bias;
+					feat[ch] = (_pre > 0.0f) ? _pre : d_lru_slope * _pre;
 				}
 			}
 
@@ -2370,6 +2389,12 @@ void FORWARD::setResidualMode(int mode) {
 __global__ void setSteReluFwdKernel(int v) { d_ste_relu_fwd = v; }
 void FORWARD::setSteRelu(int v) {
 	setSteReluFwdKernel<<<1, 1>>>(v);
+}
+
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss activation (mode 0).
+__global__ void setLruSlopeFwdKernel(float v) { d_lru_slope = v; }
+void FORWARD::setLruSlope(float v) {
+	setLruSlopeFwdKernel<<<1, 1>>>(v);
 }
 
 // Set anti-aliasing params (Nexels-style hash-grid down-weighting)

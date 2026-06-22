@@ -86,6 +86,8 @@ namespace BACKWARD
 	void setResBias(float val);
 	// 0 = 3D_SH_res (stacked outer ReLU), 1 = 3D_SH_add (separate ReLUs).
 	void setResidualMode(int mode);
+	// `--lru`: leaky-ReLU slope α for the outer per-Gauss ReLU (mode 0 only).
+	void setLruSlope(float v);
 	void setAaKernelSize(float val);
 	// Periodic-freeze flag: when true, the mode 5 backward skips all
 	// hash/MLP gradient work (weight-grad GEMMs, input-chain backprop,

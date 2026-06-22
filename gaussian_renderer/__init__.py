@@ -77,6 +77,40 @@ except ImportError:
     _mixed_3d_rasterizer = None
     MIXED_3D_RASTERIZER_AVAILABLE = False
 
+# `--method res_3d` SINGLE-PASS library — fork of diff_surfel_mixed_3d with
+# single-pass dual-cascade forward + backward. Forward emits out_color =
+# C_sv_aux + C_tex_aux (signed sum); backward maintains independent T_sv /
+# T_tex reverse cascades and routes color/alpha grads per-Gauss via
+# is_textured. Renderer composes LRU(out_color) for the final image.
+try:
+    import diff_surfel_res_3d as _res_3d_rasterizer
+    RES_3D_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _res_3d_rasterizer = None
+    RES_3D_RASTERIZER_AVAILABLE = False
+
+# `--method res_3d_paired` SLIM library — a clone of diff_surfel_mixed_3d
+# with `out_others` trimmed from 18 channels to 5 (DEPTH + ALPHA + NORMAL).
+# At 4K image resolution this saves ~870 MB of per-pixel forward output and
+# the matching backward gradient tensor. Functionally identical otherwise.
+# The renderer routes res_3d_paired post-split through this when available.
+try:
+    import diff_surfel_res_3d_paired as _res_3d_paired_rasterizer
+    RES_3D_PAIRED_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _res_3d_paired_rasterizer = None
+    RES_3D_PAIRED_RASTERIZER_AVAILABLE = False
+
+# `--method film`: FiLM (Feature-wise Linear Modulation) rasterizer. Fork of
+# diff_surfel_rasterization (cat mode) with per-Gauss gamma/beta modulating the
+# hashgrid feature (f = gamma*H + beta) before blend. MLP runs in PyTorch (cat-family).
+try:
+    import diff_surfel_film as _film_rasterizer
+    FILM_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _film_rasterizer = None
+    FILM_RASTERIZER_AVAILABLE = False
+
 # SH+residual 32-dim library (diff_surfel_3D_sh_32) — same as sh_res but 32-dim hidden MLP
 try:
     import diff_surfel_3D_sh_32 as _sh_32_rasterizer
@@ -98,6 +132,7 @@ else:
     _main_rasterizer = None
 
 from scene.gaussian_model import GaussianModel
+from scene.camera_pose_opt import quaternion_multiply as _pose_quaternion_multiply
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal, save_points, depths_to_points, cam2rays
 import torch.nn.functional as torch_F
@@ -794,7 +829,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2, no_gumbel = False, dropout_lambda = 0.0, is_training = True,
     aabb_mode = "2dgs", aa = 0.0, aa_threshold = 0.01, skybox = None, background_mode = "none", bg_hashgrid = None, detach_hash_grad = False,
     return_raw_features = False, fast_inference = False, cache = None, max_intersections_per_pixel = 32, lowpass = False, pixel_center = False, antialiasing = 0.0, sv_metric = "l2",
-    metric_map = None):
+    metric_map = None, pose_correction = None, deform = None):
     """
     Render the scene.
 
@@ -834,6 +869,24 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
     means3D = pc.get_xyz
+    # --deform: per-surfel canonical->time-t deformation (Δposition), applied
+    # BEFORE the --3rgs rigid correction below and before the CUDA hash query
+    # (which is reconstructed from these means). deform = (d_xyz [N,3], d_rot
+    # [N,4]); None ⇒ no deformation. Grad flows to the per-surfel latent + the
+    # deform MLP via dL/dmeans3D.
+    if deform is not None:
+        means3D = means3D + deform[0]
+    # --3rgs camera pose refinement: apply the per-camera differentiable rigid
+    # transform M = C2W·inv(Td)·W2V to the Gaussian centers (and, below, to the
+    # surfel rotations). Rendering the transformed cloud through the ORIGINAL
+    # camera matrices == rendering the un-transformed cloud through the
+    # delta-corrected camera, so the pose gradient flows to the per-camera delta
+    # via dL/dmeans3D (the kernel has no viewmatrix grad). Injected here — before
+    # the SV/beta/hash view-dir prep below — so the whole forward is consistent.
+    # pose_correction = (M_rot [3,3], M_t [3], q_M [4]); None ⇒ identity (no-op).
+    if pose_correction is not None:
+        _pc_Mrot, _pc_Mt, _pc_qM = pose_correction
+        means3D = means3D @ _pc_Mrot.transpose(0, 1) + _pc_Mt
     means2D = screenspace_points
     opacity = pc.get_opacity
 
@@ -886,6 +939,36 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         _dirs_sv = means3D - _cam_center.unsqueeze(0)
         _dirs_sv = _dirs_sv / (_dirs_sv.norm(dim=-1, keepdim=True) + 1e-8)
         pc._beta_fake_shs, _sv_rgb = _build_fake_shs_from_SV(pc, _dirs_sv)
+        # `--method res_3d` post-split: the 2D residual-carriers must contribute
+        # ZERO SV. We already zeroed the SV/SH params on those rows at split
+        # AND mask `colors_precomp` to 0 for them at the rasterizer call, but
+        # `_build_fake_shs_from_SV` may apply biases / softmax-normalisation
+        # that lift a 0-param row's output above 0 (e.g. an SV-DC bias). Zero
+        # `_sv_rgb` and `pc._beta_fake_shs` for tex rows here so any code path
+        # that uses these tensors (SH fallback, decompose dump, etc.) sees a
+        # rigorous zero for the residual-carrier half.
+        # IMPORTANT: gate on `(~_is_textured).any()` (split has fired = at
+        # least one untex row exists), NOT on `.any()` — `_is_textured` is
+        # initialised to all-True at startup, so `.any()` is trivially true
+        # pre-split and would zero _sv_rgb / _beta_fake_shs for EVERY Gauss,
+        # starving the forward of SV signal (and consequently the backward
+        # of SV gradients) until the split fires at --res_3d_iter.
+        # SKIP for `--method res_3d_paired` AND `--method res_3d_double`:
+        # both keep SV on tex carriers (full per-Gauss capacity), so don't
+        # zero anything.
+        _paired_keeps_sv = (ingp is not None
+                             and (getattr(ingp, 'is_res_3d_paired_mode', False)
+                                  or getattr(ingp, 'is_res_3d_double_mode', False)))
+        if (not _paired_keeps_sv
+                and hasattr(pc, '_is_textured') and pc._is_textured.numel() == _sv_rgb.shape[0]
+                and bool((~pc._is_textured).any())):
+            with torch.no_grad():
+                _tex_mask = pc._is_textured
+                _sv_rgb = _sv_rgb.clone()
+                _sv_rgb[_tex_mask] = 0.0
+                if pc._beta_fake_shs is not None:
+                    pc._beta_fake_shs = pc._beta_fake_shs.clone()
+                    pc._beta_fake_shs[_tex_mask] = 0.0
         override_color = _sv_rgb
 
     def _effective_shs():
@@ -914,7 +997,55 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         scales = pc.get_scaling
         rotations = pc.get_rotation
-    
+        # --deform: per-surfel canonical->time-t rotation delta (quaternion
+        # residual, add-then-renormalize; Deformable-3DGS). Applied before the
+        # --3rgs rotation below. Grad flows to the latent + MLP via dL/drotations.
+        # deform[1] is None for position-only deform (v1 canonical-hash path: with
+        # the rotation un-deformed, the canonical hash reconstruction — canonical
+        # center + deformed tangents — is exact, since tangents are unchanged).
+        if deform is not None and deform[1] is not None:
+            rotations = torch_F.normalize(rotations + deform[1], dim=-1)
+        # --3rgs: rotate each surfel's orientation by the camera's pose-delta
+        # rotation (q_M ⊗ q), so the splat normals move with the camera — needed
+        # for the cloud-transform to be *exactly* equivalent to moving the camera
+        # (means alone only handles the disk centers). Grad flows to the delta via
+        # dL/drotations. q_M ≈ identity (deltas are tiny), so this is a no-op at
+        # init. The compute_cov3D_python path above is left to means-only (it is
+        # not on the default training path).
+        if pose_correction is not None:
+            rotations = _pose_quaternion_multiply(pose_correction[2], rotations)
+
+    # --- clip_relight: per-Gauss deform + relight pre-pass (on top of 3D_SH_res) ---
+    # Run the clip head over ALL surfels: override geometry/opacity and inject the
+    # exposed SV as the per-Gauss SH base. The invariant texgrid (hash+MLP) is added
+    # downstream in CUDA, untouched (clip plane = reveal + reshade, not a texture edit).
+    # Requires --feature SV (override_color holds the clamped sv_rgb at this point).
+    if (ingp is not None and getattr(ingp, 'is_clip_relight_mode', False)
+            and getattr(ingp, 'clip_head', None) is not None
+            and override_color is not None
+            and scales is not None and rotations is not None):
+        _clip_plane = getattr(viewpoint_camera, 'clip_plane', None)
+        if _clip_plane is not None:
+            _cr = ingp.clip_head(means3D, scales, rotations, opacity,
+                                 override_color, _clip_plane.to(means3D.device))
+            means3D = _cr.mu
+            scales = _cr.scaling
+            rotations = _cr.rotation
+            opacity = _cr.opacity
+            # Inject signed sv_exposed as the per-Gauss SH base. CUDA (mode 2) computes
+            #   base = ReLU(SH_C0·DC + sh_bias); set DC = (sv_exposed - sh_bias)/SH_C0
+            # (higher orders 0) so the pre-ReLU base == sv_exposed (Phase-1 clamped base),
+            # then the invariant texgrid residual is added and the per-pixel ReLU deferred.
+            _shb = float(_ACTIVATION_BIAS[0])
+            _fake = torch.zeros_like(pc._beta_fake_shs)
+            _fake[:, 0, :] = (_cr.sv_exposed - _shb) / _SH_C0
+            pc._beta_fake_shs = _fake
+            override_color = _cr.sv_exposed
+        elif not getattr(render, '_clip_relight_warned', False):
+            print("[CLIP_RELIGHT] WARNING: viewpoint_camera.clip_plane is None — "
+                  "running as plain 3D_SH_res (no cull/relight). Is this a clip dataset?")
+            render._clip_relight_warned = True
+
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     
@@ -1018,6 +1149,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Cat mode detection and setup
     is_cat_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_cat_mode') and ingp.is_cat_mode
 
+    # FiLM mode detection (per-Gauss gamma/beta modulate the hashgrid feature; cat-family)
+    is_film_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_film_mode') and ingp.is_film_mode
+
     # Adaptive_zero mode detection (cat-like features + weighted hash, zeros when weight=0)
     is_adaptive_zero_mode = hash_in_CUDA and ingp is not None and hasattr(ingp, 'is_adaptive_zero_mode') and ingp.is_adaptive_zero_mode
 
@@ -1117,6 +1251,32 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 shape_dims = cache.get_shape_dims((gaussian_dim, hash_dim, output_dim), [gaussian_dim, hash_dim, output_dim])
             else:
                 shape_dims = torch.tensor([gaussian_dim, hash_dim, output_dim], dtype=torch.int32, device="cuda")
+
+        # FiLM mode: f = gamma*H + beta per Gauss, then blend + screen-space MLP
+        # (cat-family blend-then-PyTorch-MLP). hybrid_levels=0 → all 24D come from
+        # the hashgrid; per-Gauss gamma/beta are passed as separate kernel tensors.
+        elif is_film_mode:
+            # Keep SH for preprocessing exactly like BASELINE (shs = _effective_shs(),
+            # colors_precomp = None set above): the preprocess needs a color source to
+            # build geomState.rgb — leaving both empty makes computeColorFromSH read an
+            # empty sh tensor (illegal access). The render kernel's case-1 path queries
+            # the hash + applies FiLM and ignores geomState.rgb, so the SH is unused at
+            # render time (just like baseline's hash render).
+            total_levels = ingp.levels
+            active_hashgrid_levels = ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0
+            # Cat-style level encoding with hybrid=0 → kernel takes the case-1 path
+            # and queries all active hash levels (C2F respected) per Gauss.
+            levels = (total_levels << 16) | (active_hashgrid_levels << 8) | 0
+
+            # Pad offsets to 17 (CUDA copies up to 16 levels + 1)
+            if offsets.shape[0] < 17:
+                padded_offsets = torch.zeros(17, dtype=offsets.dtype, device=offsets.device)
+                padded_offsets[:offsets.shape[0]] = offsets
+                offsets = padded_offsets
+
+            render_mode = 1
+            output_dim = total_levels * ingp.level_dim  # 6*4 = 24
+            shape_dims = torch.tensor([0, output_dim, output_dim], dtype=torch.int32, device="cuda")
 
         # 3D_SH_cat mode: per-Gaussian SH + hash+DC_SH MLP residual
         # Same as 3D_SH_res but MLP input = [hash(4) | DC_SH(3) | bias(1)]
@@ -1774,9 +1934,57 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # `--method mixed`: route through diff_surfel_mixed (the fork that has the
         # per-Gauss textured/untextured CUDA branch). For all other 3D_SH_res / 3D_SH_cat
         # runs use the original rasterizer (bit-identical to before).
-        _is_mixed_3d = ingp is not None and getattr(ingp, 'is_mixed_3d_mode', False) and MIXED_3D_RASTERIZER_AVAILABLE
+        # `--method res_3d`: ONLY route through diff_surfel_mixed_3d AFTER the
+        # split fires (post-split needs the EWA-ellipsoid path for the 3D
+        # SV-only carrier). Pre-split res_3d uses the same rasterizer as
+        # 3D_SH_res (diff_surfel_3D_sh_res) so it's bit-identical to
+        # `--method 3D_SH_res --lru α` until the split — no risk of crossing
+        # mixed_3d's setup paths for a configuration it wasn't initialised for.
+        # `--method res_3d` SINGLE-PASS path (preferred when available): one
+        # forward+backward call to diff_surfel_res_3d. Forward emits the
+        # signed dual-cascade sum; renderer applies LRU/relu after. Backward
+        # routes per-Gauss color/alpha grads through dual T cascades.
+        # `--method res_3d` AND `--method res_3d_double` both route through
+        # the single-pass dual-cascade kernel `diff_surfel_res_3d`. The two
+        # methods differ only in the kernel's `d_textured_bias_gate` value
+        # (set at stage 2 by train.py): res_3d keeps it at 1 (tex sh_color
+        # forced to 0), res_3d_double sets it to 0 (tex keeps SV color).
+        _is_res_3d_single_pass = (ingp is not None
+                                   and ((getattr(ingp, 'is_res_3d_mode', False)
+                                          and getattr(ingp, 'is_res_3d_post_split', False))
+                                        or (getattr(ingp, 'is_res_3d_double_mode', False)
+                                            and getattr(ingp, 'is_res_3d_double_post_split', False)))
+                                   and RES_3D_RASTERIZER_AVAILABLE)
+        # `--method res_3d_paired` post-split: SHARED-T joint cascade via the
+        # mixed_3d kernel (single render, no two-render dispatch, no dual cascade).
+        # Opacity scaling at split (texsplit_tex_frac) is what differentiates
+        # the two halves' contributions.
+        _is_res_3d_paired = (ingp is not None
+                              and getattr(ingp, 'is_res_3d_paired_mode', False)
+                              and getattr(ingp, 'is_res_3d_paired_post_split', False))
+        _is_mixed_3d = ingp is not None and (
+            getattr(ingp, 'is_mixed_3d_mode', False)
+            # res_3d falls back to mixed_3d two-render path only if
+            # diff_surfel_res_3d isn't built.
+            or (getattr(ingp, 'is_res_3d_mode', False)
+                and getattr(ingp, 'is_res_3d_post_split', False)
+                and not _is_res_3d_single_pass)
+            or _is_res_3d_paired
+        ) and MIXED_3D_RASTERIZER_AVAILABLE
         _is_mixed = ingp is not None and getattr(ingp, 'is_mixed_mode', False) and MIXED_RASTERIZER_AVAILABLE
-        if _is_mixed_3d:
+        # res_3d_paired routes through its dedicated SLIM submodule when built,
+        # falling back to plain mixed_3d if not. Both kernels are functionally
+        # identical for the per-Gauss math; the paired clone just trims the
+        # 18-channel out_others (kept) to 5 (DEPTH+ALPHA+NORMAL) — at 4K image
+        # resolution this saves ~870 MB of per-pixel forward output + matching
+        # backward gradient. The Python allmap reads below are size-aware so
+        # the trimmed channels return None.
+        _use_paired_slim = (_is_res_3d_paired and RES_3D_PAIRED_RASTERIZER_AVAILABLE)
+        if _is_res_3d_single_pass:
+            _rmod = _res_3d_rasterizer
+        elif _use_paired_slim:
+            _rmod = _res_3d_paired_rasterizer
+        elif _is_mixed_3d:
             _rmod = _mixed_3d_rasterizer
         elif _is_mixed:
             _rmod = _mixed_rasterizer
@@ -1791,6 +1999,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rasterizer = _fp16_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
     elif is_3D_direct_lean_mode and LEAN_RASTERIZER_AVAILABLE:
         rasterizer = _lean_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
+    elif is_film_mode and FILM_RASTERIZER_AVAILABLE:
+        # `--method film`: FiLM rasterizer fork (per-Gauss gamma/beta modulate the hash).
+        rasterizer = _film_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
     else:
         rasterizer = GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
 
@@ -1895,18 +2106,115 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if metric_map is not None and (
             'diff_surfel_3D_sh_res' in _rasterizer_mod or 'diff_surfel_mixed' in _rasterizer_mod):
         rasterizer_kwargs['metric_map'] = metric_map
-    # `--method mixed[_3d]`: pass per-Gauss textured/untextured bool to the kernel.
-    # (`diff_surfel_mixed` substring also matches `diff_surfel_mixed_3d`.)
-    if 'diff_surfel_mixed' in _rasterizer_mod and hasattr(pc, '_is_textured') \
+    # `--method mixed[_3d]` / `--method res_3d`: pass per-Gauss textured/
+    # untextured bool to the kernel. (`diff_surfel_mixed` substring also matches
+    # `diff_surfel_mixed_3d`; res_3d is a separate fork.)
+    _kernel_takes_is_textured = (
+        'diff_surfel_mixed' in _rasterizer_mod
+        or 'diff_surfel_res_3d' in _rasterizer_mod
+    )
+    if _kernel_takes_is_textured and hasattr(pc, '_is_textured') \
             and pc._is_textured.numel() > 0 and pc._is_textured.shape[0] == pc.get_xyz.shape[0]:
         rasterizer_kwargs['is_textured'] = pc._is_textured
-    # `--method mixed_3d`: untextured surfels render as 3D ellipsoids — pass the
-    # learnable 3rd axis as the ACTIVATED scale (exp), consistent with `scales`
-    # (= pc.get_scaling, also activated). Only the _3d submodule consumes it.
-    if 'diff_surfel_mixed_3d' in _rasterizer_mod and hasattr(pc, '_scaling_z') \
+    # EWA-3D-ellipsoid untextured: untextured surfels render as 3D ellipsoids —
+    # pass the learnable 3rd axis as the ACTIVATED scale (exp), consistent with
+    # `scales` (= pc.get_scaling, also activated). Both `mixed_3d` and `res_3d`
+    # use this path.
+    _kernel_takes_scaling_z = (
+        'diff_surfel_mixed_3d' in _rasterizer_mod
+        or 'diff_surfel_res_3d' in _rasterizer_mod
+    )
+    if _kernel_takes_scaling_z and hasattr(pc, '_scaling_z') \
             and pc._scaling_z.numel() > 0 and pc._scaling_z.shape[0] == pc.get_xyz.shape[0]:
         rasterizer_kwargs['scaling_z'] = pc.get_scaling_z
-    rasterizer_output = rasterizer(**rasterizer_kwargs)
+
+    # `--method film`: pass per-Gauss FiLM scale (gamma [N,1]) + bias (beta [N,24])
+    # to the FiLM rasterizer. Empty / absent → kernel falls back to plain cat behaviour.
+    if is_film_mode and 'diff_surfel_film' in _rasterizer_mod \
+            and hasattr(pc, '_film_params') and pc._film_params.numel() > 0 \
+            and pc._film_params.shape[0] == pc.get_xyz.shape[0]:
+        rasterizer_kwargs['film_gamma'] = pc.get_film_gamma
+        rasterizer_kwargs['film_beta'] = pc.get_film_beta
+
+    # `--method res_3d` post-split dispatch (TWO renders, mathematically
+    # equivalent to a single-pass dual-cascade kernel — each render visits
+    # one primitive subset, masked by opacity, so its T cascade is independent
+    # of the other half). Render A: only 2D residual-carriers contribute
+    # (3D opacity → 0). Render B: only 3D EWA SV-carriers contribute (2D
+    # opacity → 0). Composed: image = C_sv + LRU(C_tex, α). The SV baseline
+    # is also zeroed for 2D rows in render A so the textured contribution is
+    # residual-only (mode 2 → feat = colors_precomp + residual + res_bias,
+    # which equals residual + res_bias when colors_precomp = 0).
+    _is_res_3d_post_split = (ingp is not None
+                              and (getattr(ingp, 'is_res_3d_post_split', False)
+                                   or getattr(ingp, 'is_res_3d_double_post_split', False))
+                              and hasattr(pc, '_is_textured')
+                              and pc._is_textured.numel() == pc.get_xyz.shape[0])
+    _use_res_3d_single_pass = (_is_res_3d_post_split
+                                and 'diff_surfel_res_3d' in _rasterizer_mod)
+    if _use_res_3d_single_pass:
+        # SINGLE-PASS dual-cascade kernel. Forward emits out_color =
+        # C_sv_aux + C_tex_aux (signed sum); apply LRU/relu here, backward
+        # routes per-Gauss color grads through dual T cascades.
+        rasterizer_output = rasterizer(**rasterizer_kwargs)
+        _image_signed = rasterizer_output[0]
+        _alpha_lru = float(getattr(ingp, 'lru_slope', 0.0))
+        if _alpha_lru > 0.0:
+            _image_composed = torch.nn.functional.leaky_relu(_image_signed, negative_slope=_alpha_lru)
+        else:
+            _image_composed = torch.relu(_image_signed)
+        rasterizer_output = (_image_composed,) + tuple(rasterizer_output[1:])
+    elif _is_res_3d_post_split:
+        # Two-render fallback when diff_surfel_res_3d isn't built. Each render
+        # visits one primitive subset, masked by opacity, so its T cascade
+        # is independent of the other half (mathematically equivalent to
+        # single-pass but ~2× kernel cost).
+        _orig_opacity = rasterizer_kwargs['opacities']                       # [N, 1]
+        _orig_colors_precomp = rasterizer_kwargs['colors_precomp']           # [N, 3] or empty
+        _tex_mask_f = pc._is_textured.float().unsqueeze(-1)                  # [N, 1]
+        _untex_mask_f = 1.0 - _tex_mask_f                                    # [N, 1]
+
+        # --- Render A: only 2D residual-carriers contribute (image_tex) ---
+        # Mask 3D opacity to 0; zero SV baseline for 2D rows (so feat is
+        # residual-only in mode 2). Bypass autograd on the gate by multiplying
+        # (mask is constant 0/1).
+        rasterizer_kwargs['opacities'] = _orig_opacity * _tex_mask_f
+        if _orig_colors_precomp is not None and _orig_colors_precomp.numel() > 0 \
+                and _orig_colors_precomp.shape[0] == pc.get_xyz.shape[0]:
+            rasterizer_kwargs['colors_precomp'] = _orig_colors_precomp * _untex_mask_f
+        rasterizer_output_tex = rasterizer(**rasterizer_kwargs)
+        _image_tex = rasterizer_output_tex[0]
+
+        # --- Render B: only 3D EWA SV-carriers contribute (image_sv) ---
+        rasterizer_kwargs['opacities'] = _orig_opacity * _untex_mask_f
+        rasterizer_kwargs['colors_precomp'] = _orig_colors_precomp  # SV intact
+        rasterizer_output = rasterizer(**rasterizer_kwargs)
+        _image_sv = rasterizer_output[0]
+
+        # Compose: image = LRU(C_sv + C_tex, α). The LRU is on the SUM so that
+        # signed C_tex (residual cascade) can SUBTRACT from C_sv (SV cascade)
+        # to darken overbright SV regions — recovering the per-Gauss "residual
+        # modulates SV" capability that pre-split mode 0 had, but at the
+        # per-pixel post-blend site instead of per-Gauss. The LRU's negative
+        # slope α controls how much the sum can leak below 0.
+        _alpha_lru = float(getattr(ingp, 'lru_slope', 0.0))
+        if _alpha_lru > 0.0:
+            _image_composed = torch.nn.functional.leaky_relu(_image_sv + _image_tex, negative_slope=_alpha_lru)
+        else:
+            _image_composed = torch.relu(_image_sv + _image_tex)
+
+        # Re-pack rasterizer_output with the composed image in slot 0. We
+        # keep render B's geometry/depth/normal buffers for downstream regs
+        # (densification uses SV-side radii primarily; depth/normal from the
+        # SV render reflects the EWA primitives' geometry). The 2D-side
+        # info is available via rasterizer_output_tex for future use.
+        rasterizer_output = (_image_composed,) + tuple(rasterizer_output[1:])
+
+        # Restore for safety (caller doesn't reuse, but explicit is better).
+        rasterizer_kwargs['opacities'] = _orig_opacity
+        rasterizer_kwargs['colors_precomp'] = _orig_colors_precomp
+    else:
+        rasterizer_output = rasterizer(**rasterizer_kwargs)
     # Main rasterizer returns 7 values (with max_weight, accum_weights); other rasterizers (lean, fp16, etc.) return 8 (with intersection_buffer, intersection_count, geomBuffer)
     # diff_surfel_3D_sh_res additionally appends out_index (max-contrib id) and
     # metric_counts (FastGS per-Gaussian counter) → 10 values.
@@ -1963,8 +2271,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # flows at clamped pixels where grad_out < 0 (release-clamp direction),
     # rescuing the "many texture queries miss gradient at clamped pixels" case.
     if ingp is not None and getattr(ingp, 'is_mixed_deferred_relu_mode', False):
+        _lru_alpha = float(getattr(ingp, 'lru_slope', 0.0))
         if getattr(ingp, 'is_ste_relu', False):
             rendered_image = STERelu.apply(rendered_image)
+        elif _lru_alpha != 0.0:
+            # `--lru` α: leaky-ReLU at the per-pixel after-blend clamp (mode 2).
+            # autograd handles forward + backward naturally.
+            rendered_image = torch.nn.functional.leaky_relu(rendered_image, negative_slope=_lru_alpha)
         else:
             rendered_image = torch.relu(rendered_image)
 
@@ -2283,13 +2596,30 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "render_depth": allmap[0:1],  # expected depth (unnormalized)
         }
 
-    # get normal map
-    # transform normal from view space to world space
-    render_normal = allmap[2:5]
-    render_normal = (render_normal.permute(1,2,0) @ (viewpoint_camera.world_view_transform[:3,:3].T)).permute(2,0,1)
+    # `--skip_aux_normal_dist` (pipe flag): skip the expensive Python-side
+    # normal/dist intermediates when no consumer (lambda_normal, w_normal,
+    # lambda_dist) is active. At 4K image res this avoids ~600 MB per call
+    # for dx, dy, cross product, and the 3-ch viewmatrix rotate.
+    _skip_aux = bool(getattr(pipe, 'skip_aux_normal_dist', False))
 
-    # get median depth map
-    render_depth_median = allmap[5:6]
+    # Sizes for the optional zero placeholders below.
+    _N = allmap.shape[0]
+    _H, _W = allmap.shape[1], allmap.shape[2]
+    _zero_hw = torch.zeros(1, _H, _W, device=allmap.device, dtype=allmap.dtype)
+
+    # get normal map. transform normal from view space to world space.
+    if _skip_aux:
+        render_normal = torch.zeros(3, _H, _W, device=allmap.device, dtype=allmap.dtype)
+    else:
+        render_normal = allmap[2:5]
+        render_normal = (render_normal.permute(1,2,0) @ (viewpoint_camera.world_view_transform[:3,:3].T)).permute(2,0,1)
+
+    # get median depth map. `--method res_3d_paired` SLIM out_others has only
+    # 5 channels (DEPTH+ALPHA+NORMAL) — every read below is size-gated and
+    # falls back to a zero tensor of matching [1, H, W] shape when the channel
+    # is absent. Downstream consumers (mini reinit, --lambda_dist, etc.) must
+    # not require these for res_3d_paired runs with this build.
+    render_depth_median = allmap[5:6] if _N >= 6 else _zero_hw
     render_depth_median = torch.nan_to_num(render_depth_median, 0, 0)
 
     # get expected depth map
@@ -2298,7 +2628,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     render_depth_expected = torch.nan_to_num(render_depth_expected, 0, 0)
 
     # get depth distortion map
-    render_dist = allmap[6:7]
+    render_dist = allmap[6:7] if _N >= 7 else _zero_hw
 
     # psedo surface attributes
     # surf depth is either median or expected by setting depth_ratio to 1 or 0
@@ -2307,24 +2637,27 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     surf_depth = render_depth_expected * (1-pipe.depth_ratio) + (pipe.depth_ratio) * render_depth_median
 
     # # assume the depth points form the 'surface' and generate psudo surface normal for regularizations.
-    surf_normal = depth_to_normal(viewpoint_camera, surf_depth)
-    surf_normal = surf_normal.permute(2,0,1)
-    # remember to multiply with accum_alpha since render_normal is unnormalized.
-    surf_normal = surf_normal * (render_alpha).detach()
+    if _skip_aux:
+        surf_normal = torch.zeros(3, _H, _W, device=allmap.device, dtype=allmap.dtype)
+    else:
+        surf_normal = depth_to_normal(viewpoint_camera, surf_depth)
+        surf_normal = surf_normal.permute(2,0,1)
+        # remember to multiply with accum_alpha since render_normal is unnormalized.
+        surf_normal = surf_normal * (render_alpha).detach()
 
     # surf_normal = render_normal
 
     # get contributed gaussians per pixel
-    render_gs_nums = allmap[7:8]
+    render_gs_nums = allmap[7:8] if _N >= 8 else _zero_hw
 
     # get overdraw map (soft contributor count from sigmoid relaxation)
-    render_overdraw = allmap[14:15]
+    render_overdraw = allmap[14:15] if _N >= 15 else _zero_hw
 
     # get max-contributor depth (intersection depth of Gaussian with highest alpha*T per pixel)
-    render_depth_max_contributor = allmap[15:16]
+    render_depth_max_contributor = allmap[15:16] if _N >= 16 else _zero_hw
 
     # get w² sum (sum of squared weights per pixel, for weight_reg loss)
-    render_w_square = allmap[16:17]
+    render_w_square = allmap[16:17] if _N >= 17 else _zero_hw
 
     # per-pixel sum of w_i * beta_i (--w_lambda_perpix shape reg). Only meaningful
     # for beta-supporting kernels (beta / beta_scaled / general / flex). For scalar
@@ -2552,7 +2885,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 rendered_image = rendered_image.view(H, W, -1).permute(2, 0, 1)
                 rendered_image = rendered_image * render_mask
 
-        vis_appearance_level = allmap[11:14]
+        vis_appearance_level = allmap[11:14] if allmap.shape[0] >= 14 else torch.zeros(
+            3, allmap.shape[1], allmap.shape[2], device=allmap.device, dtype=allmap.dtype)
 
     # Background compositing: skybox or solid color (legacy path for skybox texture)
     # Initialize FG/BG outputs for visualization

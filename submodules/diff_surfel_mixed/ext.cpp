@@ -31,6 +31,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_activation_bias", &SetActivationBiasCUDA);
   m.def("set_residual_mode", &SetResidualModeCUDA,
         "0 = 3D_SH_res outer ReLU (default). 1 = 3D_SH_add separate ReLUs.");
+  m.def("set_lru_slope", &SetLruSlopeCUDA,
+        "`--lru`: leaky-ReLU slope α for the outer per-Gauss activation "
+        "(mode 0 only). α == 0 (default) reduces to standard ReLU.");
   m.def("set_anti_alias", &SetAntiAliasCUDA);
   m.def("set_compact_mult", &SetCompactMultCUDA);
   m.def("set_aa_kernel_size", &SetAaKernelSizeCUDA);

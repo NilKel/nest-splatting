@@ -59,6 +59,29 @@ Hash levels are selected **finest-first** from `[128, 203, 322, 512]`. Hash tabl
 
 `MLP(sum(w_i * f_i))` — accumulate features then evaluate MLP once per pixel. Render mode 1 in `diff-surfel-rasterization`. Same hybrid_levels semantics. Less expressive than 3D_SH_res; kept for comparison.
 
+## `--method film` (FiLM — Feature-wise Linear Modulation)
+
+Full reference: [`docs/FILM_MODE.md`](../../docs/FILM_MODE.md). Cat-family
+*blend-then-PyTorch-MLP* mode where each surfel **conditions** the hash grid via a
+FiLM layer (Perez et al. 2018): `f_i = γ_i · H(x_i) + β_i`, then 2DGS-blend, then the
+same screen-space MLP as cat. Per-Gauss `γ` (scalar) + `β` (24D) instead of a
+concatenated coarse feature; `hybrid_levels=0` (all 24D = 6 hash levels × 4D).
+- **Submodule**: `submodules/diff_surfel_film` (clone of `diff-surfel-rasterization`;
+  case-1 forward applies `γ·H+β`, backward γ-scales the hash/xyz grad and emits
+  `dL_dfilm_gamma`/`dL_dfilm_beta` + α-recurrence on the modulated feature). Build like
+  any submodule. `film_gamma`/`film_beta` are dedicated kernel tensors; empty ⇒ nullptr
+  ⇒ byte-identical to cat.
+- **Storage**: packed `GaussianModel._film_params` `[N,25]` (col 0 = γ init 1.0, cols
+  1:25 = β init 0 → starts at pure hash). Shares `feature_lr`. PLY cols `film_0..24`.
+  Init is configurable: `--film_gamma_init` (def 1.0) / `--film_beta_init` (def 0.0);
+  use `0.1` / `1.0` to bias appearance lifting from the hashgrid toward β. (Init only
+  biases the start; the hash LR is 8× β's, so pair with `--hash_lr_scale 0.1` if needed.)
+- **MLP**: PyTorch (no `set_mlp_weights`); view-dependent (only view-dep mechanism).
+- Wired as cat-family across train.py / modules.py / renderer; **not** in the
+  3D_SH_res CUDA-setter lists. Use standard or FastGS densification (MCMC/minimc-reinit/
+  consolidate tensor-rebuild + baked pipeline are NOT yet wired for FiLM).
+- Future ablation noted in the doc: `(1+γ)`+weight-decay reparametrization.
+
 ## Baked Rendering Pipeline
 
 Goal: bake the MLP residual into static per-Gaussian SH textures for fast inference.
@@ -122,6 +145,54 @@ Goal: bake the MLP residual into static per-Gaussian SH textures for fast infere
 - `--freeze_sh` — permanently zero SH LR
 - `--sh_freeze_iter N` — freeze SH LR for first N iters
 - `--freeze_mlp` — freeze MLP weights
+- `--ste` — sign-aware straight-through estimator on the per-Gauss outer ReLU
+  (mode 0 / 3D_SH_res + mixed[_3d]). At clamped sites (`pre ≤ 0`), gradient
+  flows ONLY when `dL/dpixel < 0` (release-clamp direction); blocks the deep-
+  negative-runaway pathology of naive STE. Forward unchanged. CUDA-side via
+  `d_ste_relu` for the per-Gauss clamp; Python-side via `STERelu.apply()` in
+  the renderer for mode 2 (sep methods, per-pixel after-blend clamp).
+  Mutually exclusive with `--lru`.
+- **Res-3D mode family** (`res_switch`, `res_3d`, `res_3d_paired`,
+  `res_3d_double`) — staged curriculum (mode-0 → mode-2 flip at
+  `--res_switch_iter`, optional 2D-residual / 3D-EWA-SV split at
+  `--res_3d_iter`). Full reference: [`docs/RES_3D_MODES.md`](../../docs/RES_3D_MODES.md).
+  Quick summary:
+  - `res_switch` — just the mode flip, no split. `diff_surfel_3D_sh_res`.
+  - `res_3d` — dual T cascade post-split. Tex carriers residual ONLY
+    (hardwired bias gate forces `sh_color = 0`). Single-pass kernel
+    `diff_surfel_res_3d`.
+  - `res_3d_paired` — joint T cascade post-split. Tex carriers keep SV →
+    `feat = ReLU(SV+0.5) + residual` (full mixed_3d-style capacity).
+    Opacity scaled by `--texsplit_tex_frac` (default 0.5). Kernel:
+    `diff_surfel_mixed_3d`. Baking uses `diff_surfel_bake_render_paired`
+    (a clone of `diff_surfel_bake_render`, auto-aliased via `sys.modules`
+    by `benchmark_baked.py`).
+  - `res_3d_double` — dual T cascade post-split (kernel: `diff_surfel_res_3d`)
+    with the bias gate explicitly flipped to 0 at stage 2 →
+    `feat = ReLU(SV+0.5) + residual`. Combines `res_3d`'s cross-set
+    occlusion-independence with `res_3d_paired`'s full per-Gauss capacity.
+  - All four auto-default `--lru` to 0.01 so the mode-0 per-Gauss LRU
+    matches the post-flip post-blend LRU slope (smooth knee, no
+    discontinuous jump).
+  - Stage-1 flip mechanism (`set_residual_mode(2)`,
+    `ingp.is_mixed_deferred_relu_mode = True`, `args._residual_mode = 2`)
+    is shared across `res_switch` / `res_3d` / `res_3d_paired` /
+    `res_3d_double` at `--res_switch_iter`.
+  - Stage-2 split mechanism (`split_at_res_3d(keep_tex_sv=...)`, setter-
+    mirror install, `set_textured_bias_gate(0)` for `res_3d_double`) fires
+    at `--res_3d_iter` only for the three split-variant modes.
+
+- `--lru α` — leaky-ReLU slope α for the SAME outer activation sites as
+  `--ste`. α == 0 (default) reduces to standard ReLU. α > 0 modifies **both**
+  forward and backward: forward `feat = (pre>0)?pre:α·pre` (clamped sites
+  contribute α·pre instead of 0), backward gate at clamped sites = α
+  (non-zero feedback to MLP/hash without STE's "100% pass" magnitude). CUDA
+  device-global `d_lru_slope` in all 3 mode-0-capable submodules
+  (`diff_surfel_3D_sh_res`, `diff_surfel_mixed`, `diff_surfel_mixed_3d`),
+  threaded via the setter-mirror pattern from `diff_surfel_3D_sh_res`.
+  Python-side via `F.leaky_relu(rendered_image, α)` in the renderer's
+  deferred-ReLU dispatch for mode 2. Typical α = 0.01. Mutually exclusive
+  with `--ste` (both modify the same clamp; pick one policy).
 
 ### Hash/MLP LRs
 - `--res_lr_scale X` — scale hash + MLP LR
@@ -325,6 +396,32 @@ Goal: bake the MLP residual into static per-Gaussian SH textures for fast infere
   **26.34 dB / 0.776 / 0.208 @ 1157 FPS vs neural 26.61 / 0.819 / 0.160 @
   111 FPS — 10.4× speedup, −0.27 dB** (same bake-quant band as `--method
   mixed`: −0.32 dB), confirming the EWA geometry bakes correctly.
+
+### `--3rgs` (camera pose refinement)
+Joint camera-pose + Gaussian optimization — the *sfm* core of 3R-GS (Huang et al.
+2025, clone `../3rgs`). Full reference: [`docs/3RGS_POSE_REFINE.md`](../../docs/3RGS_POSE_REFINE.md).
+- **Mechanism**: the rasterizers here have **no viewmatrix gradient** (backward
+  returns grads for means3D/means2D/sh/scales/rotations/opacities only). So the
+  per-camera rigid pose delta `Td` (`C2W' = C2W·Td`, 3 translation + 6D rotation,
+  zero-init) is back-propagated by applying the equivalent world-frame transform
+  `M = C2W·inv(Td)·W2V` to the Gaussian **means + rotations** before rasterizing
+  (`x' = M_rot·x + M_t`, `q' = quat(M_rot)⊗q`). Identical to moving the camera;
+  zero-init ⇒ byte-identical at iter 0; grad reaches `Td` via `dL/dmeans3D` +
+  `dL/drotations`. **No CUDA rebuild**; method-agnostic (`3D_SH_res`,
+  `res_3d_paired`, `mixed[_3d]`, …).
+- **Files**: `scene/camera_pose_opt.py` (`CameraPoseOpt` + helpers + export);
+  `render()` gains a `pose_correction=(M_rot,M_t,q_M)` arg applied right after
+  `means3D = pc.get_xyz` and `rotations = pc.get_rotation`; `train.py` builds a
+  **separate** Adam (per-camera, fixed count — untouched by densification or the
+  res_3d_paired splits), steps it in `[warmup, until]`, and exports refined poses.
+- **Flags**: `--3rgs` (enable, `dest=pose_refine`), `--3rgs_lr` (1e-5),
+  `--3rgs_warmup` (500; raise to 1000–2000 under `--cold`), `--3rgs_until`
+  (-1 = total iters), `--3rgs_reg` (0). Just append `--3rgs` to any normal command.
+- **Output** (per save, next to the PLY): `point_cloud/iteration_<N>/refined_poses/`
+  → `refined_poses.npz` (names, R_wc, t, c2w, delta) + `images_refined.txt` (COLMAP,
+  reuse original `cameras.txt`). The trained PLY *is* the improved reconstruction.
+- **Not ported** (need correspondence data): MLP pose variant, the global epipolar
+  loss (MASt3R-SfM), and test-time pose opt (for held-out `--eval` PSNR).
 
 ### Other
 - `--init_ply PATH` — initialize Gaussians from external PLY

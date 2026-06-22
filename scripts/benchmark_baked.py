@@ -1105,10 +1105,21 @@ def main():
                              "Decompressed to a temp .ply before rendering. "
                              "Use to bench the 'RVQply' combo (8-bit PLY + RVQ atlas).")
     parser.add_argument("--aabb_mode", type=int, default=3,
-                        help="AABB mode: 0=square, 1=square+AdR, 2=rect, 3=rect+AdR (default: 3)")
+                        help="AABB mode: 0=square, 1=square+AdR, 2=rect+SnugBox, "
+                             "3=rect+AdR+SnugBox (default), 5=alias for 2. "
+                             "Mode 3 composes AdR (opacity-aware r_beta cutoff — shrinks ellipse) "
+                             "with AccuTile SnugBox (ellipse-tight tile enumeration). At bake time "
+                             "AdR is quality-neutral and saves ~22% FPS vs fixed-4σ. The EWA "
+                             "untextured path applies its own opacity-aware Mahalanobis cutoff "
+                             "regardless of aabb_mode.")
     parser.add_argument("--sort_mode", type=int, default=0,
-                        help="Sort scheme: 0=legacy 64-bit single sort, 1=FastGS two-stage "
-                             "(32-bit depth on n_visible + 32-bit tile on n_instances). default 0")
+                        help="Sort scheme: 0=legacy 64-bit single sort (default), "
+                             "1=FastGS two-stage (32-bit depth on n_visible + 32-bit tile on "
+                             "n_instances). Mode 1 is FastGS-spec but on this paired EWA+textured "
+                             "workload it's a regression: tile-touch redundancy is high (3D "
+                             "ellipsoids cover more tiles than 2DGS discs), so the two-stage "
+                             "prefix-sum + duplicate-emit overhead exceeds the savings (counter: "
+                             "696.9 → 648.5 FPS, -7%%).")
     parser.add_argument("--view_aware_res", action="store_true",
                         help="Size each surfel's atlas resolution by its max projected "
                              "footprint across all training views (viewing-Nyquist). "
@@ -1185,6 +1196,19 @@ def main():
         args = pickle.load(f)
     args.model_path = model_path
     args.eval = True
+
+    # `--method res_3d_paired`: bake + render through diff_surfel_bake_render_paired
+    # (a clone of diff_surfel_bake_render). Functionally identical to mixed_3d_sep's
+    # baked path (mode 2 + EWA untex + per-pixel ReLU) — kept as a separate compile
+    # target so res_3d_paired bakes can evolve independently of mixed_3d_sep.
+    # Alias via sys.modules so every `from diff_surfel_bake_render import X` inside
+    # this script transparently resolves to the paired build.
+    if getattr(args, 'method', '') == 'res_3d_paired':
+        import sys
+        import diff_surfel_bake_render_paired as _paired_pkg
+        sys.modules['diff_surfel_bake_render'] = _paired_pkg
+        print(f"[CONFIG] Routing bake-render through diff_surfel_bake_render_paired "
+              f"(--method res_3d_paired).")
 
     config_yaml_path = os.path.join(model_path, "config.yaml")
     cfg = Config(config_yaml_path) if os.path.exists(config_yaml_path) else Config(args.yaml)
@@ -1313,7 +1337,11 @@ def main():
         _method_train = getattr(args, 'method', '')
         if _method_train == "3D_SH_add":
             _rm = 1
-        elif _method_train in ("mixed_sep", "mixed_3d_sep"):
+        elif _method_train in ("mixed_sep", "mixed_3d_sep",
+                                 "res_switch", "res_3d", "res_3d_paired", "res_3d_double",
+                                 "3D_SH_res_sep"):
+            # All deferred per-pixel ReLU modes — kernel leaves feat signed,
+            # Python re-applies torch.relu (or LRU) on the blended pixel.
             _rm = 2
         else:
             _rm = 0

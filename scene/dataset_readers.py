@@ -37,6 +37,7 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     alpha: np.array
+    clip_plane: object = None   # [a,b,c,d] world-space clip plane (clip_relight); None if absent
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -259,8 +260,10 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             w2c_list.append(w2c)
             
 
+            _clip_plane = frame.get("clip_plane", None)  # per-frame clip plane (clip_relight dataset)
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image, alpha=None,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
+                            clip_plane=_clip_plane))
         
     return cam_infos
 

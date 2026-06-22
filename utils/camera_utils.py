@@ -74,7 +74,8 @@ def loadCam(args, id, cam_info, resolution_scale):
                   image_name=cam_info.image_name, uid=id,
                   data_device=args.data_device,
                   HWK=HWK,
-                  image_path=getattr(cam_info, 'image_path', None))
+                  image_path=getattr(cam_info, 'image_path', None),
+                  clip_plane=getattr(cam_info, 'clip_plane', None))
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

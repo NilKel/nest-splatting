@@ -1,0 +1,42 @@
+#
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
+#
+# This software is free for non-commercial, research and evaluation use 
+# under the terms of the LICENSE.md file.
+#
+# For inquiries contact  george.drettakis@inria.fr
+#
+
+from setuptools import setup
+from torch.utils.cpp_extension import CUDAExtension, BuildExtension
+import os
+import sys
+_src_path = os.path.dirname(os.path.abspath(__file__))
+
+# Get conda environment include path
+conda_include = os.path.join(sys.prefix, 'include')
+# Get glm include path
+glm_include = os.path.join(_src_path, 'third_party', 'glm')
+
+setup(
+    name="diff_surfel_film",
+    packages=['diff_surfel_film'],
+    version='0.0.1',
+    ext_modules=[
+        CUDAExtension(
+            name="diff_surfel_film._C",
+            sources=[
+            "cuda_rasterizer/rasterizer_impl.cu",
+            "cuda_rasterizer/forward.cu",
+            "cuda_rasterizer/backward.cu",
+            "cuda_rasterizer/utils.cu",
+            "rasterize_points.cu",
+            "ext.cpp"],
+            extra_compile_args={"nvcc": ["-I" + conda_include, "-I" + glm_include]})
+        ],
+    cmdclass={
+        'build_ext': BuildExtension
+    }
+)

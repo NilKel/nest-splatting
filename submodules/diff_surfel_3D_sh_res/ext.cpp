@@ -36,6 +36,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "(mode 0 only). 1 = backward gradient passes through clamped "
         "activations as identity (MLP/hashgrid keeps receiving signal). "
         "0 = exact gradient (default).");
+  m.def("set_detach_res_shape_grad", &SetDetachResShapeGradCUDA,
+        "`--detach_res_shape_grad`: backward-only. 1 = the per-Gauss "
+        "alpha/shape gradient is driven by the SV (SH base) color only; the "
+        "MLP residual is detached from surfel-shape gradients (it still drives "
+        "position via the hash-query xyz path + opacity). Forward unchanged. "
+        "0 = default (residual in shape gradient).");
+  m.def("set_lru_slope", &SetLruSlopeCUDA,
+        "`--lru`: leaky-ReLU slope α for the outer per-Gauss activation "
+        "(mode 0 only). α == 0 (default) reduces to standard ReLU. α > 0 → "
+        "forward `feat = (pre>0)?pre:α·pre`, backward clamp gate = α.");
   m.def("set_anti_alias", &SetAntiAliasCUDA);
   m.def("set_compact_mult", &SetCompactMultCUDA);
   m.def("set_aa_kernel_size", &SetAaKernelSizeCUDA);

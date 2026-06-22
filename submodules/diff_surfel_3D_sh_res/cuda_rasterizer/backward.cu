@@ -34,9 +34,26 @@ __device__ float d_res_bias = 0.5f;  // Residual activation bias: ReLU(residual 
 // to emit residuals that don't blow past the SV-zero. Default 0 (off → exact
 // gradient). Inner SH ReLU is unaffected.
 __device__ int d_ste_relu = 0;
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss ReLU (mode 0). Backward
+// uses this as the gate value at clamped sites (pre ≤ 0): α = 0 (default) →
+// standard ReLU (gate = 0). α > 0 → gate = α → grad scaled by α at clamped
+// sites. STE overrides LRU at clamped sites where dL/dpixel < 0 (release-
+// clamp direction wins). Mirrors forward.cu — host setter pair stays in sync.
+__device__ float d_lru_slope = 0.0f;
 // d_residual_mode: 0 = 3D_SH_res (stacked outer ReLU), 1 = 3D_SH_add (separate ReLUs).
 // Mirrors forward.cu — the backward gradient routing differs between the two modes.
 __device__ int d_residual_mode = 0;
+// `--detach_res_shape_grad`: backward-only. When 1, the per-Gauss alpha/shape
+// gradient `dL_dalpha += (color - accum_rec)·dL_dpix` is driven by the SV
+// (SH base) color ONLY — the MLP residual is detached from the shape gradient.
+// Forward is unchanged (still renders SV+residual). This isolates the
+// optimization-dynamics question "should high-frequency residual reshape the
+// surfel, or should geometry follow the low-frequency SV only?": with the flag
+// on, SV sculpts surfel shape (via G→ρ→transMat) while the residual influences
+// position only through the hash-query xyz path (and opacity). Default 0 =
+// byte-identical (residual stays in the shape gradient). Pairs with
+// `--detach_hash_grad` (which kills the xyz path) to form the 2×2 ablation.
+__device__ int d_detach_res_shape_grad = 0;
 __device__ float d_aa_kernel_size = 0.0f;  // AA-2DGS Jacobian mip filter σ (0 = off)
 // Periodic-freeze flag for the mode 5 (3D_SH_res) backward. When true, the
 // kernel skips EVERYTHING hash/MLP-gradient-related: the 3 weight-grad WMMA
@@ -817,8 +834,15 @@ renderCUDAsurfelBackward(
 	// Gaussian is known from each pixel from the forward.
 	uint32_t contributor = toDo;
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
-	
+
 	float accum_rec[C] = { 0 };
+	// `--detach_res_shape_grad`: parallel SV-only behind-color recurrence. Tracks
+	// the accumulated SV (no residual) so the alpha/shape gradient can use
+	// (SV - accum_rec_sv) instead of (feat - accum_rec). Advanced in lockstep
+	// with accum_rec (same last_alpha) at every contribution site so it stays
+	// consistent. Unused (and cheap) when the flag is off.
+	float accum_rec_sv[C] = { 0 };
+	float last_color_sv[C] = { 0 };
 	float dL_dpixel[C];
 
 #if RENDER_AXUTILITY
@@ -1326,7 +1350,7 @@ renderCUDAsurfelBackward(
 							// deep-negative-runaway pathology of naive STE.
 							gate_res = ((sh_color[o] + my_residual[o] + d_res_bias > 0.0f) ||
 							            (d_ste_relu && dL_dpixel[o] < 0.0f))
-							           ? 1.0f : 0.0f;
+							           ? 1.0f : d_lru_slope;  // `--lru` α (0 = std ReLU)
 						}
 						my_dL_dz3[o] = dL_dpixel[o] * w * gate_res;
 					}
@@ -1342,7 +1366,7 @@ renderCUDAsurfelBackward(
 							// `--ste` sign-aware (see gate_res above).
 							gate_sh = ((sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ||
 							           (d_ste_relu && dL_dpixel[ch] < 0.0f))
-							          ? 1.0f : 0.0f;
+							          ? 1.0f : d_lru_slope;  // `--lru` α (0 = std ReLU)
 						}
 						acc_dL_dcolors[ch] += dL_dpixel[ch] * w * gate_sh;
 					}
@@ -2043,6 +2067,11 @@ renderCUDAsurfelBackward(
 					// Update last color (to be used in the next iteration)
 					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
 					last_color[ch] = c;
+					// `--detach_res_shape_grad`: level-0 (SH-only) has no residual,
+					// so SV == c; advance accum_rec_sv in lockstep to keep it
+					// consistent for any level>0 contributor later in this pixel.
+					accum_rec_sv[ch] = last_alpha * last_color_sv[ch] + (1.f - last_alpha) * accum_rec_sv[ch];
+					last_color_sv[ch] = c;
 
 					const float dL_dchannel = dL_dpixel[ch];
 					dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
@@ -2068,6 +2097,10 @@ renderCUDAsurfelBackward(
 				else xyz = pk;
 
 				float dL_dchannels[C], grad_feat[C], feat[C];
+				// `--detach_res_shape_grad`: SV-only color (no residual), used for
+				// the shape gradient when the flag is on. Default = feat (no-op).
+				float feat_sv[C];
+				for (int _i = 0; _i < C; _i++) feat_sv[_i] = 0.0f;
 				float sum_grad = 0.0;
 				for(int ch = 0; ch < C; ch++){
 					// const float dL_dchannel = dL_dpixel[ch];
@@ -2203,7 +2236,7 @@ renderCUDAsurfelBackward(
 						// gradient in scope here.
 						float g = ((sh_color_bw[c] + residual[c] + d_res_bias > 0.0f) ||
 						           (d_ste_relu && dL_dchannels[c] < 0.0f))
-						          ? 1.0f : 0.0f;
+						          ? 1.0f : d_lru_slope;  // `--lru` α (0 = std ReLU)
 						gate_res = g;
 						gate_sh = g;
 					}
@@ -2330,6 +2363,10 @@ renderCUDAsurfelBackward(
 						feat[ch] = sh_c + residual[ch] + d_res_bias;
 					else
 						feat[ch] = fmaxf(0.0f, sh_c + residual[ch] + d_res_bias);
+					// `--detach_res_shape_grad`: SV-only color for the shape grad.
+					// sh_c is ReLU(SH+sh_bias) (inner ReLU upstream) — the residual-free
+					// base. Used in the alpha-grad recurrence below when the flag is on.
+					feat_sv[ch] = sh_c;
 				}
 
 				break;
@@ -2414,7 +2451,7 @@ renderCUDAsurfelBackward(
 						// `--ste` sign-aware: see case-5 site above.
 						float g = ((sh_color_bw_6[c] + residual_6[c] + d_res_bias > 0.0f) ||
 						           (d_ste_relu && dL_dchannels[c] < 0.0f))
-						          ? 1.0f : 0.0f;
+						          ? 1.0f : d_lru_slope;  // `--lru` α (0 = std ReLU)
 						gate_res = g;
 						gate_sh = g;
 					}
@@ -2532,6 +2569,7 @@ renderCUDAsurfelBackward(
 						feat[ch] = sh_c + fmaxf(0.0f, residual_6[ch] + d_res_bias);
 					else
 						feat[ch] = fmaxf(0.0f, sh_c + residual_6[ch] + d_res_bias);
+					feat_sv[ch] = sh_c;  // `--detach_res_shape_grad`: SV-only color
 				}
 
 				break;
@@ -2547,8 +2585,20 @@ renderCUDAsurfelBackward(
 					// Update last color (to be used in the next iteration)
 					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
 					last_color[ch] = c;
+					// `--detach_res_shape_grad`: advance the SV-only behind-color
+					// recurrence in lockstep (same last_alpha). feat_sv = SV (no
+					// residual), set in the case 5/6 feat build above.
+					accum_rec_sv[ch] = last_alpha * last_color_sv[ch] + (1.f - last_alpha) * accum_rec_sv[ch];
+					last_color_sv[ch] = feat_sv[ch];
 
-					dL_dalpha += (c - accum_rec[ch]) * dL_dchannels[ch];
+					if (d_detach_res_shape_grad) {
+						// Shape gradient from SV only — residual detached. Forward
+						// (the rendered image, color grads, hash xyz grads) is
+						// unchanged; only this dL_dalpha term differs.
+						dL_dalpha += (feat_sv[ch] - accum_rec_sv[ch]) * dL_dchannels[ch];
+					} else {
+						dL_dalpha += (c - accum_rec[ch]) * dL_dchannels[ch];
+					}
 				}
 
 			}
@@ -3276,6 +3326,18 @@ void BACKWARD::setResidualMode(int mode) {
 __global__ void setSteReluBwKernel(int v) { d_ste_relu = v; }
 void BACKWARD::setSteRelu(int v) {
 	setSteReluBwKernel<<<1, 1>>>(v);
+}
+
+// `--detach_res_shape_grad`: drive the alpha/shape gradient from SV only.
+__global__ void setDetachResShapeGradBwKernel(int v) { d_detach_res_shape_grad = v; }
+void BACKWARD::setDetachResShapeGrad(int v) {
+	setDetachResShapeGradBwKernel<<<1, 1>>>(v);
+}
+
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss ReLU (mode 0 only).
+__global__ void setLruSlopeBwKernel(float v) { d_lru_slope = v; }
+void BACKWARD::setLruSlope(float v) {
+	setLruSlopeBwKernel<<<1, 1>>>(v);
 }
 
 __global__ void setAaKernelSizeBwKernel(float val) { d_aa_kernel_size = val; }

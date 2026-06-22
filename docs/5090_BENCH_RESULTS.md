@@ -136,6 +136,67 @@ every other config in the table — **smallest atlas (245 MB), highest FPS
 tightened the untextured-half tile coverage by ~55 % at no quality cost, and
 the bake-quant loss only ever hit textured rows in this mode.
 
+## `res_3d_paired` vs `3D_SH_res` (9-scene per-config split)
+
+Same scene set, five configs side by side: the two `3D_SH_res` regularization
+points (`0w0` = no w-reg, `005w25` = production w_lambda=0.005, γ=25) against
+the three `res_3d_paired` variants from the 35k-iter `_5ksp_i2*` runs.
+
+- **G2**: `--kernel beta_scaled --kernel2 gaussian` — textured 2DGS beta_scaled +
+  untextured 3D EWA Gaussian.
+- **BS2**: `--kernel beta_scaled --kernel2 beta_scaled` — both halves use the
+  compact-support beta_scaled cutoff.
+- **BS2_fast**: same config as BS2, "fast" trained variant — slightly fewer
+  Gaussians (~16 % fewer than BS2 mean).
+
+Bake config for all five: `--max_res 64 --bake_dtype bc7 --atlas_budget_mb 8192
+--num_benchmark 100`. Render path: aabb_mode 3 (rect+AdR+SnugBox), sort_mode 0,
+FMA-fused EWA Mahalanobis.
+
+### Baked FPS
+
+| Scene | 0w0 | 005w25 | G2 | BS2 | BS2_fast |
+|---|---:|---:|---:|---:|---:|
+| bicycle  | 510.3 |  999.0 | 696.6 |  798.7 |  847.5 |
+| bonsai   | 311.4 |  576.4 | 536.8 |  580.5 |  634.1 |
+| counter  | 523.5 |  863.6 | 727.5 |  919.3 |  908.0 |
+| flowers  | 279.6 |  559.2 | 544.7 |  634.7 |  692.6 |
+| garden   | 533.9 | 1111.7 | 848.4 | 1029.7 | 1053.9 |
+| kitchen  | 451.4 |  697.7 | 544.1 |  667.7 |  727.4 |
+| room     | 611.1 |  886.1 | 958.9 | 1160.0 | 1186.9 |
+| stump    | 360.8 |  689.1 | 629.4 |  683.4 |  858.8 |
+| treehill | 267.7 |  560.6 | 566.1 |  630.1 |  695.5 |
+| **mean** | **427.7** | **771.5** | **672.5** | **789.3** | **845.0** |
+
+### Baked PSNR (dB)
+
+| Scene | 0w0 | 005w25 | G2 | BS2 | BS2_fast |
+|---|---:|---:|---:|---:|---:|
+| bicycle  | 24.14 | 23.84 | 24.14 | 23.94 | 23.96 |
+| bonsai   | 32.84 | 31.94 | 33.02 | 32.60 | 32.35 |
+| counter  | 29.41 | 28.98 | 29.55 | 29.22 | 29.12 |
+| flowers  | 20.68 | 20.56 | 20.74 | 20.65 | 20.78 |
+| garden   | 26.98 | 26.65 | 27.02 | 26.79 | 26.76 |
+| kitchen  | 31.55 | 30.62 | 31.68 | 31.28 | 31.06 |
+| room     | 31.06 | 30.37 | 31.51 | 31.10 | 31.19 |
+| stump    | 25.83 | 25.62 | 25.74 | 25.75 | 25.78 |
+| treehill | 22.36 | 22.34 | 22.41 | 22.40 | 22.54 |
+| **mean** | **27.21** | **26.77** | **27.31** | **27.08** | **27.06** |
+
+**Reading the rollup:**
+- **PSNR order:** G2 (27.31) > 0w0 (27.21) > BS2 (27.08) ≈ BS2_fast (27.06) > 005w25 (26.77).
+- **FPS order:** BS2_fast (845.0) > BS2 (789.3) > 005w25 (771.5) > G2 (672.5) > 0w0 (427.7).
+- `0w0` is the quality king of the 3D_SH_res baselines but slowest — no overdraw
+  penalty lets surfels grow large → high per-pixel contributor count.
+- `005w25` is the fastest 3D_SH_res config but pays ~0.4 dB vs `0w0` for the
+  surfel-footprint compression.
+- **G2 strictly beats both 3D_SH_res variants on PSNR** while sitting between
+  them on FPS — adding the untex EWA half buys back the dB that w-reg gave up,
+  at no per-Gauss capacity cost.
+- **BS2 / BS2_fast** trade ~0.25 dB vs G2 for big FPS gains (beta_scaled's hard
+  Mahalanobis cutoff at the untex half culls more pixels per Gauss). BS2_fast
+  adds another +7.0 % FPS over BS2 essentially free (−0.02 dB mean).
+
 ## 5090-specific renderer-path findings
 
 These optimizations were measured on the 5090 (`--skip_bake`, render path

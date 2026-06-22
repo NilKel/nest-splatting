@@ -914,10 +914,22 @@ void SetResidualModeCUDA(int mode) {
     BACKWARD::setResidualMode(mode);
 }
 
+// `--method res_3d_paired`: per-Gauss bias gate (textured sh_color → 0).
+void SetTexturedBiasGateCUDA(int v) {
+    FORWARD::setTexturedBiasGate(v);
+    BACKWARD::setTexturedBiasGate(v);
+}
+
 // `--ste`: straight-through estimator on the per-Gauss outer ReLU.
 void SetSteReluCUDA(int v) {
     FORWARD::setSteRelu(v);
     BACKWARD::setSteRelu(v);
+}
+
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss activation (mode 0).
+void SetLruSlopeCUDA(float v) {
+    FORWARD::setLruSlope(v);
+    BACKWARD::setLruSlope(v);
 }
 
 void SetAntiAliasCUDA(float factor, float focal) {

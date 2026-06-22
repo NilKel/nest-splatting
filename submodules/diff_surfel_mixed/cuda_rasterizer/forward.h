@@ -134,6 +134,11 @@ namespace FORWARD
 	// 1 = 3D_SH_add (separate: ReLU(SH+bias) + ReLU(residual+bias)).
 	void setResidualMode(int mode);
 
+	// `--lru`: leaky-ReLU slope α for the outer per-Gauss activation (mode 0).
+	// α == 0 (default) → standard ReLU. α > 0 → forward+backward leak through
+	// negative activations scaled by α.
+	void setLruSlope(float v);
+
 	// Set Nexels-style anti-aliasing params for hash-grid down-weighting.
 	// factor=0 disables AA. Typical factor=1.0, focal=max(fx,fy).
 	void setAntiAlias(float factor, float focal);

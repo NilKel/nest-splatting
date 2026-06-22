@@ -694,6 +694,30 @@ def set_ste_relu(v=0):
     v=1 enables; v=0 disables (default, exact gradient)."""
     _C.set_ste_relu(int(v))
 
+
+def set_detach_res_shape_grad(v=0):
+    """`--detach_res_shape_grad`: backward-only. When v=1, the per-Gauss
+    alpha/shape gradient `dL_dalpha += (color - accum_rec)·dL_dpix` is driven by
+    the SV (SH base) color ONLY — the MLP residual is detached from surfel-shape
+    gradients. The forward image, color gradients, and the hash-query xyz
+    gradient are all unchanged; only which color term feeds the shape gradient
+    differs. Isolates 'should the high-freq residual reshape surfels, or should
+    geometry follow the low-freq SV?'. Pairs with `--detach_hash_grad` (which
+    kills the xyz path) for the 2x2 ablation. v=0 = default (residual in shape
+    gradient)."""
+    _C.set_detach_res_shape_grad(int(v))
+
+
+def set_lru_slope(alpha=0.0):
+    """`--lru`: leaky-ReLU slope α for the outer per-Gauss activation (mode 0).
+    Forward: `feat = (pre > 0) ? pre : α·pre`. Backward gate at clamped sites
+    becomes `α` instead of 0 — non-zero feedback at clamped pixels without the
+    deep-negative runaway risk of naive STE. α=0 (default) reduces to standard
+    ReLU. Combined with --ste: STE wins at clamped sites where the loss wants
+    the channel higher (dL/dpixel<0 → gate=1); LRU handles the rest.
+    Patches both forward and backward device globals — call once at startup."""
+    _C.set_lru_slope(float(alpha))
+
 def set_anti_alias(factor=0.0, focal=1.0):
     """Set Nexels-style hash-grid anti-aliasing down-weighting.
     factor=0 disables AA. factor=1.0 matches Nexels' grid_threshold_factor=1.0

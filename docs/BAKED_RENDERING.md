@@ -4,6 +4,16 @@ End-to-end baked-rendering pipeline for `3D_SH_res` models: a static SH PLY plus
 per-Gaussian residual atlas, sampled via hardware bilinear at inference. **6–9×
 faster than the neural renderer at near-identical quality.**
 
+> **Method coverage**: `3D_SH_res`, `3D_SH_res_sep`, `res_switch`, `res_3d`,
+> `res_3d_paired`, `res_3d_double`, `mixed_3d`, `mixed_3d_sep`, `3D_SH_cat`.
+> For the staged-curriculum / 2D-3D-split modes see [`RES_3D_MODES.md`](RES_3D_MODES.md).
+> `--method res_3d_paired` is routed through a dedicated bake-render submodule
+> `diff_surfel_bake_render_paired` (functionally a clone of
+> `diff_surfel_bake_render`; built separately so paired-specific kernel
+> tweaks don't touch the shared submodule). `benchmark_baked.py` does this
+> aliasing automatically via `sys.modules` when it detects
+> `args.method == "res_3d_paired"` in `args.pkl`.
+
 ## Key entry point
 
 ```bash

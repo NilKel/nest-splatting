@@ -698,6 +698,13 @@ def set_residual_mode(mode=0):
     Patches both forward and backward device globals — call once at startup."""
     _C.set_residual_mode(int(mode))
 
+
+def set_lru_slope(alpha=0.0):
+    """`--lru`: leaky-ReLU slope α for the outer per-Gauss activation (mode 0).
+    Forward `feat = (pre>0) ? pre : α·pre`. Backward clamp gate = α (instead
+    of 0). α == 0 (default) reduces to standard ReLU."""
+    _C.set_lru_slope(float(alpha))
+
 def set_anti_alias(factor=0.0, focal=1.0):
     """Set Nexels-style hash-grid anti-aliasing down-weighting.
     factor=0 disables AA. factor=1.0 matches Nexels' grid_threshold_factor=1.0

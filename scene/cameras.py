@@ -20,6 +20,7 @@ class Camera(nn.Module):
                  image_name, uid, rays = None, depth_path = None, HWK = None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  image_path = None,
+                 clip_plane = None,
                  ):
         super(Camera, self).__init__()
 
@@ -39,6 +40,11 @@ class Camera(nn.Module):
         self.depth_path = depth_path
         self.depth_map = None
 
+        # --method clip_relight: per-frame world-space clip plane [a,b,c,d]
+        # (kept half n·x+d<=0). None for non-clip datasets.
+        self.clip_plane = (torch.as_tensor(clip_plane, dtype=torch.float32, device="cuda")
+                           if clip_plane is not None else None)
+
         try:
             self.data_device = torch.device(data_device)
         except Exception as e:
@@ -47,12 +53,27 @@ class Camera(nn.Module):
             self.data_device = torch.device("cuda")
 
         self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
+        # `--data_device cpu`: pin host memory so per-iter `.cuda(non_blocking=True)`
+        # can do a real async DMA transfer that overlaps with the prior iter's
+        # backward / Adam step. Without pinning, the transfer is a synchronous
+        # bounce-buffer copy and blocks the GPU. At 4K (192 MB / image FP32),
+        # pinning cuts the perceived transfer cost from ~10-20 ms to ~0 ms.
+        if self.data_device.type == "cpu":
+            try:
+                self.original_image = self.original_image.pin_memory()
+            except RuntimeError:
+                pass  # pin failed (rare; e.g. exhausted pinned-memory pool)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 
         if gt_alpha_mask is not None:
             # self.original_image *= gt_alpha_mask.to(self.data_device)
             self.gt_alpha_mask = gt_alpha_mask.to(self.data_device)
+            if self.data_device.type == "cpu":
+                try:
+                    self.gt_alpha_mask = self.gt_alpha_mask.pin_memory()
+                except RuntimeError:
+                    pass
         else:
             self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
             # self.gt_alpha_mask = None

@@ -222,6 +222,15 @@ void SetResidualModeCUDA(int mode);
 // 1 = backward bypasses the clamp gate; 0 = exact gradient (default).
 void SetSteReluCUDA(int v);
 
+// `--detach_res_shape_grad`: drive the alpha/shape gradient from SV only
+// (detach the MLP residual from surfel-shape gradients). Backward-only.
+void SetDetachResShapeGradCUDA(int v);
+
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss activation (mode 0).
+// α == 0 (default) → standard ReLU. α > 0 → forward + backward leak through
+// negative activations scaled by α.
+void SetLruSlopeCUDA(float v);
+
 // Set Nexels-style anti-aliasing params (hash-grid down-weighting)
 void SetAntiAliasCUDA(float factor, float focal);
 

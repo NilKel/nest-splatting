@@ -890,6 +890,12 @@ void SetResidualModeCUDA(int mode) {
     BACKWARD::setResidualMode(mode);
 }
 
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss activation (mode 0).
+void SetLruSlopeCUDA(float v) {
+    FORWARD::setLruSlope(v);
+    BACKWARD::setLruSlope(v);
+}
+
 void SetAntiAliasCUDA(float factor, float focal) {
     FORWARD::setAntiAlias(factor, focal);
 }

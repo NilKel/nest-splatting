@@ -632,12 +632,15 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		rect_tiles = (rect_max.x - rect_min.x) * (rect_max.y - rect_min.y);
 		if (rect_tiles == 0) return;
 
-		// SnugBox+AccuTile is the default for rect modes (2 and 5; aabb_mode 5 is
-		// kept as an alias for backward compatibility). Verified +4..14% FPS on
-		// 18/18 scene-config pairs vs the rect-AABB-only enumeration with bit-
-		// identical PSNR. The rect-AABB code path below is still reached as a
-		// fallback for numerically-degenerate conics (disc → 0⁻).
-		bool use_snugbox = (aabb_mode == 2 || aabb_mode == 5);
+		// SnugBox+AccuTile is enabled for ALL rect modes (2, 3, 5).
+		// Composes cleanly with mode-3's AdR: the AdR cutoff just feeds into
+		// compute_conic_from_transmat() the same way the fixed 4σ cutoff does.
+		// AdR shrinks the per-Gauss ellipse for low-α surfels; AccuTile then
+		// enumerates only the tiles where the shrunken ellipse actually
+		// intersects — the two tightening effects compound. The rect-AABB code
+		// path below is still reached as a fallback for numerically-degenerate
+		// conics (disc → 0⁻).
+		bool use_snugbox = (aabb_mode == 2 || aabb_mode == 3 || aabb_mode == 5);
 
 		if (use_snugbox) {
 			if (compute_conic_from_transmat(T, cutoff, A_c, B_c, E_c, t_c, p_c)) {
@@ -918,9 +921,10 @@ renderBakedCUDA(
 				if (con_o.w <= 0.0f) continue;            // culled in preprocess
 				const float2 xy_e = collected_xy[j];
 				const float2 de = { xy_e.x - pixf.x, xy_e.y - pixf.y };
-				const float me = con_o.x * de.x * de.x
-				               + 2.0f * con_o.y * de.x * de.y
-				               + con_o.z * de.y * de.y;
+				// FMA-fused: me = (con_o.x*de.x + 2·con_o.y*de.y)*de.x + con_o.z*de.y*de.y.
+				// Reduces from 4 muls + 2 adds to a single fmaf chain.
+				const float me = fmaf(fmaf(2.0f * con_o.y, de.y, con_o.x * de.x), de.x,
+				                      con_o.z * de.y * de.y);
 				// Untextured kernel = `--kernel2` (d_untex_kernel, set from
 				// bake_meta) if ≥0, else the run's --kernel. Matches the
 				// mixed_3d training forward EWA decode.

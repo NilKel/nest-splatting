@@ -51,6 +51,9 @@ __device__ float d_weight_reg_lambda = 0.0f;
 // Default: sh_bias=0.5, res_bias=0.5 (standard 3DGS gray init + residual offset)
 // For decomposition: sh_only sets res_bias=-999 (ReLU clamps to 0), tex_only sets sh_bias=-999
 __device__ int d_residual_mode = 0;
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss activation (mode 0).
+// α == 0 (default) → standard ReLU. α > 0 → `feat = (pre>0)?pre:α·pre`.
+__device__ float d_lru_slope = 0.0f;
 __device__ float d_sh_bias = 0.5f;
 // Nexels-style anti-aliasing d_aa_factor / d_aa_focal are now declared in hashgrid.h
 // (per-TU static __device__). Setters below update this TU's copy.
@@ -1535,7 +1538,9 @@ renderCUDAsurfelForward(
 						// mixed: signed residual, no per-Gauss ReLU.
 						feat_ch = my_sh_color[ch] + residual + d_res_bias;
 					} else {
-						feat_ch = fmaxf(0.0f, my_sh_color[ch] + residual + d_res_bias);
+						// `--lru`: leaky ReLU. d_lru_slope == 0 (default) → standard ReLU.
+						const float _pre = my_sh_color[ch] + residual + d_res_bias;
+						feat_ch = (_pre > 0.0f) ? _pre : d_lru_slope * _pre;
 					}
 					C[ch] += feat_ch * my_w;
 				}
@@ -2125,7 +2130,9 @@ renderCUDAsurfelForward(
 				} else if (d_residual_mode == 2) {
 					feat[ch] = sh_color[ch] + residual[ch] + d_res_bias;
 				} else {
-					feat[ch] = fmaxf(0.0f, sh_color[ch] + residual[ch] + d_res_bias);
+					// `--lru`: leaky ReLU. d_lru_slope == 0 (default) → standard ReLU.
+					const float _pre = sh_color[ch] + residual[ch] + d_res_bias;
+					feat[ch] = (_pre > 0.0f) ? _pre : d_lru_slope * _pre;
 				}
 			}
 
@@ -2392,6 +2399,12 @@ void FORWARD::setActivationBias(float sh_bias, float res_bias) {
 __global__ void setResidualModeFwdKernel(int v) { d_residual_mode = v; }
 void FORWARD::setResidualMode(int mode) {
 	setResidualModeFwdKernel<<<1, 1>>>(mode);
+}
+
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss activation (mode 0).
+__global__ void setLruSlopeFwdKernel(float v) { d_lru_slope = v; }
+void FORWARD::setLruSlope(float v) {
+	setLruSlopeFwdKernel<<<1, 1>>>(v);
 }
 
 // Set anti-aliasing params (Nexels-style hash-grid down-weighting)

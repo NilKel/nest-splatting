@@ -60,6 +60,11 @@ class INGP(nn.Module):
         self.is_cat_mode = args is not None and hasattr(args, 'method') and args.method == "cat"
         # Store args for cat_dropout mode configuration (cat with hash dropout during training)
         self.is_cat_dropout_mode = args is not None and hasattr(args, 'method') and args.method == "cat_dropout"
+        # FiLM mode: per-Gauss scale gamma + bias beta modulate the hashgrid feature
+        # (f = gamma*H + beta), then blend + screen-space MLP. hybrid_levels stays 0
+        # (all 24D come from the hash); MLP is the same as cat (blend-then-PyTorch-MLP),
+        # so FiLM lands in the generic `else` feat_dim = levels*dim branch below.
+        self.is_film_mode = args is not None and hasattr(args, 'method') and args.method == "film"
 
         # Store args for adaptive mode configuration
         self.is_adaptive_mode = args is not None and hasattr(args, 'method') and args.method == "adaptive"
@@ -91,7 +96,32 @@ class INGP(nn.Module):
         # Store args for 3D_SH_res mode (per-Gaussian SH + tiny hash MLP residual, diff_surfel_3D_sh_res)
         # `--method mixed` is treated as 3D_SH_res at the INGP level (same hashgrid + MLP architecture).
         # The mixed-specific behavior (per-Gauss textured/untextured split) lives in the renderer + train loop.
-        self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method in ("3D_SH_res", "3D_SH_res_sep", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep")
+        self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method in ("3D_SH_res", "3D_SH_res_sep", "res_switch", "res_3d", "res_3d_paired", "res_3d_double", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep", "clip_relight")
+        # `--method res_3d`: at --res_3d_iter, each Gauss splits into a 2D
+        # residual-carrier + 3D EWA SV-carrier. Pre-split, behaves like
+        # 3D_SH_res + --lru (single render via diff_surfel_mixed_3d with all
+        # is_textured=True). Post-split, the renderer dispatches TWO renders
+        # (one per primitive type, masked by opacity) and composes the result
+        # as `C_sv + LRU(C_tex, α)`. `is_res_3d_post_split` flips at iter N.
+        self.is_res_3d_mode = args is not None and hasattr(args, 'method') and args.method == "res_3d"
+        self.is_res_3d_post_split = False
+        # `--method res_3d_double`: dual-cascade like res_3d, but textured
+        # carriers KEEP their SV (bias gate set to 0 at split → feat =
+        # ReLU(SV+0.5) + residual). Rendered through diff_surfel_res_3d
+        # (single-pass dual cascade), so renderer dispatches it the same way
+        # as plain res_3d. The behavioural difference is purely the CUDA
+        # `d_textured_bias_gate` flag flipped to 0 at stage 2.
+        self.is_res_3d_double_mode = args is not None and hasattr(args, 'method') and args.method == "res_3d_double"
+        self.is_res_3d_double_post_split = False
+        # `--method res_3d_paired`: same staged curriculum as res_3d (mode flip
+        # at --res_switch_iter, split at --res_3d_iter), but POST-SPLIT uses a
+        # SHARED-T joint cascade through diff_surfel_mixed_3d. At split, the
+        # tex copy keeps `--texsplit_tex_frac` of the original opacity and the
+        # untex copy keeps `1 - texsplit_tex_frac`. Both halves contribute to
+        # a single image via joint cascade — like the 0.99/0.01 trick from
+        # `--method mixed_3d --texsplit`. Single render call, no dual-cascade.
+        self.is_res_3d_paired_mode = args is not None and hasattr(args, 'method') and args.method == "res_3d_paired"
+        self.is_res_3d_paired_post_split = False
         # `--method mixed[_3d]`: textured/untextured manifold split. INGP-level
         # behavior is identical to 3D_SH_res; the split lives in renderer + train.
         # is_mixed_mode covers BOTH variants (shared color/relu/grad plumbing);
@@ -109,17 +139,27 @@ class INGP(nn.Module):
         # Includes `3D_SH_res_sep` — non-mixed homogeneous variant that just
         # swaps the activation site (per-Gauss → per-pixel) without any
         # textured/untextured split or EWA.
-        self.is_mixed_deferred_relu_mode = args is not None and hasattr(args, 'method') and args.method in ("mixed_sep", "mixed_3d_sep", "3D_SH_res_sep")
+        self.is_mixed_deferred_relu_mode = args is not None and hasattr(args, 'method') and args.method in ("mixed_sep", "mixed_3d_sep", "3D_SH_res_sep", "clip_relight")
         # `--ste`: sign-aware straight-through ReLU. In mode 0 it gates the
         # per-Gauss outer ReLU's backward (CUDA-side d_ste_relu); in mode 2
         # (mixed_*_sep) it switches the renderer's post-blend torch.relu →
         # STERelu (gaussian_renderer/__init__.py). Flag is read at the
         # renderer's per-pixel clamp site and at CUDA setup in train.py.
         self.is_ste_relu = args is not None and hasattr(args, 'ste') and args.ste
+        # `--lru` α: leaky-ReLU slope for the per-pixel after-blend clamp in
+        # mode 2 (sep methods). The renderer's deferred-ReLU dispatch picks
+        # F.leaky_relu(rendered_image, α) when α > 0 and STE is off. CUDA-mode
+        # (modes 0/1/cat) uses the parallel d_lru_slope device global instead.
+        self.lru_slope = float(getattr(args, 'lru', 0.0)) if args is not None else 0.0
         # Store args for 3D_SH_cat mode (per-Gaussian SH + hash+DC MLP residual, diff_surfel_3D_sh_res)
         self.is_3D_SH_cat_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_cat"
         # Store args for 3D_SH_32 mode (per-Gaussian SH + 32-dim hash MLP residual, diff_surfel_3D_sh_32)
         self.is_3D_SH_32_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_32"
+        # Store args for clip_relight mode: clip-conditioned per-Gauss deform+relight head ON TOP of
+        # 3D_SH_res. Rides the 3D_SH_res_sep machinery (residual_mode 2, deferred per-pixel ReLU, SV
+        # base via fake-SH); the head (clipgrid + multi-head MLP) is a Python pre-pass that overrides
+        # per-Gauss geometry/opacity and the SV base. Texgrid (hash+MLP) stays invariant in CUDA.
+        self.is_clip_relight_mode = args is not None and hasattr(args, 'method') and args.method == "clip_relight"
         self.freeze_mlp = args is not None and hasattr(args, 'freeze_mlp') and args.freeze_mlp
         # Treat lean/fp16/tc/sh_tc/sh_res/sh_cat mode same as fused mode for MLP/rendering logic
         if self.is_3D_direct_lean_mode or self.is_3D_direct_fp16_mode or self.is_3D_direct_tc_mode or self.is_3D_direct_sh_tc_mode or self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode or self.is_3D_SH_32_mode:
@@ -436,6 +476,18 @@ class INGP(nn.Module):
             self.mlp_fused_hash_dim = (total_levels - self.hybrid_levels) * level_dim
             self.mlp_fused_gauss_dim = self.hybrid_levels * level_dim
 
+        # --method clip_relight: build the clip-conditioned deform+relight head
+        # (clipgrid + multi-head MLP). Built BEFORE training_setup so its params
+        # land in self.optimizer. The texgrid (hash + mlp_fused) above is unchanged.
+        self.clip_head = None
+        if getattr(self, 'is_clip_relight_mode', False):
+            from hash_encoder.clip_relight import ClipRelightHead
+            _sb = float(self.voxel_range[1]) if (hasattr(self, 'voxel_range') and len(self.voxel_range) > 1) else 1.5
+            self.clip_head = ClipRelightHead(scene_bound=_sb).cuda()
+            print(f"[CLIP_RELIGHT] ClipRelightHead built (scene_bound={_sb}, "
+                  f"sigma={self.clip_head.sigma}, cull_k={self.clip_head.cull_k}, "
+                  f"m_max={self.clip_head.m_max}); input = clipgrid | s_g | n.")
+
         self.training_setup(cfg_model.optim)
 
         self.pre_level = None
@@ -464,7 +516,7 @@ class INGP(nn.Module):
 
         # Apply LR scaling for 3D_SH_res mode
         if self.args is not None and hasattr(self.args, 'res_lr_scale') and self.args.res_lr_scale != 1.0:
-            if self.args.method in ["3D_SH_res", "3D_SH_cat", "3D_SH_32"]:
+            if self.args.method in ["3D_SH_res", "3D_SH_res_sep", "res_switch", "res_3d", "res_3d_paired", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep", "clip_relight"]:
                 print(f"[3D_SH_RES] Scaling hash/MLP LR by {self.args.res_lr_scale}: encoding {lr_encoding} -> {lr_encoding * self.args.res_lr_scale}, mlp {lr_mlp_rgb} -> {lr_mlp_rgb * self.args.res_lr_scale}")
                 lr_encoding *= self.args.res_lr_scale
                 lr_mlp_rgb *= self.args.res_lr_scale
@@ -491,6 +543,9 @@ class INGP(nn.Module):
         # Skip when freeze_mlp: weights stay at init, no optimizer state needed
         if hasattr(self, 'mlp_fused') and self.mlp_fused is not None and not self.freeze_mlp:
             l.append({'params': self.mlp_fused.parameters(), 'lr': lr_mlp_rgb, "name": "mlp_fused"})
+        # clip_relight head (clipgrid + multi-head MLP) — trains alongside hash/MLP.
+        if getattr(self, 'clip_head', None) is not None:
+            l.append({'params': self.clip_head.parameters(), 'lr': lr_mlp_rgb, "name": "clip_head"})
 
         # For diffuse mode, create a dummy optimizer (no INGP params to optimize)
         if len(l) == 0:
@@ -1136,6 +1191,16 @@ class INGP(nn.Module):
                 self.active_hashgrid_levels = min(self.hashgrid_levels, anneal_levels + init_hashgrid_levels)
             # active_levels represents total active output levels (for MLP input size tracking)
             self.active_levels = self.hybrid_levels + self.active_hashgrid_levels
+        elif self.is_film_mode:
+            # FiLM: full hashgrid (hybrid_levels=0). disable_c2f (default) → all
+            # hashgrid levels active immediately, like cat; otherwise C2F ramp.
+            if self.disable_c2f:
+                self.active_hashgrid_levels = self.hashgrid_levels
+                self.active_levels = self.levels
+            else:
+                self.active_levels = min(self.levels, anneal_levels + self.init_active_level)
+                self.active_hashgrid_levels = self.active_levels
+            self.optim_gaussian = True  # Train Gaussians throughout
         else:
             # Baseline mode: C2F from init_active_level → total_levels
             self.active_levels = min(self.levels, anneal_levels + self.init_active_level)
@@ -1146,9 +1211,9 @@ class INGP(nn.Module):
         if current_iter >= self.switch_iter and current_iter < self.switch_iter + self.keep_geometry:
             self.optim_gaussian = False
         elif current_iter >= self.initialize and current_iter < self.initialize + self.warm_up:
-            # Cat mode: never freeze Gaussians during warm-up
-            # Per-Gaussian features need to train from the start since they handle coarse levels
-            if self.is_cat_mode:
+            # Cat / FiLM mode: never freeze Gaussians during warm-up
+            # Per-Gaussian features (cat) / FiLM gamma-beta need to train alongside geometry
+            if self.is_cat_mode or self.is_film_mode:
                 self.optim_gaussian = True
             else:
                 self.optim_gaussian = False

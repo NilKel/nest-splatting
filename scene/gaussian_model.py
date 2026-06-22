@@ -133,6 +133,14 @@ class GaussianModel:
         # untextured half, which renders as a 3D ellipsoid (beta-splatting EWA).
         # Empty for non-mixed runs. Textured surfels ignore it (stay 2DGS).
         self._scaling_z = torch.empty(0)
+        # `--deform`: per-surfel deformation latent [N, deform_dim], zero-init
+        # (= identity deformation). Decoded with a per-frame time code by the
+        # DeformModel MLP into a (Δpos, Δrot) that moves the surfel from its
+        # canonical pose to its time-t pose before rasterizing. Empty unless
+        # --deform. Threaded through clone/split/prune/ply exactly like _scaling_z.
+        self._deform_latent = torch.empty(0)
+        self.deform_dim = 0
+        self.deform_latent_lr = 0.0
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
@@ -162,6 +170,9 @@ class GaussianModel:
         # Per-Gaussian features for cat mode
         self._gaussian_features = torch.empty(0)
         self._gaussian_feat_dim = 0  # Will be set in create_from_pcd
+        # --method film: packed per-Gauss FiLM params, [N, 25]: col 0 = gamma (scale),
+        # cols 1:25 = beta (24D bias). f = gamma*H(x) + beta. Empty unless method=="film".
+        self._film_params = torch.empty(0)
         
         # Adaptive mode parameters
         self._gamma = torch.empty(0)  # (N, 1) learnable blend parameter
@@ -367,6 +378,12 @@ class GaussianModel:
             self._adaptive_num_levels = 0
             self._adaptive_cat_weight = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
         
+        # --method film: not stored in the .pth capture tuple (keeps the length-based
+        # format detection above intact). Resume relies on load_ply; guarantee the
+        # attribute exists so downstream code never AttributeErrors.
+        if not hasattr(self, '_film_params'):
+            self._film_params = torch.empty(0)
+
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -383,7 +400,21 @@ class GaussianModel:
         if self._scaling_z.numel() == 0:
             return self._scaling_z
         return self.scaling_activation(self._scaling_z)
-    
+
+    def init_deform_latent(self, dim, lr):
+        """`--deform`: create the per-surfel deformation latent (zero-init =
+        identity deformation), one row per current Gaussian. Idempotent: a no-op
+        if already created at the right size. Call AFTER the geometry exists and
+        BEFORE the training loop; the param group is added to the optimizer in
+        train.py (and re-added on every training_setup rebuild)."""
+        N = self._xyz.shape[0]
+        if self._deform_latent.numel() > 0 and self._deform_latent.shape == (N, dim):
+            return
+        self.deform_dim = int(dim)
+        self.deform_latent_lr = float(lr)
+        self._deform_latent = nn.Parameter(
+            torch.zeros(N, int(dim), device="cuda").requires_grad_(True))
+
     @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
@@ -405,6 +436,20 @@ class GaussianModel:
     @property
     def get_gaussian_features(self):
         return self._gaussian_features
+
+    @property
+    def get_film_gamma(self):
+        # [N, 1] per-Gauss FiLM scale (column 0 of _film_params). Empty unless --method film.
+        if self._film_params.numel() == 0:
+            return self._film_params
+        return self._film_params[:, 0:1]
+
+    @property
+    def get_film_beta(self):
+        # [N, 24] per-Gauss FiLM bias (columns 1: of _film_params). Empty unless --method film.
+        if self._film_params.numel() == 0:
+            return self._film_params
+        return self._film_params[:, 1:]
     
     @property
     def get_gamma(self):
@@ -575,7 +620,22 @@ class GaussianModel:
             self._gaussian_features = nn.Parameter(gaussian_feats.requires_grad_(True))
         else:
             self._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
-        
+
+        # --method film: packed per-Gauss FiLM params [N, 25]. col 0 = gamma (hash scale),
+        # cols 1:25 = beta (bias). Defaults gamma=1.0/beta=0.0 → identity (pure hash); set
+        # --film_gamma_init 0.1 --film_beta_init 1.0 to bias lifting toward beta. width = 24
+        # (6 hash levels x 4D).
+        if hasattr(args, 'method') and args.method == "film":
+            N = self.get_xyz.shape[0]
+            g_init = getattr(args, 'film_gamma_init', 1.0)
+            b_init = getattr(args, 'film_beta_init', 0.0)
+            film_gamma_init = g_init * torch.ones((N, 1), device="cuda").float()
+            film_beta_init = b_init * torch.ones((N, 24), device="cuda").float()
+            film_params = torch.cat([film_gamma_init, film_beta_init], dim=1)  # [N, 25]
+            self._film_params = nn.Parameter(film_params.requires_grad_(True))
+        else:
+            self._film_params = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+
         # Initialize adaptive mode parameters
         if hasattr(args, 'method') and args.method == "adaptive":
             per_level_dim = 4
@@ -884,6 +944,10 @@ class GaussianModel:
         if self._gaussian_feat_dim > 0:
             l.append({'params': [self._gaussian_features], 'lr': training_args.feature_lr, "name": "gaussian_features"})
 
+        # --method film: packed FiLM params (gamma + beta) share feature_lr.
+        if self._film_params.numel() > 0:
+            l.append({'params': [self._film_params], 'lr': training_args.feature_lr, "name": "film_params"})
+
         # --feature beta: spherical-beta parameter LR groups.
         # Matches beta-splatting reference: only sb_params (per-primitive
         # r,g,b,θ,φ,β_per_prim) is optimized. No shared sharpness parameter.
@@ -975,6 +1039,15 @@ class GaussianModel:
             l.append({'params': [self._scaling_z], 'lr': training_args.scaling_lr,
                       "name": "scaling_z"})
 
+        # `--deform`: per-surfel deformation latent. Own LR (stored at init).
+        # Re-added on every optimizer rebuild (e.g. the res_3d_paired split) so
+        # it survives tensor reconstruction with its Adam state intact.
+        if hasattr(self, '_deform_latent') and self._deform_latent.numel() > 0 \
+                and self._deform_latent.requires_grad:
+            l.append({'params': [self._deform_latent],
+                      'lr': self.deform_latent_lr,
+                      "name": "deform_latent"})
+
         # Add flex kernel per-Gaussian beta parameter (if present)
         if hasattr(self, '_flex_beta') and self._flex_beta.numel() > 0:
             l.append({'params': [self._flex_beta], 'lr': training_args.opacity_lr, "name": "flex_beta"})
@@ -1035,6 +1108,10 @@ class GaussianModel:
         if self._gaussian_feat_dim > 0:
             for i in range(self._gaussian_feat_dim):
                 l.append('gf_{}'.format(i))
+        # --method film: packed FiLM params (25 cols: gamma + 24D beta)
+        if self._film_params.numel() > 0:
+            for i in range(self._film_params.shape[1]):
+                l.append('film_{}'.format(i))
         # Add beta kernel shape parameter
         if hasattr(self, '_shape') and self._shape.numel() > 0:
             l.append('shape')
@@ -1087,6 +1164,10 @@ class GaussianModel:
         # `--method mixed` 3rd ellipsoid axis (log-scale). Only emitted post-split.
         if hasattr(self, '_scaling_z') and self._scaling_z.numel() > 0:
             l.append('scale_z')
+        # `--deform` per-surfel deformation latent columns.
+        if hasattr(self, '_deform_latent') and self._deform_latent.numel() > 0:
+            for i in range(self._deform_latent.shape[1]):
+                l.append('deform_{}'.format(i))
         return l
 
     def save_ply(self, path):
@@ -1111,6 +1192,10 @@ class GaussianModel:
         if self._gaussian_feat_dim > 0:
             gaussian_feats = self._gaussian_features.detach().cpu().numpy()
             attr_list.append(gaussian_feats)
+
+        # --method film: packed FiLM params [N, 25]
+        if self._film_params.numel() > 0:
+            attr_list.append(self._film_params.detach().cpu().numpy())
 
         # Include shape parameter if present (beta kernel)
         if hasattr(self, '_shape') and self._shape.numel() > 0:
@@ -1160,6 +1245,10 @@ class GaussianModel:
         # `--method mixed` 3rd ellipsoid axis (raw log-scale)
         if hasattr(self, '_scaling_z') and self._scaling_z.numel() > 0:
             attr_list.append(self._scaling_z.detach().cpu().numpy().reshape(-1, 1))
+
+        # `--deform` per-surfel deformation latent [N, deform_dim]
+        if hasattr(self, '_deform_latent') and self._deform_latent.numel() > 0:
+            attr_list.append(self._deform_latent.detach().cpu().numpy())
 
         attributes = np.concatenate(attr_list, axis=1)
         elements[:] = list(map(tuple, attributes))
@@ -1262,6 +1351,26 @@ class GaussianModel:
             self._gaussian_feat_dim = 0
             self._gaussian_features = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
+        # --method film: load packed FiLM params (film_0..film_N) if present, else
+        # fall back to identity init (gamma=1, beta=0) for a film run, else empty.
+        film_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("film_")]
+        if len(film_names) > 0:
+            film_names = sorted(film_names, key=lambda x: int(x.split('_')[-1]))
+            film_arr = np.zeros((xyz.shape[0], len(film_names)), dtype=np.float32)
+            for idx, attr_name in enumerate(film_names):
+                film_arr[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            self._film_params = nn.Parameter(torch.tensor(film_arr, dtype=torch.float, device="cuda").requires_grad_(True))
+            print(f"Loaded {film_arr.shape[1]}-col FiLM params for film mode")
+        elif args is not None and hasattr(args, 'method') and args.method == "film":
+            N = xyz.shape[0]
+            g_init = getattr(args, 'film_gamma_init', 1.0)
+            b_init = getattr(args, 'film_beta_init', 0.0)
+            film_arr = torch.cat([g_init * torch.ones((N, 1)), b_init * torch.ones((N, 24))], dim=1).float().cuda()
+            self._film_params = nn.Parameter(film_arr.requires_grad_(True))
+            print("Warning: No FiLM params in PLY, initialized gamma=1/beta=0 for film mode")
+        else:
+            self._film_params = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
+
         # Appearance level: prefer the column from the PLY if present,
         # otherwise fall back to the legacy init_level=6 default.
         ply_props = [p.name for p in plydata.elements[0].properties]
@@ -1290,6 +1399,20 @@ class GaussianModel:
                 torch.tensor(sz_np, dtype=torch.float, device="cuda").requires_grad_(True))
         else:
             self._scaling_z = torch.empty(0, device="cuda")
+
+        # `--deform` per-surfel deformation latent columns (deform_0..D-1).
+        deform_names = sorted([p.name for p in plydata.elements[0].properties
+                               if p.name.startswith("deform_")],
+                              key=lambda x: int(x.split('_')[-1]))
+        if len(deform_names) > 0:
+            dl = np.zeros((xyz.shape[0], len(deform_names)))
+            for idx, attr_name in enumerate(deform_names):
+                dl[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            self._deform_latent = nn.Parameter(
+                torch.tensor(dl, dtype=torch.float, device="cuda").requires_grad_(True))
+            self.deform_dim = len(deform_names)
+        else:
+            self._deform_latent = torch.empty(0, device="cuda")
 
         # Load beta kernel shape parameter (if present in PLY)
         if "shape" in ply_props:
@@ -1489,6 +1612,8 @@ class GaussianModel:
         self._appearance_level = optimizable_tensors["ap_level"]
         if "gaussian_features" in optimizable_tensors:
             self._gaussian_features = optimizable_tensors["gaussian_features"]
+        if "film_params" in optimizable_tensors:
+            self._film_params = optimizable_tensors["film_params"]
         if "gamma" in optimizable_tensors:
             self._gamma = optimizable_tensors["gamma"]
         if "adaptive_features" in optimizable_tensors:
@@ -1506,6 +1631,8 @@ class GaussianModel:
             self._shape = nn.Parameter(self._shape.data[valid_points_mask].clone(), requires_grad=False)
         if "scaling_z" in optimizable_tensors:
             self._scaling_z = optimizable_tensors["scaling_z"]
+        if "deform_latent" in optimizable_tensors:
+            self._deform_latent = optimizable_tensors["deform_latent"]
         if "flex_beta" in optimizable_tensors:
             self._flex_beta = optimizable_tensors["flex_beta"]
         # --feature beta: sb params go through the optimizer pruner like any other param.
@@ -1593,7 +1720,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level=None, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None, new_adaptive_zero_weight=None, new_gate_logits=None, new_shape=None, new_flex_beta=None, new_sb_params=None, new_sg_directions=None, new_sg_sharpness=None, new_sg_rgb=None, new_sv_sites=None, new_sv_colors=None, new_sv_dc=None, new_sv_tau=None, new_is_textured=None, new_scaling_z=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level=None, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None, new_adaptive_zero_weight=None, new_gate_logits=None, new_shape=None, new_flex_beta=None, new_sb_params=None, new_sg_directions=None, new_sg_sharpness=None, new_sg_rgb=None, new_sv_sites=None, new_sv_colors=None, new_sv_dc=None, new_sv_tau=None, new_is_textured=None, new_scaling_z=None, new_film_params=None, new_deform_latent=None):
         # CRITICAL: ap_level defaults to 24 (all hash levels active).
         # ap_level=0 silently disables hash encoding — see hashgrid.h: max_level = min(ap_level, L).
         if new_ap_level is None:
@@ -1609,6 +1736,10 @@ class GaussianModel:
         # Add gaussian_features if present (cat mode)
         if new_gaussian_features is not None and self._gaussian_feat_dim > 0:
             d["gaussian_features"] = new_gaussian_features
+
+        # --method film: packed FiLM params
+        if new_film_params is not None and self._film_params.numel() > 0:
+            d["film_params"] = new_film_params
 
         # Add adaptive mode parameters
         if new_gamma is not None and self._adaptive_feat_dim > 0:
@@ -1631,6 +1762,10 @@ class GaussianModel:
         # `--method mixed` 3rd ellipsoid axis (children inherit parent's z)
         if new_scaling_z is not None and hasattr(self, '_scaling_z') and self._scaling_z.numel() > 0:
             d["scaling_z"] = new_scaling_z
+
+        # `--deform`: per-surfel deformation latent (children inherit parent's)
+        if new_deform_latent is not None and hasattr(self, '_deform_latent') and self._deform_latent.numel() > 0:
+            d["deform_latent"] = new_deform_latent
 
         # Add beta kernel shape parameter
         if new_shape is not None and hasattr(self, '_shape') and self._shape.numel() > 0:
@@ -1672,6 +1807,8 @@ class GaussianModel:
         self._appearance_level = optimizable_tensors["ap_level"]
         if "gaussian_features" in optimizable_tensors:
             self._gaussian_features = optimizable_tensors["gaussian_features"]
+        if "film_params" in optimizable_tensors:
+            self._film_params = optimizable_tensors["film_params"]
         if "gamma" in optimizable_tensors:
             self._gamma = optimizable_tensors["gamma"]
         if "adaptive_features" in optimizable_tensors:
@@ -1684,6 +1821,8 @@ class GaussianModel:
             self._gate_logits = optimizable_tensors["gate_logits"]
         if "scaling_z" in optimizable_tensors:
             self._scaling_z = optimizable_tensors["scaling_z"]
+        if "deform_latent" in optimizable_tensors:
+            self._deform_latent = optimizable_tensors["deform_latent"]
         if "shape" in optimizable_tensors:
             self._shape = optimizable_tensors["shape"]
         elif new_shape is not None and hasattr(self, '_shape') and self._shape.numel() > 0:
@@ -1774,6 +1913,10 @@ class GaussianModel:
         new_gaussian_features = None
         if self._gaussian_feat_dim > 0:
             new_gaussian_features = self._gaussian_features[selected_pts_mask].repeat(N,1)
+
+        new_film_params = None
+        if self._film_params.numel() > 0:
+            new_film_params = self._film_params[selected_pts_mask].repeat(N,1)
         
         # Handle adaptive mode parameters
         new_gamma = None
@@ -1857,8 +2000,11 @@ class GaussianModel:
         new_scaling_z = None
         if self._scaling_z.numel() > 0 and self._scaling_z.shape[0] == selected_pts_mask.shape[0]:
             new_scaling_z = self._scaling_z[selected_pts_mask].repeat(N, 1)
+        new_deform_latent = None
+        if self._deform_latent.numel() > 0 and self._deform_latent.shape[0] == selected_pts_mask.shape[0]:
+            new_deform_latent = self._deform_latent[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions, new_sg_sharpness_split, new_sg_rgb_split, new_sv_sites, new_sv_colors, new_sv_dc, new_sv_tau=new_sv_tau, new_is_textured=new_is_textured, new_scaling_z=new_scaling_z)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions, new_sg_sharpness_split, new_sg_rgb_split, new_sv_sites, new_sv_colors, new_sv_dc, new_sv_tau=new_sv_tau, new_is_textured=new_is_textured, new_scaling_z=new_scaling_z, new_film_params=new_film_params, new_deform_latent=new_deform_latent)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -1882,6 +2028,10 @@ class GaussianModel:
         new_gaussian_features = None
         if self._gaussian_feat_dim > 0:
             new_gaussian_features = self._gaussian_features[selected_pts_mask]
+
+        new_film_params = None
+        if self._film_params.numel() > 0:
+            new_film_params = self._film_params[selected_pts_mask]
         
         # Handle adaptive mode parameters
         new_gamma = None
@@ -1965,8 +2115,11 @@ class GaussianModel:
         new_scaling_z_c = None
         if self._scaling_z.numel() > 0 and self._scaling_z.shape[0] == selected_pts_mask.shape[0]:
             new_scaling_z_c = self._scaling_z[selected_pts_mask]
+        new_deform_latent_c = None
+        if self._deform_latent.numel() > 0 and self._deform_latent.shape[0] == selected_pts_mask.shape[0]:
+            new_deform_latent_c = self._deform_latent[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions_c, new_sg_sharpness_c, new_sg_rgb_c, new_sv_sites_c, new_sv_colors_c, new_sv_dc_c, new_sv_tau=new_sv_tau_c, new_is_textured=new_is_textured_c, new_scaling_z=new_scaling_z_c)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level, new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight, new_adaptive_zero_weight, new_gate_logits, new_shape, new_flex_beta, new_sb_params, new_sg_directions_c, new_sg_sharpness_c, new_sg_rgb_c, new_sv_sites_c, new_sv_colors_c, new_sv_dc_c, new_sv_tau=new_sv_tau_c, new_is_textured=new_is_textured_c, new_scaling_z=new_scaling_z_c, new_film_params=new_film_params, new_deform_latent=new_deform_latent_c)
 
     def _clone_by_mask_fastgs(self, selected_pts_mask):
         """Clone Gaussians flagged by ``selected_pts_mask`` (bool, [N]).
@@ -1983,6 +2136,10 @@ class GaussianModel:
         new_gaussian_features = None
         if self._gaussian_feat_dim > 0:
             new_gaussian_features = self._gaussian_features[selected_pts_mask]
+
+        new_film_params = None
+        if self._film_params.numel() > 0:
+            new_film_params = self._film_params[selected_pts_mask]
 
         new_gamma = None
         new_adaptive_features = None
@@ -2053,6 +2210,9 @@ class GaussianModel:
         new_scaling_z_c = None
         if self._scaling_z.numel() > 0 and self._scaling_z.shape[0] == selected_pts_mask.shape[0]:
             new_scaling_z_c = self._scaling_z[selected_pts_mask]
+        new_deform_latent_c = None
+        if self._deform_latent.numel() > 0 and self._deform_latent.shape[0] == selected_pts_mask.shape[0]:
+            new_deform_latent_c = self._deform_latent[selected_pts_mask]
 
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacities,
@@ -2062,7 +2222,8 @@ class GaussianModel:
             new_sb_params, new_sg_directions_c, new_sg_sharpness_c,
             new_sg_rgb_c, new_sv_sites_c, new_sv_colors_c, new_sv_dc_c,
             new_sv_tau=new_sv_tau_c, new_is_textured=new_is_textured_c,
-            new_scaling_z=new_scaling_z_c)
+            new_scaling_z=new_scaling_z_c, new_film_params=new_film_params,
+            new_deform_latent=new_deform_latent_c)
         return num_new
 
     def _split_by_mask_fastgs(self, selected_pts_mask, N=2):
@@ -2087,6 +2248,10 @@ class GaussianModel:
         new_gaussian_features = None
         if self._gaussian_feat_dim > 0:
             new_gaussian_features = self._gaussian_features[selected_pts_mask].repeat(N, 1)
+
+        new_film_params = None
+        if self._film_params.numel() > 0:
+            new_film_params = self._film_params[selected_pts_mask].repeat(N, 1)
 
         new_gamma = None
         new_adaptive_features = None
@@ -2157,6 +2322,9 @@ class GaussianModel:
         new_scaling_z_split = None
         if self._scaling_z.numel() > 0 and self._scaling_z.shape[0] == selected_pts_mask.shape[0]:
             new_scaling_z_split = self._scaling_z[selected_pts_mask].repeat(N, 1)
+        new_deform_latent_split = None
+        if self._deform_latent.numel() > 0 and self._deform_latent.shape[0] == selected_pts_mask.shape[0]:
+            new_deform_latent_split = self._deform_latent[selected_pts_mask].repeat(N, 1)
 
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacity,
@@ -2166,7 +2334,8 @@ class GaussianModel:
             new_sb_params, new_sg_directions, new_sg_sharpness_split,
             new_sg_rgb_split, new_sv_sites, new_sv_colors, new_sv_dc,
             new_sv_tau=new_sv_tau, new_is_textured=new_is_textured_split,
-            new_scaling_z=new_scaling_z_split)
+            new_scaling_z=new_scaling_z_split, new_film_params=new_film_params,
+            new_deform_latent=new_deform_latent_split)
 
         # Prune the parents (children inherit at the tail of the tensor).
         prune_filter = torch.cat((
@@ -2180,7 +2349,8 @@ class GaussianModel:
                                  grad_thresh=0.0002, grad_abs_thresh=0.0012,
                                  dense=0.001, importance_thresh=1,
                                  prune_budget_frac=0.5,
-                                 extra_split_mask=None):
+                                 extra_split_mask=None,
+                                 opacity_clamp=0.8):
         """FastGS densification + pruning. Grad-qualifiers combined with the
         multi-view consistency metric mask. Pruning uses the pruning_score to
         bias-sample within the opacity-pruned set (50% budget by default).
@@ -2302,12 +2472,27 @@ class GaussianModel:
             n_pruned = int(final_prune.sum().item())
             self.prune_points(final_prune)
 
+        # FastGS opacity clamp (reference gaussian_model.py:520): cap every
+        # Gaussian's opacity at `opacity_clamp` (paper: 0.8) at the END of each
+        # densify step. This is the primary count-control lever during the
+        # densification phase — it prevents opacities from saturating toward 1.0,
+        # keeping marginal Gaussians inside the `opacity < min_opacity` pruneable
+        # band so VCP's budget sampling can continuously cull them. Without it,
+        # Gaussians lock in at high opacity, the prune-candidate set collapses to
+        # near-empty, and the count balloons until the >15k aggressive prune.
+        # `opacity_clamp <= 0` disables it (back-compat).
+        if opacity_clamp > 0.0:
+            clamped = torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * opacity_clamp)
+            opacities_new = self.inverse_opacity_activation(clamped)
+            optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+            self._opacity = optimizable_tensors["opacity"]
+
         n_split_children = 2 * n_split_parents  # N=2 in _split_by_mask_fastgs
         n_net = n_cloned + n_split_children - n_split_parents - n_pruned
         print(f"[FASTGS/action] cloned={n_cloned}, split_parents={n_split_parents} "
               f"(→{n_split_children} children), opacity_pruneable={to_remove} "
               f"(budget={remove_budget}), actually_pruned={n_pruned}, "
-              f"ΔN={n_net:+d} -> N={self.get_xyz.shape[0]}")
+              f"opacity_clamp={opacity_clamp}, ΔN={n_net:+d} -> N={self.get_xyz.shape[0]}")
         torch.cuda.empty_cache()
         return {"cloned": n_cloned, "split_parents": n_split_parents, "pruned": n_pruned}
 
@@ -2424,9 +2609,11 @@ class GaussianModel:
             elif name == "opacity": self._opacity = param
             elif name == "scaling": self._scaling = param
             elif name == "scaling_z": self._scaling_z = param
+            elif name == "deform_latent": self._deform_latent = param
             elif name == "rotation": self._rotation = param
             elif name == "ap_level": self._appearance_level = param
             elif name == "gaussian_features": self._gaussian_features = param
+            elif name == "film_params": self._film_params = param
             elif name == "gamma": self._gamma = param
             elif name == "adaptive_features": self._adaptive_features = param
             elif name == "adaptive_cat_weight" and hasattr(self, '_adaptive_cat_weight'): self._adaptive_cat_weight = param
@@ -2766,11 +2953,12 @@ class GaussianModel:
         self._scaling.data[add_idx] = new_scaling
 
         # Add new Gaussians using existing densification_postfix
+        new_film_params = self._film_params[add_idx] if self._film_params.numel() > 0 else None
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacity,
             new_scaling, new_rotation, new_ap_level,
             new_gaussian_features, new_gamma, new_adaptive_features, new_adaptive_cat_weight,
-            new_adaptive_zero_weight, new_gate_logits, new_shape
+            new_adaptive_zero_weight, new_gate_logits, new_shape, new_film_params=new_film_params
         )
         
         # Reset optimizer state for modified source indices
@@ -3506,6 +3694,9 @@ class GaussianModel:
         new_gaussian_features = None
         if hasattr(self, '_gaussian_features') and self._gaussian_features.numel() > 0:
             new_gaussian_features = self._gaussian_features[selected_pts_mask]
+        new_film_params = None
+        if self._film_params.numel() > 0:
+            new_film_params = self._film_params[selected_pts_mask]
 
         # CRITICAL: ap_level must be 24, NOT 0. See hashgrid.h: max_level = min(ap_level, L).
         # ap_level=0 → zero hash levels queried → dead hash gradients.
@@ -3513,7 +3704,7 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest,
                                    new_opacity, new_scaling, new_rotation,
                                    new_ap_level,
-                                   new_gaussian_features=new_gaussian_features)
+                                   new_gaussian_features=new_gaussian_features, new_film_params=new_film_params)
 
     @torch.no_grad()
     def mini_culling_with_clone(self, scene, render_fn, pipe, background, beta, iteration, cfg, ingp=None, imp_metric="indoor",
@@ -3627,6 +3818,9 @@ class GaussianModel:
         new_gaussian_features = None
         if self._gaussian_feat_dim > 0 and self._gaussian_features.numel() > 0:
             new_gaussian_features = self._gaussian_features[survivor_clone_mask]
+        new_film_params = None
+        if self._film_params.numel() > 0:
+            new_film_params = self._film_params[survivor_clone_mask]
 
         new_gamma = None
         new_adaptive_features = None
@@ -3671,7 +3865,7 @@ class GaussianModel:
             new_shape, new_flex_beta, new_sb_params,
             None, None, None,  # no SG here
             new_sv_sites_mc, new_sv_colors_mc,
-            new_sv_tau=new_sv_tau_mc,
+            new_sv_tau=new_sv_tau_mc, new_film_params=new_film_params,
         )
 
         # Extend factor_culling with the cloned donors' factors so downstream
@@ -4377,6 +4571,7 @@ class GaussianModel:
             '_flex_beta', '_shape',
             '_sb_params', '_sg_directions', '_sg_sharpness_sg', '_sg_rgb',
             '_sv_sites', '_sv_colors', '_sv_tau', '_sv_dc',
+            '_deform_latent',
         ]
         for name in _PARAM_NAMES:
             t = getattr(self, name, None)
@@ -4473,3 +4668,155 @@ class GaussianModel:
         self.mini_factor_culling = None
 
         print(f"[TEXSPLIT] duplicate split: {N} textured + {N} untextured = {new_total} total")
+
+
+    def split_at_res_3d(self, tex_opacity_scale=None, untex_opacity_scale=None,
+                         keep_tex_sv=False):
+        """`--method res_3d` / `--method res_3d_paired` one-shot 2D-residual /
+        3D-EWA-SV split.
+
+        Pure DUPLICATION of the live surfel set (no depth reinit). The two
+        copies become the residual-carrier (textured) and the SV-carrier
+        (untextured EWA ellipsoid) halves.
+
+        - **2D residual-carrier** (first N, `_is_textured=True`):
+          - `keep_tex_sv=False` (default, `--method res_3d`): exact copy with
+            SV/SH params zeroed → tex carriers contribute residual ONLY (the
+            kernel's per-Gauss bias gate also forces sh_color = 0 on read).
+          - `keep_tex_sv=True` (`--method res_3d_paired`): exact copy with SV
+            kept → tex carriers contribute `ReLU(SV + sh_bias) + residual`
+            (full mixed_3d-style capacity per Gauss). No SV/SH zeroing, no
+            kernel bias gate.
+        - **3D SV-carrier** (second N, `_is_textured=False`): exact copy plus
+          a learnable `_scaling_z` (the 3rd EWA ellipsoid axis, initialised
+          flat — log(0.05) + min(log sx, log sy) — so it starts ≈ the 2D
+          surfel it was duplicated from). Untextured branch skips the hash
+          query → no residual contribution. SV baseline is the per-Gauss
+          colour (inner-ReLU'd at SV/SH eval time → hard ≥ 0 per Gauss).
+
+        Opacity scaling:
+        - **`--method res_3d`** (both None, the default): both copies keep the
+          original α — the dual-cascade T's are mathematically independent so
+          neither halving nor rescaling is needed.
+        - **`--method res_3d_paired`** (`tex_opacity_scale=texsplit_tex_frac`,
+          `untex_opacity_scale=1-texsplit_tex_frac`): joint cascade — both
+          copies share T, so opacity scaling assigns mass between them. With
+          `tex_opacity_scale=0.99, untex_opacity_scale=0.01` you recover the
+          mixed_3d "tex dominates, untex perturbs" curriculum.
+
+        After this returns, caller MUST call ``self.training_setup(opt)`` to
+        rebuild Adam for the doubled tensor. Densify accumulators are zeroed.
+        """
+        device = self._xyz.device
+        N = int(self._xyz.shape[0])
+
+        # Duplicate every per-Gauss optimisable parameter row-for-row: the 2D
+        # residual-carrier copy first, the 3D SV-carrier copy second. SH/SV
+        # params are duplicated as-is (renderer zeros the SV path for the 2D
+        # half via override_color at call time — keeps a single source of
+        # truth for the SV computation and lets future de-coupling rebalance
+        # without re-running the split).
+        _PARAM_NAMES = [
+            '_xyz', '_features_dc', '_features_rest', '_scaling', '_rotation',
+            '_opacity', '_appearance_level',
+            '_gaussian_features', '_gamma', '_adaptive_features',
+            '_adaptive_cat_weight', '_adaptive_zero_weight', '_gate_logits',
+            '_flex_beta', '_shape',
+            '_sb_params', '_sg_directions', '_sg_sharpness_sg', '_sg_rgb',
+            '_sv_sites', '_sv_colors', '_sv_tau', '_sv_dc',
+            '_deform_latent',
+        ]
+        for name in _PARAM_NAMES:
+            t = getattr(self, name, None)
+            if t is None or (hasattr(t, 'numel') and t.numel() == 0):
+                continue
+            req = bool(t.requires_grad) if hasattr(t, 'requires_grad') else False
+            dup = torch.cat([t.detach().clone(), t.detach().clone()], dim=0)
+            setattr(self, name, nn.Parameter(dup.requires_grad_(req)))
+
+        # `_is_textured`: 2D residual-carrier first half, 3D SV-carrier second.
+        is_tex = torch.zeros(2 * N, dtype=torch.bool, device=device)
+        is_tex[:N] = True
+        self._is_textured = is_tex
+
+        # `_scaling_z` for the EWA-ellipsoid 3rd axis. Same initialisation as
+        # `split_at_texsplit(make_scaling_z=True)`: log(FLAT_FRAC) + min(log sx,
+        # log sy). The kernel ignores this for `is_textured=True` rows; we
+        # populate the full [2N,1] tensor so the optimiser slot is uniform.
+        FLAT_FRAC = 0.05
+        _sxy_min = torch.min(self._scaling[:, :2], dim=1, keepdim=True).values  # [2N,1] log
+        sz = float(np.log(FLAT_FRAC)) + _sxy_min                                # [2N,1] log
+        self._scaling_z = nn.Parameter(sz.detach().contiguous().requires_grad_(True))
+
+        if getattr(self, '_sv_mask', None) is not None:
+            self._sv_mask = None
+
+        # `--method res_3d` ONLY (skip for `--method res_3d_paired`): zero out
+        # the SV/SH params on the 2D residual-carrier half (first N rows = textured).
+        # Reasons:
+        #   1. Textured surfels are supposed to be residual-ONLY post-split.
+        #   2. The renderer already masks `colors_precomp[tex_rows] = 0` at
+        #      every render A call, so the kernel sees `sh_color = 0` for tex
+        #      rows. Zeroing the param storage matches what the kernel
+        #      actually consumes → checkpoint round-trips are bit-correct.
+        #   3. With both the value AND the post-backward grad mask in place
+        #      (see train.py's grad-freeze block right after backward), these
+        #      rows can never drift, even if a future code path bypasses the
+        #      renderer's colors_precomp mask.
+        # `--method res_3d_paired` (keep_tex_sv=True) keeps SV intact on tex
+        # rows so they contribute the full ReLU(SV + 0.5) baseline alongside
+        # the MLP residual — matches mixed_3d's per-Gauss capacity exactly.
+        if not keep_tex_sv:
+            with torch.no_grad():
+                for sv_name in ['_sv_sites', '_sv_colors', '_sv_tau', '_sv_dc']:
+                    sv = getattr(self, sv_name, None)
+                    if sv is not None and hasattr(sv, 'numel') and sv.numel() > 0:
+                        sv.data[:N] = 0
+                # Also zero the SH baseline so the 2D side's "fallback" colour
+                # path (in case override_color isn't applied for some reason) is
+                # likewise zero. _features_dc + _features_rest are SH coeffs.
+                if self._features_dc.numel() > 0:
+                    self._features_dc.data[:N] = 0
+                if self._features_rest.numel() > 0:
+                    self._features_rest.data[:N] = 0
+
+        # `--method res_3d_paired`: scale opacity logits per half. Mirrors
+        # split_at_texsplit's recipe — re-logit the activated α after the
+        # `frac` multiplication so the optimizer continues from a stable
+        # initialisation. Defaults to None on both → no scaling (res_3d).
+        if tex_opacity_scale is not None or untex_opacity_scale is not None:
+            _ts = float(tex_opacity_scale)   if tex_opacity_scale   is not None else 1.0
+            _us = float(untex_opacity_scale) if untex_opacity_scale is not None else 1.0
+            with torch.no_grad():
+                # `_opacity` rows 0..N are textured copies, rows N..2N are untex.
+                # Each row currently holds the ORIGINAL pre-sigmoid logit.
+                _logit = self._opacity.data
+                _alpha = torch.sigmoid(_logit)                                   # [2N,1]
+                _scaled_tex   = (_alpha[:N]   * _ts).clamp_(1e-6, 1.0 - 1e-6)    # [N,1]
+                _scaled_untex = (_alpha[N:2*N] * _us).clamp_(1e-6, 1.0 - 1e-6)   # [N,1]
+                new_logit = torch.cat([
+                    torch.log(_scaled_tex   / (1.0 - _scaled_tex)),
+                    torch.log(_scaled_untex / (1.0 - _scaled_untex)),
+                ], dim=0)
+                self._opacity.data.copy_(new_logit)
+            print(f"[RES_3D_SPLIT] opacity scales — textured={_ts:.3f} untextured={_us:.3f}")
+
+        # Reset accumulators (row count doubled; Adam rebuilt by caller).
+        new_total = 2 * N
+        self.xyz_gradient_accum = torch.zeros(new_total, 1, device=device)
+        self.xyz_gradient_accum_abs = torch.zeros(new_total, 1, device=device)
+        self.feat_gradient_accum = torch.zeros(new_total, 1, device=device)
+        self.denom = torch.zeros(new_total, 1, device=device)
+        self.max_radii2D = torch.zeros(new_total, device=device)
+        if self.minimc_error_accum.numel() > 0:
+            self.minimc_error_accum = torch.zeros(new_total, 1, device=device)
+            self.minimc_win_count = torch.zeros(new_total, 1, device=device)
+        self.mini_factor_culling = None
+
+        _op_note = (f"scaled (tex={tex_opacity_scale}, untex={untex_opacity_scale})"
+                    if (tex_opacity_scale is not None or untex_opacity_scale is not None)
+                    else "kept at original α (independent cascades)")
+        print(f"[RES_3D_SPLIT] duplicate split: {N} 2D-residual-carriers + "
+              f"{N} 3D-EWA-SV-carriers = {new_total} total. Opacity {_op_note}. "
+              f"_scaling_z initialised flat (log({FLAT_FRAC}) + min log sxy). "
+              f"SV/SH params zeroed on the 2D-residual-carrier half (residual-only).")

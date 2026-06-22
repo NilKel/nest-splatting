@@ -30,6 +30,10 @@ __device__ float d_res_bias = 0.5f;  // Residual activation bias: ReLU(residual 
 // d_residual_mode: 0 = 3D_SH_res (stacked outer ReLU), 1 = 3D_SH_add (separate ReLUs).
 // Mirrors forward.cu — the backward gradient routing differs between the two modes.
 __device__ int d_residual_mode = 0;
+// `--lru`: leaky-ReLU slope α for the outer per-Gauss ReLU (mode 0). Backward
+// uses this as the gate value at clamped sites (pre ≤ 0). α = 0 (default) →
+// standard ReLU (gate = 0). α > 0 → gate = α → grad scaled by α.
+__device__ float d_lru_slope = 0.0f;
 __device__ float d_aa_kernel_size = 0.0f;  // AA-2DGS Jacobian mip filter σ (0 = off)
 // Periodic-freeze flag for the mode 5 (3D_SH_res) backward. When true, the
 // kernel skips EVERYTHING hash/MLP-gradient-related: the 3 weight-grad WMMA
@@ -1334,7 +1338,8 @@ renderCUDAsurfelBackward(
 						} else if (d_residual_mode == 2) {
 							gate_res = 1.0f;
 						} else {
-							gate_res = (sh_color[o] + my_residual[o] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+							// `--lru` α (0 = std ReLU): clamped sites get slope α.
+							gate_res = (sh_color[o] + my_residual[o] + d_res_bias > 0.0f) ? 1.0f : d_lru_slope;
 						}
 						my_dL_dz3[o] = dL_dpixel[o] * w * gate_res;
 					}
@@ -1347,7 +1352,7 @@ renderCUDAsurfelBackward(
 							// mode 2: no ReLU; SH's inner ReLU is upstream).
 							gate_sh = 1.0f;
 						} else {
-							gate_sh = (sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+							gate_sh = (sh_color[ch] + my_residual[ch] + d_res_bias > 0.0f) ? 1.0f : d_lru_slope;
 						}
 						acc_dL_dcolors[ch] += dL_dpixel[ch] * w * gate_sh;
 					}
@@ -2247,7 +2252,7 @@ renderCUDAsurfelBackward(
 						gate_res = 1.0f;
 						gate_sh = 1.0f;
 					} else {
-						float g = (sh_color_bw[c] + residual[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						float g = (sh_color_bw[c] + residual[c] + d_res_bias > 0.0f) ? 1.0f : d_lru_slope; // `--lru` (0 = std ReLU)
 						gate_res = g;
 						gate_sh = g;
 					}
@@ -2455,7 +2460,7 @@ renderCUDAsurfelBackward(
 						gate_res = (residual_6[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
 						gate_sh = 1.0f;
 					} else {
-						float g = (sh_color_bw_6[c] + residual_6[c] + d_res_bias > 0.0f) ? 1.0f : 0.0f;
+						float g = (sh_color_bw_6[c] + residual_6[c] + d_res_bias > 0.0f) ? 1.0f : d_lru_slope; // `--lru` (0 = std ReLU)
 						gate_res = g;
 						gate_sh = g;
 					}
@@ -3311,6 +3316,10 @@ void BACKWARD::setResBias(float val) {
 }
 
 __global__ void setResidualModeBwKernel(int v) { d_residual_mode = v; }
+__global__ void setLruSlopeBwKernel(float v) { d_lru_slope = v; }
+void BACKWARD::setLruSlope(float v) {
+	setLruSlopeBwKernel<<<1, 1>>>(v);
+}
 void BACKWARD::setResidualMode(int mode) {
 	setResidualModeBwKernel<<<1, 1>>>(mode);
 }

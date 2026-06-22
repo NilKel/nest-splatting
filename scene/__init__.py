@@ -140,7 +140,14 @@ class Scene:
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
         print(f'camera extent {self.cameras_extent}')
-        
+
+        # Cache the per-camera CameraInfo objects (image_path, R, T, fov...) so
+        # train.py can mid-train reload at a different `--resolution`/`--data_device`
+        # (progressive res schedule). Cheap (small list of dataclasses, no image
+        # data — original PIL files stay on disk).
+        self._cam_infos_train = list(scene_info.train_cameras)
+        self._cam_infos_test = list(scene_info.test_cameras)
+
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)

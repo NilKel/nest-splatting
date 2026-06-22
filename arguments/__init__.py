@@ -56,6 +56,19 @@ class ModelParams(ParamGroup):
         self.eval = False
 
         self.load_allres = False
+
+        # Progressive resolution curriculum (`--start_resolution N`): train at
+        # this lower-res `-r` value initially, then mid-train reload at the
+        # full `--resolution` value at `--freeze_hash_iter`. Pre-switch the
+        # hash+MLP train every iter and need cheap iters (low-res + GPU GT).
+        # Post-switch the hash trains 1-in-`--freeze_hash_period` iters → can
+        # afford slow 4K iters with CPU-staged GT. Default 0 = curriculum off.
+        self.start_resolution = 0
+        # Optional separate `--data_device` during the start-resolution phase.
+        # Default "cuda" — the low-res GT fits comfortably on-GPU even with
+        # 200+ images. After the mid-train reload, `--data_device` (the host
+        # field above) takes effect.
+        self.start_data_device = "cuda"
         
         self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -71,6 +84,18 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.depth_ratio = 0.0
         self.debug = False
+        # Skip the per-call Python-side `depth_to_normal` + render-normal
+        # rotate + normal_error computation when no normal-consistency or
+        # depth-distortion regularizer is active. At 4K image resolution
+        # this avoids ~600 MB of intermediate tensors (dx, dy, cross product,
+        # normal error map) per render call. Auto-enabled by train.py when
+        # lambda_normal == w_normal == lambda_dist == 0; user can also pass
+        # --skip_aux_normal_dist to force-enable.
+        self.skip_aux_normal_dist = False
+        # Opt-out of the above auto-enable: pass --keep_aux_normal_dist to force
+        # normals/depth-distortion aux rendering ON even when no reg consumes them
+        # (e.g. to populate the training_output normal/decomposition views).
+        self.keep_aux_normal_dist = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
