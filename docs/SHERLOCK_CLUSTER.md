@@ -49,6 +49,50 @@ If a task doesn't need a GPU, drop `--gres=gpu:1` to share node resources
 more cheaply. The principle is the same: **the login node never runs the
 real work.**
 
+### 0a. Automation / agents: do NOT spam the login node with `ssh`+`srun`
+
+This bit us hard (2026-06-22). Driving the cluster with **dozens of
+`ssh sherlock01h '... srun ... bash ...'` calls** — many wrapped in `timeout`
+or later `scancel`led — plus a monitor that `ssh`-polled every 5 min, **orphans
+the remote `srun` + `bash`** on the login node each time a call is killed or
+times out. They pile up under your user, hit the **per-user process cap**, and
+the login node starts returning:
+
+```
+/usr/libexec/grepconf.sh: fork: retry: Resource temporarily unavailable   # shell rc can't fork
+Connection to <ip> closed by remote host                                  # sshd can't spawn your session
+```
+
+Once wedged you **can't even get a shell to clean up** (kill/ps also need to
+fork). It's a *per-user* cap, so other users are fine — but it locks *you* out
+of the login node. (`ping` may still answer while TCP/22 sessions die — that
+combo = login node out of process slots, NOT a network or disk problem.)
+
+**Rules to avoid it:**
+- **One long-lived session, not many short ones.** `salloc --no-shell …` once,
+  then `srun --jobid=$JOBID --overlap bash -lc "<all the work>"`; or a single
+  `ssh` running a script that does everything. Never loop `ssh host 'srun …'`.
+- **Don't wrap `ssh … srun …` in tight `timeout`s** or `scancel` them abruptly —
+  that's what orphans the remote side. `scancel` the *job id*; don't kill the
+  ssh client out from under a running `srun`.
+- **No polling monitors over `ssh`.** Batch status into one infrequent call
+  (`ssh host 'squeue; sacct; tail …'`), not a per-minute loop.
+- `sbatch`/`squeue`/`sacct` in moderation are cheap; repeated session/`srun`
+  **spawns** are the hazard.
+
+**Recovery when already wedged:**
+- Single-fork kill (retry a few times — needs only one fork to land):
+  `ssh sherlock01h "pkill -9 -u z0051beu -f srun"`
+- If SSH returns `Connection closed by remote host` (can't spawn a session):
+  **wait 15–30 min** — orphaned timed-out `ssh`/`srun`/`sleep` clients die on
+  their own and free fork slots — then retry the `pkill` **once**. Don't keep
+  hammering it; each attempt adds churn.
+- Else **HPC support**: "login node sherlock01, user z0051beu hitting its
+  process limit (`fork: Resource temporarily unavailable`); please clear my
+  orphaned `srun`/`bash` or bounce the login node." Fixed in seconds.
+- **SBATCH jobs are unaffected** — they run on compute nodes; login-node fork
+  exhaustion never touches them.
+
 ---
 
 ## 1. Connection
@@ -182,11 +226,13 @@ Template from `../beta-splatting/slurm_benchmark_mip360.sh` (verified working):
 
 set -e
 
-module load gcc/13.2.0
-module load cuda12.1/toolkit/12.1.0
-
+module load gcc/13.1.0          # gcc/13.2.0 no longer present
+# NOTE: do NOT `module load cuda12.1/...` — that module was removed (only 13.0
+# exists). For nest_splatting (torch cu121) the CUDA 12.1 toolkit lives in the
+# conda env (installed from conda-forge, see § Modules); point at it instead:
 source ~/userdir/miniconda3/etc/profile.d/conda.sh
 conda activate <env-name>
+export CUDA_HOME=$CONDA_PREFIX; export PATH=$CONDA_PREFIX/bin:$PATH  # nvcc 12.1 (for builds)
 
 cd ~/userdir/Projects/<repo>
 mkdir -p slurm_logs
@@ -214,13 +260,36 @@ scancel <job_id>                                  # cancel
 
 ### Modules
 
-- `gcc/13.2.0` — compiler for CUDA extensions.
-- `cuda12.1/toolkit/12.1.0` — CUDA 12.1 toolkit.
+- `gcc/13.1.0` — compiler for CUDA extensions (loaded by default; `gcc/13.2.0`
+  is no longer present, `gcc/15.1.0`/`gcc11/11.5.0` also available).
+- **⚠️ `cuda12.1/toolkit/12.1.0` HAS BEEN REMOVED** (verified 2026-06-22).
+  `module avail` now shows only **`cuda13.0/toolkit/13.0`** (shared apps:
+  `cuda11.7`, `cuda13.0`, `cuda13.2U1`; system `/usr/local/cuda` = 13.x). The
+  `nest_splatting` env's torch is **cu121**, so building its CUDA extensions
+  needs **nvcc 12.1** — a 13.x toolkit fails with
+  `_check_cuda_version` "detected 13.x vs PyTorch 12.1".
 
-> 5090 / Blackwell note: the modules above target CUDA 12.1. If you're moving
-> a workload from the 5090 (which forces CUDA 12.8 + PyTorch nightly cu128),
-> you'll likely need to rebuild CUDA extensions on sherlock against the
-> cluster's 12.1 toolkit. See § Common pitfalls.
+> **Get CUDA 12.1 on the cluster (modules can't anymore): install it into the
+> conda env from conda-forge.** The `nvidia` channel's pins do NOT propagate to
+> the compiler (`cuda-nvcc` stays 13.x); conda-forge's `cuda-version` metapackage
+> is the canonical global pin:
+> ```bash
+> conda install -y --solver=libmamba --override-channels \
+>   -c https://prefix.dev/conda-forge \
+>   cuda-version=12.1 cuda-toolkit=12.1.1 cuda-nvcc=12.1.105
+> # then build (on a COMPUTE node):
+> export CUDA_HOME=$CONDA_PREFIX; export PATH=$CONDA_PREFIX/bin:$PATH
+> module load gcc/13.1.0; export TORCH_CUDA_ARCH_LIST=8.0   # A100 sm_80
+> rm -rf <submod>/build <submod>/*/_C.cpython-310*.so       # force clean recompile
+> cd <submod> && python -m pip install -e . --no-build-isolation
+> ```
+> Verify `nvcc --version | grep release` == 12.1 BEFORE compiling. This toolkit
+> install persists in the env, so it's a one-time fix.
+
+> 5090 / Blackwell note: the 5090 forces CUDA 12.8 + PyTorch nightly cu128, so
+> its prebuilt `.so`s won't load on the A100s (sm_80, cu121). Always rebuild the
+> CUDA submodules on sherlock against the env's CUDA 12.1 (installed as above).
+> See § Common pitfalls.
 
 ---
 
@@ -270,10 +339,15 @@ For nest-splatting, mirror the env-bootstrap from `bench_4090.md` /
   mean VPN is down, not a credential problem.
 - **`~` perms**: SSH silently rejects pubkeys if `~` is group/world-writable.
   `chmod go-w ~` after any home-dir-touching script.
-- **CUDA arch mismatch**: cluster has A100 (sm_80) on CUDA 12.1; the local
-  5090 (sm_120) needs CUDA 12.8 + cu128 PyTorch. Don't blindly clone the
-  5090 env onto sherlock — rebuild CUDA extensions against the cluster's
-  toolkit (`module load cuda12.1/toolkit/12.1.0`).
+- **CUDA arch / version mismatch**: A100 = sm_80; the local 5090 (sm_120) needs
+  CUDA 12.8 + cu128 PyTorch, so its prebuilt `.so`s won't load on sherlock.
+  Rebuild CUDA extensions on the cluster — but note the **`cuda12.1` module is
+  gone** (only `cuda13.0` exists), and the env's torch is cu121, so a 13.x nvcc
+  fails the torch version check. Install CUDA 12.1 into the env from conda-forge
+  (`cuda-version=12.1`, see § Modules) and build with `CUDA_HOME=$CONDA_PREFIX`,
+  `TORCH_CUDA_ARCH_LIST=8.0`. Which submodule to rebuild matters: `cat`/`baseline`
+  use `diff-surfel-rasterization` (not `diff_surfel_3D`); `3D_SH_res`/`mixed`/etc.
+  use their own. A stale `.so` (older than its `.cu`) silently runs old code.
 - **Relative paths in slurm scripts**: SLURM doesn't change cwd; the body
   must `cd ~/userdir/Projects/<repo>` before invoking anything.
 - **Resuming from `metrics.json`**: `slurm_benchmark_mip360.sh` skips scenes

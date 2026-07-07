@@ -67,6 +67,9 @@ RasterizeGaussiansCUDA(
 // Device-global setters mirroring training-time setters.
 void SetActivationBiasBakeCUDA(float sh_bias, float res_bias);
 void SetCompactMultBakeCUDA(float val);
+void SetBetaMultBakeCUDA(float val);
+void SetDropLowpassBakeCUDA(bool val);
+void SetOpacityAwareBetaBakeCUDA(bool val);
 void SetResidualModeBakeCUDA(int mode);
 void SetUntexKernelBakeCUDA(int v);
 

@@ -204,6 +204,12 @@ void SetContribThreshCUDA(float val);
 // Set count threshold (skip hash after N contributing Gaussians per pixel, 0 = disabled)
 void SetCountThreshCUDA(int val);
 
+// Set opacity threshold (skip hash+MLP when alpha = opa*kernel_val < val, 0 = disabled)
+void SetOpacityThreshCUDA(float val);
+
+// Set texture-query dropout rate + per-iteration seed (training only, 0 rate = disabled)
+void SetDropoutCUDA(float rate, int seed);
+
 // Set overdraw regularization lambda (0 = disabled)
 void SetOverdrawLambdaCUDA(float val);
 
@@ -237,6 +243,7 @@ void SetAntiAliasCUDA(float factor, float focal);
 // FastGS Compact Box Mahalanobis² scale factor for AdR cutoff.
 // val=1.0 = our current AdR; val=0.5 = FastGS paper default (tighter AABB, faster rasterization).
 void SetCompactMultCUDA(float val);
+void SetBetaMultCUDA(float val);
 
 // Set AA-2DGS mip filter kernel size σ (0 disables, typical 0.1).
 void SetAaKernelSizeCUDA(float val);

@@ -17,6 +17,18 @@ namespace cg = cooperative_groups;
 __device__ float d_sh_bias = 0.5f;
 __device__ float d_res_bias = 0.0f;
 __device__ float d_compact_mult = 1.0f;
+// EXPERIMENT (beta_scaled mult + lowpass sweep): scales the beta/non-AdR footprint
+// cutoff (default 1.0 => cutoff=4σ baseline). d_drop_lowpass removes the Gaussian
+// low-pass (alpha max-pool in the render kernel + the filter_r screen extension).
+// Kept SEPARATE from d_compact_mult so existing beta bakes (which carry compact_mult
+// in bake_meta) render byte-identically.
+__device__ float d_beta_mult = 1.0f;
+__device__ bool  d_drop_lowpass = false;
+// Mode-5/0/2 beta footprint: OPACITY-AWARE cutoff = max(r_beta, r_lp) (the 1/255 iso)
+// so AccuTile traces a tighter — but lossless — ellipse. DEFAULT true (verified ~1.34–1.35×
+// FPS at unchanged PSNR/SSIM/LPIPS on db drjohnson/playroom). set_opacity_aware_beta(False)
+// reverts to the old fixed 4σ (×d_beta_mult) for A/B comparison.
+__device__ bool  d_opacity_aware_beta = true;
 // d_residual_mode mirrors the training-time global in diff_surfel_3D_sh_res /
 // diff_surfel_mixed:
 //   0 (3D_SH_res): color = ReLU(SH_clamped + residual + d_res_bias)
@@ -594,12 +606,25 @@ __global__ void preprocessCUDA(int P, int D, int M,
 			float log_term = logf(255.0f * opacity_val);
 			cutoff = (log_term > 0.0f) ? sqrtf(2.0f * log_term) : 0.1f;
 			cutoff = fminf(cutoff, 4.0f);
+		} else if (d_opacity_aware_beta) {
+			// EXPERIMENT: opacity-aware beta cutoff = max(r_beta, r_lp) — the 1/255 iso.
+			// Tighter than fixed 4σ for faint/sharp surfels (lossless; clips only <1/255),
+			// so AccuTile traces a smaller ellipse → fewer Gaussian-tile pairs.
+			float k = (kernel_type == 4) ? 3.0f : 1.0f;
+			float opacity_val = fmaxf(opacities[idx], 1.0f / 255.0f);
+			float shape = shapes[idx];
+			float ratio = 1.0f / (255.0f * opacity_val);
+			float threshold = powf(ratio, 1.0f / shape);
+			float r_beta = (threshold < 1.0f) ? k * sqrtf(1.0f - threshold) : 0.0f;
+			float log_term = logf(255.0f * opacity_val);
+			float r_lp = (log_term > 0.0f) ? sqrtf(2.0f * log_term) : 0.0f;
+			cutoff = fminf(fmaxf(r_beta, r_lp), k + 2.0f) * d_beta_mult;
 		} else {
 			// Mode 0 (square) / mode 2 (rect) + beta_scaled: fixed 4σ (2DGS
 			// default). Training uses 4.0 for these modes; the bake-render
 			// must match to avoid multiplicative dimming (~16 % at mode=2
 			// + beta_scaled was observed when this was 3.3).
-			cutoff = 4.0f;
+			cutoff = 4.0f * d_beta_mult;  // EXPERIMENT: beta footprint mult (1.0 => 4σ baseline)
 		}
 
 		// Project the surfel disk to a screen-space ellipse and take its bbox.
@@ -612,7 +637,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		bool ok = compute_aabb(T, cutoff, point_image, extent);
 		if (!ok) return;
 
-		float filter_r = cutoff * FilterSize;
+		float filter_r = d_drop_lowpass ? 0.0f : cutoff * FilterSize;  // EXPERIMENT: drop low-pass screen extension
 
 		// Always compute the rect AABB. We need its tile count as an upper bound
 		// for SnugBox+AccuTile (a numerically-sound ellipse can never touch more
@@ -1011,7 +1036,7 @@ renderBakedCUDA(
 				float base = fmaxf(0.0f, 1.0f - rho3d / k_sq);
 				float alpha_beta = powf(base, shape);
 				float alpha_lp = expf(-rho2d / 2.0f);
-				float kernel_val = fmaxf(alpha_beta, alpha_lp);
+				float kernel_val = d_drop_lowpass ? alpha_beta : fmaxf(alpha_beta, alpha_lp);  // EXPERIMENT: drop low-pass alpha max-pool
 				alpha = fminf(0.99f, opa * kernel_val);
 			} else if (kernel_type == 2) {
 				// Flex kernel
@@ -1340,6 +1365,21 @@ void FORWARD::setActivationBias(float sh_bias, float res_bias) {
 __global__ void setBakeCompactMultKernel(float val) { d_compact_mult = val; }
 void FORWARD::setCompactMult(float val) {
 	setBakeCompactMultKernel<<<1, 1>>>(val);
+}
+
+__global__ void setBakeBetaMultKernel(float val) { d_beta_mult = val; }
+void FORWARD::setBetaMult(float val) {
+	setBakeBetaMultKernel<<<1, 1>>>(val);
+}
+
+__global__ void setBakeOpacityAwareBetaKernel(bool val) { d_opacity_aware_beta = val; }
+void FORWARD::setOpacityAwareBeta(bool val) {
+	setBakeOpacityAwareBetaKernel<<<1, 1>>>(val);
+}
+
+__global__ void setBakeDropLowpassKernel(bool val) { d_drop_lowpass = val; }
+void FORWARD::setDropLowpass(bool val) {
+	setBakeDropLowpassKernel<<<1, 1>>>(val);
 }
 
 __global__ void setBakeResidualModeKernel(int mode) { d_residual_mode = mode; }

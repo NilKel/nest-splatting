@@ -58,6 +58,55 @@ except ImportError:
     _sh_res_rasterizer = None
     SH_RES_RASTERIZER_AVAILABLE = False
 
+# 3D_SH_filmres: 3D_SH_res fork that FiLM-conditions the residual MLP's hash input.
+# Same kernel family as diff_surfel_3D_sh_res; its device-global setters (set_mlp_weights,
+# set_activation_bias, set_residual_mode, ...) are module-local, so for filmres they MUST
+# target this module, not diff_surfel_3D_sh_res. Use _sh_res_setter_mod(ingp) to resolve.
+try:
+    import diff_surfel_3D_sh_filmres as _sh_filmres_rasterizer
+    SH_FILMRES_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _sh_filmres_rasterizer = None
+    SH_FILMRES_RASTERIZER_AVAILABLE = False
+
+# diff_surfel_3D_sh_res_harden: an ISOLATED clone of diff_surfel_3D_sh_res used
+# ONLY for the GEStex explore+harden phase (0-20k, before the joint transition).
+# It is byte-identical to the shared rasterizer EXCEPT it carries the first-
+# intersection (tile-depth) sort (set_tile_depth_sort). GEStex-specific rasterizer
+# changes go HERE, never in the shared diff_surfel_3D_sh_res (see
+# docs/GESTEX_PIPELINE.md "CUDA isolation rule"). The name deliberately KEEPS the
+# `diff_surfel_3D_sh_res` prefix so the renderer's substring gates below
+# (metric_map ON; is_textured / scaling_z / film OFF) resolve exactly as they do
+# for the base — and does NOT contain `diff_surfel_gestex` / `_mixed` / `_res_3d`,
+# which would wrongly trip those gates. Its device-globals are module-local, so
+# both the per-render set_mlp_weights (via _sh_res_setter_mod) AND train.py's
+# _SHRES_SETTER_MOD resolve to this module for a GEStex harden.
+try:
+    import diff_surfel_3D_sh_res_harden as _gestex_harden_rasterizer
+    GESTEX_HARDEN_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _gestex_harden_rasterizer = None
+    GESTEX_HARDEN_RASTERIZER_AVAILABLE = False
+
+def _is_gestex_harden(ingp):
+    """True for a GEStex run in its explore+harden phase (0-20k), i.e. rendering
+    through the isolated diff_surfel_3D_sh_res_harden clone rather than the shared
+    3D_SH_res rasterizer. False once the joint stage is entered."""
+    return (ingp is not None and getattr(ingp, 'is_gestex_mode', False)
+            and not getattr(ingp, 'is_gestex_joint', False)
+            and GESTEX_HARDEN_RASTERIZER_AVAILABLE)
+
+def _sh_res_setter_mod(ingp):
+    """Module whose device-global setters back the active 3D_SH_res-family render.
+    For --method 3D_SH_filmres that's diff_surfel_3D_sh_filmres; for a GEStex
+    explore/harden it's the isolated diff_surfel_3D_sh_res_harden clone; otherwise the base."""
+    if _is_gestex_harden(ingp):
+        return _gestex_harden_rasterizer
+    if (ingp is not None and getattr(ingp, 'is_3D_SH_filmres_mode', False)
+            and SH_FILMRES_RASTERIZER_AVAILABLE):
+        return _sh_filmres_rasterizer
+    return _sh_res_rasterizer
+
 # `--method mixed` library — fork of diff_surfel_3D_sh_res that will host
 # the diffuse-textured / specular-untextured per-Gauss kernel branch.
 # Currently identical to the 3D_SH_res renderer (CUDA branch is phase 2).
@@ -118,6 +167,89 @@ try:
 except ImportError:
     _sh_32_rasterizer = None
     SH_32_RASTERIZER_AVAILABLE = False
+
+# 3D_SH_concat (diff_surfel_3D_sh_concat) — 32-dim MLP, input = concat[surfel latent(16) | hash(16)]
+try:
+    import diff_surfel_3D_sh_concat as _sh_concat_rasterizer
+    SH_CONCAT_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _sh_concat_rasterizer = None
+    SH_CONCAT_RASTERIZER_AVAILABLE = False
+
+# `--method GEStex` joint-stage rasterizer — a clone of diff_surfel_res_3d_paired
+# (textured 2D surfels + untextured EWA 3D "Gaussians", joint cascade, full backward)
+# with the textured residual swapped from hash+MLP to an explicit per-surfel RGB
+# texture-atlas bilinear lookup (set_gestex_atlas). Built on demand.
+try:
+    import diff_surfel_gestex as _gestex_rasterizer
+    GESTEX_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _gestex_rasterizer = None
+    GESTEX_RASTERIZER_AVAILABLE = False
+# `--method GEStex` SORT-FREE 2-pass kernels (full-hardening joint stage):
+#   joint_s = surfel z-buffer (frontmost + SV + atlas); joint_g = additive depth-tested Gaussians.
+try:
+    import diff_surfel_gestex_joint_s as _gestex_joint_s
+    import diff_surfel_gestex_joint_g as _gestex_joint_g
+    GESTEX_JOINT_S_AVAILABLE = True
+    GESTEX_JOINT_G_AVAILABLE = True
+except ImportError:
+    _gestex_joint_s = None
+    _gestex_joint_g = None
+    GESTEX_JOINT_S_AVAILABLE = False
+    GESTEX_JOINT_G_AVAILABLE = False
+
+
+@torch.no_grad()
+def ges_bake_atlas(ingp, pc, R, uv_extent=4.0):
+    """`--method GEStex` bake: evaluate the trained hashgrid+fused-MLP residual at each
+    surfel's R×R UV lattice and return an unbounded RGB atlas [N, R, R, 3] (u-major,
+    v-minor; view-independent). Recipe is byte-faithful to scripts/benchmark_baked.py's
+    bake_atlas (FP16 MLP math, texel-center UV, no bias column). Only textured (surfel)
+    rows are baked; the caller has not yet spawned the untextured 3D Gaussians."""
+    from utils.general_utils import build_rotation
+    device = pc.get_xyz.device
+    centers = pc.get_xyz
+    N = centers.shape[0]
+    Rot = build_rotation(pc.get_rotation)          # [N,3,3]
+    r0 = Rot[:, :, 0]                               # tangent u axis
+    r1 = Rot[:, :, 1]                               # tangent v axis
+    scales = pc.get_scaling                         # [N,>=2]
+    sx = scales[:, 0:1]
+    sy = scales[:, 1:2]
+
+    # Deep-copy the MLP to FP16 for the bake — nn.Module.half() is IN-PLACE, and
+    # mutating ingp.mlp_fused would break the renderer's later set_mlp_weights (which
+    # expects FP32 weights). The copy matches the training kernel's __half2 math.
+    import copy
+    mlp = copy.deepcopy(ingp.mlp_fused).half().eval()
+    hash_dim = int(ingp.mlp_fused_hash_dim)
+    mlp_input_padded = int(mlp[0].weight.shape[1])
+
+    step = 2.0 * uv_extent / R
+    uv = (torch.arange(R, dtype=torch.float32, device=device) + 0.5) * step - uv_extent
+    uu, vv = torch.meshgrid(uv, uv, indexing='ij')  # [R,R] (u-major, v-minor)
+    u_flat = uu.reshape(-1)                          # [R*R]
+    v_flat = vv.reshape(-1)
+    n_pts = R * R
+
+    atlas = torch.zeros(N, R, R, 3, dtype=torch.float32, device=device)
+    # Chunk over surfels to bound memory.
+    bytes_per = 168 * n_pts
+    chunk = max(1, int((4 * (1024 ** 3)) // max(bytes_per, 1)))
+    for s in range(0, N, chunk):
+        e = min(s + chunk, N)
+        c = centers[s:e]                             # [b,3]
+        xyz = (c.unsqueeze(1)
+               + u_flat.view(1, -1, 1) * (sx[s:e].unsqueeze(1) * r0[s:e].unsqueeze(1))
+               + v_flat.view(1, -1, 1) * (sy[s:e].unsqueeze(1) * r1[s:e].unsqueeze(1)))  # [b,R*R,3]
+        xyz_flat = xyz.reshape(-1, 3)
+        hash_feat = ingp._encode_3D(xyz_flat)
+        mlp_in = torch.zeros(xyz_flat.shape[0], mlp_input_padded, device=device, dtype=torch.float16)
+        mlp_in[:, :hash_dim] = hash_feat[:, :hash_dim].to(torch.float16)
+        rgb = mlp(mlp_in)[:, :3].float()             # [b*R*R,3], residual (view-independent)
+        atlas[s:e] = rgb.reshape(e - s, R, R, 3)
+    return atlas
 
 # Import main rasterizer if lean-only mode not set
 if not _USE_LEAN_ONLY:
@@ -824,6 +956,173 @@ def set_default_activation_bias(sh_bias, res_bias):
     global _ACTIVATION_BIAS
     _ACTIVATION_BIAS = [sh_bias, res_bias]
 
+
+def _render_gestex_joint(viewpoint_camera, pc, bg_color, lru_slope=0.01, decompose_mode=None):
+    """`--method GEStex` full-hardening SORT-FREE 2-pass render:
+      Pass 1 (joint_s): textured surfels as a frontmost z-buffer, C_S = LRU(SV + atlas(uv)),
+                        + depth threshold D_S = minDepth + mod_depth.
+      Pass 2 (joint_g): untextured 3D Gaussians (SH), additive with `depth >= D_S` discard,
+                        -> C_G, W_G, per-Gauss max_contrib.
+      Composite: LRU((C_S*s_w + C_G)/(s_w + W_G)).
+    Surfel geometry+opacity are frozen (no geom VJP in joint_s); atlas + surfel SV + Gaussians
+    train. Atlas grad flows via a subset device-global buffer; train.py scatters it back to
+    pc._tex_atlas.grad[surfel_mask]."""
+    import diff_surfel_gestex_joint_s as _js
+    import diff_surfel_gestex_joint_g as _jg
+    dev = pc.get_xyz.device
+    sm = pc._is_textured           # surfel (textured) mask
+    gm = ~sm                       # gaussian (untextured) mask
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    H, W = int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)
+    wvt = viewpoint_camera.world_view_transform
+    fpt = viewpoint_camera.full_proj_transform
+    campos = viewpoint_camera.camera_center
+    deg = pc.active_sh_degree
+
+    means = pc.get_xyz
+    opac = pc.get_opacity          # sigmoid (N,1)
+    scal = pc.get_scaling          # (N,2) for the 2DGS surfel model
+    rot = pc.get_rotation
+
+    # Decomposition for diagnostics (mirrors the 3D_SH_res sh_only/tex_only split):
+    #   'sh_only'  -> surfel color = SV base only          (atlas residual zeroed)
+    #   'tex_only' -> surfel color = atlas residual only   (SV base zeroed)
+    # Affects ONLY the textured surfel pass (C_S); the untextured Gaussian pass (C_G)
+    # is unchanged so the tex/untex split stays visible. Return dict also exposes the
+    # separate C_S / C_G / W_G so callers can inspect each component directly.
+    _zero_atlas = (decompose_mode == 'sh_only')
+    _zero_sv    = (decompose_mode == 'tex_only')
+
+    # ---- per-primitive view-dependent SV colour ----
+    # BOTH the surfels (colors_precomp for joint_s) and the untextured Gaussians (fake-SH
+    # for joint_g) must use the SV colour, else the Gaussians' _sv_* params get NO gradient
+    # (previously joint_g used raw get_features → SV never optimized → Gaussians learned no
+    # colour). We build the fake-SH once and index it per set.
+    dirs = means - campos.unsqueeze(0)
+    dirs = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-8)
+    fm = getattr(pc, 'feature_mode', 'sh')
+    _g_shs = None
+    if fm == 'SV' and getattr(pc, '_sv_sites', torch.empty(0)).numel() > 0:
+        fake_shs, sv_rgb = _build_fake_shs_from_SV(pc, dirs)
+        # sv_rgb is ALREADY relu(feat + 0.5) (post-bias, post-clamp) — render it directly.
+        # The previous `+ _ACTIVATION_BIAS[0]` double-biased it → a >=0.5 brightness floor
+        # (washed-out surfels) and a colour jump vs the harden-phase base. Dropped.
+        surfel_colors = sv_rgb[sm].contiguous()
+        _g_shs = fake_shs[gm].contiguous()   # Gaussians: SV via fake-SH so _sv_* gets gradient
+    else:
+        shs_view = pc.get_features.transpose(1, 2).view(means.shape[0], 3, -1)
+        surfel_colors = torch.clamp_min(eval_sh(deg, shs_view, dirs) + _ACTIVATION_BIAS[0], 0.0)[sm].contiguous()
+
+    if _zero_sv:
+        surfel_colors = torch.zeros_like(surfel_colors)   # tex_only: atlas residual alone
+
+    # ---- Pass 1: joint_s (surfel z-buffer + atlas) ----
+    # TS+ rising opacity floor: surfel opacity = O_t + (1-O_t)*get_opacity, <= 1 (no
+    # ∝opacity>1 amplification). O_t == 0 (default/pre-harden) => opacity unchanged.
+    _floor = float(getattr(pc, 'ges_opac_floor', 0.0))
+    _opac_s = (_floor + (1.0 - _floor) * opac[sm]) if _floor > 0.0 else opac[sm]
+    s_scales = scal[sm][:, :2].contiguous()
+    mod_depth = (5.0 * s_scales.mean(-1, keepdim=True)).contiguous()
+    atlas_s = pc._tex_atlas[sm].contiguous()
+    if _zero_atlas:
+        atlas_s = torch.zeros_like(atlas_s)               # sh_only: SV base alone
+    atlas_grad = torch.zeros_like(atlas_s)
+    _js.set_gestex_atlas(atlas_s, atlas_grad, int(pc.ges_atlas_res), 4.0)
+    pc._ges_atlas_grad = atlas_grad          # train.py scatters -> _tex_atlas.grad[sm]
+    pc._ges_surfel_mask = sm.clone()
+    st_s = _js.GaussianRasterizationSettings(H, W, tanfovx, tanfovy, bg_color, 1.0,
+                                             wvt, fpt, deg, campos, False, False)
+    C_S, radii_s, others_s = _js.GaussianRasterizer(st_s)(
+        means3D=means[sm].contiguous(), opacities=_opac_s.contiguous(),
+        colors_precomp=surfel_colors, mod_depth=mod_depth,
+        scales=s_scales, rotations=rot[sm].contiguous())
+    D_S = others_s[1:2].contiguous()         # [1,H,W] depth threshold
+
+    # ---- Pass 2: joint_g (additive Gaussians, SH, depth-tested vs D_S) ----
+    ng = int(gm.sum().item())
+    # full-size screenspace so standard densification reads viewspace_points.grad
+    screenspace = torch.zeros((means.shape[0], 3), dtype=means.dtype, device=dev, requires_grad=True) + 0
+    try: screenspace.retain_grad()
+    except Exception: pass
+    maxc = torch.zeros((means.shape[0], 1), dtype=means.dtype, device=dev, requires_grad=True) + 0
+    try: maxc.retain_grad()
+    except Exception: pass
+    radii_g = None
+    if ng > 0:
+        sz = pc.get_scaling_z[gm] if getattr(pc, '_scaling_z', torch.empty(0)).numel() > 0 else scal[gm][:, :1]
+        g_scales = torch.cat([scal[gm][:, :2], sz], dim=1).contiguous()
+        st_g = _jg.GaussianRasterizationSettings(H, W, tanfovx, tanfovy, bg_color, 1.0,
+                                                 wvt, fpt, deg, campos, False, False)
+        C_G, radii_g, W_G = _jg.GaussianRasterizer(st_g)(
+            means3D=means[gm].contiguous(), means2D=screenspace[gm], max_contrib_ret=maxc[gm],
+            opacities=opac[gm].contiguous(), depth_map=D_S,
+            shs=(_g_shs if _g_shs is not None else pc.get_features[gm].contiguous()),
+            scales=g_scales, rotations=rot[gm].contiguous())
+    else:
+        C_G = torch.zeros_like(C_S)
+        W_G = torch.zeros((1, H, W), device=dev)
+
+    # ---- sort-free composite ----
+    # LeakyReLU is applied ONCE, AFTER compositing the sort-free 3DGS onto the surfels
+    # (single post-composite site) — NOT per-pass. So negative C_S / C_G survive into the
+    # blend and only the combined result is rectified.
+    s_w = float(getattr(pc, 'ges_s_weight', 1.0))
+    final = (C_S * s_w + C_G) / (s_w + W_G + 1e-8)
+    final = torch.nn.functional.leaky_relu(final, lru_slope)
+
+    N = means.shape[0]
+    radii = torch.zeros(N, device=dev, dtype=torch.int32)
+    if radii_s is not None: radii[sm] = radii_s.to(torch.int32)
+    if radii_g is not None: radii[gm] = radii_g.to(torch.int32)
+    pc._ges_maxc = maxc                        # per-Gauss max contribution (for prune)
+
+    # Aux maps for the training loop. rend_alpha = foreground coverage (opaque surfel
+    # frontmost, or Gaussian weight) — used by --random_background. Surfels are opaque
+    # z-buffer discs so their coverage is ~binary; W_G adds Gaussian-only pixels.
+    surfel_cov = (others_s[2:3] >= 0).float()
+    rend_alpha = torch.clamp(surfel_cov + W_G, 0.0, 1.0)
+    surf_depth = others_s[0:1]
+    # --- Auxiliary maps for training_output / eval viz ---
+    # rend_normal: frontmost surfel view-space normal (joint_s out_others[5:8]), rotated
+    # view->world to match the res_switch convention (allmap @ W2V[:3,:3].T). Falls back to
+    # zeros if joint_s wasn't rebuilt with the 8-channel out_others.
+    if others_s.shape[0] >= 8:
+        _vn = others_s[5:8]                                   # [3,H,W] view-space surfel normal
+        rend_normal = (_vn.permute(1, 2, 0) @ wvt[:3, :3].T).permute(2, 0, 1).contiguous()
+    else:
+        rend_normal = torch.zeros(3, H, W, device=dev)
+    # surf_normal: geometric normal from the rendered (frontmost-surfel) depth — the
+    # normal-consistency target; comparing it to rend_normal reveals surfel misalignment.
+    try:
+        surf_normal = depth_to_normal(viewpoint_camera, surf_depth).permute(2, 0, 1).contiguous()
+    except Exception:
+        surf_normal = torch.zeros(3, H, W, device=dev)
+    return {
+        "render": final,
+        "surfel_render": C_S,                # C_S: textured-surfel pass (SV + atlas), post-LRU
+        "gaussian_render": C_G,              # C_G: untextured 3D-Gaussian additive pass, post-LRU
+        "gaussian_weight": W_G,              # W_G: [1,H,W] summed Gaussian alpha (untex coverage)
+        "surfel_coverage": (others_s[2:3] >= 0).float(),  # [1,H,W] frontmost-surfel hit mask
+        "viewspace_points": screenspace,
+        "visibility_filter": radii > 0,
+        "radii": radii,
+        "max_contrib_idx": None,
+        "rend_alpha": rend_alpha,
+        "rend_normal": rend_normal,
+        "surf_normal": surf_normal,
+        "surf_depth": surf_depth,
+        # Opaque z-buffer surfels concentrate to one depth → ~zero distortion by design.
+        "rend_dist": torch.zeros(1, H, W, device=dev),
+        # Depth maps for eval/save (render_final_images). GEStex's coarse depth is the
+        # frontmost-surfel view-space depth; median/max-contrib reuse it (opaque discs).
+        "depth_expected": surf_depth,
+        "depth_median": surf_depth,
+        "depth_max_contributor": surf_depth,
+        "gaussian_num": (W_G > 0.01).float(),   # untex-Gaussian coverage (final-save heatmap)
+    }
+
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, ingp = None,
     beta = 0, iteration = None, cfg = None, record_transmittance = False, use_xyz_mode = False, decompose_mode = None, max_intersections = 0,
     skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2, no_gumbel = False, dropout_lambda = 0.0, is_training = True,
@@ -889,6 +1188,34 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         means3D = means3D @ _pc_Mrot.transpose(0, 1) + _pc_Mt
     means2D = screenspace_points
     opacity = pc.get_opacity
+
+    # `--method GEStex`: TS+-style rising opacity FLOOR to harden surfels into near-opaque
+    # flat discs while keeping opacity <= 1 (so the ∝opacity geometry-gradient amplification
+    # that bloats surfels never appears). surfel_opac_eff = O_t + (1-O_t)*get_opacity, with
+    # O_t = pc.ges_opac_floor ramped 0 -> ~0.99 over the harden window. The optimizer keeps
+    # per-surfel freedom within [O_t, 1]. O_t == 0 (default) => opacity unchanged.
+    #  - harden phase (10k-20k): ALL rows are surfels → floor everything.
+    #  - joint stage (>= --ges_joint_iter): floor ONLY textured (surfel) rows; the spawned
+    #    untextured 3D Gaussians keep their trained (differentiable) opacity.
+    _floor = float(getattr(pc, 'ges_opac_floor', 0.0))
+    if getattr(pc, 'is_gestex', False) and _floor > 0.0:
+        _gj = (ingp is not None and getattr(ingp, 'is_gestex_joint', False))
+        _surf_op = _floor + (1.0 - _floor) * opacity   # in [O_t, 1], <= 1
+        if _gj and hasattr(pc, '_is_textured') and pc._is_textured.numel() == opacity.shape[0]:
+            opacity = torch.where(pc._is_textured.view(-1, 1), _surf_op, opacity)
+        else:
+            opacity = _surf_op
+
+    # `--method GEStex` SORT-FREE joint stage: intercept before the (aliased res_switch /
+    # cascade) rasterizer path. Opt-in via ingp.is_gestex_sortfree so the verified cascade
+    # path stays the default until this is validated end-to-end.
+    if (ingp is not None and getattr(ingp, 'is_gestex_joint', False)
+            and getattr(ingp, 'is_gestex_sortfree', False)
+            and GESTEX_JOINT_S_AVAILABLE and GESTEX_JOINT_G_AVAILABLE
+            and getattr(pc, '_tex_atlas', None) is not None and pc._tex_atlas.numel() > 0):
+        _lru = float(getattr(ingp, 'lru_slope', 0.0)) or 0.01
+        return _render_gestex_joint(viewpoint_camera, pc, bg_color, lru_slope=_lru,
+                                    decompose_mode=decompose_mode)
 
     # --feature beta / --feature sg: compute fake SH tensor from the directional
     # lobes once per render. Stashed on pc._beta_fake_shs so dispatch blocks below
@@ -956,9 +1283,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # SKIP for `--method res_3d_paired` AND `--method res_3d_double`:
         # both keep SV on tex carriers (full per-Gauss capacity), so don't
         # zero anything.
+        # `--method GEStex` ALSO keeps SV on its textured surfels (surfel colour = SV +
+        # texture) — it is NOT a res_3d residual-carrier. Without this, GEStex's surfel SV
+        # gets zeroed once untextured Gaussians exist (post-20k spawn), producing a gray
+        # sh_only and a degraded joint render.
         _paired_keeps_sv = (ingp is not None
                              and (getattr(ingp, 'is_res_3d_paired_mode', False)
-                                  or getattr(ingp, 'is_res_3d_double_mode', False)))
+                                  or getattr(ingp, 'is_res_3d_double_mode', False)
+                                  or getattr(ingp, 'is_gestex_mode', False)))
+        _paired_keeps_sv = _paired_keeps_sv or bool(getattr(pc, 'is_gestex', False))
         if (not _paired_keeps_sv
                 and hasattr(pc, '_is_textured') and pc._is_textured.numel() == _sv_rgb.shape[0]
                 and bool((~pc._is_textured).any())):
@@ -1087,8 +1420,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_3D_SH_cat_mode = ingp is not None and hasattr(ingp, 'is_3D_SH_cat_mode') and ingp.is_3D_SH_cat_mode
     # 3D_SH_32 mode: per-Gaussian SH + 32-dim hash MLP residual (diff_surfel_3D_sh_32)
     is_3D_SH_32_mode = ingp is not None and hasattr(ingp, 'is_3D_SH_32_mode') and ingp.is_3D_SH_32_mode
-    # Treat lean/fp16/tc/sh_tc/sh_res/sh_cat/sh_32 mode same as fused mode for rendering logic
-    if is_3D_direct_lean_mode or is_3D_direct_fp16_mode or is_3D_direct_tc_mode or is_3D_direct_sh_tc_mode or is_3D_SH_res_mode or is_3D_SH_cat_mode or is_3D_SH_32_mode:
+    # 3D_SH_concat mode: 32-dim MLP, input = concat[surfel latent(16) | hash(16)] (diff_surfel_3D_sh_concat)
+    is_3D_SH_concat_mode = ingp is not None and hasattr(ingp, 'is_3D_SH_concat_mode') and ingp.is_3D_SH_concat_mode
+    # Treat lean/fp16/tc/sh_tc/sh_res/sh_cat/sh_32/sh_concat mode same as fused mode for rendering logic
+    if is_3D_direct_lean_mode or is_3D_direct_fp16_mode or is_3D_direct_tc_mode or is_3D_direct_sh_tc_mode or is_3D_SH_res_mode or is_3D_SH_cat_mode or is_3D_SH_32_mode or is_3D_SH_concat_mode:
         is_3D_direct_fused_mode = True
 
     hash_in_CUDA = True
@@ -1321,11 +1656,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             if decompose_mode == 'sh_only':
                 _zero_mlp_weights = True
                 _restore_bias = True
-                from diff_surfel_3D_sh_res import set_activation_bias
+                set_activation_bias = _sh_res_setter_mod(ingp).set_activation_bias
                 set_activation_bias(sh_bias=_ACTIVATION_BIAS[0], res_bias=0.0)  # sh_only: zero MLP weights handle it
             elif decompose_mode == 'tex_only':
                 _restore_bias = True
-                from diff_surfel_3D_sh_res import set_activation_bias
+                set_activation_bias = _sh_res_setter_mod(ingp).set_activation_bias
                 set_activation_bias(sh_bias=-999.0, res_bias=_ACTIVATION_BIAS[1])  # tex_only: kill SH
 
             # Hash grid setup: use actual hashgrid_levels (not config total),
@@ -1380,27 +1715,43 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
         # 3D_SH_32 mode: per-Gaussian SH + 32-dim hash MLP residual (diff_surfel_3D_sh_32)
         # Same as 3D_SH_res but with 32-dim hidden MLP
-        elif is_3D_SH_32_mode:
-            from diff_surfel_3D_sh_32 import set_mlp_weights
+        elif is_3D_SH_32_mode or is_3D_SH_concat_mode:
+            # Route setters to the concat fork when --method 3D_SH_concat (else plain 3D_SH_32).
+            _setter_mod = _sh_concat_rasterizer if is_3D_SH_concat_mode else _sh_32_rasterizer
+            set_mlp_weights = _setter_mod.set_mlp_weights
 
             # Use standard SH coefficients (NOT per-Gaussian features)
             shs = _effective_shs()
             colors_precomp = None
 
-            # Decompose mode for 3D_SH_32:
-            #   'sh_only': zero MLP weights, set res_bias=-999 → ReLU(0-999)=0
-            #   'tex_only': set sh_bias=-999 → ReLU(SH-999)=0 for any normal SH values
+            # Decompose mode for 3D_SH_32 / 3D_SH_concat:
+            #   'sh_only'      : zero MLP weights        → SV/SH base only.
+            #   'tex_only'     : sh_bias=-999 (kill SH)  → MLP residual only (full input).
+            #   'concat_latent': kill SH + zero hash     → ReLU(MLP([latent(16)|0]))   (latent's residual)
+            #   'concat_hash'  : kill SH + zero latent   → ReLU(MLP([0|hash(16)]))      (hash's residual)
             _zero_mlp_weights = False
             _restore_bias = False
+            _concat_zero_hash = False     # 'concat_latent': force active hash levels → 0
+            _concat_zero_latent = False   # 'concat_hash': suppress the film_beta latent kwarg
             if decompose_mode == 'sh_only':
                 _zero_mlp_weights = True
                 _restore_bias = True
-                from diff_surfel_3D_sh_32 import set_activation_bias
+                set_activation_bias = _setter_mod.set_activation_bias
                 set_activation_bias(sh_bias=_ACTIVATION_BIAS[0], res_bias=0.0)  # sh_only: zero MLP weights handle it
             elif decompose_mode == 'tex_only':
                 _restore_bias = True
-                from diff_surfel_3D_sh_32 import set_activation_bias
+                set_activation_bias = _setter_mod.set_activation_bias
                 set_activation_bias(sh_bias=-999.0, res_bias=_ACTIVATION_BIAS[1])  # tex_only: kill SH
+            elif decompose_mode == 'concat_latent':
+                _restore_bias = True
+                _concat_zero_hash = True
+                set_activation_bias = _setter_mod.set_activation_bias
+                set_activation_bias(sh_bias=-999.0, res_bias=0.0)  # kill SH; hash zeroed via active=0 below
+            elif decompose_mode == 'concat_hash':
+                _restore_bias = True
+                _concat_zero_latent = True
+                set_activation_bias = _setter_mod.set_activation_bias
+                set_activation_bias(sh_bias=-999.0, res_bias=0.0)  # kill SH; latent zeroed via film_beta suppression
 
             # Hash grid setup: use actual hashgrid_levels (not config total),
             # since hybrid_levels may have reduced the hash grid size.
@@ -1408,6 +1759,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             active_hashgrid_levels = min(
                 ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0,
                 total_levels)
+
+            # concat_latent decompose: zero the hash half (query 0 hash levels)
+            # → mlp_input = [latent(16) | 0], residual reflects the latent alone.
+            if _concat_zero_hash:
+                active_hashgrid_levels = 0
 
             # Encode levels: (total << 16) | (active_hashgrid << 8) | hybrid=0
             levels = (total_levels << 16) | (active_hashgrid_levels << 8) | 0
@@ -1437,9 +1793,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             # One-time verification
             if not _3D_DIRECT_FUSED_VERIFIED:
                 hash_dim = active_hashgrid_levels * ingp.level_dim
-                print(f"[3D_SH_32] render_mode={render_mode}, "
+                _tag = "3D_SH_CONCAT" if is_3D_SH_concat_mode else "3D_SH_32"
+                _inp = f"input=[latent(16)|hash({hash_dim}D)]" if is_3D_SH_concat_mode else f"hash={active_hashgrid_levels}×{ingp.level_dim}={hash_dim}D"
+                print(f"[{_tag}] render_mode={render_mode}, "
                       f"SH=degree-3 (48 params), "
-                      f"hash={active_hashgrid_levels}×{ingp.level_dim}={hash_dim}D, "
+                      f"{_inp}, "
                       f"MLP=32→32→32→3 residual")
                 _3D_DIRECT_FUSED_VERIFIED = True
 
@@ -1454,7 +1812,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # Hash MLP adds view-independent spatial correction per-intersection
         # No per-Gaussian features needed (hybrid_levels=0)
         elif is_3D_SH_res_mode:
-            from diff_surfel_3D_sh_res import set_mlp_weights
+            # filmres routes its module-local device globals (incl. set_mlp_weights) to
+            # diff_surfel_3D_sh_filmres; plain 3D_SH_res-family stays on the base module.
+            set_mlp_weights = _sh_res_setter_mod(ingp).set_mlp_weights
 
             # Use standard SH coefficients (NOT per-Gaussian features)
             shs = _effective_shs()
@@ -1468,11 +1828,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             if decompose_mode == 'sh_only':
                 _zero_mlp_weights = True
                 _restore_bias = True
-                from diff_surfel_3D_sh_res import set_activation_bias
+                set_activation_bias = _sh_res_setter_mod(ingp).set_activation_bias
                 set_activation_bias(sh_bias=_ACTIVATION_BIAS[0], res_bias=0.0)  # sh_only: zero MLP weights handle it
             elif decompose_mode == 'tex_only':
                 _restore_bias = True
-                from diff_surfel_3D_sh_res import set_activation_bias
+                set_activation_bias = _sh_res_setter_mod(ingp).set_activation_bias
                 set_activation_bias(sh_bias=-999.0, res_bias=_ACTIVATION_BIAS[1])  # tex_only: kill SH
 
             # Hash grid setup: use actual hashgrid_levels (not config total),
@@ -1521,7 +1881,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             # the symbol still work.
             if antialiasing > 0.0:
                 try:
-                    from diff_surfel_3D_sh_res import set_anti_alias as _set_aa
+                    _set_aa = _sh_res_setter_mod(ingp).set_anti_alias
                     _focal = max(viewpoint_camera.image_width / (2.0 * math.tan(viewpoint_camera.FoVx / 2.0)),
                                  viewpoint_camera.image_height / (2.0 * math.tan(viewpoint_camera.FoVy / 2.0)))
                     _set_aa(antialiasing, _focal)
@@ -1928,7 +2288,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
 
     # Use SH_RES, SH_TC, TC, FP16, or lean rasterizer for fused modes
-    if is_3D_SH_32_mode and SH_32_RASTERIZER_AVAILABLE:
+    if is_3D_SH_concat_mode and SH_CONCAT_RASTERIZER_AVAILABLE:
+        rasterizer = _sh_concat_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
+    elif is_3D_SH_32_mode and SH_32_RASTERIZER_AVAILABLE:
         rasterizer = _sh_32_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
     elif (is_3D_SH_res_mode or is_3D_SH_cat_mode) and SH_RES_RASTERIZER_AVAILABLE:
         # `--method mixed`: route through diff_surfel_mixed (the fork that has the
@@ -1962,6 +2324,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         _is_res_3d_paired = (ingp is not None
                               and getattr(ingp, 'is_res_3d_paired_mode', False)
                               and getattr(ingp, 'is_res_3d_paired_post_split', False))
+        # `--method GEStex` joint stage: behaves like res_3d_paired post-split (joint
+        # cascade: textured 2D surfels + untextured EWA 3D Gaussians), but routes to the
+        # diff_surfel_gestex clone whose textured residual is the baked atlas lookup.
+        _is_gestex_joint = (ingp is not None
+                            and getattr(ingp, 'is_gestex_joint', False)
+                            and GESTEX_RASTERIZER_AVAILABLE)
         _is_mixed_3d = ingp is not None and (
             getattr(ingp, 'is_mixed_3d_mode', False)
             # res_3d falls back to mixed_3d two-render path only if
@@ -1970,7 +2338,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 and getattr(ingp, 'is_res_3d_post_split', False)
                 and not _is_res_3d_single_pass)
             or _is_res_3d_paired
-        ) and MIXED_3D_RASTERIZER_AVAILABLE
+            or _is_gestex_joint   # EWA + is_textured + scaling_z plumbing
+        ) and (MIXED_3D_RASTERIZER_AVAILABLE or _is_gestex_joint)
         _is_mixed = ingp is not None and getattr(ingp, 'is_mixed_mode', False) and MIXED_RASTERIZER_AVAILABLE
         # res_3d_paired routes through its dedicated SLIM submodule when built,
         # falling back to plain mixed_3d if not. Both kernels are functionally
@@ -1980,7 +2349,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # backward gradient. The Python allmap reads below are size-aware so
         # the trimmed channels return None.
         _use_paired_slim = (_is_res_3d_paired and RES_3D_PAIRED_RASTERIZER_AVAILABLE)
-        if _is_res_3d_single_pass:
+        # `--method 3D_SH_filmres`: 3D_SH_res with FiLM-conditioned residual MLP — its own fork.
+        _is_filmres = (ingp is not None and getattr(ingp, 'is_3D_SH_filmres_mode', False)
+                       and SH_FILMRES_RASTERIZER_AVAILABLE)
+        if _is_gestex_joint and os.environ.get('GESTEX_USE_PAIRED') == '1' and RES_3D_PAIRED_RASTERIZER_AVAILABLE:
+            _rmod = _res_3d_paired_rasterizer   # isolation: verified module, same config, no atlas
+        elif _is_gestex_joint:
+            _rmod = _gestex_rasterizer
+        elif _is_filmres:
+            _rmod = _sh_filmres_rasterizer
+        elif _is_res_3d_single_pass:
             _rmod = _res_3d_rasterizer
         elif _use_paired_slim:
             _rmod = _res_3d_paired_rasterizer
@@ -1988,8 +2366,26 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             _rmod = _mixed_3d_rasterizer
         elif _is_mixed:
             _rmod = _mixed_rasterizer
+        elif _is_gestex_harden(ingp):
+            # GEStex explore+harden (0-20k, pre-joint): the isolated clone (=sh_res +
+            # first-intersection sort). Keeps GEStex rasterizer changes out of the
+            # shared diff_surfel_3D_sh_res. Byte-identical to sh_res until first-int
+            # sort flips on at --ges_first_int_iter (15k).
+            _rmod = _gestex_harden_rasterizer
         else:
             _rmod = _sh_res_rasterizer
+        # `--method GEStex` joint stage: point the textured residual at the baked atlas
+        # (bilinear at ray-disc UV) instead of hash+MLP, and allocate the grad buffer the
+        # backward atomic-scatters into (train.py assigns it to _tex_atlas.grad post-backward).
+        if _is_gestex_joint and getattr(pc, '_tex_atlas', None) is not None and pc._tex_atlas.numel() > 0 \
+                and os.environ.get('GESTEX_NOATLAS') != '1':
+            _atlas = pc._tex_atlas.contiguous()
+            _atlas_grad = torch.zeros_like(_atlas)
+            pc._ges_atlas_grad = _atlas_grad   # retrieved by train.py after loss.backward()
+            _R = int(getattr(pc, 'ges_atlas_res', _atlas.shape[1]))
+            _rmod.set_gestex_atlas(_atlas, _atlas_grad, _R, 4.0)
+        elif _is_gestex_joint and _gestex_rasterizer is not None:
+            _gestex_rasterizer.clear_gestex_atlas()   # isolation / no-atlas fallback
         rasterizer = _rmod.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
     elif is_3D_direct_sh_tc_mode and SH_TC_RASTERIZER_AVAILABLE:
         rasterizer = _sh_tc_rasterizer.GaussianRasterizer(raster_settings=raster_settings, hashgrid_settings=hashgrid_settings)
@@ -2057,6 +2453,29 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         aabb_mode_int = 0  # "2dgs" or default
 
+    # First-intersection handling (GEStex harden) — two INDEPENDENT mechanisms
+    # on the isolated diff_surfel_3D_sh_res_harden clone, driven per-iter by
+    # train.py:
+    #  - `ingp.first_int_sort` (--ges_first_int_iter, 10k): TILE-DEPTH SORT —
+    #    key each (Gauss,tile) on the intersection depth at the tile-center ray
+    #    (set_tile_depth_sort). Exact alpha blending at any opacity, correct
+    #    ordering for tilted surfels. Rect-only → drop the AccuTile ellipse
+    #    cull (mode 5 → 3) while active.
+    #  - `ingp.frontmost_on` (--ges_frontmost_iter, 18k): GES-literal
+    #    FRONTMOST-FIRST 2-pass — per-pixel frontmost (full-range scan) blends
+    #    first (set_frontmost_first, fwd+bwd). Near-opaque regime only; does
+    #    not touch binning. Composable with the tile sort.
+    # Both off (default) ⇒ byte-identical to the shared rasterizer.
+    _first_int_sort = bool(getattr(ingp, 'first_int_sort', False)) if ingp is not None else False
+    _frontmost_on = bool(getattr(ingp, 'frontmost_on', False)) if ingp is not None else False
+    _fis_mod = _sh_res_setter_mod(ingp)
+    if _fis_mod is not None and hasattr(_fis_mod, 'set_frontmost_first'):
+        _fis_mod.set_frontmost_first(_frontmost_on)
+    if _first_int_sort and aabb_mode_int == 5:
+        aabb_mode_int = 3
+    if _fis_mod is not None and hasattr(_fis_mod, 'set_tile_depth_sort'):
+        _fis_mod.set_tile_depth_sort(_first_int_sort)
+
     # Bit 10: enable low-pass filter backward gradient (rho2d → transMat)
     if lowpass:
         render_mode |= 0x400
@@ -2112,6 +2531,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     _kernel_takes_is_textured = (
         'diff_surfel_mixed' in _rasterizer_mod
         or 'diff_surfel_res_3d' in _rasterizer_mod
+        or 'diff_surfel_gestex' in _rasterizer_mod   # `--method GEStex` joint stage
     )
     if _kernel_takes_is_textured and hasattr(pc, '_is_textured') \
             and pc._is_textured.numel() > 0 and pc._is_textured.shape[0] == pc.get_xyz.shape[0]:
@@ -2123,6 +2543,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     _kernel_takes_scaling_z = (
         'diff_surfel_mixed_3d' in _rasterizer_mod
         or 'diff_surfel_res_3d' in _rasterizer_mod
+        or 'diff_surfel_gestex' in _rasterizer_mod   # `--method GEStex` joint stage
     )
     if _kernel_takes_scaling_z and hasattr(pc, '_scaling_z') \
             and pc._scaling_z.numel() > 0 and pc._scaling_z.shape[0] == pc.get_xyz.shape[0]:
@@ -2134,6 +2555,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             and hasattr(pc, '_film_params') and pc._film_params.numel() > 0 \
             and pc._film_params.shape[0] == pc.get_xyz.shape[0]:
         rasterizer_kwargs['film_gamma'] = pc.get_film_gamma
+        rasterizer_kwargs['film_beta'] = pc.get_film_beta
+
+    # `--method 3D_SH_filmres`: pass per-Gauss gamma/beta to the filmres fork. Beta is the
+    # full [N,24] slice; the kernel reads the first hash_dim<=16 channels with stride 24.
+    if getattr(ingp, 'is_3D_SH_filmres_mode', False) and 'diff_surfel_3D_sh_filmres' in _rasterizer_mod \
+            and hasattr(pc, '_film_params') and pc._film_params.numel() > 0 \
+            and pc._film_params.shape[0] == pc.get_xyz.shape[0]:
+        rasterizer_kwargs['film_gamma'] = pc.get_film_gamma
+        rasterizer_kwargs['film_beta'] = pc.get_film_beta
+
+    # `--method 3D_SH_concat`: pass the per-Gauss surfel latent to the concat fork. The kernel
+    # reads cols 0..15 of the [N,24] beta slice as the latent half of [latent(16) | hash(16)].
+    if getattr(ingp, 'is_3D_SH_concat_mode', False) and 'diff_surfel_3D_sh_concat' in _rasterizer_mod \
+            and hasattr(pc, '_film_params') and pc._film_params.numel() > 0 \
+            and pc._film_params.shape[0] == pc.get_xyz.shape[0] \
+            and not locals().get('_concat_zero_latent', False):   # concat_hash decompose: zero latent
         rasterizer_kwargs['film_beta'] = pc.get_film_beta
 
     # `--method res_3d` post-split dispatch (TWO renders, mathematically
@@ -2913,12 +3350,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         elif bg_color.sum() > 0:
             rendered_image = rendered_image + (1.0 - render_alpha) * bg_color.unsqueeze(-1).unsqueeze(-1)
 
-    # Restore activation biases after decomposition render
+    # Restore activation biases after decomposition render. MUST target the same module the
+    # decompose set the bias on (concat set it on the concat module, else the SH stays killed).
     if '_restore_bias' in dir() and _restore_bias:
-        if is_3D_SH_32_mode:
+        if is_3D_SH_concat_mode:
+            from diff_surfel_3D_sh_concat import set_activation_bias as _restore_set_activation_bias
+        elif is_3D_SH_32_mode:
             from diff_surfel_3D_sh_32 import set_activation_bias as _restore_set_activation_bias
         else:
-            from diff_surfel_3D_sh_res import set_activation_bias as _restore_set_activation_bias
+            _restore_set_activation_bias = _sh_res_setter_mod(ingp).set_activation_bias
         _restore_set_activation_bias(sh_bias=_ACTIVATION_BIAS[0], res_bias=_ACTIVATION_BIAS[1])
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.

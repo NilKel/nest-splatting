@@ -1640,9 +1640,9 @@ renderCUDAsurfelBackward(
 					// my_dL_dz1 is 0 for untextured anyway, but skipping the compute
 					// saves 16*12 scalar mults per untextured contributor per pixel.
 					const int hash_dim = active_hashgrid_levels * l_dim;
-					float my_dL_dinput[12] = {0};  // Max 12D (3 levels × 4D)
+					float my_dL_dinput[TC_INPUT_DIM] = {0};  // 16D. Was [12]+i<12 -> OOB for hybrid_levels=2 (16D hash): dims 12:16 unwritten, dL_dhash read ran off the size-12 array (garbage grad on the finest level).
 					if (tex_j && !d_skip_mlp_grad) {
-						for (int i = 0; i < hash_dim && i < 12; i++) {
+						for (int i = 0; i < hash_dim && i < TC_INPUT_DIM; i++) {
 							float sum = 0;
 							for (int h = 0; h < TC_HIDDEN_DIM; h++) {
 								sum += my_dL_dz1[h] * __half2float(smem_mlp_W1[h * TC_INPUT_DIM + i]);

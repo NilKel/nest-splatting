@@ -1034,14 +1034,23 @@ renderCUDAsurfelForward(
 		// For cat mode (render_mode==1), 'level' is encoded as:
 		// (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 		int hashgrid_levels = level;  // Default: use level as-is (baseline mode)
+		// Strip upper flag bits before matching the base render mode: lowpass (0x400),
+		// pixel_center (0x800), skip-MLP-grad (0x200), kernel2 nibble [16..19]. Without
+		// masking, cat+lowpass arrives as render_mode 0x401 and an exact ==1 check misses
+		// it -> falls to the level>16 error. The render kernel + backward.cu already mask.
+		const int base_mode = render_mode & 0xFF;
 
-		if(render_mode == 3){
+		if(base_mode == 3){
 			// 3D mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 			// Hashgrid query happens in PyTorch, not CUDA - so hashgrid_levels = 0
 			hashgrid_levels = 0;
-		} else if(render_mode == 5){
+		} else if(base_mode == 5){
 			// 3D_direct_fused mode: level = (total_levels << 16) | (active_hashgrid_levels << 8) | hybrid_levels
 			// Hash query happens in CUDA kernel (like cat mode), so use active_hashgrid_levels
+			int active_hashgrid_levels = (level >> 8) & 0xFF;
+			hashgrid_levels = active_hashgrid_levels;
+		} else if(base_mode == 1){
+			// cat mode: same packed encoding as render_mode 5 (decode active hashgrid levels).
 			int active_hashgrid_levels = (level >> 8) & 0xFF;
 			hashgrid_levels = active_hashgrid_levels;
 		} else if(level > 16){

@@ -164,7 +164,7 @@ __global__ void duplicateKeysWithTileDepth(
 				// pixel center of this tile
 				const float pixx = BLOCK_X * x + BLOCK_X / 2;
 				const float pixy = BLOCK_Y * y + BLOCK_Y / 2;
-				
+
 				float3 k = pixx * Tw - Tu;
 				float3 l = pixy * Tw - Tv;
 				float3 p = cross(k, l);

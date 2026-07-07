@@ -609,66 +609,102 @@ def _export_bc7_codebook(baked: Path, output_path: str | None, kernel_type: int,
     # Repack pipeline may emit a raw-bytes sidecar (atlas_texture.u8.bin +
     # atlas_texture.u8.shape) instead of a .pt to dodge an iostream bug in
     # torch.save on multi-GB tensors. Prefer the raw sidecar if present.
+    # Keep the atlas on CPU. The X matrix (N_blocks × 48 fp32) for wide
+    # atlases easily exceeds 12 GB which doesn't fit on a partially-used GPU;
+    # we extract block-vectors in row-strips on demand instead of materializing
+    # the full X tensor on GPU.
     bin_path = baked / "atlas_texture.u8.bin"
     shape_path = baked / "atlas_texture.u8.shape"
     if bin_path.exists() and shape_path.exists():
         H, W, C = [int(x) for x in shape_path.read_text().strip().split(",")]
-        atlas_u8 = torch.from_numpy(np.fromfile(bin_path, dtype=np.uint8).reshape(H, W, C)).cuda()
+        atlas_u8_cpu = torch.from_numpy(np.fromfile(bin_path, dtype=np.uint8).reshape(H, W, C))
     else:
-        atlas_u8 = torch.load(baked / "atlas_texture.pt", map_location='cuda', weights_only=False)
-        if atlas_u8.dim() == 3 and atlas_u8.shape[2] == 4:
-            atlas_u8 = atlas_u8[..., :3]
-    H, W, C = atlas_u8.shape
+        atlas_u8_cpu = torch.load(baked / "atlas_texture.pt", map_location='cpu', weights_only=False)
+        if atlas_u8_cpu.dim() == 3 and atlas_u8_cpu.shape[2] == 4:
+            atlas_u8_cpu = atlas_u8_cpu[..., :3]
+    H, W, C = atlas_u8_cpu.shape
     if C != 3:
         raise SystemExit(f"atlas_texture.pt must be HxWx3 uint8 (got C={C})")
     if H % 4 != 0 or W % 4 != 0:
         raise SystemExit(f"atlas dims must be 4-aligned for BC7 (got {W}×{H})")
     a_scale = float(meta["atlas_scale"]); a_off = float(meta["atlas_offset"])
-    print(f"[BC7-CB] atlas {H}×{W}×3 uint8; running K={K} K-means on 4×4 RGB blocks "
-          f"(N_blocks = {(H//4)*(W//4):,})")
-
-    # ---- Build N×48 FP32 block vectors ----
-    atlas_f = atlas_u8.float() / 255.0 * a_scale + a_off
-    del atlas_u8
     B = 4
-    blocks = atlas_f.unfold(0, B, B).unfold(1, B, B).permute(0, 1, 3, 4, 2).contiguous()
-    del atlas_f
-    torch.cuda.empty_cache()
-    Hb, Wb = blocks.shape[0], blocks.shape[1]
+    Hb, Wb = H // B, W // B
     N_total = Hb * Wb
-    X = blocks.reshape(N_total, B*B*3).contiguous()
-    del blocks
-    torch.cuda.empty_cache()
-    D = X.shape[1]
+    D = B * B * 3
+    print(f"[BC7-CB] atlas {H}×{W}×3 uint8 (CPU-resident); running K={K} K-means on 4×4 RGB blocks "
+          f"(N_blocks = {N_total:,})")
+
+    # Convert STRIP_BR block-rows of CPU uint8 to a GPU float block-vector
+    # tensor of shape (STRIP_BR * Wb, 48). Peak GPU memory per strip is
+    # roughly 4 * STRIP_BR * W * 12 bytes (uint8 strip + fp32 strip + blocks).
+    STRIP_BR = 64  # 64 block-rows × Wb blocks per strip; ~100 MB GPU/strip
+    def _strip_block_vecs(bsr: int, bsr_n: int) -> torch.Tensor:
+        s_u8 = atlas_u8_cpu[bsr*B:(bsr+bsr_n)*B].to('cuda', non_blocking=True)
+        s_f = s_u8.float() / 255.0 * a_scale + a_off
+        del s_u8
+        bl = s_f.unfold(0, B, B).unfold(1, B, B).permute(0, 1, 3, 4, 2).contiguous()
+        del s_f
+        return bl.reshape(bsr_n * Wb, D)
 
     # ---- K-means: subsample for fit, then assign over the full set ----
     SUBSAMPLE = min(N_total, 1_500_000)
-    g = torch.Generator(device='cuda').manual_seed(0)
-    perm = torch.randperm(N_total, generator=g, device='cuda')[:SUBSAMPLE]
-    X_fit = X[perm]
+    g = torch.Generator(device='cpu').manual_seed(0)
+    perm_idx = torch.randperm(N_total, generator=g).numpy()[:SUBSAMPLE]
+    perm_br = perm_idx // Wb
+    perm_bc = perm_idx % Wb
+    # Group samples by strip so each strip is built once and indexed many times.
+    sort_order = np.argsort(perm_br, kind='stable')
+    perm_br_s = perm_br[sort_order]
+    perm_bc_s = perm_bc[sort_order]
+    X_fit = torch.empty((SUBSAMPLE, D), dtype=torch.float32, device='cuda')
+    cursor = 0
+    bs_starts = np.arange(0, Hb, STRIP_BR)
+    for bsr in bs_starts:
+        bsr_n = min(STRIP_BR, Hb - bsr)
+        lo = np.searchsorted(perm_br_s, bsr)
+        hi = np.searchsorted(perm_br_s, bsr + bsr_n)
+        if hi == lo:
+            continue
+        local_br = perm_br_s[lo:hi] - bsr
+        local_bc = perm_bc_s[lo:hi]
+        strip_vecs = _strip_block_vecs(int(bsr), int(bsr_n))
+        local_idx = torch.from_numpy(local_br * Wb + local_bc).long().cuda()
+        X_fit[cursor:cursor + (hi - lo)] = strip_vecs[local_idx]
+        cursor += (hi - lo)
+        del strip_vecs, local_idx
+    torch.cuda.empty_cache()
+
     print(f"[BC7-CB] K-means fit on {SUBSAMPLE:,} subsample (15 iters)…")
     t0 = time.time()
-    # Conservative chunk for the distance matrix (target ~1.5 GB).
     target_dist_bytes = int(1.5 * 1024**3)
     chunk = max(1000, min(2_000_000, target_dist_bytes // (K * 4)))
     cb = kmeans_chunked(X_fit, K, iters=15, dist_chunk=chunk)
     print(f"  fit done in {time.time()-t0:.1f}s")
-    del X_fit, perm
+    del X_fit
+    torch.cuda.empty_cache()
 
-    # Full assign + final SE for PSNR + collect indices.
-    print(f"[BC7-CB] assigning all {N_total:,} blocks…")
+    # Full assign + final SE for PSNR + collect indices. Re-extract block
+    # vectors per strip (no 12-GB X buffer).
+    print(f"[BC7-CB] assigning all {N_total:,} blocks (strip-chunked)…")
     t1 = time.time()
-    indices = torch.empty(N_total, dtype=torch.int32, device='cuda')   # need uint16 at end
+    indices = torch.empty(N_total, dtype=torch.int32, device='cuda')
     cn2 = (cb * cb).sum(1)
     se = 0.0
-    for s in range(0, N_total, chunk):
-        e = min(s + chunk, N_total)
-        d = -2.0 * (X[s:e] @ cb.T) + cn2.unsqueeze(0)
-        ass = d.argmin(1)
-        indices[s:e] = ass.to(torch.int32)
-        recon = cb[ass]
-        se += (recon - X[s:e]).pow(2).sum().item()
-        del d, ass, recon
+    for bsr in bs_starts:
+        bsr_n = min(STRIP_BR, Hb - bsr)
+        strip_vecs = _strip_block_vecs(int(bsr), int(bsr_n))
+        strip_n = strip_vecs.shape[0]
+        strip_base = int(bsr) * Wb
+        for s in range(0, strip_n, chunk):
+            e = min(s + chunk, strip_n)
+            d = -2.0 * (strip_vecs[s:e] @ cb.T) + cn2.unsqueeze(0)
+            ass = d.argmin(1)
+            indices[strip_base + s : strip_base + e] = ass.to(torch.int32)
+            recon = cb[ass]
+            se += (recon - strip_vecs[s:e]).pow(2).sum().item()
+            del d, ass, recon
+        del strip_vecs
     psnr = -10.0 * math.log10(max(se / (N_total * D), 1e-20))
     print(f"  assign done in {time.time()-t1:.1f}s; atlas-space PSNR = {psnr:.2f} dB")
 
@@ -693,7 +729,7 @@ def _export_bc7_codebook(baked: Path, output_path: str | None, kernel_type: int,
 
     # ---- Pack indices as uint16 row-major over blocks (block-row-major) ----
     indices_u16 = indices.to(torch.int32).cpu().numpy().astype(np.uint16)
-    del X, cb, cn2, indices
+    del cb, cn2, indices
     torch.cuda.empty_cache()
 
     # Layer cuts (height-axis split) — same as the raw-BC7 path.

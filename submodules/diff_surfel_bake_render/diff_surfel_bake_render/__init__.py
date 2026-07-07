@@ -344,6 +344,28 @@ def set_compact_mult(val=1.0):
     _C.set_compact_mult(float(val))
 
 
+def set_beta_mult(val=1.0):
+    """EXPERIMENT: scale the beta_scaled / non-AdR footprint cutoff.
+    1.0 => 4-sigma baseline (byte-identical to before); <1 shrinks the
+    binning box (fewer Gaussian-tile pairs => faster). Beta support ends
+    at 3-sigma, so mult down to 0.75 is free headroom before quality drops."""
+    _C.set_beta_mult(float(val))
+
+
+def set_drop_lowpass(val=False):
+    """EXPERIMENT: drop the Gaussian low-pass for beta_scaled — removes both
+    the alpha max-pool (max(alpha_beta, alpha_lp) -> alpha_beta) and the
+    filter_r low-pass screen extension of the footprint."""
+    _C.set_drop_lowpass(bool(val))
+
+
+def set_opacity_aware_beta(val=False):
+    """EXPERIMENT: mode-5/0/2 beta footprint cutoff = max(r_beta, r_lp) (the 1/255
+    iso, opacity- and shape-aware) instead of the fixed 4σ. Tighter ellipse for
+    AccuTile → fewer Gaussian-tile pairs, lossless (clips only the <1/255 region)."""
+    _C.set_opacity_aware_beta(bool(val))
+
+
 def set_residual_mode(mode=0):
     """0 = 3D_SH_res outer ReLU (default). 1 = 3D_SH_add separate ReLUs."""
     _C.set_residual_mode(int(mode))

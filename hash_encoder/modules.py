@@ -96,7 +96,12 @@ class INGP(nn.Module):
         # Store args for 3D_SH_res mode (per-Gaussian SH + tiny hash MLP residual, diff_surfel_3D_sh_res)
         # `--method mixed` is treated as 3D_SH_res at the INGP level (same hashgrid + MLP architecture).
         # The mixed-specific behavior (per-Gauss textured/untextured split) lives in the renderer + train loop.
-        self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method in ("3D_SH_res", "3D_SH_res_sep", "res_switch", "res_3d", "res_3d_paired", "res_3d_double", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep", "clip_relight")
+        self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method in ("3D_SH_res", "3D_SH_res_sep", "res_switch", "res_3d", "res_3d_paired", "res_3d_double", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep", "clip_relight", "3D_SH_filmres")
+        # 3D_SH_filmres: 3D_SH_res with FiLM conditioning of the residual MLP's hash
+        # input (residual = MLP(gamma*H + beta)). Inherits all 3D_SH_res handling above
+        # (fused in-kernel MLP, SH base, residual modes); the renderer dispatches it to
+        # the diff_surfel_3D_sh_filmres submodule and passes per-Gauss gamma/beta.
+        self.is_3D_SH_filmres_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_filmres"
         # `--method res_3d`: at --res_3d_iter, each Gauss splits into a 2D
         # residual-carrier + 3D EWA SV-carrier. Pre-split, behaves like
         # 3D_SH_res + --lru (single render via diff_surfel_mixed_3d with all
@@ -122,6 +127,13 @@ class INGP(nn.Module):
         # `--method mixed_3d --texsplit`. Single render call, no dual-cascade.
         self.is_res_3d_paired_mode = args is not None and hasattr(args, 'method') and args.method == "res_3d_paired"
         self.is_res_3d_paired_post_split = False
+        # `--method GEStex`: method is aliased to "res_switch" upstream, so the
+        # 3D_SH_res-family flags above are already set for phases 0-20k. `is_gestex_mode`
+        # is carried on args separately; `is_gestex_joint` flips True at --ges_joint_iter
+        # to route the renderer into the sort-free 2-pass dispatch (surfel z-buffer +
+        # additive Gaussian pass). See docs/GESTEX_MODE.md.
+        self.is_gestex_mode = args is not None and bool(getattr(args, 'is_gestex', False))
+        self.is_gestex_joint = False
         # `--method mixed[_3d]`: textured/untextured manifold split. INGP-level
         # behavior is identical to 3D_SH_res; the split lives in renderer + train.
         # is_mixed_mode covers BOTH variants (shared color/relu/grad plumbing);
@@ -155,6 +167,9 @@ class INGP(nn.Module):
         self.is_3D_SH_cat_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_cat"
         # Store args for 3D_SH_32 mode (per-Gaussian SH + 32-dim hash MLP residual, diff_surfel_3D_sh_32)
         self.is_3D_SH_32_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_32"
+        # 3D_SH_concat: 32-dim MLP (like 3D_SH_32) but input = concat[surfel latent(16) | hash(16)]
+        # instead of [hash | pad]. Routes through diff_surfel_3D_sh_concat. Latent = _film_params beta[0:16].
+        self.is_3D_SH_concat_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_concat"
         # Store args for clip_relight mode: clip-conditioned per-Gauss deform+relight head ON TOP of
         # 3D_SH_res. Rides the 3D_SH_res_sep machinery (residual_mode 2, deferred per-pixel ReLU, SV
         # base via fake-SH); the head (clipgrid + multi-head MLP) is a Python pre-pass that overrides
@@ -162,7 +177,7 @@ class INGP(nn.Module):
         self.is_clip_relight_mode = args is not None and hasattr(args, 'method') and args.method == "clip_relight"
         self.freeze_mlp = args is not None and hasattr(args, 'freeze_mlp') and args.freeze_mlp
         # Treat lean/fp16/tc/sh_tc/sh_res/sh_cat mode same as fused mode for MLP/rendering logic
-        if self.is_3D_direct_lean_mode or self.is_3D_direct_fp16_mode or self.is_3D_direct_tc_mode or self.is_3D_direct_sh_tc_mode or self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode or self.is_3D_SH_32_mode:
+        if self.is_3D_direct_lean_mode or self.is_3D_direct_fp16_mode or self.is_3D_direct_tc_mode or self.is_3D_direct_sh_tc_mode or self.is_3D_SH_res_mode or self.is_3D_SH_cat_mode or self.is_3D_SH_32_mode or self.is_3D_SH_concat_mode:
             self.is_3D_direct_fused_mode = True
 
         # hybrid_levels is used by cat, cat_dropout, adaptive_cat, adaptive_zero, adaptive_gate, 3D, 3D_direct, and 3D_direct_fused modes
@@ -358,8 +373,10 @@ class INGP(nn.Module):
                 for p in self.mlp_fused.parameters():
                     p.requires_grad_(False)
 
-        elif self.is_3D_SH_32_mode:
+        elif self.is_3D_SH_32_mode or self.is_3D_SH_concat_mode:
             # 3D_SH_32: Same as 3D_SH_res but with 32-dim hidden MLP
+            # 3D_SH_concat: 32-dim MLP whose 32D input is the CONCAT [surfel latent(16) | hash(16)]
+            #   (the CUDA kernel fills [0:16] from _film_params beta, [16:32] from the hash query).
             # Per-Gaussian SH handles view-dependent base color (evaluated in CUDA preprocessing)
             # MLP adds spatial correction from hash grid with larger capacity
             total_levels = cfg_model.encoding.levels
@@ -369,10 +386,14 @@ class INGP(nn.Module):
             # CUDA kernel uses TC_INPUT_DIM=32 fixed. MLP must match.
             # Input layout: [hash(hash_dim) | bias(1) | pad(32-hash_dim-1)] = 32D always
             assert hash_dim + 1 <= 32, f"hash_dim={hash_dim} + bias(1) exceeds TC_INPUT_DIM=32. Max hash_dim=31."
-            mlp_input_padded = 32  # Must match TC_INPUT_DIM in diff_surfel_3D_sh_32
+            if self.is_3D_SH_concat_mode:
+                # concat layout reserves [0:16] for the latent, so hash must fit in [16:32].
+                assert hash_dim <= 16, (f"3D_SH_concat: hash_dim={hash_dim} > 16 (4 levels). "
+                                        f"Use --hybrid_levels >= 2 so hash fits the [16:32] half.")
+            mlp_input_padded = 32  # Must match TC_INPUT_DIM in diff_surfel_3D_sh_32 / _concat
             hidden_dim = 32  # Must match TC_HIDDEN_DIM
 
-            print(f'[3D_SH_32 MODE] Building bias-free residual MLP for CUDA:')
+            print(f'[{"3D_SH_CONCAT" if self.is_3D_SH_concat_mode else "3D_SH_32"} MODE] Building bias-free residual MLP for CUDA:')
             print(f'  Hash features: {hash_dim}D ({total_levels - self.hybrid_levels} levels × {level_dim}D)')
             print(f'  MLP input: {mlp_input_dim}D hash + 1D bias + {mlp_input_padded - mlp_input_dim - 1}D pad = {mlp_input_padded}D')
             print(f'  Architecture: {mlp_input_padded}D → {hidden_dim}D (ReLU) → {hidden_dim}D (ReLU) → {hidden_dim}D (identity, first 3 = RGB residual)')
@@ -1299,8 +1320,8 @@ class INGP(nn.Module):
         # which matches CUDA's W[h * in_dim + i] access pattern
 
         # Pad weights for WMMA alignment (Tensor Core modes)
-        if self.is_3D_SH_32_mode:
-            # 3D_SH_32: All weights are [32, 32] — already WMMA-aligned
+        if self.is_3D_SH_32_mode or self.is_3D_SH_concat_mode:
+            # 3D_SH_32 / 3D_SH_concat: All weights are [32, 32] — already WMMA-aligned
             # But W3 output: [32, 32] — only first 3 rows used as RGB residual
             import torch
             actual_input_cols = W1.shape[1]

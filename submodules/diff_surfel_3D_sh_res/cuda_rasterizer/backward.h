@@ -79,6 +79,8 @@ namespace BACKWARD
 	// Set backward's own threshold copies (extern __device__ doesn't work across .cu files)
 	void setContribThresh(float val);
 	void setCountThresh(int val);
+	void setOpacityThresh(float val);
+	void setDropout(float rate, unsigned int seed);
 	void setOverdrawLambda(float val);
 	void setWeightRegLambda(float val);
 	void setResBias(float val);

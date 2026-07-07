@@ -8,12 +8,29 @@
 
 **CRITICAL: ALWAYS use `run_in_background: true` for ALL CUDA builds** — they take 2-5 minutes.
 
+> ⚠️ **CUDA ISOLATION RULE — never edit a shared rasterizer for a mode-specific feature.**
+> `diff_surfel_3D_sh_res` (and `diff-surfel-rasterization`) are **shared** by many modes and
+> the baked pipeline. A CUDA change for ONE experimental mode goes in a **clone** of the
+> nearest submodule (this is why `diff_surfel_mixed`, `_mixed_3d`, `_sh_concat`, `_filmres`,
+> `_gestex*`, `_3D_sh_res_harden`, … all exist), routed via the setter-mirror
+> (`_sh_res_setter_mod(ingp)` in the renderer, `_SHRES_SETTER_MOD` in train.py) + the `_rmod`
+> dispatch. **Do NOT modify `diff_surfel_3D_sh_res` itself** even behind a default-off toggle —
+> clone it. **Naming a clone**: keep the base's `diff_surfel_3D_sh_res` prefix so the renderer's
+> module-name substring gates (`'diff_surfel_3D_sh_res' in _rasterizer_mod` → metric_map ON)
+> resolve as base, and do NOT let the name contain another family's key substring
+> (`diff_surfel_gestex`, `diff_surfel_mixed`, `diff_surfel_res_3d`, `diff_surfel_film`) or the
+> renderer will wrongly pass that family's kwargs (`is_textured`/`scaling_z`/…) → forward
+> TypeError. (Learned the hard way: a clone named `diff_surfel_gestex_harden` tripped the
+> `diff_surfel_gestex` gate; renamed to `diff_surfel_3D_sh_res_harden`.)
+
 | Submodule | Path | Purpose |
 |---|---|---|
 | `diff-surfel-rasterization` | `submodules/diff-surfel-rasterization` | Original 2DGS rasterizer (modes 0/1) |
-| `diff_surfel_3D_sh_res` | `submodules/diff_surfel_3D_sh_res` | **Main training rasterizer** for 3D_SH_res |
+| `diff_surfel_3D_sh_res` | `submodules/diff_surfel_3D_sh_res` | **Main training rasterizer** for 3D_SH_res (SHARED — do not add mode-specific CUDA here; clone it) |
+| `diff_surfel_3D_sh_res_harden` | `submodules/diff_surfel_3D_sh_res_harden` | **GEStex explore+harden (0–20k) rasterizer** — isolated clone of `diff_surfel_3D_sh_res`, byte-identical EXCEPT: (1) **GES-paper frontmost-first promotion** (`set_frontmost_first`, default @`--ges_first_int_iter` 15k): per pixel, the frontmost surfel by exact ray-disc intersection depth blends FIRST, others keep tile order — implemented as an algebraic post-correction `C −= αF·C_snap − αF(1−T_snap)·cF` (fwd) + skip-F reverse walk with `T=1`/`c_nf` inline F (bwd, BOTH std + MODE-5 paths); color-only (aux keeps original order); converges to `joint_s`'s z-buffer. (2) the tile-depth SORT A/B variant (`set_tile_depth_sort`, `--ges_tile_depth_sort`, rect-only → AccuTile dropped). Renderer routes GEStex 0–20k here (`_is_gestex_harden`) + train.py `_SHRES_SETTER_MOD`/setter-mirror/`get_mlp_grads` all target it (reading MLP grads from the base silently freezes the MLP — bitten once). Off ⇒ byte-identical to base. See GESTEX_PIPELINE.md §1. |
 | `diff_surfel_mixed` | `submodules/diff_surfel_mixed` | `--method mixed` rasterizer (fork of `diff_surfel_3D_sh_res`) with the per-Gauss textured/untextured CUDA branch (untextured = 2DGS ray-splat, SV-only). |
 | `diff_surfel_mixed_3d` | `submodules/diff_surfel_mixed_3d` | `--method mixed_3d` rasterizer (fork of `diff_surfel_mixed`). Untextured surfels render as **EWA 3D ellipsoids** (FastGS-verbatim `computeCov3D`/`computeCov2D`/conic, eps2d=0.3) instead of 2DGS ray-splats. Textured half untouched. |
+| `diff_surfel_3D_sh_concat` | `submodules/diff_surfel_3D_sh_concat` | `--method 3D_SH_concat` rasterizer (fork of `diff_surfel_3D_sh_32`). 32-dim fused MLP whose 32D input is the **concat** `[surfel latent(16) \| hash(16)]` instead of sh_32's `[hash \| pad]`. Latent = `_film_params` β[0:16]. |
 | `diff_surfel_bake` | `submodules/diff_surfel_bake` | Bakes MLP residual into per-Gaussian SH atlas |
 | `diff_surfel_bake_render` | `submodules/diff_surfel_bake_render` | Forward-only renderer for baked atlas |
 | `gridencoder` | `gridencoder` | Python-side hash encoding (not used at inference) |
@@ -81,6 +98,148 @@ concatenated coarse feature; `hybrid_levels=0` (all 24D = 6 hash levels × 4D).
   3D_SH_res CUDA-setter lists. Use standard or FastGS densification (MCMC/minimc-reinit/
   consolidate tensor-rebuild + baked pipeline are NOT yet wired for FiLM).
 - Future ablation noted in the doc: `(1+γ)`+weight-decay reparametrization.
+
+## `--method 3D_SH_filmres` (FiLM on the 3D_SH_res residual MLP)
+
+Full reference: [`docs/FILM_MODE.md`](../../docs/FILM_MODE.md) (bottom section). The same
+FiLM idea applied to `3D_SH_res` instead of cat: per-Gauss view-dependent SH base +
+a CUDA-fused, view-independent residual MLP whose **≤16D hash input** is FiLM-modulated —
+`residual = MLP(γ_i·H(x_i) + β_i)`, then `color = act(ReLU(SH+sh_bias) + residual + res_bias)`
+(SH base + activation cascade UNCHANGED). *Decode-then-blend* (vs `--method film`'s
+*blend-then-PyTorch-MLP*).
+- **Submodule**: `submodules/diff_surfel_3D_sh_filmres` (clone of `diff_surfel_3D_sh_res`).
+  Scalar case-5 forward: `mlp_input[i] = γ·hash[i] + β[i]` before the fused MLP. Backward:
+  `dL/dβ=dL/dinput`, `dL/dγ=Σ hash·dL/dinput`, then γ-scales `dL_dinput_full` in place so the
+  existing hash backward yields `dL/dH=γ·dL/dinput`. **FiLM is patched in BOTH backward
+  paths** — the tensor-core collaborative-GEMM (default) and the scalar fallback — verified
+  to give identical γ/β grads; collab `my_dL_dinput` bumped `[12]→[16]`. (A first cut that
+  only patched scalar + force-disabled collab left γ/β grad = 0, silently frozen at init,
+  while hash/MLP still trained — watch for that symptom.) `film_gamma`/`film_beta` (+ grad
+  outputs) threaded like `colors`.
+- **β is ≤16D** (fused MLP `TC_INPUT_DIM=16`; `hash_dim = active_levels×l_dim`). **Reuses
+  the same `_film_params [N,25]`** as `--method film` (γ col 0, first `hash_dim` of the 24 β
+  cols; β **stride 24**). Same `--film_gamma_init`/`--film_beta_init` flags, PLY round-trip,
+  optimizer group.
+- **Family membership**: `is_3D_SH_res_mode` includes `3D_SH_filmres` (inherits fused-MLP
+  build, SH base, residual modes, render_mode 5, all train.py 3D_SH_res-family gates). A
+  dedicated `is_3D_SH_filmres_mode` flag drives renderer dispatch + the **module-local
+  setter routing** (`set_mlp_weights`/`get_mlp_grads`/`set_residual_mode`/… must target the
+  filmres fork — renderer `_sh_res_setter_mod(ingp)`, train.py `_SHRES_SETTER_MOD`).
+  Getting `set_mlp_weights`/`get_mlp_grads` on the wrong module silently breaks the MLP.
+- **FiLM activation** (`--film_act {identity,gamma_relu,beta_relu,gamma_sigmoid,
+  beta_sigmoid,double_relu,double_sigmoid}`, default identity): independent γ/β activation,
+  `mlp_input = γ_act(γ)·H + β_act(β)`. `gamma_*`/`beta_*` activate one param only; `double_*`
+  both. Device-global `d_film_gamma_act` (modes 0–6) mirroring `d_lru_slope`
+  (`set_film_gamma_act` patches fwd+bwd; backward chain-rules `dL/dγ` by `γ_act'(γ)` scaling
+  hash grad by `γ_act(γ)`, and `dL/dβ` by `β_act'(β)`). Separate `film_gamma_apply`/
+  `film_beta_apply` (+`_grad`) device fns: **γ** relu={1,5} sigmoid={3,6}; **β** relu={2,5}
+  sigmoid={4,6}. Reduces to identity on a param where it's already in the activation's
+  identity region. 3D_SH_filmres only (cat `--method film` still raw γ/β).
+- **β freeze** (`--film_freeze_beta_iter N`, default 0=off): zeros the β gradient
+  (`_film_params[:, 1:].grad`) for the first N iters of the run (γ, col 0, keeps training)
+  → β held at its init (`--film_beta_init`) while the hash/MLP+γ settle, then β refines.
+  Python-side (train.py, before `optimizer.step()`); Adam moments stay 0 so β truly frozen.
+  Applies to both `film` and `3D_SH_filmres`.
+- **γ lock** (`--lock_gamma X`, default off): forces `γ_eff = X` constant (bypasses the
+  stored γ AND its `--film_act` activation) and freezes γ's grad → `mlp_input = X·H +
+  β_act(β)`. Device-global `d_film_lock_gamma` (`film_gamma_apply` returns X,
+  `film_gamma_apply_grad` returns 0; -1e30 = off); train.py also pins `_film_params[:,0]=X`.
+  Canonical `--lock_gamma 1.0` = pure additive latent on the full-strength hash (removes the
+  sigmoid-γ<1 hash-attenuation handicap; with `--film_beta_init 0` byte-identical to
+  3D_SH_res at init → clean A/B for "does β help"). 3D_SH_filmres only.
+- **Perf**: γ/β staged in shared as **FP16** (fwd + bwd render kernels; mirrors
+  `collected_colors`), one global read per Gauss per tile-batch (frees L1 for the hash).
+  FP16 halves the footprint so the backward fits the 48KB static-shared cap alongside the
+  collab-GEMM tiles (FP32 overflowed). Math FP32 via `__half2float`; params/grads FP32.
+- Baked pipeline NOT wired for `3D_SH_filmres`.
+
+## `--method 3D_SH_concat` (concat per-Gauss latent ∥ hash, NOT additive FiLM)
+
+Motivation: additive FiLM (`--method 3D_SH_filmres`, `mlp_input = γ·H + β`) underperformed
+3D_SH_res — the per-Gauss β **added into the hash channels corrupts H(x)'s spatial-coherence
+prior** and is redundant with the SH base. `3D_SH_concat` instead **concatenates** a per-Gauss
+latent with the hash so the hash channels stay pure: `mlp_input = [latent(16) | hash(16)]` (32D),
+decoded by a 32→32→32→3 fused MLP. The clean control is `--method 3D_SH_32` (same 32-in/32-hidden
+MLP but input `[hash | pad]`) — concat vs 3D_SH_32 isolates the latent from MLP capacity.
+- **Submodule**: `submodules/diff_surfel_3D_sh_concat` (clone of `diff_surfel_3D_sh_32` — its
+  **verified 32-in/32-hidden WMMA GEMM is reused untouched**; only the input *layout* + grad
+  *routing* changed, never the GEMM math). Forward (scalar; the WMMA-collab forward is disabled
+  in sh_32) builds `mlp_input[0:16]=film_beta[gid*24+i]` (raw latent), `mlp_input[16:16+hash_dim]=hash`.
+  Backward (BOTH the collab-GEMM and scalar paths) splits `dL_dinput`: `[0:16]→dL_dfilm_beta`
+  (atomicAdd, the latent grad — raw concat so `d(input)/d(latent)=1`), `[16:16+hash_dim]→dL_dhash`.
+  Hash query **extended 12→16D** (sh_32 capped at 3 levels; concat needs 4 = 16D to fill `[16:32]`).
+  Correct **by construction** (fwd/bwd share the exact layout). `film_beta` threaded in (fwd recompute)
+  + `dL_dfilm_beta` out, mirroring filmres's β plumbing minus γ; backward return-tuple 15→16.
+- **Latent = `_film_params` β[0:16]** (reuses the FiLM tensor/optimizer/PLY; γ col 0 unused). Inits at
+  `--film_beta_init` (def 0 → starts as pure-hash, latent learns from 0). The `[FILM iter=…]`
+  diagnostic's **beta** stats ARE the latent (watch `grad_norm`/`moved(|b|>1e-4)` for a frozen latent).
+- **Family**: treated like `3D_SH_32` (32-dim fused MLP, render_mode 5, SH base, `is_3D_direct_fused_mode`
+  → hybrid_levels honored). Needs `--hybrid_levels ≥ 2` (hash_dim ≤ 16 to fit `[16:32]`; asserted).
+  Renderer dispatch + `set_mlp_weights`/`get_mlp_grads` route to the concat module (`_setter_mod`);
+  `_film_params` init + all train.py family gates include `3D_SH_concat`.
+- **Latent staging**: read directly from **global** memory (no shared staging — keeps the already-heavier
+  32-dim kernel under the shared cap; optimize later if the mode proves out). Baked pipeline NOT wired.
+
+## `--method GEStex` (GES-style bi-scale + baked, fine-tunable RGB atlas)
+
+**CANONICAL REFERENCE: [`docs/GESTEX_PIPELINE.md`](../../docs/GESTEX_PIPELINE.md)** (current
+pipeline). [`docs/GESTEX_MODE.md`](../../docs/GESTEX_MODE.md) is the earlier design (superseded —
+discrete `surfel_opac` 1→255 ramp).
+
+**Current pipeline (TS+ hardening):** GES-style bi-scale — flat opaque 2D surfels + 3D Gaussians
+"in front", rendered sort-free (`diff_surfel_gestex_joint_s` z-buffer + `_joint_g` additive,
+composited `LRU((C_S·s_w+C_G)/(s_w+W_G))` — **LRU applied ONCE, after the mix**;
+`_render_gestex_joint`, gated on `ingp.is_gestex_sortfree`; kernels FD-gradcheck-verified:
+`test_joint_s.py` 6/6 atlas+4/4 SV, `test_joint_g.py` 5/5 SH). Three stages: **explore** (0–10k)
+→ **harden** (10k–20k) → **joint** (20k+). Hardening (the **bloat fix**) = rising opacity **FLOOR**
+`O_t+(1−O_t)·sigmoid(w)` (≤1, `O_t` ramp 0→`--ges_opac_floor_max` 0.99; opacity stays trainable;
+reset OFF) + `beta_scaled` **β-ceiling anneal** →`--ges_beta_end` 0.1 (flat-top discs) +
+**two-phase pruning** (early `<--ges_prune_w_thresh` 0.2 opacity cut @ phase1+`--ges_hard_prune_offset`,
+then periodic `T·o` occlusion cull every `--ges_surfel_prune_interval`) with **densify left ON**
+to refill holes + a **15k shrink** (`--ges_shrink_factor` 0.75). local→global LRU flips at
+**`--ges_global_lru_iter`** (default 10k). Colour = **SV** on BOTH surfels and 3DGS (fake-SH routed
+into `joint_g` so the Gaussians' `_sv_*` gets gradient). At 20k: occlusion cull + error-map 3DGS
+spawn + (bake atlas OR **`--ges_no_bake`** live hash/MLP via the `diff_surfel_gestex` cascade) +
+freeze surfel geom + **stop textured densify** (`ges_freeze_textured_densify`) + Gaussian
+densify/prune. `joint_s` `out_others` is 8-ch (adds the frontmost surfel view-space normal for
+the training_output normal map). Root-cause note: bloat = opacity>1 amplifying `dL_dscale ∝
+opacity`; the ≤1 floor removes it. Deferred: frontmost-first harden two-pass (`d_gestex_frontmost`
+scaffolding exists, unbuilt). See GESTEX_PIPELINE.md for the full flag list, CUDA, and
+training_output decomposition. The rest of this section is background on the atlas/opacity mechanics.
+
+Also adapts the GES paper
+onto the nest pipeline: opaque **2D textured surfels** (coarse) + **3D Gaussians** (fine),
+where the hash+MLP residual is **baked into an explicit per-surfel RGB atlas at iter 20k
+and fine-tuned** thereafter (hash/MLP dropped for the final segment).
+- **Alias**: GEStex → `res_switch` for phases 0–20k (inherits every 3D_SH_res-family gate +
+  the mode 0→2 flip); a separate `args.is_gestex` flag drives the GEStex schedule and
+  `ingp.is_gestex_joint` (flipped at `--ges_joint_iter`) routes the renderer to the new
+  kernel BEFORE the res_switch path.
+- **Submodule**: `submodules/diff_surfel_gestex` — clone of `diff_surfel_res_3d_paired`
+  (textured 2D + untextured EWA 3D, joint cascade, full backward) with the textured residual
+  swapped hash+MLP → **bilinear lookup into the baked RGB atlas** `_tex_atlas [N,R,R,3]`.
+  Forward: `residual = bilinear(atlas)` (hash+MLP SKIPPED). Backward: `dL/dresidual`
+  atomic-scattered into the 4 atlas texels (`mlp_backward`+hash-backward SKIPPED — no MLP
+  weights read). Atlas plumbed via **device-global setters** (`set_gestex_atlas`/
+  `clear_gestex_atlas`, mirroring `set_mlp_weights`/`get_mlp_grads`); the renderer allocates
+  the grad buffer, stashes it on `pc._ges_atlas_grad`, and train.py assigns it to
+  `_tex_atlas.grad` after `backward()`.
+- **CRITICAL bring-up pitfalls** (see doc): (1) the gestex module has its OWN device-global
+  MLP weights — install the setter-mirror at the joint transition (else null-read in the
+  backward); (2) **force the scalar backward when the atlas is active** (`h_gestex_atlas_active`
+  → `use_collaborative_gemm=false`) — the collab-GEMM backward (0x100 bit) has no atlas hooks,
+  so the atlas silently gets zero gradient; (3) spawn must grow EVERY per-Gauss tensor incl.
+  `_sv_*`; (4) `ges_bake_atlas` must deep-copy the MLP (`.half()` is in-place).
+- **Schedule flags**: `--ges_phase1_iter` 10000, `--ges_occlusion_iter` 15000 (thr 16 / 4
+  synthetic), `--ges_opac60_iter` 18000, `--ges_opac90_iter` 19000, `--ges_joint_iter` 20000,
+  `--ges_prune_w_thresh` 0.8, `--ges_atlas_res` 8, `--ges_gs_prune_interval` 500,
+  `--ges_gs_prune_thresh` 0.02. Forces `--kernel gaussian` (GES falloff), defaults `--lru` 0.01.
+- **Tests**: `scripts/test_gestex_units.py [textured|untextured|mixed|gradcheck]` — fw+bw per
+  config + FD gradcheck of the atlas backward (6/6 texels within 0.4%). One case per process
+  (CUDA illegal access poisons the context). Debug envs: `GESTEX_NOATLAS`, `GESTEX_USE_PAIRED`,
+  `GES_ATLAS_FILL`.
+- Joint stage uses the res_3d_paired **joint alpha-blend cascade** (opaque surfels ≈
+  frontmost), not yet the GES sort-free 2-pass z-buffer (that's an inference-speed follow-up).
 
 ## Baked Rendering Pipeline
 

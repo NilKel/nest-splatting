@@ -24,7 +24,21 @@ namespace cg = cooperative_groups;
 // extern __device__ does NOT work across .cu compilation units without -rdc=true
 __device__ float d_contrib_thresh_bw = 0.0f;
 __device__ int d_count_thresh_bw = 0;
+__device__ float d_opacity_thresh_bw = 0.0f;
 __device__ float d_overdraw_lambda_bw = 0.0f;
+
+// Texture-query dropout — backward's own copy (must reproduce the forward mask exactly:
+// same splitmix hash of (gaussian_id, seed), same rate). See forward.cu for the rationale.
+__device__ float d_dropout_rate_bw = 0.0f;
+__device__ unsigned int d_dropout_seed_bw = 0u;
+__device__ __forceinline__ float dropout_hash01_bw(unsigned int a, unsigned int b) {
+	unsigned int x = a * 0x9e3779b9u ^ (b + 0x85ebca6bu + (a << 6) + (a >> 2));
+	x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+	return (x >> 8) * (1.0f / 16777216.0f);
+}
+__device__ __forceinline__ bool dropout_skip_bw(unsigned int gid) {
+	return d_dropout_rate_bw > 0.0f && dropout_hash01_bw(gid, d_dropout_seed_bw) < d_dropout_rate_bw;
+}
 __device__ float d_weight_reg_lambda_bw = 0.0f;  // Weight-squared reg: -lambda * 2 * w * T per Gaussian
 __device__ float d_res_bias = 0.5f;  // Residual activation bias: ReLU(residual + d_res_bias)
 // d_ste_relu: straight-through estimator for the per-Gauss outer ReLU
@@ -1247,7 +1261,9 @@ renderCUDAsurfelBackward(
 				float my_dL_dz3[TC_OUTPUT_DIM] = {0};
 
 				bool skip_hash = (d_contrib_thresh_bw > 0.0f && w < d_contrib_thresh_bw)
-				                 || (d_count_thresh_bw > 0 && current_contributor >= (uint32_t)d_count_thresh_bw);
+				                 || (d_count_thresh_bw > 0 && current_contributor >= (uint32_t)d_count_thresh_bw)
+				                 || (d_opacity_thresh_bw > 0.0f && alpha < d_opacity_thresh_bw)
+				                 || dropout_skip_bw((unsigned int)collected_id[j]);
 				if (participates) {
 					// 1. Query hash features — skip for tail pixels (matches forward)
 					const int hash_dim_collab = active_hashgrid_levels * l_dim;
@@ -1429,9 +1445,9 @@ renderCUDAsurfelBackward(
 				if (participates) {
 					// dL_dinput = W1^T @ dL_dz1 (first hash_dim elements = hash features)
 					const int hash_dim = active_hashgrid_levels * l_dim;
-					float my_dL_dinput[12];  // Max 12D (3 levels × 4D)
+					float my_dL_dinput[TC_INPUT_DIM];  // 16D. Was [12]+i<12 → for hybrid_levels=2 (16D hash) dims 12:16 were unwritten and the dL_dhash read below ran OOB (garbage grad on the finest level).
 					if (!d_skip_mlp_grad) {
-						for (int i = 0; i < hash_dim && i < 12; i++) {
+						for (int i = 0; i < hash_dim && i < TC_INPUT_DIM; i++) {
 							float sum = 0;
 							for (int h = 0; h < TC_HIDDEN_DIM; h++) {
 								sum += my_dL_dz1[h] * __half2float(smem_mlp_W1[h * TC_INPUT_DIM + i]);
@@ -2141,7 +2157,9 @@ renderCUDAsurfelBackward(
 
 				// 1. Query hash features — skip for tail pixels (matches forward)
 				bool skip_hash = (d_contrib_thresh_bw > 0.0f && w < d_contrib_thresh_bw)
-				                 || (d_count_thresh_bw > 0 && contributor >= (uint32_t)d_count_thresh_bw);
+				                 || (d_count_thresh_bw > 0 && contributor >= (uint32_t)d_count_thresh_bw)
+				                 || (d_opacity_thresh_bw > 0.0f && alpha < d_opacity_thresh_bw)
+				                 || dropout_skip_bw((unsigned int)collected_id[j]);
 				const int hash_dim_px = active_hashgrid_levels * l_dim;
 				float hash_feat[16] = {0};
 				if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 4) {
@@ -2393,7 +2411,9 @@ renderCUDAsurfelBackward(
 
 				// 1. Query hash features
 				bool skip_hash_6 = (d_contrib_thresh_bw > 0.0f && w < d_contrib_thresh_bw)
-				                   || (d_count_thresh_bw > 0 && contributor >= (uint32_t)d_count_thresh_bw);
+				                   || (d_count_thresh_bw > 0 && contributor >= (uint32_t)d_count_thresh_bw)
+				                   || (d_opacity_thresh_bw > 0.0f && alpha < d_opacity_thresh_bw)
+				                   || dropout_skip_bw((unsigned int)collected_id[j]);
 				float hash_feat_6[12] = {0};
 				if (!skip_hash_6 && active_hashgrid_levels_6 > 0 && l_dim == 4) {
 					if (hash_dim_6 == 4)
@@ -3293,6 +3313,7 @@ __global__ void preprocessCUDA(
 // Setter kernels for backward's own threshold copies
 __global__ void setContribThreshBwKernel(float val) { d_contrib_thresh_bw = val; }
 __global__ void setCountThreshBwKernel(int val) { d_count_thresh_bw = val; }
+__global__ void setOpacityThreshBwKernel(float val) { d_opacity_thresh_bw = val; }
 
 void BACKWARD::setContribThresh(float val) {
 	setContribThreshBwKernel<<<1, 1>>>(val);
@@ -3300,6 +3321,15 @@ void BACKWARD::setContribThresh(float val) {
 
 void BACKWARD::setCountThresh(int val) {
 	setCountThreshBwKernel<<<1, 1>>>(val);
+}
+
+void BACKWARD::setOpacityThresh(float val) {
+	setOpacityThreshBwKernel<<<1, 1>>>(val);
+}
+
+__global__ void setDropoutBwKernel(float rate, unsigned int seed) { d_dropout_rate_bw = rate; d_dropout_seed_bw = seed; }
+void BACKWARD::setDropout(float rate, unsigned int seed) {
+	setDropoutBwKernel<<<1, 1>>>(rate, seed);
 }
 
 __global__ void setOverdrawLambdaBwKernel(float val) { d_overdraw_lambda_bw = val; }

@@ -665,6 +665,20 @@ def set_count_thresh(val):
     """Set count threshold. Skip hash after N contributing Gaussians per pixel (0 = disabled)."""
     _C.set_count_thresh(val)
 
+def set_opacity_thresh(val):
+    """Set opacity threshold. Skip hash query when alpha = opa*kernel_val < val (0 = disabled).
+    Unlike contrib_thresh (w = T*alpha), this is occlusion-independent — drops the residual on
+    the soft tails of fuzzy surfels where the queried beta_scaled/Gaussian kernel × opacity is small."""
+    _C.set_opacity_thresh(val)
+
+def set_dropout(rate, seed):
+    """Set texture-query dropout (training only; call with rate=0 to disable for eval/inference).
+    A deterministic hash of (gaussian_id, seed) drops the hash/MLP residual query for ~rate of
+    Gaussians per iteration (per-Gauss, unscaled — the SH base must render those alone). Forward
+    and backward share the (rate, seed) so the dropped mask matches. Bump `seed` each iteration
+    (e.g. seed=iteration) so the dropped set rotates."""
+    _C.set_dropout(float(rate), int(seed))
+
 def set_overdraw_lambda(val):
     """Set overdraw regularization lambda. Penalizes per-pixel contributor count with sigmoid relaxation (0 = disabled)."""
     _C.set_overdraw_lambda(val)
@@ -742,6 +756,19 @@ def set_compact_mult(val=1.0):
     Only effective when --aabb is one of {adr, adrrect} (aabb_mode in {1, 3}).
     """
     _C.set_compact_mult(float(val))
+
+
+def set_beta_mult(val=1.0):
+    """Set the snugbox (--aabb snugbox, aabb_mode 5) beta-kernel footprint multiplier.
+
+    Scales the use_beta_cutoff radius (default ~3.3sigma for beta_scaled) by `val`.
+    - val=1.0 (default): unchanged.
+    - val<1: shrinks the per-surfel tile box, so during TRAINING the surfels adapt
+      to a tighter footprint (the FastGS trained-in-mult idea — see the room sweep).
+      Beta support ends at k=3sigma, so the support edge sits at val~0.9.
+    Only effective for --aabb snugbox (mode 5) + a beta kernel (kernel_type 1/4).
+    """
+    _C.set_beta_mult(float(val))
 
 def set_aa_kernel_size(val=0.0):
     """Set AA-2DGS Jacobian-based mip filter kernel size σ (0 = off, typical 0.1).

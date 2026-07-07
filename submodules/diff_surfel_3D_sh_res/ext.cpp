@@ -26,6 +26,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_mlp_weights", &SetMlpWeightsCUDA);
   m.def("set_contrib_thresh", &SetContribThreshCUDA);
   m.def("set_count_thresh", &SetCountThreshCUDA);
+  m.def("set_opacity_thresh", &SetOpacityThreshCUDA);
+  m.def("set_dropout", &SetDropoutCUDA);
   m.def("set_overdraw_lambda", &SetOverdrawLambdaCUDA);
   m.def("set_weight_reg_lambda", &SetWeightRegLambdaCUDA);
   m.def("set_activation_bias", &SetActivationBiasCUDA);
@@ -48,6 +50,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "forward `feat = (pre>0)?pre:α·pre`, backward clamp gate = α.");
   m.def("set_anti_alias", &SetAntiAliasCUDA);
   m.def("set_compact_mult", &SetCompactMultCUDA);
+  m.def("set_beta_mult", &SetBetaMultCUDA,
+        "snugbox (--aabb snugbox) beta-kernel footprint multiplier (1.0 = unchanged; "
+        "<1 shrinks the tile box so surfels adapt to a tighter footprint during training).");
   m.def("set_aa_kernel_size", &SetAaKernelSizeCUDA);
   m.def("set_skip_mlp_grad", &SetSkipMlpGradCUDA);
   m.def("set_depth_sort", &SetDepthSortCUDA);

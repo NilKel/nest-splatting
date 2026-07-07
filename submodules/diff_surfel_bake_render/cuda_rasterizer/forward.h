@@ -102,6 +102,10 @@ namespace FORWARD
 	// Device-global setters (mirror diff_surfel_3D_sh_res training-time setters).
 	void setActivationBias(float sh_bias, float res_bias);
 	void setCompactMult(float val);
+	// EXPERIMENT: beta_scaled footprint mult + drop low-pass (alpha max-pool + filter_r).
+	void setBetaMult(float val);
+	void setDropLowpass(bool val);
+	void setOpacityAwareBeta(bool val);
 	// 0 = 3D_SH_res (default outer-ReLU). 1 = 3D_SH_add (separate ReLUs).
 	void setResidualMode(int mode);
 	// `--method mixed_3d --kernel2`: untextured-EWA kernel override (-1 = unset).

@@ -6,6 +6,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mark_visible", &markVisible);
   m.def("set_activation_bias", &SetActivationBiasBakeCUDA);
   m.def("set_compact_mult", &SetCompactMultBakeCUDA);
+  m.def("set_beta_mult", &SetBetaMultBakeCUDA,
+        "EXPERIMENT: scale the beta_scaled footprint cutoff (1.0 = 4-sigma baseline).");
+  m.def("set_drop_lowpass", &SetDropLowpassBakeCUDA,
+        "EXPERIMENT: drop the Gaussian low-pass (alpha max-pool + filter_r screen extension).");
+  m.def("set_opacity_aware_beta", &SetOpacityAwareBetaBakeCUDA,
+        "EXPERIMENT: mode-5/0/2 beta cutoff = max(r_beta, r_lp) (1/255 iso) instead of fixed 4σ.");
   m.def("set_residual_mode", &SetResidualModeBakeCUDA,
         "0 = 3D_SH_res outer ReLU (default). 1 = 3D_SH_add separate ReLUs.");
   m.def("set_untex_kernel", &SetUntexKernelBakeCUDA,

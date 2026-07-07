@@ -34,6 +34,35 @@ __device__ float d_contrib_thresh = 0.0f;
 // Count threshold: skip hash query after this many contributing Gaussians per pixel (0 = disabled)
 __device__ int d_count_thresh = 0;
 
+// Opacity threshold: skip hash query when the per-pixel opacity contribution
+// alpha = min(0.99, opa * kernel_val) (the queried beta_scaled/Gaussian kernel × opacity)
+// is below this value. Unlike d_contrib_thresh (which uses w = T*alpha and so depends on
+// occlusion ordering), this drops the residual on the spatial *tails of fuzzy surfels*
+// regardless of depth — SH-only color on the soft fringe (0 = disabled).
+__device__ float d_opacity_thresh = 0.0f;
+
+// Texture-query dropout (training regularization, off at inference): for a random
+// d_dropout_rate fraction of Gaussians, skip the hash/MLP residual query so the SH base
+// must stand on its own (mirrors `--method cat_dropout`, and the baked skip-texture set).
+// The drop decision is a deterministic hash of (gaussian_id, d_dropout_seed) → the SAME
+// Gaussian is dropped for every pixel this iteration (per-Gauss dropout) AND the backward
+// reproduces the identical mask (it uses the same hash + seed). Python bumps the seed each
+// iteration so the dropped set rotates. Unscaled (0/1, like cat_dropout) — no 1/(1-p)
+// survivor scaling, so dropped surfels train their SH to render without a residual.
+__device__ float d_dropout_rate = 0.0f;        // 0 = disabled
+__device__ unsigned int d_dropout_seed = 0u;   // per-iteration seed (set from Python)
+
+// splitmix-style integer hash → uniform float in [0,1). Cheap, stateless, identical in
+// forward and backward (both compilation units carry a copy of this + the globals).
+__device__ __forceinline__ float dropout_hash01(unsigned int a, unsigned int b) {
+	unsigned int x = a * 0x9e3779b9u ^ (b + 0x85ebca6bu + (a << 6) + (a >> 2));
+	x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+	return (x >> 8) * (1.0f / 16777216.0f);
+}
+__device__ __forceinline__ bool dropout_skip(unsigned int gid) {
+	return d_dropout_rate > 0.0f && dropout_hash01(gid, d_dropout_seed) < d_dropout_rate;
+}
+
 // Overdraw regularization: lambda weight for sigmoid-based soft contributor count loss
 // k (steepness) is hardcoded to 10. When lambda > 0, forward outputs overdraw map,
 // backward adds dL_dalpha contribution to reduce per-pixel contributor count.
@@ -70,6 +99,13 @@ __device__ float d_res_bias = 0.5f;
 // AdR cutoff in preprocessCUDA:  cutoff = sqrt(2·log(opacity·255)·mult).
 // Default 1.0 = unchanged (matches our existing AdR cutoff). FastGS paper uses 0.5.
 __device__ float d_compact_mult = 1.0f;
+
+// Beta-kernel footprint multiplier for `--aabb snugbox` (mode 5) + beta kernels.
+// Scales the use_beta_cutoff radius (default cutoff = max(k*1.1, r_lp_typical) ~3.3
+// for beta_scaled). Default 1.0 = unchanged. <1 shrinks the per-surfel tile box so
+// surfels ADAPT to a tighter footprint during training (FastGS trained-in-mult idea);
+// beta support ends at k=3sigma, so the support edge is mult~0.9 from the 3.3 baseline.
+__device__ float d_beta_mult = 1.0f;
 
 // Host-side pointers for memory management
 static __half* h_mlp_W1 = nullptr;
@@ -721,11 +757,35 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		// Don't exceed original 4σ
 		cutoff = fminf(cutoff, 4.0f);
 	} else if (use_beta_cutoff) {
-		// Beta kernel: fixed cutoff for compact support with low-pass consideration
+		// Beta kernel footprint (snugbox/accutile mode 5, and aabb=beta mode 4).
+		// OPACITY-AWARE cutoff = max(r_beta, r_lp) — the 1/255 iso — when shapes are
+		// present (beta kernel). This is tighter than the old fixed max(k·1.1, r_lp_typical)
+		// ≈ 3.3 for faint/sharp surfels yet LOSSLESS (clips only the <1/255 region), so
+		// AccuTile traces a smaller ellipse → fewer Gaussian-tile pairs. Verified on the
+		// db drjohnson/playroom baked atlases: ~1.34–1.35× FPS at unchanged PSNR/SSIM/LPIPS.
+		// Falls back to the fixed cutoff for a non-beta kernel under aabb=beta (shapes==null).
 		float k = (kernel_type == 4) ? 3.0f : 1.0f;
-		// Low-pass radius for typical opacity (~0.5): sqrt(2 * ln(127.5)) ≈ 3.1
-		float r_lp_typical = sqrtf(2.0f * logf(127.5f));
-		cutoff = fmaxf(k * 1.1f, r_lp_typical);
+		if (shapes != nullptr && (kernel_type == 1 || kernel_type == 4)) {
+			float opacity_val = opacities[idx];
+			if (opacity_val < (1.0f / 255.0f)) {
+				radii[idx] = 0;
+				tiles_touched[idx] = 0;
+				return;
+			}
+			float shape = shapes[idx];
+			float ratio = 1.0f / (255.0f * opacity_val);
+			float threshold = powf(ratio, 1.0f / shape);
+			float r_beta = (threshold < 1.0f) ? k * sqrtf(1.0f - threshold) : 0.0f;
+			float log_term = logf(255.0f * opacity_val);
+			float r_lp = (log_term > 0.0f) ? sqrtf(2.0f * log_term) : 0.0f;
+			cutoff = fmaxf(r_beta, r_lp);
+		} else {
+			float r_lp_typical = sqrtf(2.0f * logf(127.5f));
+			cutoff = fmaxf(k * 1.1f, r_lp_typical);
+		}
+		cutoff = fminf(cutoff, k + 2.0f);
+		// Optional further footprint scale (--fastgs_mult on beta; default 1.0 = no-op).
+		cutoff *= d_beta_mult;
 	} else {
 #if TIGHTBBOX // no use in the paper, but it indeed help speeds.
 		// the effective extent is now depended on the opacity of gaussian.
@@ -1998,9 +2058,13 @@ renderCUDAsurfelForward(
 
 			// Skip hash query when:
 			// - contribution w = T*alpha is too small (tail pixels), or
-			// - pixel has already processed count_thresh Gaussians (depth cutoff)
+			// - pixel has already processed count_thresh Gaussians (depth cutoff), or
+			// - the per-pixel opacity contribution alpha = opa*kernel_val is too small
+			//   (soft tails of fuzzy surfels — independent of occlusion ordering)
 			bool skip_hash = (d_contrib_thresh > 0.0f && w < d_contrib_thresh)
-			                 || (d_count_thresh > 0 && contributor > (uint32_t)d_count_thresh);
+			                 || (d_count_thresh > 0 && contributor > (uint32_t)d_count_thresh)
+			                 || (d_opacity_thresh > 0.0f && alpha < d_opacity_thresh)
+			                 || dropout_skip((unsigned int)collected_id[j]);
 
 			// 0. Compute xyz intersection point
 			const float3 pk = collected_pk[j];
@@ -2138,7 +2202,9 @@ renderCUDAsurfelForward(
 			const int active_hashgrid_levels_6 = (level >> 8) & 0xFF;
 			const int hash_dim_6 = active_hashgrid_levels_6 * l_dim;
 			bool skip_hash_6 = (d_contrib_thresh > 0.0f && w < d_contrib_thresh)
-			                   || (d_count_thresh > 0 && contributor > (uint32_t)d_count_thresh);
+			                   || (d_count_thresh > 0 && contributor > (uint32_t)d_count_thresh)
+			                   || (d_opacity_thresh > 0.0f && alpha < d_opacity_thresh)
+			                   || dropout_skip((unsigned int)collected_id[j]);
 			float hash_feat_6[12];
 			for (int i = 0; i < 12; i++) hash_feat_6[i] = 0.0f;
 			if (!skip_hash_6 && active_hashgrid_levels_6 > 0 && l_dim == 4) {
@@ -2361,6 +2427,18 @@ void FORWARD::setCountThresh(int val) {
 	setCountThreshKernel<<<1, 1>>>(val);
 }
 
+// Set opacity threshold for hash query skip (alpha = opa * kernel_val)
+__global__ void setOpacityThreshKernel(float val) { d_opacity_thresh = val; }
+void FORWARD::setOpacityThresh(float val) {
+	setOpacityThreshKernel<<<1, 1>>>(val);
+}
+
+// Set texture-query dropout rate + per-iteration seed (0 rate = disabled)
+__global__ void setDropoutKernel(float rate, unsigned int seed) { d_dropout_rate = rate; d_dropout_seed = seed; }
+void FORWARD::setDropout(float rate, unsigned int seed) {
+	setDropoutKernel<<<1, 1>>>(rate, seed);
+}
+
 // Set overdraw regularization lambda
 __global__ void setOverdrawLambdaKernel(float val) { d_overdraw_lambda = val; }
 void FORWARD::setOverdrawLambda(float val) {
@@ -2407,6 +2485,12 @@ void FORWARD::setAntiAlias(float factor, float focal) {
 __global__ void setCompactMultKernel(float val) { d_compact_mult = val; }
 void FORWARD::setCompactMult(float val) {
 	setCompactMultKernel<<<1, 1>>>(val);
+}
+
+// Set the snugbox (mode 5) beta-kernel footprint multiplier.
+__global__ void setBetaMultKernel(float val) { d_beta_mult = val; }
+void FORWARD::setBetaMult(float val) {
+	setBetaMultKernel<<<1, 1>>>(val);
 }
 
 // Set AA-2DGS mip filter kernel size σ (0 disables; matches AA-2DGS's kernel_size, default 0.1)

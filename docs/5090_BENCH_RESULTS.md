@@ -136,6 +136,87 @@ every other config in the table — **smallest atlas (245 MB), highest FPS
 tightened the untextured-half tile coverage by ~55 % at no quality cost, and
 the bake-quant loss only ever hit textured rows in this mode.
 
+## Six-config 9-scene split (FPS / PSNR / SSIM / LPIPS)
+
+Same scene set, six configs side by side. Added `RD` (`RD_SV_30thr_005w25gLP_N2f_rbg`,
+3D_SH_res, beta_scaled, accutile, w_lambda=0.005, γ=25, random_background,
+**no FRP / no c2f warmup**) — a clean per-scene comparison vs the production
+`005w25` config without the freeze-residual-period schedule.
+
+Bake config for all six: `--max_res 64 --bake_dtype bc7 --atlas_budget_mb 8192
+--num_benchmark 100`. Render: aabb_mode 3 (rect+AdR+SnugBox), sort_mode 0,
+FMA-fused EWA Mahalanobis.
+
+### Baked FPS
+
+| Scene | 0w0 | 005w25 | RD | G2 | BS2 | BS2_fast |
+|---|---:|---:|---:|---:|---:|---:|
+| bicycle  | 510.3 |  999.0 |  502.4 | 696.6 |  798.7 |  847.5 |
+| bonsai   | 311.4 |  576.4 |  562.2 | 536.8 |  580.5 |  634.1 |
+| counter  | 523.5 |  863.6 |  729.7 | 727.5 |  919.3 |  908.0 |
+| flowers  | 279.6 |  559.2 |  484.1 | 544.7 |  634.7 |  692.6 |
+| garden   | 533.9 | 1111.7 |  710.5 | 848.4 | 1029.7 | 1053.9 |
+| kitchen  | 451.4 |  697.7 |  609.7 | 544.1 |  667.7 |  727.4 |
+| room     | 611.1 |  886.1 |  825.0 | 958.9 | 1160.0 | 1186.9 |
+| stump    | 360.8 |  689.1 |  577.2 | 629.4 |  683.4 |  858.8 |
+| treehill | 267.7 |  560.6 |  497.1 | 566.1 |  630.1 |  695.5 |
+| **mean** | **427.7** | **771.5** | **610.9** | **672.5** | **789.3** | **845.0** |
+
+### Baked PSNR (dB)
+
+| Scene | 0w0 | 005w25 | RD | G2 | BS2 | BS2_fast |
+|---|---:|---:|---:|---:|---:|---:|
+| bicycle  | 24.14 | 23.84 | **24.32** | 24.14 | 23.94 | 23.96 |
+| bonsai   | **32.84** | 31.94 | 32.09 | 33.02 | 32.60 | 32.35 |
+| counter  | 29.41 | 28.98 | 28.92 | **29.55** | 29.22 | 29.12 |
+| flowers  | 20.68 | 20.56 | 20.35 | 20.74 | 20.65 | **20.78** |
+| garden   | 26.98 | 26.65 | 26.44 | **27.02** | 26.79 | 26.76 |
+| kitchen  | 31.55 | 30.62 | 31.00 | **31.68** | 31.28 | 31.06 |
+| room     | 31.06 | 30.37 | 31.24 | **31.51** | 31.10 | 31.19 |
+| stump    | 25.83 | 25.62 | 25.39 | 25.74 | 25.75 | 25.78 |
+| treehill | 22.36 | 22.34 | 20.87 | 22.41 | 22.40 | **22.54** |
+| **mean** | **27.21** | **26.77** | **26.73** | **27.31** | **27.08** | **27.06** |
+
+### Baked SSIM
+
+| Scene | 0w0 | 005w25 | RD | G2 | BS2 | BS2_fast |
+|---|---:|---:|---:|---:|---:|---:|
+| bicycle  | 0.690 | 0.668 | **0.715** | 0.685 | 0.674 | 0.675 |
+| bonsai   | **0.940** | 0.929 | 0.933 | 0.940 | 0.935 | 0.933 |
+| counter  | 0.899 | 0.887 | 0.893 | **0.902** | 0.893 | 0.891 |
+| flowers  | 0.551 | 0.537 | 0.552 | **0.556** | 0.548 | 0.554 |
+| garden   | 0.823 | 0.814 | **0.830** | 0.828 | 0.818 | 0.813 |
+| kitchen  | 0.918 | 0.904 | 0.909 | **0.921** | 0.912 | 0.909 |
+| room     | 0.910 | 0.901 | **0.914** | 0.911 | 0.905 | 0.905 |
+| stump    | **0.732** | 0.717 | 0.727 | 0.730 | 0.725 | 0.724 |
+| treehill | **0.597** | 0.586 | 0.575 | 0.597 | 0.590 | 0.594 |
+| **mean** | **0.784** | **0.771** | **0.783** | **0.785** | **0.778** | **0.777** |
+
+### Baked LPIPS (lower is better)
+
+| Scene | 0w0 | 005w25 | RD | G2 | BS2 | BS2_fast |
+|---|---:|---:|---:|---:|---:|---:|
+| bicycle  | 0.282 | 0.301 | **0.248** | 0.284 | 0.298 | 0.294 |
+| bonsai   | 0.205 | 0.206 | **0.198** | 0.200 | 0.203 | 0.205 |
+| counter  | 0.214 | 0.221 | **0.204** | 0.210 | 0.217 | 0.220 |
+| flowers  | 0.345 | 0.352 | **0.338** | 0.339 | 0.343 | 0.346 |
+| garden   | 0.163 | 0.173 | **0.147** | 0.154 | 0.165 | 0.170 |
+| kitchen  | 0.144 | 0.156 | 0.145 | **0.139** | 0.147 | 0.152 |
+| room     | 0.235 | 0.245 | **0.208** | 0.232 | 0.237 | 0.238 |
+| stump    | 0.264 | 0.276 | **0.258** | 0.261 | 0.268 | 0.269 |
+| treehill | 0.346 | 0.349 | **0.326** | 0.342 | 0.347 | 0.345 |
+| **mean** | **0.244** | **0.253** | **0.230** | **0.240** | **0.247** | **0.249** |
+
+**RD's pattern:** Mid-band FPS (610.9 mean), worst mean PSNR (26.73 — dragged
+down by treehill at −1.47 dB) but **best LPIPS by a wide margin (0.230 mean,
+−0.014 vs G2)** and SSIM essentially tied with `0w0` for best (0.783 vs 0.784).
+RD wins **8 of 9 scenes on LPIPS** and **6 of 9 on SSIM** — strong
+perceptual-quality config despite the PSNR shortfall, suggesting the bake
+preserves edges/textures better than pixel-MSE captures.
+
+`G2` remains the best overall PSNR config and now also wins counter/garden/
+kitchen/room on SSIM and wins kitchen on LPIPS — closest to "pick once, ship".
+
 ## `res_3d_paired` vs `3D_SH_res` (9-scene per-config split)
 
 Same scene set, five configs side by side: the two `3D_SH_res` regularization

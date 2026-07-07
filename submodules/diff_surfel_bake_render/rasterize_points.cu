@@ -773,6 +773,18 @@ void SetCompactMultBakeCUDA(float val) {
 	FORWARD::setCompactMult(val);
 }
 
+void SetBetaMultBakeCUDA(float val) {
+	FORWARD::setBetaMult(val);
+}
+
+void SetDropLowpassBakeCUDA(bool val) {
+	FORWARD::setDropLowpass(val);
+}
+
+void SetOpacityAwareBetaBakeCUDA(bool val) {
+	FORWARD::setOpacityAwareBeta(val);
+}
+
 void SetResidualModeBakeCUDA(int mode) {
 	FORWARD::setResidualMode(mode);
 }

@@ -858,6 +858,16 @@ void SetCountThreshCUDA(int val) {
     BACKWARD::setCountThresh(val);
 }
 
+void SetOpacityThreshCUDA(float val) {
+    FORWARD::setOpacityThresh(val);
+    BACKWARD::setOpacityThresh(val);
+}
+
+void SetDropoutCUDA(float rate, int seed) {
+    FORWARD::setDropout(rate, (unsigned int)seed);
+    BACKWARD::setDropout(rate, (unsigned int)seed);
+}
+
 void SetOverdrawLambdaCUDA(float val) {
     FORWARD::setOverdrawLambda(val);
     BACKWARD::setOverdrawLambda(val);
@@ -902,6 +912,10 @@ void SetAntiAliasCUDA(float factor, float focal) {
 
 void SetCompactMultCUDA(float val) {
     FORWARD::setCompactMult(val);
+}
+
+void SetBetaMultCUDA(float val) {
+    FORWARD::setBetaMult(val);
 }
 
 void SetAaKernelSizeCUDA(float val) {

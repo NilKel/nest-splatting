@@ -120,6 +120,12 @@ namespace FORWARD
 	// Set count threshold: skip hash after N contributing Gaussians per pixel (0 = disabled)
 	void setCountThresh(int val);
 
+	// Set opacity threshold: skip hash when alpha = opa*kernel_val < val (0 = disabled)
+	void setOpacityThresh(float val);
+
+	// Set texture-query dropout rate + per-iteration seed (0 rate = disabled, training only)
+	void setDropout(float rate, unsigned int seed);
+
 	// Set overdraw regularization lambda (0 = disabled)
 	void setOverdrawLambda(float val);
 
@@ -149,6 +155,8 @@ namespace FORWARD
 	// FastGS Compact Box: Mahalanobis² scale factor for AdR cutoff.
 	// val=1.0 → matches existing AdR (our current default). val=0.5 → FastGS paper default (tighter tile AABB).
 	void setCompactMult(float val);
+	// snugbox (mode 5) beta-kernel footprint multiplier (scales the use_beta_cutoff radius).
+	void setBetaMult(float val);
 
 	// Set AA-2DGS mip-filter kernel size σ (0 disables, typical 0.1).
 	// When >0, replaces the rho3d/rho2d heuristic with the Jacobian-based

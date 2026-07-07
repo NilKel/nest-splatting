@@ -1,0 +1,707 @@
+
+#ifndef _CUDA_HASHGRID
+#define _CUDA_HASHGRID
+
+#include "stdio.h"
+#include <cuda_fp16.h>
+
+template <uint32_t D>
+__device__ uint32_t fast_hash(const uint32_t pos_grid[D]) {
+    
+    // coherent type of hashing
+    constexpr uint32_t primes[7] = { 1u, 2654435761u, 805459861u, 3674653429u, 2097192037u, 1434869437u, 2165219737u };
+
+    uint32_t result = 0;
+    #pragma unroll
+    for (uint32_t i = 0; i < D; ++i) {
+        result ^= pos_grid[i] * primes[i];
+    }
+
+    return result;
+}
+
+template <uint32_t D, uint32_t C>
+__device__ uint32_t get_grid_index(const bool align_corners, const uint32_t ch, const uint32_t hashmap_size, const uint32_t resolution, const uint32_t pos_grid[D]) {
+    uint32_t stride = 1;
+    uint32_t index = 0;
+
+    #pragma unroll
+    for (uint32_t d = 0; d < D && stride <= hashmap_size; d++) {
+        index += pos_grid[d] * stride;
+        stride *= align_corners ? resolution: (resolution + 1);
+    }
+
+    // NOTE: for NeRF, the hash is in fact not necessary. Check https://github.com/NVlabs/instant-ngp/issues/97.
+    // gridtype: 0 == hash, 1 == tiled
+    if (stride > hashmap_size) {
+        index = fast_hash<D>(pos_grid);
+    }
+
+    return (index % hashmap_size) * C + ch;
+}
+
+template <typename T>
+__device__ inline T smoothstep(T val) {
+	return val*val*(3.0f - 2.0f * val);
+}
+
+template <typename T>
+__device__ inline T smoothstep_derivative(T val) {
+	return 6*val*(1.0f - val);
+}
+// hash_features, level, l_scale, Base, align_corners, interp);
+
+// Nexels-style anti-aliasing down-weight: Δ_ℓ = 1 - exp(-1/(2π) * (f/(s_ℓ·t*))²)
+// Per-TU device globals — each TU that includes this header defines its own copy.
+// Setters in forward.cu / backward.cu update the per-TU copy.
+//
+// Semantics match Nexels' grid_threshold_factor: ts = factor * (2*depth/focal) * scale_world,
+// where scale_world = level_scale (cells/[0,1]) * grad_scale (d_normalized/d_world).
+// The Python wrapper pre-multiplies factor by 2, so on the CUDA side we use
+//   ts = d_aa_factor * depth * level_scale * grad_scale / d_aa_focal
+// and d_aa_factor's user-facing value matches Nexels' grid_threshold_factor.
+// grad_scale handles both contract (varies by position) and non-contract (1/vsize).
+static __device__ float d_aa_factor = 0.0f;
+static __device__ float d_aa_focal = 1.0f;
+__device__ __forceinline__ float hashgrid_aa_downweight(float depth, float level_scale, float grad_scale) {
+    if (d_aa_factor <= 0.0f) return 1.0f;
+    float scale_world = level_scale * grad_scale;
+    float ts = d_aa_factor * depth * scale_world / fmaxf(d_aa_focal, 1e-6f);
+    if (ts <= 0.0f) return 1.0f;
+    float x_sq = 0.5f / (ts * ts);
+    return 1.0f - expf(-4.0f * x_sq * 0.3183098862f);  // 1/π
+}
+
+template <bool BW, uint32_t C, uint32_t LD>
+__device__ void query_feature(float* feat, float3 xyz, float vmin, float vmax,
+int* offsets, const uint32_t appearance_level, const __half* __restrict__ hash_features,
+uint32_t L, float S, uint32_t H, bool align_corners, uint32_t interp, bool contract, bool debug,
+float* __restrict__ grad_feat = nullptr,
+float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = nullptr,
+float aa_depth = 0.0f)
+{
+    if(debug){
+        printf("BW tag: %d \n", BW);
+    }
+    float inputs[3] = {0.0};
+    bool flag_oob = false;
+	const uint32_t D = 3;
+    float grad_scale = 0.0;
+    // Saved state for backward Jacobian transpose. Only meaningful when BW.
+    // For non-contract: inv_world_step = 1/(vmax-vmin) and the Jacobian is scalar.
+    // For contract: pre_warp[] is the centered+rescaled point (BEFORE radial warp),
+    //               r_norm is its L2 norm, inv_world_step = 2/(vmax-vmin) (= inv_vsize_).
+    // The contract Jacobian is non-isotropic in the outer (norm > 1) region; see the
+    // accumulation block at the end.
+    float inv_world_step = 0.0f;
+    float pre_warp[3] = {0.0f, 0.0f, 0.0f};
+    float r_norm = 0.0f;
+
+    if(!contract){
+        // warp the pos to [0, 1]
+        float inv_vsize = 1.0 / (vmax - vmin);
+        inputs[0] = (xyz.x-vmin)*inv_vsize;
+        inputs[1] = (xyz.y-vmin)*inv_vsize;
+        inputs[2] = (xyz.z-vmin)*inv_vsize;
+        grad_scale = inv_vsize;
+        inv_world_step = inv_vsize;
+        flag_oob = (inputs[0] < 0 || inputs[0] > 1 || inputs[1] < 0 || inputs[1] > 1 || inputs[2] < 0 || inputs[2] > 1);
+    }
+    else{
+        // warp the center region to [-1, 1]
+        float vmid = (vmax + vmin) * 0.5;
+        float inv_vsize_ = 1.0 / ((vmax - vmin) * 0.5);
+        pre_warp[0] = (xyz.x-vmid)*inv_vsize_;
+        pre_warp[1] = (xyz.y-vmid)*inv_vsize_;
+        pre_warp[2] = (xyz.z-vmid)*inv_vsize_;
+        inputs[0] = pre_warp[0];
+        inputs[1] = pre_warp[1];
+        inputs[2] = pre_warp[2];
+        // warp the outside region to [-2, 2], then warp to [0, 1]
+        r_norm = sqrtf(pre_warp[0]*pre_warp[0] + pre_warp[1]*pre_warp[1] + pre_warp[2]*pre_warp[2]);
+        float inv_norm = 1.0f / r_norm;
+        float scale_trans = (r_norm <= 1.0f) ? 1.0f : (2.0f - inv_norm) * inv_norm;
+        #pragma unroll
+        for (uint32_t d = 0; d < D; d++)
+        {
+            // warp to range [-2, 2]
+            inputs[d] = scale_trans * inputs[d] ;
+            // norm to [0, 1]
+            inputs[d] = (inputs[d] + 2.0) * 0.25f;
+        }
+        // grad_scale: scalar approximation of d_normalized/d_world used by AA only
+        // (AA wants an isotropic per-query scale). The full backward Jacobian is
+        // applied at the end of this function.
+        grad_scale = inv_vsize_ * scale_trans * 0.25f;
+        inv_world_step = inv_vsize_;
+    }
+
+    uint32_t max_level = min(appearance_level, L);
+    
+	#pragma unroll
+	for (uint32_t ch = 0; ch < C; ch++) {
+		feat[ch] = 0; 
+	}
+
+    // for backward, initialize dy_dx
+    float dy_dx[BW ? (D * C) : 1] = {0};
+    if constexpr (BW && C >= LD) {
+        #pragma unroll
+        for (uint32_t d = 0; d < D; d++) dL_dxyz[d] = 0;
+    } 
+
+    // out of range, no features, no grad update.
+	if (flag_oob) return;
+
+    const uint32_t size = (C >= LD) ? C / LD * D : 1;
+    float level_pos[size];
+    float level_pos_deriv[size]; 
+    uint32_t level_pos_grid[size];
+    
+    #pragma unroll
+	for(uint32_t level = 0; level < max_level; level++){
+
+		float pos[D];
+        float pos_deriv[D];
+    	uint32_t pos_grid[D];
+        
+        const uint32_t hashmap_size = offsets[level + 1] - offsets[level];
+        const float scale = exp2f(level * S) * H - 1.0f;
+        const uint32_t resolution = (uint32_t)ceil(scale) + 1;
+        const __half* grid = hash_features + (uint32_t)offsets[level] * LD;
+
+        float* dL_dgrid = nullptr;
+        float* grad_level_feat = nullptr;
+        if constexpr (BW && C >= LD) {
+            dL_dgrid = dL_dfeatures + (uint32_t)offsets[level] * LD;
+            grad_level_feat = grad_feat + level * LD;
+        }
+
+		#pragma unroll
+		for (uint32_t d = 0; d < D; d++) {
+			pos[d] = inputs[d] * scale + (align_corners ? 0.0f : 0.5f);
+			pos_grid[d] = floorf(pos[d]);
+			pos[d] -= (float)pos_grid[d];
+            // smoothstep instead of linear
+            if (interp == 1) {
+                pos_deriv[d] = smoothstep_derivative(pos[d]);
+                pos[d] = smoothstep(pos[d]);
+            } else {
+                pos_deriv[d] = 1.0f; // linear deriv is default to 1
+            }
+		}
+
+		float results[LD] = {0};
+
+		// Nexels anti-aliasing downweight for this level.
+		const float level_downweight = hashgrid_aa_downweight(aa_depth, scale, grad_scale);
+
+		#pragma unroll
+		for (uint32_t idx = 0; idx < (1 << D); idx++) {
+			float w = 1;
+			uint32_t pos_grid_local[D];
+
+			#pragma unroll
+			for (uint32_t d = 0; d < D; d++) {
+				if ((idx & (1 << d)) == 0) {
+					w *= 1 - pos[d];
+					pos_grid_local[d] = pos_grid[d];
+				} else {
+					w *= pos[d];
+					pos_grid_local[d] = pos_grid[d] + 1;
+				}
+			}
+			w *= level_downweight;
+
+            uint32_t index = get_grid_index<D, LD>(align_corners, 0, hashmap_size, resolution, pos_grid_local);
+
+			// writing to register (fast)
+			#pragma unroll
+			for (uint32_t ch = 0; ch < LD; ch++) {
+				results[ch] += w * __half2float(grid[index + ch]);
+			}
+            
+            // update gradiendt
+            if constexpr (BW && C >= LD) {
+                #pragma unroll
+                for (uint32_t ch = 0; ch < LD; ch++) {
+                    atomicAdd(&dL_dgrid[index + ch], w * grad_level_feat[ch]);
+                }
+            }
+
+		}    
+
+		// writing to L*LD features
+		#pragma unroll
+		for (uint32_t ch = 0; ch < LD; ch++) {
+			feat[level * LD + ch] = results[ch]; 
+		}
+
+        if constexpr (BW && C >= LD) {
+            // save for dy_dx calculate
+            #pragma unroll
+            for (uint32_t d = 0; d < D; d++) {
+                level_pos[level * D + d] = pos[d]; 
+                level_pos_deriv[level * D + d] = pos_deriv[d]; 
+                level_pos_grid[level * D + d] = pos_grid[d]; 
+            }
+        }
+
+        if(debug && BW == 0){
+            printf("fw level %d scale %.4f res %d \npos: ", level, scale, resolution);
+            for(int d = 0; d < D; d++)printf("%d ", pos[d]);
+            printf("\n");
+        }
+
+	}
+
+    if constexpr (BW && C >= LD) {
+        // B L D C
+        // D * F (F = L * LD)
+        #pragma unroll
+    	for(uint32_t level = 0; level < max_level; level++){
+            
+            float pos[D];
+            float pos_deriv[D];
+            uint32_t pos_grid[D];
+            
+            for (uint32_t d = 0; d < D; d++) {
+                pos[d] = level_pos[level * D + d]; 
+                pos_deriv[d] = level_pos_deriv[level * D + d]; 
+                pos_grid[d] = level_pos_grid[level * D + d]; 
+            }
+
+            const uint32_t hashmap_size = offsets[level + 1] - offsets[level];
+            const float scale = exp2f(level * S) * H - 1.0f;
+            const uint32_t resolution = (uint32_t)ceil(scale) + 1;
+            const __half* grid = hash_features + (uint32_t)offsets[level] * LD;
+
+            if(debug){
+                printf("bw level %d scale %.4f res %d \npos: ", level, scale, resolution);
+                for(int d = 0; d < D; d++)printf("%d ", pos[d]);
+                printf("\n");
+            }
+
+            // Nexels AA downweight — applies uniformly to this level's dL/dxyz.
+            const float bw_level_downweight = hashgrid_aa_downweight(aa_depth, scale, grad_scale);
+
+            #pragma unroll
+            for (uint32_t gd = 0; gd < D; gd++) {
+
+                float results_grad[LD] = {0};
+
+                #pragma unroll
+                for (uint32_t idx = 0; idx < (1 << (D - 1)); idx++) {
+                    // dy_dx accumulates d(feature)/d(input_normalized) for THIS level.
+                    // The world-space Jacobian (grad_scale for non-contract, the full
+                    // anisotropic transpose for contract) is applied once at the end.
+                    float w = scale * bw_level_downweight;
+                    uint32_t pos_grid_local[D];
+
+                    #pragma unroll
+                    for (uint32_t nd = 0; nd < D - 1; nd++) {
+                        const uint32_t d = (nd >= gd) ? (nd + 1) : nd;
+
+                        if ((idx & (1 << nd)) == 0) {
+                            w *= 1 - pos[d];
+                            pos_grid_local[d] = pos_grid[d];
+                        } else {
+                            w *= pos[d];
+                            pos_grid_local[d] = pos_grid[d] + 1;
+                        }
+                    }
+
+                    pos_grid_local[gd] = pos_grid[gd];
+                    uint32_t index_left = get_grid_index<D, LD>(align_corners, 0, hashmap_size, resolution, pos_grid_local);
+                    pos_grid_local[gd] = pos_grid[gd] + 1;
+                    uint32_t index_right = get_grid_index<D, LD>(align_corners, 0, hashmap_size, resolution, pos_grid_local);
+
+                    #pragma unroll
+                    for (uint32_t ch = 0; ch < LD; ch++) {
+                        results_grad[ch] += w * (__half2float(grid[index_right + ch]) - __half2float(grid[index_left + ch])) * pos_deriv[gd];
+                    }
+                }
+
+                // update to dy_dx (D * F & D * L * LD), 
+                #pragma unroll
+                for (uint32_t ch = 0; ch < LD; ch++) {
+                    dy_dx[gd * C + level * LD + ch] = results_grad[ch];
+                }
+            }
+        }
+
+        // First accumulate dL/d(input_normalized) in normalized [0,1] coords.
+        // Then map to dL/d(xyz) via the proper Jacobian transpose:
+        //   non-contract: J = inv_world_step * I  (scalar, isotropic)
+        //   contract: pipeline is  xyz → step1 (linear, scale inv_vsize_)
+        //                              → step2 (radial warp scale_trans(r) * x)
+        //                              → step3 (linear, +2 then *0.25)
+        //   J^T_step3 = 0.25 * I
+        //   J^T_step2 v = scale_trans * v + (d_scale_trans/dr) * (x_step1 · v) * x_step1 / r
+        //                 with d_scale_trans/dr = -2(r-1)/r^3 for r>1, 0 for r<=1.
+        //   J^T_step1 = inv_vsize_ * I  (= inv_world_step * I)
+        float dL_dnormalized[D];
+        # pragma unroll
+        for (uint32_t d = 0; d < D; d++) {
+            float result = 0;
+            # pragma unroll
+            for(int level = 0; level < max_level; level++) {
+                float* grad_level_feat = grad_feat + level * LD;
+                # pragma unroll
+                for (int ch = 0; ch < LD; ch++) {
+                    // grad_feat (C & L * LD), dy_dx (D * F & D * L * LD),
+                    result += grad_level_feat[ch] * dy_dx[d * C + level * LD + ch];
+                }
+            }
+            dL_dnormalized[d] = result;
+        }
+
+        if (!contract) {
+            // Pure scalar Jacobian.
+            #pragma unroll
+            for (uint32_t d = 0; d < D; d++) {
+                dL_dxyz[d] = inv_world_step * dL_dnormalized[d];
+            }
+        } else {
+            // Recover scale_trans and its radial derivative at this query point.
+            // Inner ball (r<=1): scale_trans=1, d_scale_trans/dr=0 -> Jacobian collapses
+            // to scalar (inv_world_step*0.25); outer (r>1): full anisotropic transpose.
+            const float r_safe = fmaxf(r_norm, 1e-8f);
+            float scale_trans = 1.0f;
+            float d_st_dr = 0.0f;
+            if (r_norm > 1.0f) {
+                const float inv_r = 1.0f / r_safe;
+                scale_trans = (2.0f - inv_r) * inv_r;             // (2 - 1/r)/r
+                d_st_dr = -2.0f * (r_norm - 1.0f) * inv_r * inv_r * inv_r;  // -2(r-1)/r^3
+            }
+            const float dot_pw_g = pre_warp[0] * dL_dnormalized[0]
+                                 + pre_warp[1] * dL_dnormalized[1]
+                                 + pre_warp[2] * dL_dnormalized[2];
+            const float radial_coef = (r_norm > 1.0f) ? (d_st_dr * dot_pw_g / r_safe) : 0.0f;
+            const float chain = 0.25f * inv_world_step;
+            #pragma unroll
+            for (uint32_t d = 0; d < D; d++) {
+                dL_dxyz[d] = chain * (scale_trans * dL_dnormalized[d] + radial_coef * pre_warp[d]);
+            }
+        }
+    }
+}
+
+
+
+template <bool BW, uint32_t C, uint32_t LD>
+__device__ void query_compact_feature(float* feat, float3 xyz, float vmin, float vmax,
+int* offsets, const uint32_t appearance_level, const __half* __restrict__ hash_features,
+uint32_t L, float S, uint32_t H, bool align_corners, uint32_t interp, bool contract, bool debug,
+float* __restrict__ grad_feat = nullptr,
+float * __restrict__ dL_dfeatures = nullptr, float * __restrict__ dL_dxyz = nullptr,
+float aa_depth = 0.0f)
+{
+    if(debug){
+        printf("BW tag: %d \n", BW);
+    }
+    float inputs[3] = {0.0};
+    bool flag_oob = false;
+	const uint32_t D = 3;
+    float grad_scale = 0.0;
+    // Saved state for backward Jacobian transpose. Only meaningful when BW.
+    // For non-contract: inv_world_step = 1/(vmax-vmin) and the Jacobian is scalar.
+    // For contract: pre_warp[] is the centered+rescaled point (BEFORE radial warp),
+    //               r_norm is its L2 norm, inv_world_step = 2/(vmax-vmin) (= inv_vsize_).
+    // The contract Jacobian is non-isotropic in the outer (norm > 1) region; see the
+    // accumulation block at the end.
+    float inv_world_step = 0.0f;
+    float pre_warp[3] = {0.0f, 0.0f, 0.0f};
+    float r_norm = 0.0f;
+
+    if(!contract){
+        // warp the pos to [0, 1]
+        float inv_vsize = 1.0 / (vmax - vmin);
+        inputs[0] = (xyz.x-vmin)*inv_vsize;
+        inputs[1] = (xyz.y-vmin)*inv_vsize;
+        inputs[2] = (xyz.z-vmin)*inv_vsize;
+        grad_scale = inv_vsize;
+        inv_world_step = inv_vsize;
+        flag_oob = (inputs[0] < 0 || inputs[0] > 1 || inputs[1] < 0 || inputs[1] > 1 || inputs[2] < 0 || inputs[2] > 1);
+    }
+    else{
+        // warp the center region to [-1, 1]
+        float vmid = (vmax + vmin) * 0.5;
+        float inv_vsize_ = 1.0 / ((vmax - vmin) * 0.5);
+        pre_warp[0] = (xyz.x-vmid)*inv_vsize_;
+        pre_warp[1] = (xyz.y-vmid)*inv_vsize_;
+        pre_warp[2] = (xyz.z-vmid)*inv_vsize_;
+        inputs[0] = pre_warp[0];
+        inputs[1] = pre_warp[1];
+        inputs[2] = pre_warp[2];
+        // warp the outside region to [-2, 2], then warp to [0, 1]
+        r_norm = sqrtf(pre_warp[0]*pre_warp[0] + pre_warp[1]*pre_warp[1] + pre_warp[2]*pre_warp[2]);
+        float inv_norm = 1.0f / r_norm;
+        float scale_trans = (r_norm <= 1.0f) ? 1.0f : (2.0f - inv_norm) * inv_norm;
+        #pragma unroll
+        for (uint32_t d = 0; d < D; d++)
+        {
+            // warp to range [-2, 2]
+            inputs[d] = scale_trans * inputs[d] ;
+            // norm to [0, 1]
+            inputs[d] = (inputs[d] + 2.0) * 0.25f;
+        }
+        // grad_scale: scalar approximation of d_normalized/d_world used by AA only
+        // (AA wants an isotropic per-query scale). The full backward Jacobian is
+        // applied at the end of this function.
+        grad_scale = inv_vsize_ * scale_trans * 0.25f;
+        inv_world_step = inv_vsize_;
+    }
+
+    uint32_t max_level = min(appearance_level, L);
+    
+	#pragma unroll
+	for (uint32_t ch = 0; ch < C; ch++) {
+		feat[ch] = 0; 
+	}
+
+    // for backward, initialize dy_dx
+    float dy_dx[BW ? (D * C) : 1] = {0};
+    if constexpr (BW && C >= LD) {
+        #pragma unroll
+        for (uint32_t d = 0; d < D; d++) dL_dxyz[d] = 0;
+    } 
+
+    // out of range, no features, no grad update.
+	if (flag_oob) return;
+
+    const uint32_t size = (C >= LD) ? C / LD * D : 1;
+    float level_pos[size];
+    float level_pos_deriv[size]; 
+    uint32_t level_pos_grid[size];
+    
+    #pragma unroll
+	for(uint32_t level = 0; level < max_level; level++){
+
+		float pos[D];
+        float pos_deriv[D];
+    	uint32_t pos_grid[D];
+        
+        const uint32_t hashmap_size = offsets[level + 1] - offsets[level];
+        const float scale = exp2f(level * S) * H - 1.0f;
+        const uint32_t resolution = (uint32_t)ceil(scale) + 1;
+        const __half* grid = hash_features + (uint32_t)offsets[level] * LD;
+
+        float* dL_dgrid = nullptr;
+        float* grad_level_feat = nullptr;
+        if constexpr (BW && C >= LD) {
+            dL_dgrid = dL_dfeatures + (uint32_t)offsets[level] * LD;
+            grad_level_feat = grad_feat + level * LD;
+        }
+
+		#pragma unroll
+		for (uint32_t d = 0; d < D; d++) {
+			pos[d] = inputs[d] * scale + (align_corners ? 0.0f : 0.5f);
+			pos_grid[d] = floorf(pos[d]);
+			pos[d] -= (float)pos_grid[d];
+            // smoothstep instead of linear
+            if (interp == 1) {
+                pos_deriv[d] = smoothstep_derivative(pos[d]);
+                pos[d] = smoothstep(pos[d]);
+            } else {
+                pos_deriv[d] = 1.0f; // linear deriv is default to 1
+            }
+		}
+
+		float results[LD] = {0};
+
+		// Nexels anti-aliasing downweight for this level.
+		const float level_downweight = hashgrid_aa_downweight(aa_depth, scale, grad_scale);
+
+		#pragma unroll
+		for (uint32_t idx = 0; idx < (1 << D); idx++) {
+			float w = 1;
+			uint32_t pos_grid_local[D];
+
+			#pragma unroll
+			for (uint32_t d = 0; d < D; d++) {
+				if ((idx & (1 << d)) == 0) {
+					w *= 1 - pos[d];
+					pos_grid_local[d] = pos_grid[d];
+				} else {
+					w *= pos[d];
+					pos_grid_local[d] = pos_grid[d] + 1;
+				}
+			}
+			w *= level_downweight;
+
+            uint32_t index = get_grid_index<D, LD>(align_corners, 0, hashmap_size, resolution, pos_grid_local);
+
+			// writing to register (fast)
+			#pragma unroll
+			for (uint32_t ch = 0; ch < LD; ch++) {
+				results[ch] += w * __half2float(grid[index + ch]);
+			}
+            
+            // update gradiendt
+            if constexpr (BW && C >= LD) {
+                #pragma unroll
+                for (uint32_t ch = 0; ch < LD; ch++) {
+                    atomicAdd(&dL_dgrid[index + ch], w * grad_level_feat[ch]);
+                }
+            }
+
+		}    
+
+		// writing to L*LD features
+		#pragma unroll
+		for (uint32_t ch = 0; ch < LD; ch++) {
+			feat[level * LD + ch] = results[ch]; 
+		}
+
+        if constexpr (BW && C >= LD) {
+            // save for dy_dx calculate
+            #pragma unroll
+            for (uint32_t d = 0; d < D; d++) {
+                level_pos[level * D + d] = pos[d]; 
+                level_pos_deriv[level * D + d] = pos_deriv[d]; 
+                level_pos_grid[level * D + d] = pos_grid[d]; 
+            }
+        }
+
+        if(debug && BW == 0){
+            printf("fw level %d scale %.4f res %d \npos: ", level, scale, resolution);
+            for(int d = 0; d < D; d++)printf("%d ", pos[d]);
+            printf("\n");
+        }
+
+	}
+
+    if constexpr (BW && C >= LD) {
+        // B L D C
+        // D * F (F = L * LD)
+        #pragma unroll
+    	for(uint32_t level = 0; level < max_level; level++){
+            
+            float pos[D];
+            float pos_deriv[D];
+            uint32_t pos_grid[D];
+            
+            for (uint32_t d = 0; d < D; d++) {
+                pos[d] = level_pos[level * D + d]; 
+                pos_deriv[d] = level_pos_deriv[level * D + d]; 
+                pos_grid[d] = level_pos_grid[level * D + d]; 
+            }
+
+            const uint32_t hashmap_size = offsets[level + 1] - offsets[level];
+            const float scale = exp2f(level * S) * H - 1.0f;
+            const uint32_t resolution = (uint32_t)ceil(scale) + 1;
+            const __half* grid = hash_features + (uint32_t)offsets[level] * LD;
+
+            if(debug){
+                printf("bw level %d scale %.4f res %d \npos: ", level, scale, resolution);
+                for(int d = 0; d < D; d++)printf("%d ", pos[d]);
+                printf("\n");
+            }
+
+            // Nexels AA downweight — applies uniformly to this level's dL/dxyz.
+            const float bw_level_downweight = hashgrid_aa_downweight(aa_depth, scale, grad_scale);
+
+            #pragma unroll
+            for (uint32_t gd = 0; gd < D; gd++) {
+
+                float results_grad[LD] = {0};
+
+                #pragma unroll
+                for (uint32_t idx = 0; idx < (1 << (D - 1)); idx++) {
+                    // dy_dx accumulates d(feature)/d(input_normalized) for THIS level.
+                    // The world-space Jacobian (grad_scale for non-contract, the full
+                    // anisotropic transpose for contract) is applied once at the end.
+                    float w = scale * bw_level_downweight;
+                    uint32_t pos_grid_local[D];
+
+                    #pragma unroll
+                    for (uint32_t nd = 0; nd < D - 1; nd++) {
+                        const uint32_t d = (nd >= gd) ? (nd + 1) : nd;
+
+                        if ((idx & (1 << nd)) == 0) {
+                            w *= 1 - pos[d];
+                            pos_grid_local[d] = pos_grid[d];
+                        } else {
+                            w *= pos[d];
+                            pos_grid_local[d] = pos_grid[d] + 1;
+                        }
+                    }
+
+                    pos_grid_local[gd] = pos_grid[gd];
+                    uint32_t index_left = get_grid_index<D, LD>(align_corners, 0, hashmap_size, resolution, pos_grid_local);
+                    pos_grid_local[gd] = pos_grid[gd] + 1;
+                    uint32_t index_right = get_grid_index<D, LD>(align_corners, 0, hashmap_size, resolution, pos_grid_local);
+
+                    #pragma unroll
+                    for (uint32_t ch = 0; ch < LD; ch++) {
+                        results_grad[ch] += w * (__half2float(grid[index_right + ch]) - __half2float(grid[index_left + ch])) * pos_deriv[gd];
+                    }
+                }
+
+                // update to dy_dx (D * F & D * L * LD), 
+                #pragma unroll
+                for (uint32_t ch = 0; ch < LD; ch++) {
+                    dy_dx[gd * C + level * LD + ch] = results_grad[ch];
+                }
+            }
+        }
+
+        // First accumulate dL/d(input_normalized) in normalized [0,1] coords.
+        // Then map to dL/d(xyz) via the proper Jacobian transpose:
+        //   non-contract: J = inv_world_step * I  (scalar, isotropic)
+        //   contract: pipeline is  xyz → step1 (linear, scale inv_vsize_)
+        //                              → step2 (radial warp scale_trans(r) * x)
+        //                              → step3 (linear, +2 then *0.25)
+        //   J^T_step3 = 0.25 * I
+        //   J^T_step2 v = scale_trans * v + (d_scale_trans/dr) * (x_step1 · v) * x_step1 / r
+        //                 with d_scale_trans/dr = -2(r-1)/r^3 for r>1, 0 for r<=1.
+        //   J^T_step1 = inv_vsize_ * I  (= inv_world_step * I)
+        float dL_dnormalized[D];
+        # pragma unroll
+        for (uint32_t d = 0; d < D; d++) {
+            float result = 0;
+            # pragma unroll
+            for(int level = 0; level < max_level; level++) {
+                float* grad_level_feat = grad_feat + level * LD;
+                # pragma unroll
+                for (int ch = 0; ch < LD; ch++) {
+                    // grad_feat (C & L * LD), dy_dx (D * F & D * L * LD),
+                    result += grad_level_feat[ch] * dy_dx[d * C + level * LD + ch];
+                }
+            }
+            dL_dnormalized[d] = result;
+        }
+
+        if (!contract) {
+            // Pure scalar Jacobian.
+            #pragma unroll
+            for (uint32_t d = 0; d < D; d++) {
+                dL_dxyz[d] = inv_world_step * dL_dnormalized[d];
+            }
+        } else {
+            // Recover scale_trans and its radial derivative at this query point.
+            // Inner ball (r<=1): scale_trans=1, d_scale_trans/dr=0 -> Jacobian collapses
+            // to scalar (inv_world_step*0.25); outer (r>1): full anisotropic transpose.
+            const float r_safe = fmaxf(r_norm, 1e-8f);
+            float scale_trans = 1.0f;
+            float d_st_dr = 0.0f;
+            if (r_norm > 1.0f) {
+                const float inv_r = 1.0f / r_safe;
+                scale_trans = (2.0f - inv_r) * inv_r;             // (2 - 1/r)/r
+                d_st_dr = -2.0f * (r_norm - 1.0f) * inv_r * inv_r * inv_r;  // -2(r-1)/r^3
+            }
+            const float dot_pw_g = pre_warp[0] * dL_dnormalized[0]
+                                 + pre_warp[1] * dL_dnormalized[1]
+                                 + pre_warp[2] * dL_dnormalized[2];
+            const float radial_coef = (r_norm > 1.0f) ? (d_st_dr * dot_pw_g / r_safe) : 0.0f;
+            const float chain = 0.25f * inv_world_step;
+            #pragma unroll
+            for (uint32_t d = 0; d < D; d++) {
+                dL_dxyz[d] = chain * (scale_trans * dL_dnormalized[d] + radial_coef * pre_warp[d]);
+            }
+        }
+    }
+}
+
+#endif

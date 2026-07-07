@@ -159,8 +159,34 @@ class GaussianModel:
         # `--method mixed` per-Gauss textured/untextured flag. All-True before
         # `--texsplit` fires (kernel branch falls through to textured path,
         # bit-identical to 3D_SH_res). Old PLYs without this column default
-        # to all-True on load.
+        # to all-True on load. For `--method GEStex`: True=textured surfel,
+        # False=spawned 3D Gaussian (all-True until --ges_joint_iter spawn).
         self._is_textured = torch.empty(0, dtype=torch.bool)
+
+        # `--method GEStex`: explicit per-surfel RGB texture atlas [N, R, R, 3]
+        # (unbounded, view-independent), created at --ges_joint_iter by baking the
+        # hashgrid+MLP residual, then optimized directly as a leaf. Empty until the
+        # bake. Only textured (surfel) rows carry meaningful texels; spawned-Gaussian
+        # rows are zero and never sampled. Threaded through optimizer/densify/prune/PLY
+        # like _scaling_z. `is_gestex`/`surfel_opac`/`mod_depth`/`saved_gaussian_positions`
+        # are set from train.py / at the joint transition.
+        self._tex_atlas = torch.empty(0)
+        self.ges_atlas_res = 8
+        self.is_gestex = False
+        self.surfel_opac = 1.0
+        # TS+-style rising opacity FLOOR for GEStex surfel hardening (opacity stays <=1):
+        # surfel_opac_eff = ges_opac_floor + (1 - ges_opac_floor) * get_opacity, with
+        # ges_opac_floor ramped 0 -> ~0.99 over the harden window. Replaces the old
+        # surfel_opac>1 multiplier (which drove the ∝opacity geometry-gradient bloat).
+        # 0 (default) => no floor => opacity unchanged.
+        self.ges_opac_floor = 0.0
+        # `--method GEStex` joint stage: when True, densify_and_{clone,split} skip TEXTURED
+        # surfel rows (frozen + baked) so only the untextured 3D Gaussians grow. Set at
+        # --ges_joint_iter.
+        self.ges_freeze_textured_densify = False
+        self.ges_s_weight = 1.0
+        self.mod_depth = torch.empty(0)               # [N_surfel,1] z-buffer offset = 5*mean(scale)
+        self.saved_gaussian_positions = torch.empty(0)  # world xyz of pruned surfels (spawn seeds)
 
         # --minimc: per-Gaussian photometric error + pixel-ownership accumulators.
         # See train loop for per-step scatter_add. Lifecycle mirrors xyz_gradient_accum.
@@ -625,7 +651,7 @@ class GaussianModel:
         # cols 1:25 = beta (bias). Defaults gamma=1.0/beta=0.0 → identity (pure hash); set
         # --film_gamma_init 0.1 --film_beta_init 1.0 to bias lifting toward beta. width = 24
         # (6 hash levels x 4D).
-        if hasattr(args, 'method') and args.method == "film":
+        if hasattr(args, 'method') and args.method in ("film", "3D_SH_filmres", "3D_SH_concat"):
             N = self.get_xyz.shape[0]
             g_init = getattr(args, 'film_gamma_init', 1.0)
             b_init = getattr(args, 'film_beta_init', 0.0)
@@ -1039,6 +1065,13 @@ class GaussianModel:
             l.append({'params': [self._scaling_z], 'lr': training_args.scaling_lr,
                       "name": "scaling_z"})
 
+        # `--method GEStex`: explicit texture atlas leaf (created at --ges_joint_iter).
+        # Uses feature_lr so it fine-tunes at a comparable rate to the SH it augments.
+        if hasattr(self, '_tex_atlas') and self._tex_atlas.numel() > 0 \
+                and self._tex_atlas.requires_grad:
+            _atlas_lr = float(getattr(training_args, 'feature_lr', 0.0025))
+            l.append({'params': [self._tex_atlas], 'lr': _atlas_lr, "name": "tex_atlas"})
+
         # `--deform`: per-surfel deformation latent. Own LR (stored at init).
         # Re-added on every optimizer rebuild (e.g. the res_3d_paired split) so
         # it survives tensor reconstruction with its Adam state intact.
@@ -1168,6 +1201,10 @@ class GaussianModel:
         if hasattr(self, '_deform_latent') and self._deform_latent.numel() > 0:
             for i in range(self._deform_latent.shape[1]):
                 l.append('deform_{}'.format(i))
+        # `--method GEStex` explicit texture atlas, flattened [N, R*R*3].
+        if hasattr(self, '_tex_atlas') and self._tex_atlas.numel() > 0:
+            for i in range(int(np.prod(self._tex_atlas.shape[1:]))):
+                l.append('tex_atlas_{}'.format(i))
         return l
 
     def save_ply(self, path):
@@ -1249,6 +1286,11 @@ class GaussianModel:
         # `--deform` per-surfel deformation latent [N, deform_dim]
         if hasattr(self, '_deform_latent') and self._deform_latent.numel() > 0:
             attr_list.append(self._deform_latent.detach().cpu().numpy())
+
+        # `--method GEStex` explicit texture atlas [N, R, R, 3] → flatten to [N, R*R*3]
+        if hasattr(self, '_tex_atlas') and self._tex_atlas.numel() > 0:
+            attr_list.append(self._tex_atlas.detach().reshape(
+                self._tex_atlas.shape[0], -1).cpu().numpy())
 
         attributes = np.concatenate(attr_list, axis=1)
         elements[:] = list(map(tuple, attributes))
@@ -1361,7 +1403,7 @@ class GaussianModel:
                 film_arr[:, idx] = np.asarray(plydata.elements[0][attr_name])
             self._film_params = nn.Parameter(torch.tensor(film_arr, dtype=torch.float, device="cuda").requires_grad_(True))
             print(f"Loaded {film_arr.shape[1]}-col FiLM params for film mode")
-        elif args is not None and hasattr(args, 'method') and args.method == "film":
+        elif args is not None and hasattr(args, 'method') and args.method in ("film", "3D_SH_filmres", "3D_SH_concat"):
             N = xyz.shape[0]
             g_init = getattr(args, 'film_gamma_init', 1.0)
             b_init = getattr(args, 'film_beta_init', 0.0)
@@ -1413,6 +1455,25 @@ class GaussianModel:
             self.deform_dim = len(deform_names)
         else:
             self._deform_latent = torch.empty(0, device="cuda")
+
+        # `--method GEStex` explicit texture atlas (tex_atlas_0..R*R*3-1) → [N, R, R, 3].
+        atlas_names = sorted([p.name for p in plydata.elements[0].properties
+                              if p.name.startswith("tex_atlas_")],
+                             key=lambda x: int(x.split('_')[-1]))
+        if len(atlas_names) > 0:
+            n_atlas_cols = len(atlas_names)
+            R = int(round((n_atlas_cols / 3.0) ** 0.5))
+            assert R * R * 3 == n_atlas_cols, \
+                f"tex_atlas cols {n_atlas_cols} not R*R*3 for integer R (got R={R})"
+            atlas_flat = np.zeros((xyz.shape[0], n_atlas_cols), dtype=np.float32)
+            for idx, attr_name in enumerate(atlas_names):
+                atlas_flat[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            self.ges_atlas_res = R
+            self._tex_atlas = nn.Parameter(
+                torch.tensor(atlas_flat, dtype=torch.float, device="cuda")
+                .reshape(xyz.shape[0], R, R, 3).contiguous().requires_grad_(True))
+        else:
+            self._tex_atlas = torch.empty(0, device="cuda")
 
         # Load beta kernel shape parameter (if present in PLY)
         if "shape" in ply_props:
@@ -1631,6 +1692,12 @@ class GaussianModel:
             self._shape = nn.Parameter(self._shape.data[valid_points_mask].clone(), requires_grad=False)
         if "scaling_z" in optimizable_tensors:
             self._scaling_z = optimizable_tensors["scaling_z"]
+        if "tex_atlas" in optimizable_tensors:
+            self._tex_atlas = optimizable_tensors["tex_atlas"]
+        elif hasattr(self, '_tex_atlas') and self._tex_atlas.numel() > 0 \
+                and self._tex_atlas.shape[0] == valid_points_mask.shape[0]:
+            # Atlas exists but isn't (yet) an optimizer leaf → prune the raw tensor.
+            self._tex_atlas = self._tex_atlas[valid_points_mask]
         if "deform_latent" in optimizable_tensors:
             self._deform_latent = optimizable_tensors["deform_latent"]
         if "flex_beta" in optimizable_tensors:
@@ -1720,7 +1787,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level=None, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None, new_adaptive_zero_weight=None, new_gate_logits=None, new_shape=None, new_flex_beta=None, new_sb_params=None, new_sg_directions=None, new_sg_sharpness=None, new_sg_rgb=None, new_sv_sites=None, new_sv_colors=None, new_sv_dc=None, new_sv_tau=None, new_is_textured=None, new_scaling_z=None, new_film_params=None, new_deform_latent=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_ap_level=None, new_gaussian_features=None, new_gamma=None, new_adaptive_features=None, new_adaptive_cat_weight=None, new_adaptive_zero_weight=None, new_gate_logits=None, new_shape=None, new_flex_beta=None, new_sb_params=None, new_sg_directions=None, new_sg_sharpness=None, new_sg_rgb=None, new_sv_sites=None, new_sv_colors=None, new_sv_dc=None, new_sv_tau=None, new_is_textured=None, new_scaling_z=None, new_film_params=None, new_deform_latent=None, new_tex_atlas=None):
         # CRITICAL: ap_level defaults to 24 (all hash levels active).
         # ap_level=0 silently disables hash encoding — see hashgrid.h: max_level = min(ap_level, L).
         if new_ap_level is None:
@@ -1766,6 +1833,16 @@ class GaussianModel:
         # `--deform`: per-surfel deformation latent (children inherit parent's)
         if new_deform_latent is not None and hasattr(self, '_deform_latent') and self._deform_latent.numel() > 0:
             d["deform_latent"] = new_deform_latent
+
+        # `--method GEStex` explicit texture atlas: new points get zero texels by
+        # default (spawned Gaussians are untextured; surfels aren't densified in the
+        # joint stage). Auto-fill so callers needn't thread it through everywhere.
+        if hasattr(self, '_tex_atlas') and self._tex_atlas.numel() > 0:
+            if new_tex_atlas is None:
+                new_tex_atlas = torch.zeros(
+                    (new_xyz.shape[0],) + tuple(self._tex_atlas.shape[1:]),
+                    device=self._tex_atlas.device, dtype=self._tex_atlas.dtype)
+            d["tex_atlas"] = new_tex_atlas
 
         # Add beta kernel shape parameter
         if new_shape is not None and hasattr(self, '_shape') and self._shape.numel() > 0:
@@ -1819,6 +1896,8 @@ class GaussianModel:
             self._adaptive_zero_weight = optimizable_tensors["adaptive_zero_weight"]
         if "gate_logits" in optimizable_tensors:
             self._gate_logits = optimizable_tensors["gate_logits"]
+        if "tex_atlas" in optimizable_tensors:
+            self._tex_atlas = optimizable_tensors["tex_atlas"]
         if "scaling_z" in optimizable_tensors:
             self._scaling_z = optimizable_tensors["scaling_z"]
         if "deform_latent" in optimizable_tensors:
@@ -1894,6 +1973,13 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        # `--method GEStex` joint stage: freeze TEXTURED surfel growth (they're frozen +
+        # baked); only the untextured 3D Gaussians may densify. Screenspace-grad-driven
+        # clone/split would otherwise still grow frozen surfels (their means2D grad isn't
+        # masked). Gated on ges_freeze_textured_densify (set at --ges_joint_iter).
+        if getattr(self, 'ges_freeze_textured_densify', False) and \
+                self._is_textured.numel() == selected_pts_mask.shape[0]:
+            selected_pts_mask = torch.logical_and(selected_pts_mask, ~self._is_textured)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         stds = torch.cat([stds, 0 * torch.ones_like(stds[:,:1])], dim=-1)
@@ -2014,7 +2100,11 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+        # `--method GEStex` joint stage: freeze TEXTURED surfel growth (see densify_and_split).
+        if getattr(self, 'ges_freeze_textured_densify', False) and \
+                self._is_textured.numel() == selected_pts_mask.shape[0]:
+            selected_pts_mask = torch.logical_and(selected_pts_mask, ~self._is_textured)
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -2609,6 +2699,7 @@ class GaussianModel:
             elif name == "opacity": self._opacity = param
             elif name == "scaling": self._scaling = param
             elif name == "scaling_z": self._scaling_z = param
+            elif name == "tex_atlas": self._tex_atlas = param
             elif name == "deform_latent": self._deform_latent = param
             elif name == "rotation": self._rotation = param
             elif name == "ap_level": self._appearance_level = param
@@ -4820,3 +4911,130 @@ class GaussianModel:
               f"{N} 3D-EWA-SV-carriers = {new_total} total. Opacity {_op_note}. "
               f"_scaling_z initialised flat (log({FLAT_FRAC}) + min log sxy). "
               f"SV/SH params zeroed on the 2D-residual-carrier half (residual-only).")
+
+    # ============================ --method GEStex helpers ============================
+    def ges_set_param_lr(self, name, lr):
+        """Set the learning rate of an optimizer param group by name (used to freeze
+        surfel opacity in the harden phase). No-op if the group is absent."""
+        if self.optimizer is None:
+            return
+        for group in self.optimizer.param_groups:
+            if group.get("name") == name:
+                group['lr'] = float(lr)
+
+    @torch.no_grad()
+    def ges_prune_low_opacity(self, w_thresh):
+        """GEStex harden (--ges_phase1_iter): prune surfels whose ACTIVATED opacity is
+        below `w_thresh`, saving their world positions as seeds for 3D-Gaussian spawning
+        at the joint transition. Uses the existing prune_points so every per-Gauss tensor
+        (incl. _is_textured / accumulators) stays aligned."""
+        act = self.get_opacity.flatten()
+        prune_mask = act < float(w_thresh)
+        if bool(prune_mask.any()):
+            self.saved_gaussian_positions = self._xyz.detach()[prune_mask].clone()
+            self.prune_points(prune_mask)
+        else:
+            self.saved_gaussian_positions = torch.empty(0, 3, device=self._xyz.device)
+        return int(prune_mask.sum().item())
+
+    def ges_mod_depth(self):
+        """GEStex: per-row z-buffer depth offset = 5 * mean(2D scale). Computed live in
+        the joint dispatch (surfel geometry is frozen, so this is effectively constant),
+        which keeps it aligned through any 3D-Gaussian spawn/prune."""
+        return 5.0 * self.get_scaling[:, :2].mean(dim=-1, keepdim=True)
+
+    @torch.no_grad()
+    def ges_enter_joint_stage(self, atlas, spawn_positions, training_args, bake_atlas=True):
+        """GEStex bake & splat (--ges_joint_iter):
+          1. (bake_atlas only) register the baked per-surfel RGB atlas [N0,R,R,3] as a leaf,
+          2. give every current (surfel) row a flat _scaling_z placeholder,
+          3. append untextured 3D Gaussians (SH color, _is_textured=False) at
+             `spawn_positions`, with a real learnable _scaling_z,
+          4. rebuild the Gaussian optimizer (fresh Adam; atlas + scaling_z now leaves).
+        The caller stops stepping the INGP (hash/MLP) optimizer after this.
+
+        `bake_atlas=False` (--ges_no_bake): skip the atlas leaf and leave `_tex_atlas`
+        empty. The joint render then routes through the cascade (`diff_surfel_gestex`,
+        atlas cleared) so textured surfels keep the LIVE hash+MLP residual; the caller
+        must keep the INGP optimizer training."""
+        device = self._xyz.device
+        N0 = self._xyz.shape[0]
+        R = int(self.ges_atlas_res)
+
+        # 1) atlas leaf (surfels) — skipped in no-bake mode (hash+MLP stays live)
+        if bake_atlas:
+            assert atlas.shape[0] == N0, f"atlas rows {atlas.shape[0]} != surfels {N0}"
+            self._tex_atlas = nn.Parameter(
+                atlas.detach().to(device).float().contiguous().requires_grad_(True))
+        # 2) flat _scaling_z placeholder for surfels (unused by the z-buffer surfel pass)
+        FLAT = 0.05
+        sxy_min = torch.min(self._scaling.data[:, :2], dim=1, keepdim=True).values
+        sz = (float(np.log(FLAT)) + sxy_min)
+        self._scaling_z = nn.Parameter(sz.detach().contiguous().requires_grad_(True))
+        self._is_textured = torch.ones(N0, dtype=torch.bool, device=device)
+
+        # 3) spawn untextured 3D Gaussians. Grow EVERY per-Gauss tensor (so feature-mode
+        #    tensors like _sv_sites/_sv_colors survive — else the SV/SH color path sees a
+        #    row-count mismatch). Spawned rows INHERIT from a random surviving surfel
+        #    (valid SV sites/SH/etc.), then geometry/opacity/atlas are overridden.
+        K = 0 if (spawn_positions is None or spawn_positions.numel() == 0) else int(spawn_positions.shape[0])
+        if K > 0:
+            src = torch.randint(0, N0, (K,), device=device)
+            base_scale = float(self.get_scaling[:, :2].mean().item())
+            log_bs = float(np.log(max(base_scale, 1e-4)))
+            # Every per-Gauss tensor to grow (mirror split_at_res_3d) + atlas + scaling_z.
+            _grow_names = [
+                '_xyz', '_features_dc', '_features_rest', '_scaling', '_rotation',
+                '_opacity', '_appearance_level', '_scaling_z', '_tex_atlas',
+                '_gaussian_features', '_gamma', '_adaptive_features',
+                '_adaptive_cat_weight', '_adaptive_zero_weight', '_gate_logits',
+                '_flex_beta', '_shape',
+                '_sb_params', '_sg_directions', '_sg_sharpness_sg', '_sg_rgb',
+                '_sv_sites', '_sv_colors', '_sv_tau', '_sv_dc', '_deform_latent',
+            ]
+            for name in _grow_names:
+                t = getattr(self, name, None)
+                if t is None or not hasattr(t, 'numel') or t.numel() == 0 or t.shape[0] != N0:
+                    continue
+                req = bool(t.requires_grad) if hasattr(t, 'requires_grad') else False
+                grown = torch.cat([t.detach(), t.detach()[src]], dim=0)
+                setattr(self, name, nn.Parameter(grown.contiguous().requires_grad_(req)))
+            # Override the spawned (last-K) rows with fresh 3D-Gaussian init.
+            with torch.no_grad():
+                self._xyz.data[N0:] = spawn_positions.detach().to(device).float().reshape(K, 3)
+                self._opacity.data[N0:] = inverse_sigmoid(0.1 * torch.ones((K, 1), device=device))
+                self._rotation.data[N0:] = 0.0; self._rotation.data[N0:, 0] = 1.0
+                self._scaling.data[N0:] = log_bs
+                self._scaling_z.data[N0:] = log_bs
+                self._appearance_level.data[N0:] = 24.0
+                self._tex_atlas.data[N0:] = 0.0
+            self._is_textured = torch.cat(
+                [self._is_textured, torch.zeros(K, dtype=torch.bool, device=device)], dim=0)
+
+        Ntot = self._xyz.shape[0]
+        self.xyz_gradient_accum = torch.zeros(Ntot, 1, device=device)
+        self.xyz_gradient_accum_abs = torch.zeros(Ntot, 1, device=device)
+        self.feat_gradient_accum = torch.zeros(Ntot, 1, device=device)
+        self.denom = torch.zeros(Ntot, 1, device=device)
+        self.max_radii2D = torch.zeros(Ntot, device=device)
+        self.ges_max_contrib = torch.zeros(Ntot, device=device)
+
+        # 4) rebuild optimizer (atlas + scaling_z now included; hash/MLP untouched here)
+        self.training_setup(training_args)
+        print(f"[GEStex] joint stage: atlas[{N0},{R},{R},3] registered; spawned {K} 3D "
+              f"Gaussians; total {Ntot} primitives ({N0} surfels + {K} gauss).")
+
+    @torch.no_grad()
+    def ges_prune_gaussians(self, min_contrib):
+        """GEStex joint stage: prune UNTEXTURED 3D Gaussians whose accumulated max
+        per-pixel contribution fell below `min_contrib`. Surfels (textured) are kept."""
+        if not hasattr(self, 'ges_max_contrib') or self.ges_max_contrib.numel() != self._xyz.shape[0]:
+            return 0
+        low = self.ges_max_contrib < float(min_contrib)
+        prune_mask = torch.logical_and(low, ~self._is_textured)
+        n = int(prune_mask.sum().item())
+        if n > 0:
+            self.prune_points(prune_mask)
+            self.ges_max_contrib = torch.zeros(self._xyz.shape[0], device=self._xyz.device)
+        return n
+    # ================================================================================
