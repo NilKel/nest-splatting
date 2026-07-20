@@ -40,6 +40,45 @@ Numbers in FPS. Quality: **all PSNR/SSIM/LPIPS bit-identical** on the
 SH+atlas lane (only 0.001 dB fp16-pack noise on the SH-only bonsai
 lane).
 
+## Full-picture comparison — neural vs baked vs FastGS
+
+Puts the CONIC baked renderer in context: the "before" is the neural
+MLP-at-render path (what we compare against for baking's whole
+value-add), and FastGS is the paper's per-Gauss efficiency reference.
+
+| scene | N Gauss | resolution | neural (5090) | prod baked (5090) | **lean CONIC (5090)** | FastGS (4090)* |
+|---|---:|:---:|---:|---:|---:|---:|
+| bicycle  | 161k | 1237×822 | 111 | 711 | **1385** | 925 |
+| bonsai   |  92k | 1559×1039 | 117 | 660 | **1261** | 992 |
+| counter  |  68k | 1558×1038 | 108 | 775 | **1442** | 915 |
+| flowers  | 185k | 1256×828 | 100 | 648 | **1291** | 935 |
+| garden   | 149k | 1297×840  | 117 | 1055 | **1943** | 938 |
+| kitchen  | 120k | 1558×1039 |  93 | 831 | **1495** | 773 |
+| room     |  63k | 1557×1038 | 133 | 1049 | **1792** | 1064 |
+| stump    |  96k | 1245×825  | 132 | 741 | **1394** | 976 |
+| treehill | 175k | 1267×832  |  98 | 589 | **1105** | 962 |
+| **mean** | — | — | **112** | **784** | **1456** | **942** |
+
+Reference points:
+- **neural → lean CONIC = 13× mean speedup** on the full mip360 set (112 → 1456 FPS).
+  Baking is a big lever; CONIC re-encoding on top of the raw baked path adds another ~1.87×.
+- **lean CONIC vs FastGS on garden: 1943 vs 938 FPS = 2.07× faster** despite
+  running on the same 5090 (FastGS was measured on the RTX 4090 — see
+  caveat below). At mean-mip360 the CONIC path is **~1.55× FastGS** despite
+  the platform mismatch.
+- **N Gauss**: nest-splatting bakes are ~4× *fewer* Gauss than FastGS bakes
+  of the same scene (e.g. garden 149k vs FastGS's 661k). That's an
+  training-side consolidation win baked in; the per-Gauss compute is what
+  the CONIC renderer optimizes.
+
+\* FastGS numbers are RTX 4090 (from `docs/FPS_BENCH_RESULTS.md`, measured
+2026-05-13 with FastGS's own `render_eval.py`), not 5090. 5090's raw
+memory bandwidth is ~1.4× the 4090's, so the true 5090 FastGS FPS would
+likely be ~1.4× the 4090 number — approx 1315 FPS mean, still slower than
+the lean CONIC baked renderer. Sources: `benchmark_results.json` in each
+scene's `baked_atlas/` for the neural + prod-baked columns; `bench_lean_vs_prod.py`
+for the lean CONIC column.
+
 ## What each optimization contributed
 
 | lever | mechanism | garden ΔFPS on SH+atlas |
