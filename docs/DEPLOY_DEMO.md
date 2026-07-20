@@ -9,15 +9,21 @@ trade-offs, batch helpers), see [BITYMI_BUNDLES.md](BITYMI_BUNDLES.md).
 
 ## Which viewer is live?
 
-**Rust `Halloumi-web-splat` (WASM)**. Cards in
-[`bitymi-demos/index.html`](../../bitymi-demos/index.html) all link to
-`viewer/index.html?bundle=...`, which serves
-`viewer/web_splats_bg.wasm` + `viewer/web_splats.js`.
+**TypeScript `Halloumi-WS` (WebGPU)** — verified 2026-07-20 by inspecting
+the deployed bundle at `viewer/assets/index-*.js`.  The 349 KB JS bundle
+contains WGSL sources for `preprocess_2dgs`, `render_2dgs`, `surfel_cull`,
+the `@compute` directive, and the `WebSplatter` fork name.  No `.wasm`
+file present.
 
-The TypeScript `Halloumi-WS` is staged in `bitymi-demos/viewer-ws/`
-but **not** wired into any demo card. See
-[HALLOUMI_WS_VIEWER.md § 12](HALLOUMI_WS_VIEWER.md) for the swap
-procedure if/when we promote it.
+Cards in [`bitymi-demos/index.html`](../../bitymi-demos/index.html) all
+link to `viewer/index.html?bundle=...` which loads this TS bundle.
+`viewer-ws/` still exists as a duplicate staging dir.
+
+Earlier docs claimed the live viewer was still the Rust
+`Halloumi-web-splat` build — that was stale.  The swap happened at some
+point before this verification.  See
+[HALLOUMI_WS_VIEWER.md § 12](HALLOUMI_WS_VIEWER.md) for the current
+build+deploy workflow.
 
 ---
 
@@ -48,9 +54,18 @@ checkpoint  →  baked_atlas/  →  scene.nat2  →  <slug>.bitymi  →  HF data
 | stage | script | what it does |
 |---|---|---|
 | 1. Bake | `scripts/benchmark_baked.py` | run MLP residual to 8×8 SH atlas per Gauss, pack to BC7 |
-| 2. NAT2 | `scripts/export_textures_bin.py` (BC7) / `scripts/encode_astc.py` (ASTC) | wrap atlas in single binary container with header + rects |
-| 3. Pack | `scripts/pack_bitymi.py` | concat PLY + cameras.json + scene.nat2 into one `.bitymi` |
+| 1a. Compress PLY | `scripts/compress_baked_ply.py` | 8-bit MinMax quant of the baked.ply → `.bply` (~4× shrink, viewer decodes at load) |
+| 2. NAT2 | `scripts/export_textures_bin.py --bc7-codebook` (default) / `scripts/encode_astc.py` (ASTC) | wrap atlas in single binary container; **default is typeD BC7-codebook (atlas_format=7)** — K=65536 K-means centroids re-encoded as one BC7 4×4 each, loader gathers the full BC7 stream at load time → **single HW tex fetch per fragment** at render. ~7× smaller download than raw BC7, bit-identical render cost. |
+| 3. Pack | `scripts/pack_bitymi.py` | concat BPLY + cameras.json + scene.nat2 into one `.bitymi` |
 | 4. Upload | `hf upload Nilkel/bitymi-demos ... --repo-type=dataset` | push to HF (CORS works because HF CDN sends `Access-Control-Allow-Origin` for `nilkel.github.io`) |
+
+> ⚠️ **NEVER ship paired-RVQ (`--rvq-paired`, atlas_format=5) to mobile users.**
+> paired-RVQ bundles are ~2× smaller than typeD but the fragment shader
+> does 4-8 SW codebook taps per pixel — on TBDR mobile GPUs (Adreno /
+> Mali / Apple / PowerVR) that's **the fragment bottleneck** and made
+> garden_sh_res unusable at ~single-digit FPS on a Snapdragon phone.
+> Confirmed 2026-07-21 by re-encoding the same bake as typeD → back to
+> normal FPS. Bad rendering, small download; not worth it.
 
 ---
 
@@ -83,9 +98,18 @@ $PY scripts/benchmark_baked.py --model_path "$MP" --output_dir "$BAKE_LITE" \
     --max_res 32 --atlas_budget_mb 8192 \
     --aabb_mode 5 --sort_mode 0 --bake_dtype bc7
 
-# BC7 nat2 + pack + upload (HD)
-$PY scripts/export_textures_bin.py "$BAKE_HD" "$BAKE_HD/scene.nat2"
-$PY scripts/pack_bitymi.py "$DEMO_SCENES/${SLUG}.bitymi" --bake-dir "$BAKE_HD"
+# BPLY compress (~4× smaller PLY, viewer decodes at load)
+$PY scripts/compress_baked_ply.py --input "$BAKE_HD/baked.ply" --output "$BAKE_HD/baked.bply"
+
+# typeD BC7-codebook nat2 (default; ~7× smaller than raw BC7, same render cost)
+$PY scripts/export_textures_bin.py "$BAKE_HD" "$BAKE_HD/scene.nat2" --bc7-codebook
+
+# pack — explicit --ply baked.bply because auto-discover picks baked.ply first
+$PY scripts/pack_bitymi.py "$DEMO_SCENES/${SLUG}.bitymi" \
+    --ply "$BAKE_HD/baked.bply" \
+    --cameras "$MP/cameras.json" \
+    --atlas   "$BAKE_HD/scene.nat2"
+
 conda run -n nest_splatting hf upload Nilkel/bitymi-demos \
     "$DEMO_SCENES/${SLUG}.bitymi" "${SLUG}.bitymi" --repo-type=dataset \
     --commit-message="Add ${SLUG}"
@@ -175,5 +199,5 @@ Full pitfall table in [BITYMI_BUNDLES.md § Common pitfalls](BITYMI_BUNDLES.md#c
 - Local bundle staging → `bitymi-demos/scenes/`
 - HF dataset → [`Nilkel/bitymi-demos`](https://huggingface.co/datasets/Nilkel/bitymi-demos)
 - Live page → [`bitymi-demos`](https://nilkel.github.io/bitymi-demos/)
-- Live viewer source → `Halloumi-web-splat` (Rust + wgpu → WASM)
-- Future viewer source → `Halloumi-WS` (TS + WebGPU); see [HALLOUMI_WS_VIEWER.md](HALLOUMI_WS_VIEWER.md)
+- **Live viewer source** → `Halloumi-WS` (TS + WebGPU); see [HALLOUMI_WS_VIEWER.md](HALLOUMI_WS_VIEWER.md)
+- Legacy viewer source (no longer deployed) → `Halloumi-web-splat` (Rust + wgpu → WASM)

@@ -107,7 +107,37 @@ mmap. `scripts/export_textures_bin.py` writes `scene.nat2`
 (ASTC 4×4-flavored). Both use the same NAT2 v2 container format —
 see the docstring in `export_textures_bin.py` for the byte layout.
 
-### BC7 (desktop, iOS Safari, modern Apple)
+### BC7-CODEBOOK — **default** (typeD, atlas_format=7)
+
+```bash
+python scripts/export_textures_bin.py <baked_atlas_dir> <baked_atlas_dir>/scene.nat2 --bc7-codebook
+```
+
+Preferred format for ALL new bundles. K-means (K=65536 default) over
+the atlas's 4×4 RGB blocks, then BC7-encodes each centroid → a codebook
+of K × 16 B codewords + one uint16 index per atlas block. Loader
+reconstructs the full BC7 byte stream at LOAD time (no per-fragment
+decode work); the fragment shader then reads a normal
+`texture_2d_array<bc7-rgba-unorm>` with a **single HW bilinear tex fetch
+per fragment** — bit-identical to raw BC7 at render time.
+
+- **Download**: ~7× smaller than raw BC7 (e.g. garden 3D_SH_res 509 MB
+  raw BC7 → ~63 MB typeD). Codebook 1 MB + indices N_blocks × 2 B.
+- **Render**: bit-identical cost to raw BC7 (1 HW tex fetch). Much
+  faster than paired-RVQ on mobile because the fragment path is not
+  paying multiple SW codebook taps per pixel.
+- **Quality**: ~3 dB below raw BC7 in atlas space at K=65536 (~38-39 dB
+  atlas-space). Visually indistinguishable in practice.
+- **CPU-side pipeline**: ~1-2 min for the K-means fit; needs the
+  `bc7encoder` extension (built at `submodules/bc7enc_lib/`).
+
+Wide atlases (W > 8192) are automatically column-sharded at
+`ATLAS_LAYER_W = 8192` — the header records `n_cols`; the loader
+reassembles from the shards. Row split at `LAYER_H_BC7 = 8192` still
+applies so the atlas fits Android Adreno/Mali
+`max_texture_dimension_2d=8192`.
+
+### BC7 (raw — legacy)
 
 ```bash
 python scripts/export_textures_bin.py <baked_atlas_dir> <baked_atlas_dir>/scene.nat2
@@ -116,7 +146,9 @@ python scripts/export_textures_bin.py <baked_atlas_dir> <baked_atlas_dir>/scene.
 Re-reads `atlas_texture.bc7` directly. Splits the atlas into layers
 (8192-row chunks) so it fits Android-Adreno-style WebGPU
 `max_texture_dimension_2d=8192` limits, since the same BC7 bundle
-might be served to a multi-platform viewer.
+might be served to a multi-platform viewer. Same render cost as typeD
+but 7× larger download — prefer typeD unless the atlas is small
+enough that the difference doesn't matter.
 
 ### ASTC 4×4 (Android — Adreno/Mali devices lack BC7)
 
@@ -253,7 +285,7 @@ Examples:
 
 | script | what it does |
 |---|---|
-| `scripts/build_bc7_bundles_fp16.py` | Sweep the 9 mip-360 scenes × {SV HD, SB HD} → 18 BC7 bundles. FP16-roundtrips PLYs, ensures `scene.nat2`, packs, uploads. |
+| `scripts/build_bc7_bundles_fp16.py` | Sweep the 9 mip-360 scenes × {SV HD, SB HD} → 18 BC7 bundles. FP16-roundtrips PLYs, ensures `scene.nat2`, packs, uploads. **Note: currently emits raw BC7 nat2, NOT typeD.** For new production runs pass `--bc7-codebook` to `export_textures_bin.py` (or edit `ensure_bc7_nat2` in this script) to get the ~7× smaller typeD bundles that the mip_360 / himalaya_brain folders already ship. |
 | `scripts/build_astc_bundles_fp16.py` | Same for ASTC: 9 scenes × {SV HD, SV lite, SB HD} → 27 ASTC bundles. |
 
 Both are idempotent: skip stages whose outputs exist. To rerun
