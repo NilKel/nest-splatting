@@ -2,7 +2,14 @@
 
 The **TypeScript / WebGPU** 2DGS viewer at [`/home/nilkel/Projects/Halloumi-WS`](../../Halloumi-WS). Rewrite of the upstream WebSplatter codebase tailored to our `.bitymi` bundle format with SV/SB color paths, BC7 + ASTC atlas decode, and a 2DGS-only render pipeline.
 
-> **Deployment status**: NOT currently deployed to the `bitymi-demos` site — that still serves the older Rust/wasm `Halloumi-web-splat` viewer. See [§ Deploying to bitymi-demos](#deploying-to-bitymi-demos) at the end. Day-to-day editing happens here; switching the live demos to this viewer is a small swap.
+> **Deployment status** (verified 2026-07-20 by inspecting deployed
+> `viewer/assets/index-*.js`): this Halloumi-WS TypeScript viewer **IS the
+> live one at bitymi-demos**. The bundle contains `@compute`,
+> `preprocess_2dgs`, `render_2dgs`, `surfel_cull`, `WGSL` — no `.wasm`
+> file present. The earlier note that Rust `Halloumi-web-splat` was live
+> was stale; the swap has already been done. Day-to-day edits here ship
+> straight to the site after `npm run build` + copy to
+> `bitymi-demos/viewer/`.
 
 ---
 
@@ -210,7 +217,11 @@ Atlas toggle is separate (a button in the panel). When OFF, the renderer uses SH
 
 ## 12. Deploying to bitymi-demos
 
-The `bitymi-demos/viewer/` directory currently ships `web_splats.js` + `web_splats_bg.wasm` from the **Rust** `Halloumi-web-splat` build (compiled 2026-05-06). To switch to this TS viewer:
+The `bitymi-demos/viewer/` directory ships **this TS viewer's build output**
+(verified 2026-07-20: the deployed bundle contains `@compute`,
+`preprocess_2dgs`, `render_2dgs`, `surfel_cull`, `WGSL` and no `.wasm`).
+The previous Rust `Halloumi-web-splat` was replaced sometime before
+2026-07-20 (earlier docs still claimed Rust — stale).  Refresh workflow:
 
 1. `cd /home/nilkel/Projects/Halloumi-WS && npm run build` → produces `dist/`
 2. `rm -rf /home/nilkel/Projects/bitymi-demos/viewer && cp -r dist /home/nilkel/Projects/bitymi-demos/viewer`

@@ -8,6 +8,25 @@
 > nowhere left to push. This document is kept as a record of the
 > design, the math, and the decision.**
 
+> **⚠️ Deployment update (2026-07-23):** the L-stage residual VQ
+> deployment format (`atlas_format=5` / paired-RVQ) analysed in §9 was
+> shipped briefly then **retired** — its per-fragment SW codebook decode
+> is unusable on TBDR mobile GPUs (Adreno / Mali / Apple / PowerVR). The
+> RVQ code path was removed from the WebGPU viewer on 2026-07-23.
+> Production compressed-atlas format is now **typeD** (`atlas_format=7`,
+> `scripts/export_textures_bin.py --bc7-codebook`): single-stage K-means
+> (K=65536) over 4×4 blocks with each centroid **re-encoded as one BC7
+> block**, gathered back into a normal BC7 texture at load time → a
+> single HW BC7 tex fetch per fragment, bit-identical cost to raw BC7,
+> ~7× smaller download. The **K-means-over-4×4-blocks primitive from
+> this document is still used** — typeD is essentially §4.5's L=1 (single
+> stage) case with the codewords BC7-encoded. What was retired is the
+> L>1 residual cascade and the shader-decode path it required. See
+> [`DEPLOY_DEMO.md`](DEPLOY_DEMO.md),
+> [`BITYMI_BUNDLES.md`](BITYMI_BUNDLES.md), and
+> [`RVQ_PAIRED_PORT_PLAN.md`](RVQ_PAIRED_PORT_PLAN.md) (the retired
+> port plan) for the current pipeline and the swap rationale.
+
 Jointly-trained vector-quantization codebooks + per-Gauss atlas patches,
 applied *after* the regular bake. Sits between `bake_sh_res_atlas.py`
 (which produces the float32 atlas) and the bundle export pipeline.
@@ -266,11 +285,18 @@ inference:
 The decode is `L` codebook lookups per block (L=4 → 4 reads of a 48 B
 codeword), all cache-warm at K=256 (12 KB codebook fits in L1). No
 matrix multiplies, no FP16 work. Costs less than the BC7 decode it
-replaces.
+replaces **on desktop**.
 
-Compatible with the existing Halloumi-WS / Rust WGPU viewer with a
-new decode-side path; integration tracked in
-[`BITYMI_BUNDLES.md`](BITYMI_BUNDLES.md).
+**Retired for mobile deploy (2026-07-23):** the desktop-friendly
+per-fragment codebook decode above turned out to be the fragment
+bottleneck on TBDR mobile GPUs (Adreno / Mali / Apple / PowerVR); a
+brief production run of paired-RVQ (`atlas_format=5`) hit single-digit
+FPS on a Snapdragon phone. The shipping format is **typeD**
+(`atlas_format=7`) — L=1 K=65536 with each centroid BC7-encoded and
+the atlas gathered back to a normal BC7 texture at load time, so the
+fragment path is a single HW BC7 tex fetch. See
+[`BITYMI_BUNDLES.md`](BITYMI_BUNDLES.md) and
+[`DEPLOY_DEMO.md`](DEPLOY_DEMO.md).
 
 ---
 
@@ -304,8 +330,13 @@ new decode-side path; integration tracked in
       push.
 - [ ] Multi-scene confirmation of §9 (bicycle, garden, counter,
       kitchen, …) — sanity-check the room result isn't lucky.
-- [ ] Viewer integration of the VQ format (decode K=256 codebook +
-      uint8 index stream in the bake-render CUDA path).
+- [x] ~~Viewer integration of the VQ format (decode K=256 codebook +
+      uint8 index stream in the bake-render CUDA path).~~ **Superseded
+      2026-07-23** — paired-RVQ was integrated then retired after
+      on-device mobile testing (see deployment banner). What ships is
+      typeD (`atlas_format=7`, single-stage K=65536 with BC7-encoded
+      codewords, load-time gather to a normal BC7 texture); the
+      per-fragment shader-decode variant is dead.
 
 ---
 
@@ -355,9 +386,16 @@ the L=4 K=256 case — matching the bytes-on-the-wire that
 
 ### Implications
 
-1. **Ship post-hoc K-means RVQ as the production VQ format.** L=4,
-   K=256 gives ~4× atlas-storage compression at a render delta below
-   the BC7 noise floor.
+1. **~~Ship post-hoc K-means RVQ as the production VQ format.~~
+   Superseded** — see the deployment-update banner at the top of this
+   doc. L>1 residual VQ was tried in production (`atlas_format=5` /
+   paired-RVQ) but pulled 2026-07-23 because the per-fragment SW
+   codebook decode is unusable on TBDR mobile GPUs. The **single-stage**
+   K-means primitive still ships: production format is **typeD**
+   (`atlas_format=7`), essentially L=1 K=65536 with each centroid
+   re-encoded as one BC7 block so the fragment path is a single HW BC7
+   tex fetch (~7× smaller download than raw BC7 at bit-identical render
+   cost). See [`DEPLOY_DEMO.md`](DEPLOY_DEMO.md).
 2. **Phase 2 (end-to-end render-loss VQ-bake) is not worth pursuing
    for this codebase.** The baked path is already ≈ neural; there's
    no quality gap for end-to-end training to close.
@@ -366,14 +404,23 @@ the L=4 K=256 case — matching the bytes-on-the-wire that
    importance pruning, atlas-side resolution allocation, etc.), not
    on how we compress the residual.
 
-### Next steps
+### Next steps (historical — see deployment banner)
 
-- Confirm on other mip-360 scenes (bicycle, garden, counter, kitchen,
-  bonsai, stump): a single scene's render delta could be lucky.
-- Wire the VQ format into `diff_surfel_bake_render`: decode is L
-  codebook lookups per fragment vs current BC7 decode. Expected to be
-  comparable or faster (smaller codebook in L1, no BC7 endpoint
-  reconstruction).
-- Generate the deployment bundle pipeline analogue:
+The plan below was written **before** the mobile testing that retired
+RVQ (2026-07-23). Kept for record; do **not** treat as an actionable
+integration plan for shipping paired-RVQ.
+
+- ~~Wire the VQ format into `diff_surfel_bake_render`: decode is L
+  codebook lookups per fragment vs current BC7 decode.~~ The
+  fragment-level codebook decode is exactly what was unusable on
+  Adreno / Mali / Apple mobile GPUs. Load-time gather into a plain
+  BC7 texture (typeD) is the shape that shipped.
+- ~~Generate the deployment bundle pipeline analogue:
   `<bake_dir>/atlas_vq.bin` (concat of codebooks + indices, ~58 MB)
-  → bitymi packer.
+  → bitymi packer.~~ The typeD path ships the codebook + uint16 index
+  stream inside the existing NAT2 container instead, and reconstructs
+  the raw BC7 byte stream at load time.
+- Confirm on other mip-360 scenes (bicycle, garden, counter, kitchen,
+  bonsai, stump): a single scene's render delta could be lucky. (Still
+  valid as an atlas-quality question independent of which encoding
+  ships.)

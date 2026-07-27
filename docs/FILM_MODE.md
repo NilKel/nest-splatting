@@ -224,16 +224,29 @@ go negative too. `--film_act` selects activations applied **independently** to �
 - `beta_sigmoid`:  **γ raw**; `σ(β)` → β ∈ (0, 1).
 - `double_relu`:   ReLU on **both** → γ ≥ 0 and β ≥ 0.
 - `double_sigmoid`: σ on **both** → γ ∈ (0,1) and β ∈ (0,1).
+- `gamma_sigm_split` (mode 7): `gamma_sigmoid` with a **separate γ per hash level** —
+  `mlp_input[i] = σ(γ_l)·H[i] + β[i]`, `l = i/l_dim` (capped at 3); **β raw**. γ_0 is the
+  classic γ (col 0 of `_film_params`); γ_1..3 ride in the UNUSED β cols 21..23
+  (`_film_params` cols 22..24 — the fused-MLP input only uses β[0:hash_dim≤16]), so their
+  gradients flow through the existing `dL_dfilm_gamma`/`dL_dfilm_beta` outputs with zero
+  new plumbing. All four levels init at `--film_gamma_init`; `--lock_gamma` composes
+  (locks ALL levels to X, all γ grads frozen); `--film_freeze_beta_iter` spares cols
+  22:25 so the per-level γs keep training during the β freeze. The `[FILM iter=…]`
+  diagnostic prints per-level `σ(γ_l)` means + per-level grad norms (a level with grad
+  exactly 0 = the frozen-γ symptom). FD-gradcheck-verified via
+  `scripts/test_filmres_sigm_split.py` (γ_0..γ_3 + β vs central FD, collab == scalar).
 
-Implemented as the device-global `d_film_gamma_act` (modes 0–6; mirrors `d_lru_slope`): a
+Implemented as the device-global `d_film_gamma_act` (modes 0–7; mirrors `d_lru_slope`): a
 `set_film_gamma_act(mode)` setter patches fwd + bwd, called once at startup via the
 `_SHRES_SETTER_MOD` routing. Separate `film_gamma_apply`/`film_beta_apply` (+ `_grad`)
-device fns gate per param: **γ** relu for modes {1,5}, sigmoid for {3,6}; **β** relu for
-{2,5}, sigmoid for {4,6}. The backward chain-rules `dL/dγ` by `γ_act'(γ)` (scaling the
-hash gradient by `γ_act(γ)`) and `dL/dβ` by `β_act'(β)`. Any mode reduces to `identity`
-on the affected param wherever that param is already in the activation's identity region
-(all γ>0 for γ-relu, etc.). **3D_SH_filmres only** (the cat-family `--method film` still
-uses raw γ/β — not yet wired there).
+device fns gate per param: **γ** relu for modes {1,5}, sigmoid for {3,6,7}; **β** relu for
+{2,5}, sigmoid for {4,6}. Mode 7 additionally selects the per-level raw γ at every input
+assembly / grad site (`film_gamma_raw_lvl`; the extra γs are staged in shared FP16
+`collected_film_beta` slots 16..18, stage widened 16→19). The backward chain-rules
+`dL/dγ` by `γ_act'(γ)` (scaling the hash gradient by `γ_act(γ)`) and `dL/dβ` by
+`β_act'(β)`. Any mode reduces to `identity` on the affected param wherever that param is
+already in the activation's identity region (all γ>0 for γ-relu, etc.). **3D_SH_filmres
+only** (the cat-family `--method film` still uses raw γ/β — not yet wired there).
 
 ## Usage
 
@@ -243,6 +256,7 @@ uses raw γ/β — not yet wired there).
 ... --method 3D_SH_filmres --film_act gamma_relu            # γ >= 0, β raw
 ... --method 3D_SH_filmres --film_act beta_relu             # γ raw, β >= 0
 ... --method 3D_SH_filmres --film_act gamma_sigmoid         # γ in (0,1), β raw
+... --method 3D_SH_filmres --film_act gamma_sigm_split      # σ(γ_l) PER HASH LEVEL (4 γs), β raw
 ... --method 3D_SH_filmres --film_act double_relu           # γ >= 0 AND β >= 0
 ... --method 3D_SH_filmres --film_freeze_beta_iter 2000     # hold β at init for first 2k iters (γ trains)
 ... --method 3D_SH_filmres --lock_gamma 1.0                 # pin γ_eff=1 (no scale), pure additive latent H + β

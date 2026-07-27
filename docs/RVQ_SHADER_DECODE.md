@@ -1,5 +1,29 @@
 # RVQ shader-side atlas decode — feasibility benchmark
 
+> # ⚠️ SUPERSEDED — historical reference only
+>
+> **The shader-decode RVQ path this document analysed was removed from the
+> WebGPU viewer on 2026-07-23.** The CUDA benchmark below was
+> desktop-only and did not model TBDR mobile GPUs (Adreno / Mali / Apple /
+> PowerVR); on-device testing showed the per-fragment SW codebook decode
+> is the fragment bottleneck on mobile — a `garden_sh_res_rvq.bitymi`
+> ship hit single-digit FPS on a Snapdragon phone while the same bake as
+> typeD (BC7-codebook, `atlas_format=7`) ran at normal FPS (confirmed
+> 2026-07-21).
+>
+> **Production compressed-atlas format is now typeD**: single-stage
+> K-means over 4×4 blocks (K=65536), each centroid re-encoded as one BC7
+> block; the loader gathers the codebook + index stream back into a
+> normal BC7 texture at load time, giving a single HW BC7 fetch per
+> fragment at render — bit-identical cost to raw BC7, ~7× smaller
+> download.
+>
+> This document is kept because the codebook / cache / bandwidth
+> analysis is useful reference. Do **NOT** treat any of it as a plan for
+> shipping RVQ. See [`DEPLOY_DEMO.md`](DEPLOY_DEMO.md) and
+> [`BITYMI_BUNDLES.md`](BITYMI_BUNDLES.md) for the live pipeline
+> (`--bc7-codebook` / typeD).
+
 The "RVQply" deployment format (see [`VQ_BAKE.md`](VQ_BAKE.md) §9 +
 [`ATLAS_DECOMPOSITION_AND_CLUSTERING.md`](ATLAS_DECOMPOSITION_AND_CLUSTERING.md)
 §4.5) ships a baked scene as `8-bit PLY + RVQ codebook + indices`,

@@ -1,5 +1,28 @@
 # RVQ-paired deployment — CUDA results + WGSL port plan
 
+> # ⚠️ SUPERSEDED — historical reference only
+>
+> **RVQ was replaced by typeD (BC7-codebook, `atlas_format=7`) in production
+> because RVQ's per-fragment SW decode was unusably slow on TBDR mobile GPUs**
+> (Adreno / Mali / Apple / PowerVR). Confirmed 2026-07-21 by shipping
+> `garden_sh_res_rvq.bitymi` and hitting single-digit FPS on a Snapdragon
+> phone while the same bake as typeD ran at normal FPS.
+>
+> **The RVQ code path was removed from the WebGPU viewer on 2026-07-23**
+> (`render_2dgs.wgsl`, `Nat2Parser.ts`, `gaussian-renderer.ts` — no
+> `atlas_format == 5` branch survives). The producer-side flag
+> `scripts/export_textures_bin.py --rvq-paired` still exists but nothing
+> consumes its output; do **NOT** ship bundles produced with it.
+>
+> This document is kept because the CUDA benchmark numbers, the on-disk
+> layout, and the WGSL decode sketch may be useful reference for any
+> future compressed-atlas format that wants a shader-decode path. But the
+> plan itself is dead — do **NOT** treat any step below as an actionable
+> deployment recipe.
+>
+> **Current production path** — see [`DEPLOY_DEMO.md`](DEPLOY_DEMO.md) and
+> [`BITYMI_BUNDLES.md`](BITYMI_BUNDLES.md) (`--bc7-codebook` / typeD).
+
 ## Summary of CUDA submodule experiments
 
 Four submodules, each isolating one variant of the RVQ decode path. Bench

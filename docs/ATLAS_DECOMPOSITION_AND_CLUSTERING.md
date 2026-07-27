@@ -360,6 +360,22 @@ whole-patch path (§3 best operating point).
 
 ### 4.5 Residual VQ (L-stage nested K-means)
 
+> **Retrospective (2026-07-23):** the L-stage residual VQ format below
+> was briefly shipped to production as `atlas_format=5` (paired-RVQ)
+> but pulled after on-device testing showed the per-fragment SW codebook
+> decode is unusable on TBDR mobile GPUs (Adreno / Mali / Apple /
+> PowerVR). Production compressed-atlas format is now **typeD**
+> (`atlas_format=7`): single-stage K-means (K=65536) over 4×4 blocks
+> with each centroid re-encoded as one BC7 block, gathered back to a
+> normal BC7 texture at load time. See
+> [`RVQ_PAIRED_PORT_PLAN.md`](RVQ_PAIRED_PORT_PLAN.md) for the retired
+> shader-decode design and
+> [`reference_atlas_format_typeD_default.md`](../../.claude/memory/reference_atlas_format_typeD_default.md)
+> for the swap rationale. The clustering analysis in this section is
+> retained as research reference — the numbers still describe how the
+> different VQ variants compare on *storage* fidelity, independent of
+> which one we deploy.
+
 Same recurrence as Compact3DGS / RVQ-Gaussians, applied post-hoc to
 the baked atlas blocks (no re-bake):
 
