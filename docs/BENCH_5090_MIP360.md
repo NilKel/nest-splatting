@@ -42,6 +42,22 @@ lane).
 
 ## Full-picture comparison — neural → prod → lean → CONIC → FastGS
 
+> ⚠️ **FastGS column corrected 2026-08-03.** The original figures were measured
+> at FastGS's *training* resolution — its released `train_base.sh` loads `-i images`
+> with `-r -1`, which caps the long edge at 1600 px — while this table's resolution
+> column reports **our** mip-360 evaluation resolution (`images_4` outdoor /
+> `images_2` indoor). The two methods were therefore not timed on the same images;
+> outdoor scenes differed by ~60 % in pixel count. All 9 scenes were re-measured on
+> an idle GPU, rendering the same FastGS checkpoints at the matched evaluation
+> resolution with FastGS's own `mult=0.5` default
+> (`speed_comparison/bench_fastgs_correct_res.sh`). Mean FastGS moves
+> **1183 → 1215 FPS**, so our advantage is **1.20×**, not 1.23×. Garden is the
+> control: it was already trained at `images_4`, and its number moved only
+> 1138 → 1145 (+0.6 %). Retraining treehill at `images_4` changed its primitive
+> count by −8 % and throughput by +2.2 %, so the training-resolution mismatch does
+> not materially affect the comparison.
+
+
 All measurements on the same RTX 5090, same test cameras, same
 3D_SH_res bakes. Puts the CONIC baked renderer in context: the "before"
 is the neural MLP-at-render path (what baking replaces), and FastGS is
@@ -49,24 +65,24 @@ the per-Gauss efficiency reference.
 
 | scene | N Gauss | resolution | neural | prod baked | lean pre-CONIC | **lean CONIC** | FastGS |
 |---|---:|:---:|---:|---:|---:|---:|---:|
-| bicycle  | 161k | 1237×822  | 111 | 711  | 1014 | **1385** | 1172 |
-| bonsai   |  92k | 1559×1039 | 117 | 660  |  924 | **1261** | 1236 |
-| counter  |  68k | 1558×1038 | 108 | 775  | 1192 | **1442** | 1165 |
-| flowers  | 185k | 1256×828  | 100 | 648  |  895 | **1291** | 1147 |
-| garden   | 149k | 1297×840  | 117 | 1055 | 1624 | **1943** | 1138 |
-| kitchen  | 120k | 1558×1039 |  93 | 831  | 1307 | **1495** | 1046 |
-| room     |  63k | 1557×1038 | 133 | 1049 | 1496 | **1792** | 1294 |
-| stump    |  96k | 1245×825  | 132 | 741  | 1063 | **1394** | 1225 |
-| treehill | 175k | 1267×832  |  98 | 589  |  799 | **1105** | 1221 |
-| **mean** | — | — | **112** | **784** | **1146** | **1456** | **1183** |
+| bicycle  | 161k | 1237×822  | 111 | 711  | 1014 | **1385** | 1204 |
+| bonsai   |  92k | 1559×1039 | 117 | 660  |  924 | **1261** | 1241 |
+| counter  |  68k | 1558×1038 | 108 | 775  | 1192 | **1442** | 1207 |
+| flowers  | 185k | 1256×828  | 100 | 648  |  895 | **1291** | 1173 |
+| garden   | 149k | 1297×840  | 117 | 1055 | 1624 | **1943** | 1145 |
+| kitchen  | 120k | 1558×1039 |  93 | 831  | 1307 | **1495** | 1059 |
+| room     |  63k | 1557×1038 | 133 | 1049 | 1496 | **1792** | 1343 |
+| stump    |  96k | 1245×825  | 132 | 741  | 1063 | **1394** | 1276 |
+| treehill | 175k | 1267×832  |  98 | 589  |  799 | **1105** | 1286 |
+| **mean** | — | — | **112** | **784** | **1146** | **1456** | **1215** |
 
 Reference points:
 - **neural → CONIC lean = 13× mean speedup** on the full mip360 set
   (112 → 1456 FPS). Baking is a 7× step by itself; fp16 pack + template
   dispatch adds another 46%; CONIC on top adds another 27%; all told
   1.87× vs the raw baked path.
-- **CONIC lean vs FastGS on the same 5090: 1456 vs 1183 mean = 1.23× faster.**
-  On garden specifically: **1943 vs 1138 = 1.71×** faster. This is despite
+- **CONIC lean vs FastGS on the same 5090: 1456 vs 1215 mean = 1.20× faster.**
+  On garden specifically: **1943 vs 1145 = 1.70×** faster. This is despite
   FastGS being a mature, heavily-optimized paper renderer designed for
   splat throughput.
 - **N Gauss**: nest-splatting bakes are ~4× *fewer* Gauss than FastGS
