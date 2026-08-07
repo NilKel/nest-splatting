@@ -125,3 +125,30 @@ demo_renders
 # specific catch; the second line picks up any dotfile rsync temp.
 *.zip.*
 .??????*.zip.*
+
+# Claude Code agent worktrees. These are *embedded git repositories* -- adding
+# one makes `git add` warn and would commit a useless gitlink, not the contents.
+.claude/worktrees/
+
+# speed_comparison benchmark ARTIFACTS (regenerable: proxy meshes, per-scene
+# render dumps, baked outputs). The scripts/configs/JSON summaries at the top
+# level ARE tracked -- only the heavy output trees are ignored. ~5.7 GB.
+speed_comparison/proxy_meshes/
+speed_comparison/proxy_cull_quality/
+speed_comparison/mip360_*/
+speed_comparison/fastgs/
+speed_comparison/fastgs_overdraw_correct_res/
+speed_comparison/nest_splatting_neural/
+speed_comparison/intersection_comparison/
+speed_comparison/drift_debug/
+speed_comparison/renders_*/
+
+# One-off debug dumps
+backtrace.txt
+
+# Vendored glm inside submodule forks. These are *embedded git clones*; the repo
+# has never tracked them (see diff_surfel_bake_render, which references
+# third_party/glm in setup.py but does not carry it). Committing them would add
+# a bare gitlink with no .gitmodules -- a clone gets an empty dir it cannot fill.
+# Re-fetch per fork when building: git clone https://github.com/g-truc/glm
+submodules/*/third_party/glm/

@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- ============================================================
+     EDIT THIS: page title shown in the browser tab / search results
+     ============================================================ -->
+<title>Bake It Till You Make It: Ultrafast Spatial Texture-Surfel Splatting</title>
+<meta name="description" content="Ultrafast novel view synthesis by baking a view-independent texture into a compact atlas that surfels probe, rendering with pure hardware texture lookups.">
+
+<!-- Open Graph / social preview. EDIT the og:image URL and og:url. -->
+<meta property="og:title" content="Bake It Till You Make It">
+<meta property="og:description" content="Ultrafast texture-surfel splatting: 1500+ FPS, ~64 MB textures, real-time on a phone.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://nilkel.github.io/bitymi/">
+<meta property="og:image" content="https://nilkel.github.io/bitymi/static/images/teaser.png">
+
+<style>
+  :root{
+    --bg:#ffffff; --fg:#1a1a1a; --muted:#5a6472; --line:#e6e8ec;
+    --accent:#c0392b; --accent-soft:#fdecea; --card:#f7f8fa; --link:#b83227;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0e1116; --fg:#e6e8ec; --muted:#9aa4b2; --line:#232833;
+      --accent:#e8654f; --accent-soft:#2a1512; --card:#161b22; --link:#f0836f;
+    }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.65; font-size:18px; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:900px; margin:0 auto; padding:0 22px}
+  a{color:var(--link); text-decoration:none}
+  a:hover{text-decoration:underline}
+  h1,h2,h3{line-height:1.2; font-weight:700}
+  h2{font-size:1.6rem; margin:2.6rem 0 1rem; text-align:center}
+  h3{font-size:1.15rem; margin:1.6rem 0 .5rem}
+
+  /* ---------- Hero ---------- */
+  header{padding:3.2rem 0 1.6rem; text-align:center; border-bottom:1px solid var(--line)}
+  .title{font-size:2.5rem; margin:0 0 .2rem}
+  .subtitle{font-size:1.35rem; color:var(--muted); font-weight:600; margin:.2rem 0 1.4rem}
+  .venue{display:inline-block; margin-bottom:1.4rem; font-size:.95rem; color:var(--accent);
+         background:var(--accent-soft); padding:.25rem .7rem; border-radius:999px; font-weight:600}
+  .authors{font-size:1.08rem; margin:.4rem 0}
+  .authors a{color:var(--fg); font-weight:600}
+  .authors sup{color:var(--accent); font-weight:700}
+  .affil{color:var(--muted); font-size:.98rem; margin:.5rem 0 0}
+  .note{color:var(--muted); font-size:.9rem; margin-top:.3rem}
+
+  /* ---------- Link buttons ---------- */
+  .links{display:flex; flex-wrap:wrap; gap:.6rem; justify-content:center; margin:1.6rem 0 .4rem}
+  .btn{display:inline-flex; align-items:center; gap:.45rem; background:var(--fg); color:var(--bg);
+       padding:.55rem 1.1rem; border-radius:999px; font-weight:600; font-size:.98rem; border:1px solid var(--fg)}
+  .btn:hover{opacity:.85; text-decoration:none}
+  .btn.ghost{background:transparent; color:var(--fg); border:1px solid var(--line)}
+  .btn .ico{font-size:1.05rem; line-height:1}
+
+  /* ---------- Figures ---------- */
+  figure{margin:1.4rem 0}
+  figure img,video{width:100%; height:auto; border-radius:10px; border:1px solid var(--line); display:block}
+  figcaption{color:var(--muted); font-size:.95rem; margin-top:.6rem; text-align:center}
+  .placeholder{display:flex; align-items:center; justify-content:center; text-align:center;
+    background:var(--card); border:2px dashed var(--line); border-radius:10px;
+    min-height:280px; color:var(--muted); font-size:.95rem; padding:1.4rem}
+
+  /* ---------- Stat row ---------- */
+  .stats{display:grid; grid-template-columns:repeat(4,1fr); gap:.8rem; margin:1.8rem 0}
+  .stat{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:1rem .6rem; text-align:center}
+  .stat .num{font-size:1.7rem; font-weight:800; color:var(--accent); line-height:1.1}
+  .stat .lbl{font-size:.85rem; color:var(--muted); margin-top:.25rem}
+  @media (max-width:640px){ .stats{grid-template-columns:repeat(2,1fr)} .title{font-size:2rem} }
+
+  /* ---------- Abstract & body ---------- */
+  .abstract{font-size:1.05rem}
+  .highlights{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:1rem 1.3rem}
+  .highlights li{margin:.5rem 0}
+
+  /* ---------- BibTeX ---------- */
+  pre{background:var(--card); border:1px solid var(--line); border-radius:10px; padding:1rem 1.1rem;
+      overflow-x:auto; font-size:.86rem; line-height:1.5}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+  footer{border-top:1px solid var(--line); margin-top:3rem; padding:1.6rem 0 3rem;
+         color:var(--muted); font-size:.9rem; text-align:center}
+</style>
+</head>
+<body>
+
+<!-- =================== HERO =================== -->
+<header>
+  <div class="wrap">
+    <!-- EDIT title/subtitle to match the final paper title -->
+    <h1 class="title">Bake It Till You Make It</h1>
+    <div class="subtitle">Ultrafast Spatial Texture-Surfel Splatting</div>
+
+    <!-- EDIT venue when accepted (e.g. "ICLR 2027"); keep neutral for preprint -->
+    <div class="venue">Preprint &middot; 2026</div>
+
+    <div class="authors">
+      <!-- EDIT author homepage links -->
+      <a href="#">Neel Kelkar</a><sup>1,2</sup>,
+      <a href="#">Simon Niedermayr</a><sup>1</sup>,
+      <a href="#">Kaloian Petkov</a><sup>2</sup>,
+      <a href="#">Klaus Engel</a><sup>2</sup>,
+      <a href="#">R&uuml;diger Westermann</a><sup>1</sup>
+    </div>
+    <div class="affil"><sup>1</sup>Technical University of Munich &nbsp;&middot;&nbsp; <sup>2</sup>Siemens Healthineers</div>
+
+    <!-- =================== LINK BUTTONS ===================
+         EDIT every href. Remove buttons you do not have yet. -->
+    <div class="links">
+      <a class="btn" href="#"><span class="ico">&#128196;</span> Paper</a>
+      <a class="btn ghost" href="#"><span class="ico">&#128462;</span> arXiv</a>
+      <a class="btn ghost" href="#"><span class="ico">&#128187;</span> Code</a>
+      <a class="btn ghost" href="#demo"><span class="ico">&#127909;</span> Video</a>
+      <a class="btn ghost" href="#demo"><span class="ico">&#127918;</span> Interactive Demo</a>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- =================== TEASER =================== -->
+  <figure>
+    <img src="static/images/teaser.png" alt="Teaser: textured surfel novel view synthesis">
+    <figcaption>
+      Our textured surfel representation decouples high-frequency texture from view-dependent
+      geometry and appearance, enabling low primitive counts and real-time rendering across
+      desktop and mobile hardware.
+    </figcaption>
+  </figure>
+
+  <!-- =================== STATS =================== EDIT numbers -->
+  <div class="stats">
+    <div class="stat"><div class="num">1500+</div><div class="lbl">FPS on RTX 5090<br>(Mip-NeRF 360)</div></div>
+    <div class="stat"><div class="num">~64 MB</div><div class="lbl">BC7 texture<br>(8K, shared)</div></div>
+    <div class="stat"><div class="num">Real-time</div><div class="lbl">on M3 MacBook<br>&amp; Galaxy S24</div></div>
+    <div class="stat"><div class="num">No MLP</div><div class="lbl">pure texture<br>lookups at inference</div></div>
+  </div>
+
+  <!-- =================== ABSTRACT =================== -->
+  <h2>Abstract</h2>
+  <!-- EDIT to match the final paper abstract -->
+  <p class="abstract">
+    Recent extensions of 3D Gaussian Splatting capture fine color detail using hash-grid based
+    appearance parameterization, but pay a high per-fragment cost from neural field queries during
+    rendering. We introduce a decoupled radiance representation that models low-frequency geometry
+    and view-dependent appearance with 2D surfels, while representing high-frequency texture as a
+    view-independent residual. Because the residual is view independent, we bake it into a compact,
+    fixed-size texture that each surfel probes, so inference reduces to pure hardware texture
+    sampling with no neural queries. Combined with sparsity-enhancing optimization, our method
+    renders significantly faster and sparser than prior work while preserving perceptual fidelity,
+    reaching real-time 4K rates on consumer hardware and real-time rendering on mobile devices.
+  </p>
+
+  <!-- =================== HIGHLIGHTS =================== -->
+  <h2>Key Ideas</h2>
+  <ul class="highlights">
+    <li><strong>View-independent texture residual.</strong> Restricting the residual to be view
+      independent is what makes it bakeable, removing per-fragment neural queries at inference.</li>
+    <li><strong>Compact shared texture via surfel probing.</strong> Surfels learn probes into a
+      single fixed-size texture image, giving an order-of-magnitude smaller footprint than
+      per-surfel atlases at better perceptual quality.</li>
+    <li><strong>Hardware-native rendering.</strong> Inference is nothing but GPU texture lookups,
+      which run fast on the texture-sampling hardware every phone already has.</li>
+    <li><strong>Sparse geometry.</strong> Decoupling appearance from geometry lets the surfels stay
+      sparse instead of splitting to fit texture, lowering primitive count and overdraw.</li>
+  </ul>
+
+  <!-- =================== METHOD =================== -->
+  <h2>Method</h2>
+  <figure>
+    <!-- REPLACE with: <img src="static/images/pipeline.png" alt="Pipeline"> -->
+    <div class="placeholder">Pipeline / method figure &rarr; <code>static/images/pipeline.png</code></div>
+    <figcaption>
+      During training, view-dependent color is modeled per surfel and the view-independent texture
+      residual is learned into a shared texture. For inference, the texture is baked and compressed,
+      and rendering uses only hardware texture sampling.
+    </figcaption>
+  </figure>
+
+  <!-- =================== DEMO / VIDEO =================== -->
+  <h2 id="demo">Video &amp; Interactive Demo</h2>
+
+  <figure>
+    <!-- OPTION A: local video file -->
+    <!-- <video controls muted playsinline poster="static/images/video_poster.png">
+           <source src="static/videos/overview.mp4" type="video/mp4">
+         </video> -->
+    <!-- OPTION B: YouTube embed
+         <div style="position:relative;padding-top:56.25%;border-radius:10px;overflow:hidden;border:1px solid var(--line)">
+           <iframe style="position:absolute;inset:0;width:100%;height:100%;border:0"
+             src="https://www.youtube.com/embed/VIDEO_ID" allowfullscreen></iframe>
+         </div> -->
+    <div class="placeholder">Overview / comparison video &rarr; drop an <code>&lt;video&gt;</code> or YouTube embed here</div>
+    <figcaption>Narrated overview with side-by-side temporal comparisons against baselines.</figcaption>
+  </figure>
+
+  <figure>
+    <!-- Interactive WebGPU viewer: host the viewer and embed it.
+         <div style="position:relative;padding-top:62%;border-radius:10px;overflow:hidden;border:1px solid var(--line)">
+           <iframe style="position:absolute;inset:0;width:100%;height:100%;border:0"
+             src="viewer/index.html" title="Interactive viewer" allow="fullscreen"></iframe>
+         </div> -->
+    <div class="placeholder">Interactive WebGPU viewer &rarr; embed your live demo <code>&lt;iframe&gt;</code> here</div>
+    <figcaption>Explore a baked scene in your browser. Runs on WebGPU with the same texture-only renderer.</figcaption>
+  </figure>
+
+  <!-- =================== RESULTS =================== -->
+  <h2>Results</h2>
+  <figure>
+    <img src="static/images/comparison.png" alt="Qualitative comparison with baselines">
+    <figcaption>
+      Compared with fast splatting baselines at matched hardware, our method preserves
+      high-frequency texture that blur-prone baselines miss, at higher framerates.
+    </figcaption>
+  </figure>
+
+  <!-- Optional results table. EDIT numbers once the same-hardware benchmark is final. -->
+  <figure>
+    <img src="static/images/labeled.png" alt="Per-scene qualitative results with primitive counts">
+    <figcaption>Per-scene results with primitive counts. Replace with your final labeled figure.</figcaption>
+  </figure>
+
+  <h3>Mip-NeRF 360 (RTX 5090)</h3>
+  <figure>
+    <div class="placeholder">Drop your final results table here (as an image or an HTML &lt;table&gt;).</div>
+  </figure>
+
+  <!-- =================== BIBTEX =================== -->
+  <h2>BibTeX</h2>
+  <pre><code>@article{kelkar2026bake,
+  title   = {Bake It Till You Make It: Ultrafast Spatial Texture-Surfel Splatting},
+  author  = {Kelkar, Neel and Niedermayr, Simon and Petkov, Kaloian and
+             Engel, Klaus and Westermann, R{\"u}diger},
+  journal = {arXiv preprint arXiv:XXXX.XXXXX},
+  year    = {2026}
+}</code></pre>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <!-- EDIT acknowledgments / template credit as you like -->
+    <p>Website template is free to reuse. Built as a single self-contained HTML file.</p>
+    <p>&copy; 2026 The Authors.</p>
+  </div>
+</footer>
+
+</body>
+</html>

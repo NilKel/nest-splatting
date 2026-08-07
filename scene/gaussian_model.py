@@ -218,6 +218,14 @@ class GaussianModel:
         # Relocation mode for adaptive weights: 'clone' (copy from source) or 'reset' (initialize to 0)
         self._relocation_mode = "clone"
 
+        # WSR (sort-free weighted-sum) per-surfel occlusion logit, [N, 1].
+        # occ = sigmoid(_wsr_occ) approximates the surfel's mean transmittance;
+        # blend weight in the WSR composite is w = alpha * occ (docs/WSR_DISTILL.md).
+        # Empty unless --wsr. Gradients arrive OUTSIDE autograd (device-global
+        # accumulator in diff_surfel_3D_sh_res_probe_wsr); train.py chains the
+        # sigmoid derivative and assigns .grad manually before optimizer.step().
+        self._wsr_occ = torch.empty(0)
+
         # Frozen beta shape value (raw _shape value) - if not None, shape is frozen and this value is used for new Gaussians
         self._frozen_beta_raw = None
 
@@ -541,6 +549,13 @@ class GaussianModel:
             return torch.sigmoid(self._shape) * 5.0
 
     @property
+    def get_wsr_occ(self):
+        """Activated WSR occlusion, [N] in (0,1). Empty tensor when --wsr is off."""
+        if self._wsr_occ.numel() == 0:
+            return self._wsr_occ
+        return torch.sigmoid(self._wsr_occ).view(-1)
+
+    @property
     def get_flex_beta(self):
         """Returns per-Gaussian beta for flex kernel.
         Uses softplus to ensure non-negative values [0, inf).
@@ -658,6 +673,9 @@ class GaussianModel:
             film_gamma_init = g_init * torch.ones((N, 1), device="cuda").float()
             film_beta_init = b_init * torch.ones((N, 24), device="cuda").float()
             film_params = torch.cat([film_gamma_init, film_beta_init], dim=1)  # [N, 25]
+            # --film_act gamma_sigm_split: cols 22:25 = per-level gammas 1..3 — init like col 0.
+            if getattr(args, 'film_act', 'identity') == 'gamma_sigm_split':
+                film_params[:, 22:25] = g_init
             self._film_params = nn.Parameter(film_params.requires_grad_(True))
         else:
             self._film_params = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
@@ -970,9 +988,13 @@ class GaussianModel:
         if self._gaussian_feat_dim > 0:
             l.append({'params': [self._gaussian_features], 'lr': training_args.feature_lr, "name": "gaussian_features"})
 
-        # --method film: packed FiLM params (gamma + beta) share feature_lr.
+        # --method film / 3D_SH_filmres: packed FiLM params (gamma + beta). LR defaults to
+        # feature_lr (0.0025); `--film_latent_lr` overrides it (-1 = keep feature_lr).
         if self._film_params.numel() > 0:
-            l.append({'params': [self._film_params], 'lr': training_args.feature_lr, "name": "film_params"})
+            _film_lr = float(getattr(training_args, 'film_latent_lr', -1.0))
+            if _film_lr < 0:
+                _film_lr = training_args.feature_lr
+            l.append({'params': [self._film_params], 'lr': _film_lr, "name": "film_params"})
 
         # --feature beta: spherical-beta parameter LR groups.
         # Matches beta-splatting reference: only sb_params (per-primitive
@@ -1057,6 +1079,14 @@ class GaussianModel:
             print(f"[DEBUG] training_setup: _shape.requires_grad={self._shape.requires_grad}")
             if self._shape.requires_grad:
                 l.append({'params': [self._shape], 'lr': 0.001, "name": "shape"})
+
+        # --wsr: per-surfel occlusion logit. LR stored on the model by train.py
+        # (wsr_occ_lr) before training_setup; grads assigned manually post-backward.
+        if hasattr(self, '_wsr_occ') and self._wsr_occ.numel() > 0 \
+                and self._wsr_occ.requires_grad:
+            l.append({'params': [self._wsr_occ],
+                      'lr': float(getattr(self, 'wsr_occ_lr', 0.01)),
+                      "name": "wsr_occ"})
 
         # `--method mixed`: 3rd ellipsoid axis (untextured 3D-ellipsoid path).
         # Same LR as the 2D scaling so it can "unflatten" at a comparable rate.
@@ -1148,6 +1178,9 @@ class GaussianModel:
         # Add beta kernel shape parameter
         if hasattr(self, '_shape') and self._shape.numel() > 0:
             l.append('shape')
+        # --wsr: per-surfel occlusion logit
+        if hasattr(self, '_wsr_occ') and self._wsr_occ.numel() > 0:
+            l.append('wsr_occ')
         # --- Directional appearance banks (SB / SG / SV) ---
         # Each gets flattened [N, D] columns with a distinct prefix; the lobe
         # count K is implicit in column count / per-lobe dim.
@@ -1238,6 +1271,11 @@ class GaussianModel:
         if hasattr(self, '_shape') and self._shape.numel() > 0:
             shapes = self._shape.detach().cpu().numpy()
             attr_list.append(shapes)
+
+        # --wsr: per-surfel occlusion logit (column order matches
+        # construct_list_of_attributes: right after 'shape')
+        if hasattr(self, '_wsr_occ') and self._wsr_occ.numel() > 0:
+            attr_list.append(self._wsr_occ.detach().cpu().numpy().reshape(-1, 1))
 
         # --- Directional appearance banks (SB / SG / SV) ---
         # Flatten each [N, K, D] bank to [N, K*D] so every column is a scalar,
@@ -1408,6 +1446,9 @@ class GaussianModel:
             g_init = getattr(args, 'film_gamma_init', 1.0)
             b_init = getattr(args, 'film_beta_init', 0.0)
             film_arr = torch.cat([g_init * torch.ones((N, 1)), b_init * torch.ones((N, 24))], dim=1).float().cuda()
+            # --film_act gamma_sigm_split: cols 22:25 = per-level gammas 1..3 — init like col 0.
+            if getattr(args, 'film_act', 'identity') == 'gamma_sigm_split':
+                film_arr[:, 22:25] = g_init
             self._film_params = nn.Parameter(film_arr.requires_grad_(True))
             print("Warning: No FiLM params in PLY, initialized gamma=1/beta=0 for film mode")
         else:
@@ -1499,6 +1540,22 @@ class GaussianModel:
         else:
             self._shape = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
             self.kernel_type = "gaussian"
+
+        # --wsr: per-surfel occlusion logit. Load from PLY when present; create
+        # at logit(0.99) (≈ fully visible) when --wsr is requested on a PLY
+        # without the column — the distill-init pass overwrites it anyway.
+        if "wsr_occ" in ply_props:
+            _occ = np.asarray(plydata.elements[0]["wsr_occ"])[..., np.newaxis]
+            self._wsr_occ = nn.Parameter(
+                torch.tensor(_occ, dtype=torch.float, device="cuda").requires_grad_(True))
+            print(f"Loaded wsr_occ ({self._wsr_occ.shape[0]} surfels)")
+        elif args is not None and getattr(args, 'wsr', False):
+            self._wsr_occ = nn.Parameter(
+                torch.full((xyz.shape[0], 1), 4.595, dtype=torch.float,
+                           device="cuda").requires_grad_(True))
+            print("Initialized wsr_occ at logit(0.99) (no column in PLY)")
+        else:
+            self._wsr_occ = nn.Parameter(torch.empty(0, device="cuda").requires_grad_(False))
 
         # --- Directional appearance banks (SB / SG / SV) + flex_beta ---
         # Each is detected by its column-name prefix; lobe count K is inferred
@@ -1690,6 +1747,13 @@ class GaussianModel:
         elif hasattr(self, '_shape') and self._shape.numel() > 0:
             # Handle frozen shape parameter (not in optimizer) - prune manually
             self._shape = nn.Parameter(self._shape.data[valid_points_mask].clone(), requires_grad=False)
+        if "wsr_occ" in optimizable_tensors:
+            self._wsr_occ = optimizable_tensors["wsr_occ"]
+        elif hasattr(self, '_wsr_occ') and self._wsr_occ.numel() > 0 \
+                and self._wsr_occ.shape[0] == valid_points_mask.shape[0]:
+            # wsr_occ exists but isn't (yet) an optimizer leaf → prune the raw tensor.
+            self._wsr_occ = nn.Parameter(self._wsr_occ.data[valid_points_mask].clone(),
+                                         requires_grad=self._wsr_occ.requires_grad)
         if "scaling_z" in optimizable_tensors:
             self._scaling_z = optimizable_tensors["scaling_z"]
         if "tex_atlas" in optimizable_tensors:

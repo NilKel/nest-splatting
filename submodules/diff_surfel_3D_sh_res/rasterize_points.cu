@@ -883,6 +883,24 @@ void SetActivationBiasCUDA(float sh_bias, float res_bias) {
     BACKWARD::setResBias(res_bias);
 }
 
+void SetOccluderDepthCUDA(const torch::Tensor& depth) {
+    TORCH_CHECK(depth.is_cuda(), "occluder depth must be CUDA");
+    TORCH_CHECK(depth.scalar_type() == torch::kFloat32,
+                "occluder depth must be fp32");
+    TORCH_CHECK(depth.dim() == 2, "occluder depth must be [H, W]");
+    TORCH_CHECK(depth.is_contiguous(), "occluder depth must be contiguous");
+    const int H = depth.size(0);
+    const int W = depth.size(1);
+    const float* ptr = depth.data_ptr<float>();
+    FORWARD::setOccluderDepth(ptr, W, H);
+    BACKWARD::setOccluderDepth(ptr, W, H);
+}
+
+void ClearOccluderDepthCUDA() {
+    FORWARD::clearOccluderDepth();
+    BACKWARD::clearOccluderDepth();
+}
+
 void SetResidualModeCUDA(int mode) {
     FORWARD::setResidualMode(mode);
     BACKWARD::setResidualMode(mode);

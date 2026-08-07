@@ -66,24 +66,40 @@ __device__ float d_sh_bias = 0.5f;
 //   0 = identity (default, both raw)        4 = beta_sigmoid   (raw gamma, sigmoid beta)
 //   1 = gamma_relu    (relu g, raw b)        5 = double_relu    (relu both)
 //   2 = beta_relu     (raw g, relu b)        6 = double_sigmoid (sigmoid both)
-//   3 = gamma_sigmoid (sigmoid g, raw b)
+//   3 = gamma_sigmoid (sigmoid g, raw b)     7 = gamma_sigm_split (PER-LEVEL sigmoid gamma, raw b)
+// Mode 7 (gamma_sigm_split): mlp_input[i] = sigmoid(gamma_l)*hash[i] + beta[i] with one
+// gamma per hash LEVEL, l = i/l_dim (capped at 3). gamma_0 = the classic film_gamma
+// (col 0 of _film_params); gamma_1..3 live in film_beta cols 21..23 (unused by the <=16D
+// MLP input), staged in shared collected_film_beta slots 16..18 (see FILM_GAMMA_LVL_BASE).
 // Mirrored in backward.cu. Applies only to --method 3D_SH_filmres (film_gamma != nullptr).
 __device__ int d_film_gamma_act = 0;
 // `--lock_gamma X`: when > -1e29, force gamma_eff = X (constant, bypasses gamma + its
 // activation) and freeze gamma's gradient. -1e30 (default) = off. Mirrored in backward.cu.
 __device__ float d_film_lock_gamma = -1e30f;
-// gamma activation: locked constant if set, else relu for modes {1,5}, sigmoid for {3,6}, else raw.
+// gamma activation: locked constant if set, else relu for modes {1,5}, sigmoid for {3,6,7}, else raw.
+// (mode 7 = gamma_sigm_split: same sigmoid, but the CALLER selects the per-level raw gamma.)
+// --lock_gamma composes with mode 7: apply() returns X for ANY raw -> ALL levels locked to X.
 __device__ __forceinline__ float film_gamma_apply(float g) {
 	if (d_film_lock_gamma > -1e29f) return d_film_lock_gamma;
 	if (d_film_gamma_act == 1 || d_film_gamma_act == 5) return fmaxf(0.0f, g);
-	if (d_film_gamma_act == 3 || d_film_gamma_act == 6) return 1.0f / (1.0f + __expf(-g));
+	if (d_film_gamma_act == 3 || d_film_gamma_act == 6 || d_film_gamma_act == 7) return 1.0f / (1.0f + __expf(-g));
 	return g;
 }
 __device__ __forceinline__ float film_gamma_apply_grad(float g) {
 	if (d_film_lock_gamma > -1e29f) return 0.0f;   // gamma frozen when locked
 	if (d_film_gamma_act == 1 || d_film_gamma_act == 5) return (g > 0.0f) ? 1.0f : 0.0f;
-	if (d_film_gamma_act == 3 || d_film_gamma_act == 6) { float s = 1.0f / (1.0f + __expf(-g)); return s * (1.0f - s); }
+	if (d_film_gamma_act == 3 || d_film_gamma_act == 6 || d_film_gamma_act == 7) { float s = 1.0f / (1.0f + __expf(-g)); return s * (1.0f - s); }
 	return 1.0f;
+}
+// gamma_sigm_split (mode 7) helpers: the raw per-level gamma. Shared stage layout:
+// collected_film_beta slots [0..15] = beta cols 0..15 (the MLP-input beta),
+// slots [16..18] = beta cols 21..23 = gamma_1..3. Level 0 reads collected_film_gamma.
+#define FILM_GAMMA_LVL_BASE 16
+#define FILM_BETA_STAGE_DIM 19
+__device__ __forceinline__ float film_gamma_raw_lvl(
+	const __half* coll_gamma, const __half* coll_beta, int j, int lvl) {
+	return (lvl == 0) ? __half2float(coll_gamma[j])
+	                  : __half2float(coll_beta[(FILM_GAMMA_LVL_BASE + lvl - 1) * BLOCK_SIZE + j]);
 }
 // beta activation: relu for modes {2,5}, sigmoid for {4,6}, else raw.
 __device__ __forceinline__ float film_beta_apply(float b) {
@@ -101,6 +117,10 @@ __device__ __forceinline__ float film_beta_apply_grad(float b) {
 // AA-2DGS mip filter kernel size σ. 0 disables (use standard rho3d/rho2d).
 __device__ float d_aa_kernel_size = 0.0f;
 __device__ float d_res_bias = 0.5f;
+// Beta-kernel footprint multiplier (--fastgs_mult) for the opacity-aware beta cutoff
+// under --aabb snugbox/accutile. Default 1.0 = no-op (byte-identical to base).
+// Re-synced from diff_surfel_3D_sh_res along with the opacity-aware cutoff.
+__device__ float d_beta_mult = 1.0f;
 // FastGS Compact Box multiplier. Scales the Mahalanobis² threshold used by the
 // AdR cutoff in preprocessCUDA:  cutoff = sqrt(2·log(opacity·255)·mult).
 // Default 1.0 = unchanged (matches our existing AdR cutoff). FastGS paper uses 0.5.
@@ -756,11 +776,35 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		// Don't exceed original 4σ
 		cutoff = fminf(cutoff, 4.0f);
 	} else if (use_beta_cutoff) {
-		// Beta kernel: fixed cutoff for compact support with low-pass consideration
+		// Beta kernel footprint (snugbox/accutile mode 5, and aabb=beta mode 4).
+		// OPACITY-AWARE cutoff = max(r_beta, r_lp) — the 1/255 iso — when shapes are
+		// present (beta kernel). This is tighter than the old fixed max(k·1.1, r_lp_typical)
+		// ≈ 3.3 for faint/sharp surfels yet LOSSLESS (clips only the <1/255 region), so
+		// AccuTile traces a smaller ellipse → fewer Gaussian-tile pairs. Verified on the
+		// db drjohnson/playroom baked atlases: ~1.34–1.35× FPS at unchanged PSNR/SSIM/LPIPS.
+		// Falls back to the fixed cutoff for a non-beta kernel under aabb=beta (shapes==null).
 		float k = (kernel_type == 4) ? 3.0f : 1.0f;
-		// Low-pass radius for typical opacity (~0.5): sqrt(2 * ln(127.5)) ≈ 3.1
-		float r_lp_typical = sqrtf(2.0f * logf(127.5f));
-		cutoff = fmaxf(k * 1.1f, r_lp_typical);
+		if (shapes != nullptr && (kernel_type == 1 || kernel_type == 4)) {
+			float opacity_val = opacities[idx];
+			if (opacity_val < (1.0f / 255.0f)) {
+				radii[idx] = 0;
+				tiles_touched[idx] = 0;
+				return;
+			}
+			float shape = shapes[idx];
+			float ratio = 1.0f / (255.0f * opacity_val);
+			float threshold = powf(ratio, 1.0f / shape);
+			float r_beta = (threshold < 1.0f) ? k * sqrtf(1.0f - threshold) : 0.0f;
+			float log_term = logf(255.0f * opacity_val);
+			float r_lp = (log_term > 0.0f) ? sqrtf(2.0f * log_term) : 0.0f;
+			cutoff = fmaxf(r_beta, r_lp);
+		} else {
+			float r_lp_typical = sqrtf(2.0f * logf(127.5f));
+			cutoff = fmaxf(k * 1.1f, r_lp_typical);
+		}
+		cutoff = fminf(cutoff, k + 2.0f);
+		// Optional further footprint scale (--fastgs_mult on beta; default 1.0 = no-op).
+		cutoff *= d_beta_mult;
 	} else {
 #if TIGHTBBOX // no use in the paper, but it indeed help speeds.
 		// the effective extent is now depended on the opacity of gaussian.
@@ -1187,9 +1231,11 @@ renderCUDAsurfelForward(
 	__shared__ float2 collected_shapes[BLOCK_SIZE];  // Kernel shape: .x = primary (beta/general/flex), .y = nexel gamma_y
 	// FiLM (3D_SH_filmres): per-Gauss gamma + beta staged in shared as FP16 (mirrors the
 	// collected_colors pattern; FP16 halves the footprint + read bw, consistent with the
-	// FP16 hash/MLP. Math is done in FP32 via __half2float). Beta channel-major [16][BLOCK_SIZE].
+	// FP16 hash/MLP. Math is done in FP32 via __half2float). Beta channel-major
+	// [FILM_BETA_STAGE_DIM=19][BLOCK_SIZE]: slots 0..15 = beta cols 0..15 (MLP-input beta),
+	// slots 16..18 = beta cols 21..23 = per-level gamma_1..3 for --film_act gamma_sigm_split.
 	__shared__ __half collected_film_gamma[BLOCK_SIZE];
-	__shared__ __half collected_film_beta[16 * BLOCK_SIZE];
+	__shared__ __half collected_film_beta[FILM_BETA_STAGE_DIM * BLOCK_SIZE];
 
 	// Shared memory for per-Gaussian baseline features (dual hashgrid mode)
 	// NOTE: Disabled for baseline_double/baseline_blend_double due to shared memory limits
@@ -1341,6 +1387,10 @@ renderCUDAsurfelForward(
 			#pragma unroll
 			for (int c = 0; c < 16; c++)
 				collected_film_beta[c * BLOCK_SIZE + block.thread_rank()] = __float2half(film_beta[coll_id * 24 + c]);
+			// gamma_sigm_split: stage the per-level gammas (beta cols 21..23) into slots 16..18.
+			#pragma unroll
+			for (int c = FILM_GAMMA_LVL_BASE; c < FILM_BETA_STAGE_DIM; c++)
+				collected_film_beta[c * BLOCK_SIZE + block.thread_rank()] = __float2half(film_beta[coll_id * 24 + (c + 5)]);
 		}
 
 		// NOTE: Per-Gaussian feature caching disabled due to shared memory limits
@@ -2148,10 +2198,17 @@ renderCUDAsurfelForward(
 			for (int i = 0; i < TC_INPUT_DIM; i++) mlp_input[i] = 0.0f;
 			// FiLM (3D_SH_filmres): mlp_input = gamma*hash + beta, read from the shared
 			// per-Gauss stage (collected_film_*). Only the first hash_dim<=16 channels used.
+			// Mode 7 (gamma_sigm_split): per-LEVEL gamma — gamma_l for l = i/l_dim (capped 3).
 			for (int i = 0; i < hash_dim && i < TC_INPUT_DIM; i++) {
-				mlp_input[i] = (film_gamma != nullptr)
-					? (film_gamma_apply(__half2float(collected_film_gamma[j])) * hash_feat[i] + film_beta_apply(__half2float(collected_film_beta[i * BLOCK_SIZE + j])))
-					: hash_feat[i];
+				if (film_gamma != nullptr) {
+					const float g_raw = (d_film_gamma_act == 7)
+						? film_gamma_raw_lvl(collected_film_gamma, collected_film_beta, j, min(i / l_dim, 3))
+						: __half2float(collected_film_gamma[j]);
+					mlp_input[i] = film_gamma_apply(g_raw) * hash_feat[i]
+					             + film_beta_apply(__half2float(collected_film_beta[i * BLOCK_SIZE + j]));
+				} else {
+					mlp_input[i] = hash_feat[i];
+				}
 			}
 
 			// 4. Run MLP → RGB residual (identity activation, NO sigmoid)

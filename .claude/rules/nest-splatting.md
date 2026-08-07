@@ -31,6 +31,7 @@
 | `diff_surfel_mixed` | `submodules/diff_surfel_mixed` | `--method mixed` rasterizer (fork of `diff_surfel_3D_sh_res`) with the per-Gauss textured/untextured CUDA branch (untextured = 2DGS ray-splat, SV-only). |
 | `diff_surfel_mixed_3d` | `submodules/diff_surfel_mixed_3d` | `--method mixed_3d` rasterizer (fork of `diff_surfel_mixed`). Untextured surfels render as **EWA 3D ellipsoids** (FastGS-verbatim `computeCov3D`/`computeCov2D`/conic, eps2d=0.3) instead of 2DGS ray-splats. Textured half untouched. |
 | `diff_surfel_3D_sh_concat` | `submodules/diff_surfel_3D_sh_concat` | `--method 3D_SH_concat` rasterizer (fork of `diff_surfel_3D_sh_32`). 32-dim fused MLP whose 32D input is the **concat** `[surfel latent(16) \| hash(16)]` instead of sh_32's `[hash \| pad]`. Latent = `_film_params` β[0:16]. |
+| `diff_surfel_3D_sh_res_probe` | `submodules/diff_surfel_3D_sh_res_probe` | **`--method proberes` rasterizer** — full reference: [`docs/PROBERES_PIPELINE.md`](../../docs/PROBERES_PIPELINE.md) — isolated clone of `diff_surfel_3D_sh_res`. The case-5 residual is a **bilinear fetch from ONE shared texture image via per-surfel affine probes** (`texcoord = A·uv + t`) instead of hash+MLP. Signaled by `render_mode = 5 \| 0x1000`; probes `[N,6]` ride the `features_diffuse` kwarg, texture `[R,R,3]` rides `gridrange_diffuse`, dims `{Ht,Wt}` ride `offsets_diffuse` (grads return through the same autograd slots — `dL_dfeatures_diffuse` = dL/dprobes + new `dL_dtex` output). Collab-GEMM + backward smem-MLP load force-skipped under the flag (null MLP weights — bitten by IMA once). Backward adds `dL_duv_probe` (Aᵀ·dL_dtc) into the existing `dL_ds` chain. FD-gradcheck: `scripts/test_proberes_units.py`. Python side: `hash_encoder/probe_modules.py` (`ProbeHead3D` = 3D hash ⊕ posenc(axes) ⊕ log-scales → 4 raw outputs reparameterized to gauge-cancelled/metric-consistent probes; `ProbeTexField2D` = 2D hash+MLP field baked per render). Flags: `--probe_tex_res` 2048, `--probe_patch_px` 8, `--probe_c2f_interval` 2000. |
 | `diff_surfel_bake` | `submodules/diff_surfel_bake` | Bakes MLP residual into per-Gaussian SH atlas |
 | `diff_surfel_bake_render` | `submodules/diff_surfel_bake_render` | Forward-only renderer for baked atlas |
 | `gridencoder` | `gridencoder` | Python-side hash encoding (not used at inference) |
@@ -127,14 +128,20 @@ a CUDA-fused, view-independent residual MLP whose **≤16D hash input** is FiLM-
   filmres fork — renderer `_sh_res_setter_mod(ingp)`, train.py `_SHRES_SETTER_MOD`).
   Getting `set_mlp_weights`/`get_mlp_grads` on the wrong module silently breaks the MLP.
 - **FiLM activation** (`--film_act {identity,gamma_relu,beta_relu,gamma_sigmoid,
-  beta_sigmoid,double_relu,double_sigmoid}`, default identity): independent γ/β activation,
-  `mlp_input = γ_act(γ)·H + β_act(β)`. `gamma_*`/`beta_*` activate one param only; `double_*`
-  both. Device-global `d_film_gamma_act` (modes 0–6) mirroring `d_lru_slope`
+  beta_sigmoid,double_relu,double_sigmoid,gamma_sigm_split}`, default identity): independent
+  γ/β activation, `mlp_input = γ_act(γ)·H + β_act(β)`. `gamma_*`/`beta_*` activate one param
+  only; `double_*` both. Device-global `d_film_gamma_act` (modes 0–7) mirroring `d_lru_slope`
   (`set_film_gamma_act` patches fwd+bwd; backward chain-rules `dL/dγ` by `γ_act'(γ)` scaling
   hash grad by `γ_act(γ)`, and `dL/dβ` by `β_act'(β)`). Separate `film_gamma_apply`/
-  `film_beta_apply` (+`_grad`) device fns: **γ** relu={1,5} sigmoid={3,6}; **β** relu={2,5}
+  `film_beta_apply` (+`_grad`) device fns: **γ** relu={1,5} sigmoid={3,6,7}; **β** relu={2,5}
   sigmoid={4,6}. Reduces to identity on a param where it's already in the activation's
   identity region. 3D_SH_filmres only (cat `--method film` still raw γ/β).
+  **`gamma_sigm_split` (mode 7)** = `gamma_sigmoid` with a separate γ PER HASH LEVEL:
+  `mlp_input[i] = σ(γ_l)·H[i] + β[i]`, `l = i/l_dim` (capped 3), β raw; γ_0 = col 0, γ_1..3 =
+  unused β cols 21..23 (`_film_params` cols 22..24, grads via the existing `dL_dfilm_beta` —
+  zero new plumbing; staged in shared FP16 slots 16..18, stage 16→19). Composes with
+  `--lock_gamma` (all levels locked); FD-gradcheck `scripts/test_filmres_sigm_split.py`
+  (both backward paths, all 4 γ levels nonzero+matching).
 - **β freeze** (`--film_freeze_beta_iter N`, default 0=off): zeros the β gradient
   (`_film_params[:, 1:].grad`) for the first N iters of the run (γ, col 0, keeps training)
   → β held at its init (`--film_beta_init`) while the hash/MLP+γ settle, then β refines.
@@ -247,11 +254,11 @@ Goal: bake the MLP residual into static per-Gaussian SH textures for fast infere
 
 **Full reference**: see [`docs/BAKED_RENDERING.md`](../../docs/BAKED_RENDERING.md) — includes BC7 atlas compression, AABB modes (SnugBox+AccuTile), sort modes, importance-based pruning/skip-texture, atlas-width auto-grow, FP16/uint8/BC7 dtype trade-offs, and the 18-pair mip-360 results.
 
-**Deploy a single scene (quick procedure)**: see [`docs/DEPLOY_DEMO.md`](../../docs/DEPLOY_DEMO.md) — short operational summary of the 4-stage bake → nat2 → pack → upload pipeline plus the `index.html` card snippet. Cross-references BITYMI_BUNDLES for depth. **Live viewer is the Rust `Halloumi-web-splat` WASM build** (not the TS Halloumi-WS).
+**Deploy a single scene (quick procedure)**: see [`docs/DEPLOY_DEMO.md`](../../docs/DEPLOY_DEMO.md) — short operational summary of the 4-stage bake → nat2 → pack → upload pipeline plus the `index.html` card snippet. Cross-references BITYMI_BUNDLES for depth. **Live viewer is the TypeScript `Halloumi-WS` WebGPU build** (verified 2026-07-20; the earlier claim of Rust `Halloumi-web-splat` was stale — the swap already happened).
 
 **Deployment / WebGPU viewer (full reference)**: see [`docs/BITYMI_BUNDLES.md`](../../docs/BITYMI_BUNDLES.md) — full bake → `scene.nat2` → `.bitymi` → HF upload pipeline, including BC7 vs. ASTC, HD vs. lite, naming conventions, batch helpers (`build_bc7_bundles_fp16.py`, `build_astc_bundles_fp16.py`), and the single-scene variant template.
 
-**Halloumi-WS viewer (TS/WebGPU "WebSplatter")**: see [`docs/HALLOUMI_WS_VIEWER.md`](../../docs/HALLOUMI_WS_VIEWER.md) — the TypeScript viewer at `/home/nilkel/Projects/Halloumi-WS` (build with `npm run build`, dev with `npm run dev`). Covers the surfel buffer layout (32 B/Gauss), shader pipeline (surfel_cull → preprocess_2dgs → radix sort → tile_raster → display), bundle loader (BITYMI chunks), orbit-pivot logic (ray-disk intersection in `pickGaussAt`), and modifications vs. upstream WebSplatter (2DGS-only, BC7+ASTC, SV/SB color paths). Currently *not* deployed to bitymi-demos — the live viewer is still the Rust `Halloumi-web-splat` build; swap procedure in § 12 of the doc.
+**Halloumi-WS viewer (TS/WebGPU "WebSplatter")**: see [`docs/HALLOUMI_WS_VIEWER.md`](../../docs/HALLOUMI_WS_VIEWER.md) — the TypeScript viewer at `/home/nilkel/Projects/Halloumi-WS` (build with `npm run build`, dev with `npm run dev`). Covers the surfel buffer layout (32 B/Gauss), shader pipeline (surfel_cull → preprocess_2dgs → radix sort → tile_raster → display), bundle loader (BITYMI chunks), orbit-pivot logic (ray-disk intersection in `pickGaussAt`), and modifications vs. upstream WebSplatter (2DGS-only, BC7+ASTC, SV/SB color paths). **This is the deployed viewer at bitymi-demos** (verified 2026-07-20 by inspecting `viewer/assets/index-*.js`).
 
 **4090 benchmarking**: see [`docs/BENCH_4090.md`](../../docs/BENCH_4090.md) — full procedure to bench a baked model on `neel@10.176.128.69` (SSH key installed). Pipeline: `build_bench_bundle.py` locally → `rsync` to `~/nest-bench/bundles/<name>/` → `ssh ... bash -c '. miniforge3/.../conda.sh && conda activate bench && python bench_minimal.py ...'`. Returns PSNR/SSIM/LPIPS/FPS JSON. Uses cuda.Event timing (GPU-throughput).
 
@@ -581,6 +588,42 @@ Joint camera-pose + Gaussian optimization — the *sfm* core of 3R-GS (Huang et 
   reuse original `cameras.txt`). The trained PLY *is* the improved reconstruction.
 - **Not ported** (need correspondence data): MLP pose variant, the global epipolar
   loss (MASt3R-SfM), and test-time pose opt (for held-out `--eval` PSNR).
+
+### `--ppisp` (photometric / ISP compensation)
+NVIDIA PPISP (Deutsch et al. 2026, clone `../ppisp`) as a **differentiable ISP layer on the
+rendered image**, trained jointly with the Gaussians. Full reference:
+[`docs/PPISP_PHOTOMETRIC.md`](../../docs/PPISP_PHOTOMETRIC.md).
+- **Not a data preprocessor, not a post-process on trained splats.** Chain (identity at init,
+  verified 1e-5 vs the repo's torch reference): `2^exposure[frame]` → per-camera per-channel
+  radial vignetting → per-frame chromaticity homography (intensity-preserving, so it can't
+  change brightness) → per-camera per-channel toe/shoulder CRF. ~2.7 K floats for a 300-image
+  scene. Method-agnostic (image-space) — works with `3D_SH_res`, `mixed*`, `res_3d*`, GEStex.
+- **Mapping**: `num_cameras=1` (one lens ⇒ vignetting + CRF are scene-global),
+  `num_frames = len(getTrainCameras())`, keyed `image_name → idx` (same idiom as `--3rgs`).
+- **Two deviations from library defaults, both about the exported scene**: CRF frozen at
+  identity unless `--ppisp_crf` (our single ISP's curve is already in the GT and we want the
+  splats to reproduce it — training it leaves them in pre-CRF space and they render wrong in
+  Halloumi-WS); controller off unless `--ppisp_controller` (novel views then get zero per-frame
+  correction = canonical appearance = what we bake).
+- **⚠ `[0,1]` clamp trap**: the kernel clamps before the CRF, gated on `camera_idx != -1` — it
+  fires whenever the per-camera path is on, *even with CRF frozen*. Measured: pixels >1 get
+  `|grad| = 1e-10` (vs 6.6e-4 without the camera path) ⇒ over-bright pixels freeze permanently
+  under our unbounded SH. Mitigated by `--ppisp_overflow_w` (default 0.01, adds
+  `w·relu(render−1).mean()` on the **pre**-ISP render) or `--ppisp_no_camera` (drops
+  vignetting+CRF+clamp, exposure+colour only).
+- **Placement**: applied right after `render_pkg["render"]` is unpacked, **before** the
+  `--random_background` composite — the composite adds the same raw bg to both `image` and
+  `gt_image`, so the ISP never sees (or tries to explain) the synthetic background. Everything
+  downstream (`error_img`, L1/SSIM/LPIPS, error-guided reg weights) uses the ISP'd image.
+- **Eval**: `training_report` resolves the frame index by `image_name`; train cams use their
+  fitted params, test cams fall through to `frame_idx=-1` (zero correction). No test GT is
+  consulted. Note held-out PSNR is *penalised* on a scene with real drift — the win is fewer
+  floaters / cleaner corners / fewer Gaussians, not necessarily the test number.
+- **Output**: `point_cloud/iteration_<N>/ppisp.pt` (kept out of the PLY — the exported splats
+  are the ISP-free canonical scene). `[PPISP iter=…]` logs every 500; the exposure **std** is
+  how many stops of drift the capture actually had.
+- **Not wired**: baked pipeline (bake the canonical scene, by design) and `--start_checkpoint`
+  restore. Build: `cd ../ppisp && pip install . --no-build-isolation`.
 
 ### Other
 - `--init_ply PATH` — initialize Gaussians from external PLY

@@ -1,0 +1,41 @@
+{
+  "model_path": "outputs/mip_360/garden/3D_SH_res/RD_SV_30thr_005w25gLP_N2f_frz5k10",
+  "bake_dir": "outputs/mip_360/garden/3D_SH_res/RD_SV_30thr_005w25gLP_N2f_frz5k10/baked_atlas",
+  "num_gaussians": 148658,
+  "resolution": "1297x840",
+  "num_test_cams": 24,
+  "modes": {
+    "sv_atlas": {
+      "mode": "A: SV+atlas",
+      "ms_mean": 0.9853241580724716,
+      "ms_std": 0.008972362725933047,
+      "fps": 1014.894430231202,
+      "num_bench": 200
+    },
+    "sv_only": {
+      "mode": "B: SV only",
+      "ms_mean": 0.6979649579524994,
+      "ms_std": 0.006595415475509652,
+      "fps": 1432.7366848523875,
+      "num_bench": 200
+    },
+    "passthrough": {
+      "mode": "C: passthrough",
+      "ms_mean": 0.6933529597520828,
+      "ms_std": 0.006891987814150152,
+      "fps": 1442.2668655767516,
+      "num_bench": 200
+    }
+  },
+  "decomposition_ms": {
+    "atlas_sample": 0.2873592001199723,
+    "sv_softmax_eval": 0.004611998200416578,
+    "residual_pipeline": 0.6933529597520828,
+    "total_A": 0.9853241580724716
+  },
+  "decomposition_frac_of_A": {
+    "atlas_sample": 0.29163925167745325,
+    "sv_softmax_eval": 0.004680691285839113,
+    "residual_pipeline": 0.7036800570367077
+  }
+}

@@ -219,6 +219,14 @@ void SetWeightRegLambdaCUDA(float val);
 // Set activation biases: color = ReLU(SH + sh_bias) + ReLU(residual + res_bias)
 void SetActivationBiasCUDA(float sh_bias, float res_bias);
 
+// Per-pixel Z-cull proxy occluder — fragments with per-pixel ray-splat depth
+// exceeding occluder[pix] are dropped in fwd AND bwd (contributor sets stay
+// identical). Pass a CUDA fp32 [H, W] cam-Z depth map (non-hits = +inf, they
+// skip the cull naturally via isfinite). Caller keeps the tensor alive.
+// clear_occluder_depth reverts to pre-flag byte-identical behavior.
+void SetOccluderDepthCUDA(const torch::Tensor& depth);
+void ClearOccluderDepthCUDA();
+
 // Select residual activation mode (mirrors training render method).
 //   0 = 3D_SH_res (default): color = ReLU(ReLU(SH+sh_bias) + residual + res_bias)
 //   1 = 3D_SH_add:           color = ReLU(SH+sh_bias) + ReLU(residual + res_bias)

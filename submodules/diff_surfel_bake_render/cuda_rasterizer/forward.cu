@@ -17,6 +17,17 @@ namespace cg = cooperative_groups;
 __device__ float d_sh_bias = 0.5f;
 __device__ float d_res_bias = 0.0f;
 __device__ float d_compact_mult = 1.0f;
+
+// Per-pixel Z-cull frontier: when d_occluder_depth != nullptr, any fragment
+// in renderBakedCUDA whose surfel `depth > d_occluder_depth[pix_y*W+pix_x]`
+// (and the value is finite) gets `continue`'d — same as failing an opaque-
+// mesh depth test. Behind-mesh contributions are dropped; background color
+// fills the remaining transmittance naturally. Non-finite entries (e.g.
+// no mesh hit) pass through with no cull. Set via set_occluder_depth /
+// cleared via clear_occluder_depth.
+__device__ const float* d_occluder_depth = nullptr;
+__device__ int d_occluder_W = 0;
+__device__ int d_occluder_H = 0;
 // EXPERIMENT (beta_scaled mult + lowpass sweep): scales the beta/non-AdR footprint
 // cutoff (default 1.0 => cutoff=4σ baseline). d_drop_lowpass removes the Gaussian
 // low-pass (alpha max-pool in the render kernel + the filter_r screen extension).
@@ -1019,6 +1030,13 @@ renderBakedCUDA(
 			float rho = min(rho3d, rho2d);
 			float depth = (rho3d <= rho2d) ? (s.x * Tw.x + s.y * Tw.y) + Tw.z : Tw.z;
 			if (depth < near_n) continue;
+			// Per-pixel Z-cull against a proxy mesh depth map. Zero setup cost
+			// when d_occluder_depth==nullptr. When active: drop contributions
+			// past the mesh frontier so behind-mesh surfels leave no trace.
+			if (d_occluder_depth != nullptr && pix.x < d_occluder_W && pix.y < d_occluder_H) {
+				float occ = d_occluder_depth[pix.y * d_occluder_W + pix.x];
+				if (isfinite(occ) && depth > occ) continue;
+			}
 			float4 nor_o = collected_normal_opacity[j];
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
 			float opa = nor_o.w;
@@ -1380,6 +1398,22 @@ void FORWARD::setOpacityAwareBeta(bool val) {
 __global__ void setBakeDropLowpassKernel(bool val) { d_drop_lowpass = val; }
 void FORWARD::setDropLowpass(bool val) {
 	setBakeDropLowpassKernel<<<1, 1>>>(val);
+}
+
+// Per-pixel Z-cull frontier: set to a per-pixel depth map (camera-space z)
+// that acts as an opaque occluder. Fragments with surfel `depth > occ_map[pix]`
+// are dropped from the render. Non-finite entries (NaN/inf) skip the cull for
+// that pixel (no-op). Pass ptr=nullptr (or via clear_occluder_depth) to disable.
+__global__ void setBakeOccluderDepthKernel(const float* ptr, int W, int H) {
+	d_occluder_depth = ptr;
+	d_occluder_W = W;
+	d_occluder_H = H;
+}
+void FORWARD::setOccluderDepth(const float* ptr, int W, int H) {
+	setBakeOccluderDepthKernel<<<1, 1>>>(ptr, W, H);
+}
+void FORWARD::clearOccluderDepth() {
+	setBakeOccluderDepthKernel<<<1, 1>>>(nullptr, 0, 0);
 }
 
 __global__ void setBakeResidualModeKernel(int mode) { d_residual_mode = mode; }

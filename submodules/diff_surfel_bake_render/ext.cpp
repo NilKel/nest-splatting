@@ -16,6 +16,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "0 = 3D_SH_res outer ReLU (default). 1 = 3D_SH_add separate ReLUs.");
   m.def("set_untex_kernel", &SetUntexKernelBakeCUDA,
         "mixed_3d --kernel2: untextured-EWA kernel int (-1 = unset → use --kernel).");
+  m.def("set_occluder_depth", &SetOccluderDepthBakeCUDA,
+        "Per-pixel Z-cull. Pass a CUDA fp32 [H, W] depth map; fragments "
+        "with surfel depth > occluder[pix] are dropped. Non-finite entries "
+        "skip the cull for that pixel. Caller must keep the tensor alive.");
+  m.def("clear_occluder_depth", &ClearOccluderDepthBakeCUDA,
+        "Disable the per-pixel Z-cull.");
   m.def("clear_atlas_cache", &ClearAtlasCacheCUDA);
   m.def("set_atlas_use_uint8", &SetAtlasUseUint8CUDA);
   m.def("set_use_atlas_tex_object", &SetUseAtlasTexObjectCUDA);

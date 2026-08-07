@@ -134,6 +134,13 @@ namespace FORWARD
 
 	// Set activation biases for SH and residual.
 	void setActivationBias(float sh_bias, float res_bias);
+
+	// Per-pixel Z-cull proxy occluder. `ptr` = CUDA fp32 [H*W] cam-Z depth
+	// (non-hits = +inf); fragments with depth > occluder[pix] are dropped in
+	// the render forward. Pair with BACKWARD::setOccluderDepth so bwd's
+	// contributor set matches. nullptr → check is a no-op.
+	void setOccluderDepth(const float* ptr, int W, int H);
+	void clearOccluderDepth();
 	// 0 = 3D_SH_res (stacked: ReLU(ReLU(SH+bias)+residual+bias), default).
 	// 1 = 3D_SH_add (separate: ReLU(SH+bias) + ReLU(residual+bias)).
 	void setResidualMode(int mode);

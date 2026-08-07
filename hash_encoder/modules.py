@@ -96,12 +96,39 @@ class INGP(nn.Module):
         # Store args for 3D_SH_res mode (per-Gaussian SH + tiny hash MLP residual, diff_surfel_3D_sh_res)
         # `--method mixed` is treated as 3D_SH_res at the INGP level (same hashgrid + MLP architecture).
         # The mixed-specific behavior (per-Gauss textured/untextured split) lives in the renderer + train loop.
-        self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method in ("3D_SH_res", "3D_SH_res_sep", "res_switch", "res_3d", "res_3d_paired", "res_3d_double", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep", "clip_relight", "3D_SH_filmres")
+        self.is_3D_SH_res_mode = args is not None and hasattr(args, 'method') and args.method in ("3D_SH_res", "3D_SH_res_sep", "res_switch", "res_3d", "res_3d_paired", "res_3d_double", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep", "clip_relight", "3D_SH_filmres", "proberes")
         # 3D_SH_filmres: 3D_SH_res with FiLM conditioning of the residual MLP's hash
         # input (residual = MLP(gamma*H + beta)). Inherits all 3D_SH_res handling above
         # (fused in-kernel MLP, SH base, residual modes); the renderer dispatches it to
         # the diff_surfel_3D_sh_filmres submodule and passes per-Gauss gamma/beta.
         self.is_3D_SH_filmres_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_filmres"
+        # `--method proberes`: 3D_SH_res-family, but the residual is a bilinear
+        # fetch from ONE shared 2D texture image via per-surfel affine probes
+        # (probe = ProbeHead3D(geometry), texture = ProbeTexField2D baked per
+        # render). The 3D scene hash + fused MLP are built (family inheritance)
+        # but UNUSED by the CUDA kernel (render_mode 5 | 0x1000, hash levels 0).
+        # Renderer dispatches to diff_surfel_3D_sh_res_probe.
+        self.is_proberes_mode = args is not None and hasattr(args, 'method') and args.method == "proberes"
+        # `--wsr` (proberes only): sort-free weighted-sum finetune. Routes the
+        # render + setters to the diff_surfel_3D_sh_res_probe_wsr clone and
+        # activates its WSR composite (docs/WSR_DISTILL.md). `wsr_sorted` is a
+        # runtime override: when True the wsr clone renders SORTED (set_wsr(0))
+        # — used by the distill-target dump pass (which needs this clone's
+        # Σα/Σ(αT) record_transmittance accumulators).
+        self.is_wsr_mode = args is not None and getattr(args, 'wsr', False)
+        self.wsr_sorted = False
+        # `--wsr_composite`: ht=1-style operator — exact frontmost fragment
+        # (per-pixel depth argmin) + occ-weighted mean of the REST (wsr_mode 2).
+        self.is_wsr_composite = args is not None and getattr(args, 'wsr_composite', False)
+        # `--wsr_gate_tau`: 2-pass transmittance saturation gate. >0 arms the
+        # depth-binned pre-pass in the wsr clone; fragments behind the per-pixel
+        # saturation depth are fully discarded (forward+backward). Runtime-
+        # mutable (eval scripts can sweep it without a new INGP).
+        self.wsr_gate_tau = float(getattr(args, 'wsr_gate_tau', 0.0) or 0.0) if args is not None else 0.0
+        # `--wsr_dgate_margin` (?wsr=3): mean-depth gate — sorted pre-pass
+        # computes per-pixel (D̄, A); occ weight fades behind D̄ over this
+        # relative margin. Mutually exclusive with wsr_gate_tau.
+        self.wsr_dgate_margin = float(getattr(args, 'wsr_dgate_margin', 0.0) or 0.0) if args is not None else 0.0
         # `--method res_3d`: at --res_3d_iter, each Gauss splits into a 2D
         # residual-carrier + 3D EWA SV-carrier. Pre-split, behaves like
         # 3D_SH_res + --lru (single render via diff_surfel_mixed_3d with all
@@ -134,6 +161,19 @@ class INGP(nn.Module):
         # additive Gaussian pass). See docs/GESTEX_MODE.md.
         self.is_gestex_mode = args is not None and bool(getattr(args, 'is_gestex', False))
         self.is_gestex_joint = False
+        # `--densfix` (--method 3D_SH_res only): route render + setters to the
+        # diff_surfel_3D_sh_res_densfix clone, which excludes the hashgrid query-
+        # point term from the densification proxy. Renderer gates on this flag.
+        self.is_densfix_mode = (args is not None and bool(getattr(args, 'densfix', False))
+                                and hasattr(args, 'method') and args.method == "3D_SH_res")
+        # `--trunc` (--method 3D_SH_res only): route render + setters to the
+        # diff_surfel_3D_sh_res_trunc clone, whose settable exit_T lets the
+        # forward walk stop after the T-crossing fragment blends (opacity-cliff
+        # / base-plate training). Renderer gates on this flag.
+        self.is_trunc_mode = (args is not None
+                              and (bool(getattr(args, 'trunc', False))
+                                   or bool(getattr(args, 'gap_noise', False)))
+                              and hasattr(args, 'method') and args.method == "3D_SH_res")
         # `--method mixed[_3d]`: textured/untextured manifold split. INGP-level
         # behavior is identical to 3D_SH_res; the split lives in renderer + train.
         # is_mixed_mode covers BOTH variants (shared color/relu/grad plumbing);
@@ -163,6 +203,11 @@ class INGP(nn.Module):
         # F.leaky_relu(rendered_image, α) when α > 0 and STE is off. CUDA-mode
         # (modes 0/1/cat) uses the parallel d_lru_slope device global instead.
         self.lru_slope = float(getattr(args, 'lru', 0.0)) if args is not None else 0.0
+        # `--sv_lru`: leaky slope for the INNER ReLU on the SV/SH base, i.e. relu(SV+sh_bias).
+        # Independent of --lru (the outer activation). For --feature SV this is Python-side
+        # (renderer's _build_fake_shs_from_SV → F.leaky_relu(feat+0.5, α)); autograd carries
+        # the leaky gradient so the SV base keeps learning when SV+bias goes negative.
+        self.sv_lru_slope = float(getattr(args, 'sv_lru', 0.0)) if args is not None else 0.0
         # Store args for 3D_SH_cat mode (per-Gaussian SH + hash+DC MLP residual, diff_surfel_3D_sh_res)
         self.is_3D_SH_cat_mode = args is not None and hasattr(args, 'method') and args.method == "3D_SH_cat"
         # Store args for 3D_SH_32 mode (per-Gaussian SH + 32-dim hash MLP residual, diff_surfel_3D_sh_32)
@@ -509,6 +554,53 @@ class INGP(nn.Module):
                   f"sigma={self.clip_head.sigma}, cull_k={self.clip_head.cull_k}, "
                   f"m_max={self.clip_head.m_max}); input = clipgrid | s_g | n.")
 
+        # --method proberes: build the probe head (3D hash + MLP → per-surfel
+        # affine probes) and the shared 2D texture field. Built BEFORE
+        # training_setup so their params land in self.optimizer. The inherited
+        # 3D scene hash + mlp_fused above stay built but are unused by the
+        # proberes CUDA kernel (harmless; keeps family gates intact).
+        self.probe_head = None
+        self.probe_field = None
+        if getattr(self, 'is_proberes_mode', False):
+            from hash_encoder.probe_modules import ProbeTexField2D, ProbeHead3D
+            _tex_res = int(getattr(args, 'probe_tex_res', 2048))
+            _patch_px = float(getattr(args, 'probe_patch_px', 8.0))
+            _tex_levels = int(getattr(args, 'probe_tex_levels', 16))
+            _tex_hidden = int(getattr(args, 'probe_tex_hidden', 64))
+            _tex_base = int(getattr(args, 'probe_tex_base', 8))
+            _pixels = not bool(getattr(args, 'probe_no_pixels', False))
+            self.probe_field = ProbeTexField2D(tex_res=_tex_res, levels=_tex_levels,
+                                               base_res=_tex_base,
+                                               hidden=_tex_hidden, pixels=_pixels).cuda()
+            self.probe_field.bake_interval = int(getattr(args, 'probe_bake_interval', 1))
+            self.probe_field.no_field = bool(getattr(args, 'probe_no_field', False))
+            self.probe_head = ProbeHead3D(tex_res=_tex_res, patch_px=_patch_px,
+                                          abs_placement=bool(getattr(args, 'probe_abs_placement', False))).cuda()
+            _init_dir = getattr(args, 'probe_init_dir', None)
+            if _init_dir:
+                import torch as _t
+                _ti = _t.load(os.path.join(_init_dir, 'tex_init.pt'), map_location='cuda')
+                assert self.probe_field.pixels is not None, "--probe_init_dir needs the pixel image ON (drop --probe_no_pixels)"
+                assert _ti.shape[0] == _tex_res, f"tex_init res {_ti.shape[0]} != --probe_tex_res {_tex_res}"
+                self.probe_field.pixels.data.copy_(_ti.cuda())
+                _pr = _t.load(os.path.join(_init_dir, 'probes.pt'), map_location='cuda')
+                _pr_t = (_pr['probes'] if isinstance(_pr, dict) else _pr).cuda().contiguous()
+                if float(getattr(args, 'probe_learn_lr', 0.0)) > 0.0:
+                    # LEARNABLE loaded probes: dL/dprobes (already returned by the
+                    # rasterizer every iteration) now refines placement — colliding
+                    # surfels can migrate apart, the unlock for bake-time smear.
+                    self.probe_head.fixed_probes = nn.Parameter(_pr_t)
+                else:
+                    self.probe_head.fixed_probes = _pr_t
+                if isinstance(_pr, dict):
+                    self.probe_head.fixed_centers = _pr['centers'].cuda().contiguous()
+                print(f"[PROBERES] UV-field init from {_init_dir}: atlas content baked from the "
+                      f"teacher INGP via phi_inv, {int(self.probe_head.fixed_probes.shape[0])} FIXED probes from phi.")
+            print(f"[PROBERES] ProbeTexField2D (tex {_tex_res}x{_tex_res}, "
+                  f"{self.probe_field.levels} levels x {self.probe_field.level_dim}D, "
+                  f"hidden {_tex_hidden}, pixels={'ON' if _pixels else 'OFF'}) + ProbeHead3D "
+                  f"(patch_px={_patch_px}, {self.probe_head.levels} levels) built.")
+
         self.training_setup(cfg_model.optim)
 
         self.pre_level = None
@@ -537,7 +629,7 @@ class INGP(nn.Module):
 
         # Apply LR scaling for 3D_SH_res mode
         if self.args is not None and hasattr(self.args, 'res_lr_scale') and self.args.res_lr_scale != 1.0:
-            if self.args.method in ["3D_SH_res", "3D_SH_res_sep", "res_switch", "res_3d", "res_3d_paired", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep", "clip_relight"]:
+            if self.args.method in ["3D_SH_res", "3D_SH_res_sep", "res_switch", "res_3d", "res_3d_paired", "3D_SH_cat", "3D_SH_32", "mixed", "mixed_3d", "mixed_sep", "mixed_3d_sep", "clip_relight", "proberes"]:
                 print(f"[3D_SH_RES] Scaling hash/MLP LR by {self.args.res_lr_scale}: encoding {lr_encoding} -> {lr_encoding * self.args.res_lr_scale}, mlp {lr_mlp_rgb} -> {lr_mlp_rgb * self.args.res_lr_scale}")
                 lr_encoding *= self.args.res_lr_scale
                 lr_mlp_rgb *= self.args.res_lr_scale
@@ -567,6 +659,44 @@ class INGP(nn.Module):
         # clip_relight head (clipgrid + multi-head MLP) — trains alongside hash/MLP.
         if getattr(self, 'clip_head', None) is not None:
             l.append({'params': self.clip_head.parameters(), 'lr': lr_mlp_rgb, "name": "clip_head"})
+        # proberes: probe head (3D hash + MLP → per-surfel probes) and 2D texture
+        # field (2D hash + MLP → shared image). Hash tables at lr_encoding, MLPs
+        # at lr_mlp_rgb (both already include res_lr_scale/hash_lr_scale above).
+        if getattr(self, 'probe_head', None) is not None \
+                and isinstance(getattr(self.probe_head, 'fixed_probes', None), nn.Parameter):
+            _plr = float(getattr(self.args, 'probe_learn_lr', 0.0)) if self.args is not None else 0.0
+            l.append({'params': [self.probe_head.fixed_probes], 'lr': _plr, "name": "probe_fixed_learn"})
+        if getattr(self, 'probe_head', None) is not None:
+            # --probe_freeze_head: probes stay at their init placement — head
+            # params get no optimizer group AND the head detaches from geometry
+            # (probes follow moving surfels but drive nothing). The "can the
+            # texture learn under STATIC probes" isolation.
+            if self.args is not None and getattr(self.args, 'probe_freeze_head', False):
+                self.probe_head.detach_geom = True
+                for _hp in self.probe_head.parameters():
+                    _hp.requires_grad_(False)
+                print("[PROBERES] probe head FROZEN (--probe_freeze_head): static placement, no head training")
+            else:
+                l.append({'params': self.probe_head.enc.parameters(), 'lr': lr_encoding, "name": "probe_head_enc"})
+                l.append({'params': self.probe_head.mlp.parameters(), 'lr': lr_mlp_rgb, "name": "probe_head_mlp"})
+        if getattr(self, 'probe_field', None) is not None:
+            # --probe_field_lr_scale: boost for the 2D texture field (hash + MLP).
+            # The field competes with per-surfel SV (direct params, strong grads)
+            # for the same error signal; a higher LR lets it claim detail before
+            # densification erases the within-surfel error. Head + pixels are NOT
+            # boosted (placement stability / noise control).
+            _pf_scale = float(getattr(self.args, 'probe_field_lr_scale', 1.0)) if self.args is not None else 1.0
+            l.append({'params': self.probe_field.enc.parameters(), 'lr': lr_encoding * _pf_scale, "name": "probe_field_enc"})
+            l.append({'params': self.probe_field.mlp.parameters(), 'lr': lr_mlp_rgb * _pf_scale, "name": "probe_field_mlp"})
+            # Direct per-texel pixel image (tex = field + pixels). NOT at the hash
+            # LR: with the iNGP Adam (eps=1e-15), any sparse near-zero gradient
+            # becomes a full lr-sized step, and 12.6M rarely-touched texels
+            # random-walk into visible atlas noise. Scaled down by
+            # --probe_pixel_lr_scale (default 0.1); pairs with the decoupled
+            # per-step decay applied in train.py (--probe_pixel_decay).
+            if getattr(self.probe_field, 'pixels', None) is not None:
+                _px_scale = float(getattr(self.args, 'probe_pixel_lr_scale', 0.1)) if self.args is not None else 0.1
+                l.append({'params': [self.probe_field.pixels], 'lr': lr_encoding * _px_scale, "name": "probe_field_pixels"})
 
         # For diffuse mode, create a dummy optimizer (no INGP params to optimize)
         if len(l) == 0:
@@ -1189,6 +1319,23 @@ class INGP(nn.Module):
                 self.active_hashgrid_levels = self.hashgrid_levels
             self.active_levels = self.levels  # Total levels (for MLP input size)
             self.optim_gaussian = True  # Train Gaussians throughout
+            # proberes coarse-to-fine: coarsest level of the 2D texture field
+            # (and probe-head hash) always on, one finer level every
+            # --probe_c2f_interval iters. Disabled (ALL levels active from
+            # iter 1, both the image field and the head's 3D hash) when
+            # --disable_c2f is set OR probe_c2f_interval <= 0.
+            if getattr(self, 'is_proberes_mode', False) and self.probe_field is not None:
+                _iv = int(getattr(self.args, 'probe_c2f_interval', 2000)) if self.args is not None else 2000
+                if self.disable_c2f or _iv <= 0:
+                    _act = self.probe_field.levels
+                else:
+                    _act = min(self.probe_field.levels, 1 + current_iter // _iv)
+                self.probe_field.active_levels = _act
+                self.probe_head.active_levels = min(self.probe_head.levels, _act)
+                # Freeze the running s_med (probe-scale calibration) once
+                # densification has settled; texture content stays aligned after.
+                _smf = int(getattr(self.args, 'probe_smed_freeze_iter', 15000)) if self.args is not None else 15000
+                self.probe_head.smed_frozen = current_iter >= _smf
         elif self.is_residual_hybrid_mode:
             # Residual_hybrid mode: No C2F, all hashgrid levels active from start
             self.active_levels = self.hashgrid_levels

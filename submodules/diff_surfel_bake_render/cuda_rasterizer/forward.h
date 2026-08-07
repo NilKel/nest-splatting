@@ -106,6 +106,9 @@ namespace FORWARD
 	void setBetaMult(float val);
 	void setDropLowpass(bool val);
 	void setOpacityAwareBeta(bool val);
+	// Per-pixel occluder Z-cull. Fragments past occ[pix] get dropped.
+	void setOccluderDepth(const float* ptr, int W, int H);
+	void clearOccluderDepth();
 	// 0 = 3D_SH_res (default outer-ReLU). 1 = 3D_SH_add (separate ReLUs).
 	void setResidualMode(int mode);
 	// `--method mixed_3d --kernel2`: untextured-EWA kernel override (-1 = unset).

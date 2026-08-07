@@ -1,0 +1,50 @@
+{
+  "model_path": "/home/nilkel/Projects/nest-splatting/outputs/mip_360/garden/3D_SH_res/RD_SV_30thr_005w25gLP_N2f_frz5k10",
+  "bake_dir": "/home/nilkel/Projects/nest-splatting/outputs/mip_360/garden/3D_SH_res/RD_SV_30thr_005w25gLP_N2f_frz5k10/baked_atlas",
+  "num_gaussians": 148658,
+  "resolution": "1297x840",
+  "compact_mult_bake": 1.0,
+  "residual_mode": 0,
+  "modes": {
+    "prod_sh_only": {
+      "tag": "PROD  SH-only  (no atlas)",
+      "ms_mean": 0.699284720569849,
+      "ms_std": 0.006630189637192393,
+      "fps": 1430.032675653341,
+      "psnr": 20.152525663375854,
+      "ssim": 0.42230428879459697,
+      "lpips": 0.49269820377230644
+    },
+    "prod_sh_atlas": {
+      "tag": "PROD  SH+atlas (BC7)",
+      "ms_mean": 0.9498578391969204,
+      "ms_std": 0.005178183021222442,
+      "fps": 1052.7891214178676,
+      "psnr": 26.713151534398396,
+      "ssim": 0.8170867711305618,
+      "lpips": 0.16935635109742483
+    },
+    "lean_sh_only": {
+      "tag": "LEAN  SH-only  (no atlas)",
+      "ms_mean": 0.5399748778343201,
+      "ms_std": 0.005900766874748083,
+      "fps": 1851.9380086916358,
+      "psnr": 20.14380391438802,
+      "ssim": 0.4212031153341134,
+      "lpips": 0.49314842497309047
+    },
+    "lean_sh_atlas": {
+      "tag": "LEAN  SH+atlas (BC7)",
+      "ms_mean": 0.6180544808506966,
+      "ms_std": 0.005771180272629038,
+      "fps": 1617.980341512272,
+      "psnr": 26.52675660451253,
+      "ssim": 0.8083015431960424,
+      "lpips": 0.1739942661176125
+    }
+  },
+  "deltas": {
+    "sh_only_pct": -22.78182806650014,
+    "sh_atlas_pct": -34.931896611681886
+  }
+}

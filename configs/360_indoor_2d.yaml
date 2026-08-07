@@ -59,8 +59,8 @@ encoding:
   type: hashgrid
   levels: 8
   hashgrid:
-      min_logres: 8
-      max_logres: 11
+      min_logres: 6
+      max_logres: 12
       dict_size: 21
       dim: 2
       range: [-5, 5]

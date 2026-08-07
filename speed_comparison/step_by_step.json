@@ -1,0 +1,79 @@
+{
+  "model_path": "outputs/mip_360/garden/3D_SH_res/RD_SV_30thr_005w25gLP_N2f_frz5k10",
+  "bake_dir": "outputs/mip_360/garden/3D_SH_res/RD_SV_30thr_005w25gLP_N2f_frz5k10/baked_atlas",
+  "num_gaussians": 148658,
+  "resolution": "1297x840",
+  "num_test_cams": 24,
+  "modes": {
+    "baseline": {
+      "mode": "baseline (SV only)",
+      "ms_mean": 0.6977300781011582,
+      "ms_std": 0.009544055615535415,
+      "fps": 1433.218993111858,
+      "num_bench": 200
+    },
+    "flat": {
+      "mode": "flat kernel (shape=0)",
+      "ms_mean": 0.6611348810791969,
+      "ms_std": 0.006623178464015241,
+      "fps": 1512.550658902855,
+      "num_bench": 200
+    },
+    "sort1": {
+      "mode": "sort_mode=1 (two-stage)",
+      "ms_mean": 0.83667376101017,
+      "ms_std": 0.007594818613099273,
+      "fps": 1195.2089889763433,
+      "num_bench": 200
+    },
+    "beta_half": {
+      "mode": "beta_mult=0.5 (half cutoff)",
+      "ms_mean": 0.6955982393026352,
+      "ms_std": 0.006515338861767118,
+      "fps": 1437.6114594576025,
+      "num_bench": 200
+    },
+    "combo": {
+      "mode": "beta_mult=0.5 + drop_lp + fixed4",
+      "ms_mean": 0.697394081056118,
+      "ms_std": 0.007092140104543439,
+      "fps": 1433.909502767248,
+      "num_bench": 200
+    },
+    "aabb2_ref": {
+      "mode": "aabb=2 baseline (opacity-aware, mult=1.0)",
+      "ms_mean": 0.6960721585154533,
+      "ms_std": 0.00679153811058818,
+      "fps": 1436.6326648270895,
+      "num_bench": 200
+    },
+    "aabb2_half": {
+      "mode": "aabb=2 + beta_mult=0.5 (tight)",
+      "ms_mean": 0.45550847947597506,
+      "ms_std": 0.006342278389804374,
+      "fps": 2195.348813594903,
+      "num_bench": 200
+    },
+    "gauss_ref": {
+      "mode": "kernel=Gaussian, compact_mult=1.0",
+      "ms_mean": 0.6799556827545166,
+      "ms_std": 0.006599383677398953,
+      "fps": 1470.6840833346319,
+      "num_bench": 200
+    },
+    "gauss_half": {
+      "mode": "kernel=Gaussian, compact_mult=0.5 (FastGS)",
+      "ms_mean": 0.5405831983685494,
+      "ms_std": 0.006068810753698524,
+      "fps": 1849.8540151043271,
+      "num_bench": 200
+    },
+    "gauss_quarter": {
+      "mode": "kernel=Gaussian, compact_mult=0.25",
+      "ms_mean": 0.44704911977052686,
+      "ms_std": 0.0064815223988746624,
+      "fps": 2236.890658711746,
+      "num_bench": 200
+    }
+  }
+}

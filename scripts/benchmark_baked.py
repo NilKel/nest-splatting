@@ -285,9 +285,68 @@ def shelf_pack_atlas(resolutions, atlas_width=4096):
 # Bake: atlas on CPU, MLP chunks on GPU
 # ---------------------------------------------------------------------------
 @torch.no_grad()
+def precompute_per_gauss_dc(ingp, gaussians, uv_extent=4.0, n_uvs=32):
+    """Per-Gauss mean residual μ_i over `n_uvs` random UVs, returned as [N, 3].
+
+    Purpose (DC compensation): shift each Gauss's residual to zero-mean by
+    subtracting μ_i from every atlas texel of that Gauss AND storing μ_i as
+    the Gauss's `_sv_dc` (which gets folded into `sv_colors` at PLY save
+    time — see bake_render_setup around line 880). Mathematically exact:
+      feat = SV_baked + residual   (SV_baked = ReLU(SV+sh_bias) at preprocess)
+           = (SV_baked + μ_i) + (residual − μ_i)
+      → shifted atlas is zero-mean per Gauss; SV_baked absorbs the offset.
+    The inner ReLU is already applied at preprocess so the shift never
+    changes any activation crossing — no PSNR loss from the shift itself,
+    only PSNR GAIN from the tighter quant range on the centered residual.
+
+    Streams over all Gauss in chunks to keep GPU memory bounded.
+    """
+    from utils.general_utils import build_rotation
+    N = int(gaussians.get_xyz.shape[0])
+    per_gauss_mu = torch.zeros(N, 3, device='cuda', dtype=torch.float32)
+
+    mlp = ingp.mlp_fused.half().eval()
+    hash_dim = ingp.mlp_fused_hash_dim
+    mlp_input_padded = mlp[0].weight.shape[1]
+
+    centers = gaussians.get_xyz
+    scales = gaussians.get_scaling
+    R = build_rotation(gaussians.get_rotation)
+    R0, R1 = R[:, :, 0], R[:, :, 1]
+
+    # Chunk so peak GPU is bounded.  With n_uvs=32, per-Gauss cost is small.
+    CH = 32768
+    for i in range(0, N, CH):
+        j = min(i + CH, N)
+        c = centers[i:j]; sx = scales[i:j, 0:1]; sy = scales[i:j, 1:2]
+        r0 = R0[i:j]; r1 = R1[i:j]
+        K = j - i
+        uv = (torch.rand(K, n_uvs, 2, device='cuda') * 2 - 1) * uv_extent
+        xyz = (c.unsqueeze(1)
+               + uv[..., 0:1] * (sx.unsqueeze(1) * r0.unsqueeze(1))
+               + uv[..., 1:2] * (sy.unsqueeze(1) * r1.unsqueeze(1)))
+        xyz_flat = xyz.reshape(-1, 3)
+
+        hf = ingp._encode_3D(xyz_flat)
+        mi = torch.zeros(xyz_flat.shape[0], mlp_input_padded, device='cuda', dtype=torch.float16)
+        mi[:, :hash_dim] = hf[:, :hash_dim].to(torch.float16)
+        rb = mlp(mi)[:, :3].to(torch.float32).reshape(K, n_uvs, 3)
+        per_gauss_mu[i:j] = rb.mean(dim=1)
+
+    mu_min = per_gauss_mu.min().item()
+    mu_max = per_gauss_mu.max().item()
+    mu_mean = per_gauss_mu.mean().item()
+    mu_std = per_gauss_mu.std().item()
+    print(f"[BAKE] per-Gauss residual μ over {N:,} Gauss × {n_uvs} UVs: "
+          f"range=[{mu_min:.4f}, {mu_max:.4f}] mean={mu_mean:.4f} std={mu_std:.4f}")
+    return per_gauss_mu
+
+
+@torch.no_grad()
 def precompute_atlas_quant_range(ingp, gaussians, uv_extent=4.0,
                                   n_gaussians=20000, n_uvs_per_gaussian=64,
-                                  margin=0.02, k_sigma=None):
+                                  margin=0.02, k_sigma=None,
+                                  per_gauss_mu=None):
     """Estimate (offset, scale) for uint8/BC7 quantization of the MLP residual,
     reversible via `x ≈ q/255 * scale + offset`.
 
@@ -319,6 +378,15 @@ def precompute_atlas_quant_range(ingp, gaussians, uv_extent=4.0,
     hash_dim = ingp.mlp_fused_hash_dim
     mlp_input_padded = mlp[0].weight.shape[1]
 
+    # If per-Gauss μ is provided, we need to know which Gauss each xyz row
+    # came from so we can subtract μ_i BEFORE computing the range. Rows are
+    # laid out as [gauss0_uv0, gauss0_uv1, ..., gauss1_uv0, ...] so the row
+    # index → Gauss index is `row // n_uvs`. Broadcast μ to match.
+    if per_gauss_mu is not None:
+        # sample_idx (chosen above) → the true Gauss ids we're evaluating
+        mu_this = per_gauss_mu[sample_idx]                   # [K, 3]
+        # Chunk memory: reshape happens per chunk below.
+
     # Chunked forward — K·n_uvs can be ~1M+ rows at full sampling.
     CH = 262144
     lo = torch.tensor(float('inf'), device='cuda')
@@ -331,6 +399,10 @@ def precompute_atlas_quant_range(ingp, gaussians, uv_extent=4.0,
         mi = torch.zeros(xb.shape[0], mlp_input_padded, device='cuda', dtype=torch.float16)
         mi[:, :hash_dim] = hf[:, :hash_dim].to(torch.float16)
         rb = mlp(mi)[:, :3].to(torch.float32)
+        if per_gauss_mu is not None:
+            # Row indices in the flat tensor correspond to gauss (i + row)//n_uvs
+            row_ids = torch.arange(i, i + rb.shape[0], device='cuda') // n_uvs_per_gaussian
+            rb = rb - mu_this[row_ids]
         lo = torch.minimum(lo, rb.min()); hi = torch.maximum(hi, rb.max())
         s1 += rb.sum(); s2 += (rb * rb).sum(); cnt += rb.numel()
 
@@ -349,13 +421,38 @@ def precompute_atlas_quant_range(ingp, gaussians, uv_extent=4.0,
     span = max(hi - lo, 1e-6)
     offset = lo - margin * span
     scale = span * (1.0 + 2.0 * margin)
+
+    # ZERO-PRESERVING SNAP: adjust `scale` slightly so residual=0 encodes to
+    # an integer quant level (and decodes back to 0 exactly). The encode is
+    #   q = round( (0 - offset)/scale * 255 )
+    #     = round( -offset/scale * 255 )
+    # and decode is q/255 * scale + offset. Without snapping, this round
+    # trips residual=0 → about ±0.5/255 * scale = ±0.5·scale/255 negative
+    # bias, which then propagates through the fragment ReLU
+    # `feat = fmaxf(0, feat + res_bias)` (bake_render forward.cu:998) and
+    # causes a systematic dim on any pixel with contributors near the ReLU
+    # threshold. Scales with widening residual range, not with #contribs
+    # directly — but the ReLU amplifies it.
+    # Snap: choose scale' such that -offset/scale' * 255 is EXACTLY an
+    # integer, keeping offset fixed. `-offset` is always positive here
+    # (residuals include 0 in their range and offset = lo - margin*span < 0).
+    if offset < 0.0:
+        k_target = round(-offset / scale * 255.0)
+        if k_target > 0:
+            scale_snap = -offset * 255.0 / k_target
+            if scale_snap >= span:   # must still cover [lo, hi]
+                scale = scale_snap
+
     # How much the OLD mean±6σ range would have clipped, for visibility.
     old_lo, old_hi = mean - 6.0 * std, mean + 6.0 * std
     clip_frac = ((lo < old_lo) or (hi > old_hi))
+    q0 = round(-offset / scale * 255.0)
+    decoded0 = q0/255.0 * scale + offset
     print(f"[BAKE] Empirical residual range over {n_tex:,} texels: "
           f"min={lo:.4f} max={hi:.4f} (mean={mean:.4f} std={std:.4f})")
-    print(f"[BAKE]   → offset={offset:.4f} scale={scale:.4f} "
+    print(f"[BAKE]   → offset={offset:.6f} scale={scale:.6f} "
           f"(±{margin*100:.0f}% margin; spans full [min,max], no clamp)")
+    print(f"[BAKE]   zero-preserving snap: residual=0 → q={int(q0)} → decode={decoded0:+.6f}")
     if clip_frac:
         print(f"[BAKE]   NOTE old mean±6σ=[{old_lo:.4f},{old_hi:.4f}] would have "
               f"clipped the true [{lo:.4f},{hi:.4f}] tails → dull-intensity bias.")
@@ -751,7 +848,16 @@ def bake_atlas(ingp, gaussians, uv_extent, max_res, min_res, atlas_width, ss,
             # `atlas_h * atlas_w * 3 B` (3× smaller than FP16) instead of holding
             # the full FP16 atlas alive until the end of the bake loop.
             if bake_dtype in ("uint8", "bc7"):
-                q = ((residual - atlas_offset) / atlas_scale * 255.0).clamp(0, 255)
+                # ROUND, not truncate.  `.to(torch.uint8)` on a float value
+                # floors positive values (166.44 → 166), which produces a
+                # SYSTEMATIC negative bias of half a quant step per residual
+                # (scale/(2·255)).  On a scene with the standard ~6-unit range
+                # this is ~0.013 per residual — under the noise threshold on
+                # baked PSNR.  On a scene with wide residuals (~14-unit range
+                # for BS3k treehill), it becomes ~0.028 per residual, which
+                # accumulates through the outer ReLU into a uniform ~2.3%
+                # per-channel intensity dim — the exposure loss we chased.
+                q = ((residual - atlas_offset) / atlas_scale * 255.0).round().clamp(0, 255)
                 residual_cpu = q.to(torch.uint8).cpu()
             else:
                 residual_cpu = residual.half().cpu()
@@ -1204,11 +1310,23 @@ def main():
     # Alias via sys.modules so every `from diff_surfel_bake_render import X` inside
     # this script transparently resolves to the paired build.
     if getattr(args, 'method', '') == 'res_3d_paired':
+        # NOTE: diff_surfel_bake_render_paired was originally a separate clone
+        # for paired-independent evolution, but it's now stale (missing
+        # set_opacity_aware_beta / set_drop_lowpass / newer features).  Base
+        # diff_surfel_bake_render is functionally identical for paired data
+        # (has is_textured + scaling_z + set_untex_kernel + residual_mode=2),
+        # so route paired scenes through base until the paired clone is
+        # refreshed.  Preserves the compile-target seam via a probe.
         import sys
         import diff_surfel_bake_render_paired as _paired_pkg
-        sys.modules['diff_surfel_bake_render'] = _paired_pkg
-        print(f"[CONFIG] Routing bake-render through diff_surfel_bake_render_paired "
-              f"(--method res_3d_paired).")
+        if hasattr(_paired_pkg, "set_opacity_aware_beta"):
+            sys.modules['diff_surfel_bake_render'] = _paired_pkg
+            print(f"[CONFIG] Routing bake-render through diff_surfel_bake_render_paired "
+                  f"(--method res_3d_paired).")
+        else:
+            print(f"[CONFIG] res_3d_paired: _paired clone is stale "
+                  f"(no set_opacity_aware_beta) — using base diff_surfel_bake_render "
+                  f"(functionally identical).")
 
     config_yaml_path = os.path.join(model_path, "config.yaml")
     cfg = Config(config_yaml_path) if os.path.exists(config_yaml_path) else Config(args.yaml)
@@ -1561,9 +1679,17 @@ def main():
     _res_bias = float(bake_meta_render.get("res_bias", getattr(args, 'activation_bias', [0.5, 0.0])[1]))
     _compact_mult = float(bake_meta_render.get("compact_mult", 1.0))
     from diff_surfel_bake_render import (set_activation_bias, set_compact_mult,
-                                         set_residual_mode, set_untex_kernel)
+                                         set_residual_mode, set_untex_kernel,
+                                         set_opacity_aware_beta)
     set_activation_bias(_sh_bias, _res_bias)
     set_compact_mult(_compact_mult)
+    # Disable the July-7 default-on opacity-aware AABB cutoff. It clips the
+    # beta_scaled footprint at the 1/255 iso instead of a fixed 4σ, which is
+    # a lossy speed optimization: any Gauss whose residual has meaningful
+    # magnitude outside that iso just gets dropped from those pixels →
+    # systematic dim on any checkpoint whose residual has energy in the
+    # tails (BS3k on treehill). Restore the pre-July 4σ AABB for correctness.
+    set_opacity_aware_beta(False)
     # 0 = 3D_SH_res outer ReLU; 1 = 3D_SH_add separate ReLUs. Default 0 if absent.
     _residual_mode = int(bake_meta_render.get("residual_mode", 0))
     set_residual_mode(_residual_mode)

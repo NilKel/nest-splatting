@@ -31,6 +31,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_overdraw_lambda", &SetOverdrawLambdaCUDA);
   m.def("set_weight_reg_lambda", &SetWeightRegLambdaCUDA);
   m.def("set_activation_bias", &SetActivationBiasCUDA);
+  m.def("set_occluder_depth", &SetOccluderDepthCUDA,
+        "Per-pixel Z-cull. Pass a CUDA fp32 [H, W] cam-Z depth map; fragments "
+        "with per-fragment ray-splat depth > occluder[pix] are dropped in fwd "
+        "and bwd (both std + MODE-5 collab-GEMM paths). Non-finite entries "
+        "(+inf where the mesh missed) skip the cull. Caller keeps the tensor "
+        "alive across the render call.");
+  m.def("clear_occluder_depth", &ClearOccluderDepthCUDA,
+        "Disable the per-pixel Z-cull (fwd + bwd revert to byte-identical).");
   m.def("set_residual_mode", &SetResidualModeCUDA,
         "0 = 3D_SH_res outer ReLU (default). 1 = 3D_SH_add separate ReLUs.");
   m.def("set_ste_relu", &SetSteReluCUDA,

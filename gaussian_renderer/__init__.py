@@ -88,6 +88,74 @@ except ImportError:
     _gestex_harden_rasterizer = None
     GESTEX_HARDEN_RASTERIZER_AVAILABLE = False
 
+# diff_surfel_3D_sh_res_densfix: an ISOLATED clone of diff_surfel_3D_sh_res for
+# `--densfix` (--method 3D_SH_res only). Byte-identical to the base EXCEPT the
+# backward optionally excludes the hash-query-point term from the AbsGS
+# densification proxy (set_exclude_hash_from_densify) — surfels still reposition
+# on the full SV+hash gradient, but densification drops the hash-inflated boost.
+# Name keeps the `diff_surfel_3D_sh_res` prefix (substring gates resolve as base)
+# and avoids gestex/mixed/res_3d/film substrings.
+try:
+    import diff_surfel_3D_sh_res_densfix as _densfix_rasterizer
+    DENSFIX_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _densfix_rasterizer = None
+    DENSFIX_RASTERIZER_AVAILABLE = False
+
+# diff_surfel_3D_sh_res_trunc: an ISOLATED clone of diff_surfel_3D_sh_res for
+# `--trunc` (--method 3D_SH_res only). Byte-identical to the base EXCEPT a
+# settable POST-blend truncation exit threshold (set_exit_T, default 1e-4):
+# at e.g. 0.5 the forward walk stops once T drops below 0.5 — the crossing
+# fragment still blends, so an opaque terminator can drive T→0 and kill the
+# Python-side (1−rend_alpha)·noise term (opacity-cliff / base-plate training).
+# Name keeps the `diff_surfel_3D_sh_res` prefix (substring gates resolve as
+# base) and avoids gestex/mixed/res_3d/film substrings.
+try:
+    import diff_surfel_3D_sh_res_trunc as _trunc_rasterizer
+    TRUNC_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _trunc_rasterizer = None
+    TRUNC_RASTERIZER_AVAILABLE = False
+
+# diff_surfel_3D_sh_res_probe: an ISOLATED clone of diff_surfel_3D_sh_res for
+# `--method proberes`. The residual is a bilinear fetch from ONE shared texture
+# image via per-surfel affine probes (texcoord = A·uv + t) instead of the 3D
+# hash + fused MLP. Signaled by render_mode = 5 | 0x1000; probes [N,6] ride the
+# features_diffuse kwarg, the texture [R,R,3] rides gridrange_diffuse, dims
+# {Ht,Wt} ride offsets_diffuse — the kernel returns dL/dprobes + dL/dtex through
+# those autograd slots. Name keeps the `diff_surfel_3D_sh_res` prefix so the
+# substring gates below resolve as base.
+try:
+    import diff_surfel_3D_sh_res_probe as _sh_res_probe_rasterizer
+    SH_RES_PROBE_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _sh_res_probe_rasterizer = None
+    SH_RES_PROBE_RASTERIZER_AVAILABLE = False
+
+# diff_surfel_3D_sh_res_probe_wsr: isolated clone of the probe rasterizer with
+# the WSR sort-free weighted-sum composite (`--wsr`, docs/WSR_DISTILL.md).
+# Byte-identical to the probe clone under set_wsr(0); its record_transmittance
+# accumulators dump the distill targets (Σα, Σ(α·T)).
+try:
+    import diff_surfel_3D_sh_res_probe_wsr as _sh_res_probe_wsr_rasterizer
+    SH_RES_PROBE_WSR_RASTERIZER_AVAILABLE = True
+except ImportError:
+    _sh_res_probe_wsr_rasterizer = None
+    SH_RES_PROBE_WSR_RASTERIZER_AVAILABLE = False
+
+def _is_proberes(ingp):
+    """True for a --method proberes run: render + setters route to the isolated
+    diff_surfel_3D_sh_res_probe clone (or its _wsr clone under --wsr)."""
+    return (ingp is not None and getattr(ingp, 'is_proberes_mode', False)
+            and (SH_RES_PROBE_RASTERIZER_AVAILABLE
+                 or _is_proberes_wsr(ingp)))
+
+def _is_proberes_wsr(ingp):
+    """True for a --wsr proberes run: routes to diff_surfel_3D_sh_res_probe_wsr."""
+    return (ingp is not None and getattr(ingp, 'is_proberes_mode', False)
+            and getattr(ingp, 'is_wsr_mode', False)
+            and SH_RES_PROBE_WSR_RASTERIZER_AVAILABLE)
+
 def _is_gestex_harden(ingp):
     """True for a GEStex run in its explore+harden phase (0-20k), i.e. rendering
     through the isolated diff_surfel_3D_sh_res_harden clone rather than the shared
@@ -96,15 +164,36 @@ def _is_gestex_harden(ingp):
             and not getattr(ingp, 'is_gestex_joint', False)
             and GESTEX_HARDEN_RASTERIZER_AVAILABLE)
 
+def _is_densfix(ingp):
+    """True for a `--densfix` run (--method 3D_SH_res): render + setters route to
+    the isolated diff_surfel_3D_sh_res_densfix clone."""
+    return (ingp is not None and getattr(ingp, 'is_densfix_mode', False)
+            and DENSFIX_RASTERIZER_AVAILABLE)
+
+def _is_trunc(ingp):
+    """True for a `--trunc` run (--method 3D_SH_res): render + setters route to
+    the isolated diff_surfel_3D_sh_res_trunc clone (settable exit_T)."""
+    return (ingp is not None and getattr(ingp, 'is_trunc_mode', False)
+            and TRUNC_RASTERIZER_AVAILABLE)
+
 def _sh_res_setter_mod(ingp):
     """Module whose device-global setters back the active 3D_SH_res-family render.
     For --method 3D_SH_filmres that's diff_surfel_3D_sh_filmres; for a GEStex
-    explore/harden it's the isolated diff_surfel_3D_sh_res_harden clone; otherwise the base."""
+    explore/harden it's the isolated diff_surfel_3D_sh_res_harden clone; for
+    --densfix the diff_surfel_3D_sh_res_densfix clone; otherwise the base."""
     if _is_gestex_harden(ingp):
         return _gestex_harden_rasterizer
     if (ingp is not None and getattr(ingp, 'is_3D_SH_filmres_mode', False)
             and SH_FILMRES_RASTERIZER_AVAILABLE):
         return _sh_filmres_rasterizer
+    if _is_densfix(ingp):
+        return _densfix_rasterizer
+    if _is_trunc(ingp):
+        return _trunc_rasterizer
+    if _is_proberes_wsr(ingp):
+        return _sh_res_probe_wsr_rasterizer
+    if _is_proberes(ingp):
+        return _sh_res_probe_rasterizer
     return _sh_res_rasterizer
 
 # `--method mixed` library — fork of diff_surfel_3D_sh_res that will host
@@ -469,7 +558,7 @@ def _build_fake_shs_from_voronoi(pc, view_dirs, max_sh_degree, sh_bias: float = 
     return fake
 
 
-def _build_fake_shs_from_SV(pc, view_dirs):
+def _build_fake_shs_from_SV(pc, view_dirs, sv_lru=0.0):
     """SV via fake-SH injection (2dgs-voronoi formulation: `relu(feat + 0.5)`).
 
     Plumbs SV into both rendering paths so the same `relu(feat + 0.5)` comes
@@ -510,7 +599,11 @@ def _build_fake_shs_from_SV(pc, view_dirs):
     )
     if _sv_dc is not None:
         feat = feat + _sv_dc
-    sv_rgb = torch.nn.functional.relu(feat + 0.5)
+    # `--sv_lru α`: leaky inner ReLU on the SV base, relu(feat+0.5). α=0 ⇒ F.leaky_relu is
+    # exactly relu (byte-identical default). α>0 lets the SV base recover when feat+0.5<0 —
+    # autograd carries the leaky gradient here into _sv_sites/_sv_colors/_sv_tau, so the base
+    # keeps learning instead of dying (the inner-ReLU analog of what --lru does for the outer).
+    sv_rgb = torch.nn.functional.leaky_relu(feat + 0.5, negative_slope=sv_lru)
     real_shs = pc.get_features                                              # [N, M, 3]
     fake = real_shs.new_zeros(real_shs.shape)
     fake[:, 0, :] = feat / _SH_C0  # pre-bias slot — rasterizer adds sh_bias
@@ -992,7 +1085,7 @@ def _render_gestex_joint(viewpoint_camera, pc, bg_color, lru_slope=0.01, decompo
     # is unchanged so the tex/untex split stays visible. Return dict also exposes the
     # separate C_S / C_G / W_G so callers can inspect each component directly.
     _zero_atlas = (decompose_mode == 'sh_only')
-    _zero_sv    = (decompose_mode == 'tex_only')
+    _zero_sv    = (decompose_mode in ('tex_only', 'tex_only_raw'))
 
     # ---- per-primitive view-dependent SV colour ----
     # BOTH the surfels (colors_precomp for joint_s) and the untextured Gaussians (fake-SH
@@ -1004,7 +1097,7 @@ def _render_gestex_joint(viewpoint_camera, pc, bg_color, lru_slope=0.01, decompo
     fm = getattr(pc, 'feature_mode', 'sh')
     _g_shs = None
     if fm == 'SV' and getattr(pc, '_sv_sites', torch.empty(0)).numel() > 0:
-        fake_shs, sv_rgb = _build_fake_shs_from_SV(pc, dirs)
+        fake_shs, sv_rgb = _build_fake_shs_from_SV(pc, dirs, sv_lru=float(getattr(ingp, 'sv_lru_slope', 0.0)))
         # sv_rgb is ALREADY relu(feat + 0.5) (post-bias, post-clamp) — render it directly.
         # The previous `+ _ACTIVATION_BIAS[0]` double-biased it → a >=0.5 brightness floor
         # (washed-out surfels) and a colour jump vs the harden-phase base. Dropped.
@@ -1128,7 +1221,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     skip_mlp = False, force_no_hash_cuda = False, temperature = 1.0, force_ratio = 0.2, no_gumbel = False, dropout_lambda = 0.0, is_training = True,
     aabb_mode = "2dgs", aa = 0.0, aa_threshold = 0.01, skybox = None, background_mode = "none", bg_hashgrid = None, detach_hash_grad = False,
     return_raw_features = False, fast_inference = False, cache = None, max_intersections_per_pixel = 32, lowpass = False, pixel_center = False, antialiasing = 0.0, sv_metric = "l2",
-    metric_map = None, pose_correction = None, deform = None):
+    metric_map = None, pose_correction = None, deform = None, override_opacity = None):
     """
     Render the scene.
 
@@ -1188,6 +1281,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         means3D = means3D @ _pc_Mrot.transpose(0, 1) + _pc_Mt
     means2D = screenspace_points
     opacity = pc.get_opacity
+    # Finetune-with-occluder-mesh hook: multiply by a per-Gauss [N,1] mask so
+    # occluded Gaussians contribute nothing this frame (autograd zeroes their
+    # per-view grad). Set to `pc.get_opacity * mask` from the caller; None ⇒
+    # untouched, byte-identical to before.
+    if override_opacity is not None:
+        opacity = override_opacity
 
     # `--method GEStex`: TS+-style rising opacity FLOOR to harden surfels into near-opaque
     # flat discs while keeping opacity <= 1 (so the ∝opacity geometry-gradient amplification
@@ -1265,7 +1364,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             _cam_center = viewpoint_camera.camera_center.to(means3D.device)
         _dirs_sv = means3D - _cam_center.unsqueeze(0)
         _dirs_sv = _dirs_sv / (_dirs_sv.norm(dim=-1, keepdim=True) + 1e-8)
-        pc._beta_fake_shs, _sv_rgb = _build_fake_shs_from_SV(pc, _dirs_sv)
+        # `--sv_lru α`: leaky INNER ReLU on the SV base (relu(feat+0.5)) for the main
+        # 3D_SH_res-family render path (3D_SH_res, 3D_SH_filmres, mixed[_3d], …). α=0 ⇒
+        # F.leaky_relu is exactly ReLU ⇒ byte-identical. getattr handles ingp=None → 0.0.
+        pc._beta_fake_shs, _sv_rgb = _build_fake_shs_from_SV(
+            pc, _dirs_sv, sv_lru=float(getattr(ingp, 'sv_lru_slope', 0.0)))
         # `--method res_3d` post-split: the 2D residual-carriers must contribute
         # ZERO SV. We already zeroed the SV/SH params on those rows at split
         # AND mask `colors_precomp` to 0 for them at the rasterizer call, but
@@ -1500,6 +1603,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     render_mode = 0  # 0 = baseline, 1 = cat, 2 = adaptive_zero, 3 = 3D
     viewdirs_enc = None  # Pre-encoded view directions for 3D_direct_fused mode
+    # proberes: (probes [N,6], tex [R,R,3], dims int32 [2]) — filled in the
+    # 3D_SH_res body when _is_proberes(ingp); threaded via the *_diffuse kwargs.
+    _probe_tensors = None
     # NOTE: 3D mode (render_mode=3) is set after hash_in_CUDA block to avoid being overwritten
 
     # Initialize shape_dims tensor [GS, HS, OS] - will be updated per mode
@@ -1658,7 +1764,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 _restore_bias = True
                 set_activation_bias = _sh_res_setter_mod(ingp).set_activation_bias
                 set_activation_bias(sh_bias=_ACTIVATION_BIAS[0], res_bias=0.0)  # sh_only: zero MLP weights handle it
-            elif decompose_mode == 'tex_only':
+            elif decompose_mode in ('tex_only', 'tex_only_raw'):
                 _restore_bias = True
                 set_activation_bias = _sh_res_setter_mod(ingp).set_activation_bias
                 set_activation_bias(sh_bias=-999.0, res_bias=_ACTIVATION_BIAS[1])  # tex_only: kill SH
@@ -1738,7 +1844,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 _restore_bias = True
                 set_activation_bias = _setter_mod.set_activation_bias
                 set_activation_bias(sh_bias=_ACTIVATION_BIAS[0], res_bias=0.0)  # sh_only: zero MLP weights handle it
-            elif decompose_mode == 'tex_only':
+            elif decompose_mode in ('tex_only', 'tex_only_raw'):
                 _restore_bias = True
                 set_activation_bias = _setter_mod.set_activation_bias
                 set_activation_bias(sh_bias=-999.0, res_bias=_ACTIVATION_BIAS[1])  # tex_only: kill SH
@@ -1830,7 +1936,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 _restore_bias = True
                 set_activation_bias = _sh_res_setter_mod(ingp).set_activation_bias
                 set_activation_bias(sh_bias=_ACTIVATION_BIAS[0], res_bias=0.0)  # sh_only: zero MLP weights handle it
-            elif decompose_mode == 'tex_only':
+            elif decompose_mode in ('tex_only', 'tex_only_raw'):
                 _restore_bias = True
                 set_activation_bias = _sh_res_setter_mod(ingp).set_activation_bias
                 set_activation_bias(sh_bias=-999.0, res_bias=_ACTIVATION_BIAS[1])  # tex_only: kill SH
@@ -1842,6 +1948,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 ingp.active_hashgrid_levels if not ingp.hashgrid_disabled else 0,
                 total_levels)
 
+            # PROBERES: silence the 3D scene hash — the kernel probe branch
+            # (flag 0x1000, set below) replaces the hash+MLP residual entirely.
+            if _is_proberes(ingp):
+                active_hashgrid_levels = 0
+            
             # Encode levels: (total << 16) | (active_hashgrid << 8) | hybrid=0
             levels = (total_levels << 16) | (active_hashgrid_levels << 8) | 0
 
@@ -1851,8 +1962,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 padded_offsets[:offsets.shape[0]] = offsets
                 offsets = padded_offsets
 
-            # Upload MLP weights (zero for sh_only decomposition)
-            if _zero_mlp_weights:
+            # Upload MLP weights (zero for sh_only decomposition).
+            # proberes: no in-kernel MLP — skip the upload entirely.
+            if _is_proberes(ingp):
+                pass
+            elif _zero_mlp_weights:
                 mlp_weights = ingp.get_fused_mlp_weights()
                 if mlp_weights is not None:
                     W1, W2, W3 = mlp_weights
@@ -1866,6 +1980,27 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             render_mode = 5  # Fused in-kernel MLP
             if ingp.freeze_mlp:
                 render_mode |= 0x200  # bit 9: skip MLP weight gradients in CUDA backward
+            
+            if _is_proberes(ingp):
+                # PROBERES: flag the kernel probe branch and build the per-render
+                # probe/texture tensors. Both stay graph-connected: dL/dprobes
+                # flows through ProbeHead3D into xyz/rotation/scale (positional
+                # gradients) and dL/dtex through the bake into ProbeTexField2D.
+                render_mode |= 0x1000
+                # --res_warmup: while the family's hashgrid_disabled flag is up,
+                # withhold the probe/texture tensors — the kernel's null-pointer
+                # guard renders residual = 0 (SV-only), matching res-warmup
+                # semantics for the other family members. Same trick implements
+                # decompose_mode='sh_only' (the base's zero-MLP-weights route
+                # doesn't exist here). 'tex_only' needs no probe-side handling:
+                # the sh_bias=-999 set above zeroes the SV base as usual.
+                if not ingp.hashgrid_disabled and decompose_mode != 'sh_only':
+                    _pr = ingp.probe_head(pc.get_xyz, pc.get_rotation, pc.get_scaling)
+                    _tex = (ingp.probe_field.bake_cached(iteration)
+                            if is_training else ingp.probe_field.bake(sparse_bw=False))
+                    _dims = torch.tensor([_tex.shape[0], _tex.shape[1]],
+                                         dtype=torch.int32, device="cuda")
+                    _probe_tensors = (_pr.contiguous(), _tex.contiguous(), _dims)
 
             # One-time verification
             if not _3D_DIRECT_FUSED_VERIFIED:
@@ -2372,6 +2507,68 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             # shared diff_surfel_3D_sh_res. Byte-identical to sh_res until first-int
             # sort flips on at --ges_first_int_iter (15k).
             _rmod = _gestex_harden_rasterizer
+        elif _is_densfix(ingp):
+            # `--densfix` (--method 3D_SH_res): isolated clone that excludes the
+            # hash-query-point term from the AbsGS densify proxy. Byte-identical to
+            # sh_res unless set_exclude_hash_from_densify(1) is installed.
+            _rmod = _densfix_rasterizer
+        elif _is_trunc(ingp):
+            # `--trunc` (--method 3D_SH_res): isolated clone with the settable
+            # POST-blend truncation exit threshold (set_exit_T). Byte-identical
+            # to sh_res at the default 1e-4.
+            _rmod = _trunc_rasterizer
+        elif _is_proberes_wsr(ingp):
+            # `--wsr` proberes: WSR clone (sort-free weighted-sum composite,
+            # docs/WSR_DISTILL.md). Sorted-identical under set_wsr(0).
+            _rmod = _sh_res_probe_wsr_rasterizer
+            _H = int(viewpoint_camera.image_height)
+            _W = int(viewpoint_camera.image_width)
+            if getattr(ingp, 'wsr_sorted', False):
+                # Distill-dump / debug: render SORTED through the wsr clone
+                # (needed for its Σα / Σ(α·T) record_transmittance semantics).
+                _rmod.set_wsr(0)
+                pc._wsr_render_state = None
+            else:
+                assert hasattr(pc, '_wsr_occ') and pc._wsr_occ.numel() > 0, \
+                    "--wsr render needs pc._wsr_occ (load a PLY with args.wsr set)"
+                # Detached activation: occ grads arrive via the device-global
+                # accumulator; train.py chains the sigmoid derivative manually.
+                _occ_act = torch.sigmoid(pc._wsr_occ.detach()).view(-1).contiguous()
+                _occ_grad = torch.zeros_like(_occ_act)
+                # aux is [8,H,W]: mode 1 uses slots 0..3 (C̄, den); mode 2
+                # (--wsr_composite, ht=1-style front + occ tail) adds P_t, α_F
+                # and the front gauss id in slots 4..6.
+                _wsr_aux = torch.zeros((8, _H, _W), dtype=torch.float32, device="cuda")
+                _wsr_m = 2 if getattr(ingp, 'is_wsr_composite', False) else 1
+                _rmod.set_wsr(_wsr_m, _occ_act, _occ_grad, _wsr_aux)
+                # Transmittance gate (--wsr_gate_tau > 0): arm the depth-binned
+                # pre-pass. tbin must outlive the backward (stashed below).
+                # Constants (bins=16, zmin=0.2, zmax=120) are mirrored in the
+                # viewer's WGSL uniforms — change together or train≠deploy.
+                _gate_tau = float(getattr(ingp, 'wsr_gate_tau', 0.0) or 0.0)
+                _dgate_m = float(getattr(ingp, 'wsr_dgate_margin', 0.0) or 0.0)
+                if _gate_tau > 0.0:
+                    _wsr_tbin = torch.empty((16, _H, _W), dtype=torch.float32, device="cuda")
+                    _rmod.set_wsr_gate(_gate_tau, 16, 0.2, 120.0, _wsr_tbin)
+                    _rmod.set_wsr_dgate(0.0)
+                elif _dgate_m > 0.0:
+                    # Mean-depth gate (?wsr=3): sorted pre-pass fills (D̄, A).
+                    _wsr_tbin = torch.empty((2, _H, _W), dtype=torch.float32, device="cuda")
+                    _rmod.set_wsr_dgate(_dgate_m, _wsr_tbin)
+                    _rmod.set_wsr_gate(0.0)
+                else:
+                    _wsr_tbin = None
+                    _rmod.set_wsr_gate(0.0)
+                    _rmod.set_wsr_dgate(0.0)
+                # Keep alive through backward + let train.py read the grads.
+                # NOTE: any additional render between this forward and its
+                # backward would clobber the device-global pointers.
+                pc._wsr_render_state = (_occ_act, _occ_grad, _wsr_aux, _wsr_tbin)
+        elif _is_proberes(ingp):
+            # `--method proberes`: isolated clone whose case-5 residual is a
+            # probe-mapped bilinear fetch from the shared texture image
+            # (render_mode 5 | 0x1000). No in-kernel MLP, collab-GEMM forced off.
+            _rmod = _sh_res_probe_rasterizer
         else:
             _rmod = _sh_res_rasterizer
         # `--method GEStex` joint stage: point the textured residual at the baked atlas
@@ -2517,13 +2714,26 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         kernel_type = kernel_type,
         aabb_mode = aabb_mode_int,
     )
+    # PROBERES: probes [N,6] / texture [R,R,3] / dims {Ht,Wt} ride the (otherwise
+    # unused) dual-hashgrid kwargs — the probe kernel reads them under flag 0x1000
+    # and returns dL/dprobes + dL/dtex through the same autograd slots.
+    if _probe_tensors is not None:
+        rasterizer_kwargs['features_diffuse'] = _probe_tensors[0]
+        rasterizer_kwargs['gridrange_diffuse'] = _probe_tensors[1]
+        rasterizer_kwargs['offsets_diffuse'] = _probe_tensors[2]
     # Other rasterizers (lean, fp16, etc.) still accept viewdirs_enc
     if viewdirs_enc is not None and not isinstance(rasterizer, GaussianRasterizer):
         rasterizer_kwargs['viewdirs_enc'] = viewdirs_enc
     # FastGS: only diff_surfel_3D_sh_res / diff_surfel_mixed accept metric_map.
+    # NOTE: diff_surfel_3D_sh_filmres is a res-family clone whose name does NOT contain
+    # the 'diff_surfel_3D_sh_res' substring (film·res, not _sh_res), so it must be listed
+    # explicitly — otherwise metric_map is never passed → FastGS importance is all-zero →
+    # every clone/split is gated off → densification silently disabled for filmres.
     _rasterizer_mod = getattr(type(rasterizer), '__module__', '') or ''
     if metric_map is not None and (
-            'diff_surfel_3D_sh_res' in _rasterizer_mod or 'diff_surfel_mixed' in _rasterizer_mod):
+            'diff_surfel_3D_sh_res' in _rasterizer_mod
+            or 'diff_surfel_3D_sh_filmres' in _rasterizer_mod
+            or 'diff_surfel_mixed' in _rasterizer_mod):
         rasterizer_kwargs['metric_map'] = metric_map
     # `--method mixed[_3d]` / `--method res_3d`: pass per-Gauss textured/
     # untextured bool to the kernel. (`diff_surfel_mixed` substring also matches
@@ -2707,7 +2917,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # straight-through ReLU instead of the plain torch.relu — gradient also
     # flows at clamped pixels where grad_out < 0 (release-clamp direction),
     # rescuing the "many texture queries miss gradient at clamped pixels" case.
-    if ingp is not None and getattr(ingp, 'is_mixed_deferred_relu_mode', False):
+    # 'tex_only_raw' returns the SIGNED blended residual sum(w_i * residual_i)
+    # WITHOUT the mode-2 per-pixel clamp — that sum is linear in the residual and
+    # is the distillation target/prediction (--probe_distill_dir). Plain 'tex_only'
+    # keeps the clamp so existing --decomp supervision is byte-identical.
+    if (ingp is not None and getattr(ingp, 'is_mixed_deferred_relu_mode', False)
+            and decompose_mode != 'tex_only_raw'):
         _lru_alpha = float(getattr(ingp, 'lru_slope', 0.0))
         if getattr(ingp, 'is_ste_relu', False):
             rendered_image = STERelu.apply(rendered_image)

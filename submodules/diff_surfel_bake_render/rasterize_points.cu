@@ -785,6 +785,25 @@ void SetOpacityAwareBetaBakeCUDA(bool val) {
 	FORWARD::setOpacityAwareBeta(val);
 }
 
+// Per-pixel occluder Z-cull. Pass a CUDA fp32 [H, W] tensor; the kernel
+// caches the raw pointer + W/H in a device global and drops fragments where
+// surfel `depth > occluder[pix]`. Non-finite entries skip the cull for that
+// pixel. Call with an empty tensor (or use SetOccluderDepthClearBakeCUDA)
+// to disable. Caller must keep the tensor alive until the next render or
+// clear call — the device global stores a raw pointer.
+void SetOccluderDepthBakeCUDA(const torch::Tensor& depth) {
+	TORCH_CHECK(depth.is_cuda(), "occluder depth must be CUDA");
+	TORCH_CHECK(depth.dtype() == torch::kFloat32, "occluder depth must be fp32");
+	TORCH_CHECK(depth.dim() == 2, "occluder depth must be [H, W]");
+	const int H = depth.size(0);
+	const int W = depth.size(1);
+	FORWARD::setOccluderDepth(depth.contiguous().data_ptr<float>(), W, H);
+}
+
+void ClearOccluderDepthBakeCUDA() {
+	FORWARD::clearOccluderDepth();
+}
+
 void SetResidualModeBakeCUDA(int mode) {
 	FORWARD::setResidualMode(mode);
 }

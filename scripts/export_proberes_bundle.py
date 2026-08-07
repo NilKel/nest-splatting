@@ -105,6 +105,40 @@ def quantise_atlas(pixels: np.ndarray):
     return rgba, scale, lo
 
 
+def build_mip_pyramid(pixels: np.ndarray, max_levels: int = 0):
+    """float32 [H,W,3] -> list of float32 levels, L0 first, 2x2 box-filtered.
+
+    Filtering happens on the FLOAT atlas, before quantisation, so coarse levels
+    are true averages rather than averages-of-codes. All levels are later
+    quantised with ONE shared (scale, offset) so the shader keeps a single
+    dequant pair regardless of which level it samples.
+
+    Why mips at all: bilinear alone handles magnification, not MINIFICATION. A
+    surfel with a 74-texel footprint drawn 5 px wide steps ~15 texels per pixel
+    -> shimmer under camera motion. The renderer's low-pass branch is only a
+    binary 2-level approximation (full-res bilinear, or collapse to the probe
+    centre) and pops at the switch; a real chain makes that transition smooth.
+    """
+    levels = [pixels]
+    H, W, _ = pixels.shape
+    while min(H, W) > 4 and (max_levels == 0 or len(levels) < max_levels):
+        cur = levels[-1]
+        H, W = cur.shape[0] // 2, cur.shape[1] // 2
+        levels.append(cur[:2 * H, :2 * W].reshape(H, 2, W, 2, 3).mean(axis=(1, 3)))
+    return levels
+
+
+def quantise_level(level: np.ndarray, scale: float, offset: float) -> np.ndarray:
+    """Quantise one mip level with the pyramid-wide (scale, offset)."""
+    step = scale / 255.0
+    codes = np.clip(np.round((level - offset) / step), 0, 255).astype(np.uint8)
+    H, W, _ = codes.shape
+    rgba = np.empty((H, W, 4), dtype=np.uint8)
+    rgba[..., :3] = codes
+    rgba[..., 3] = 255
+    return rgba
+
+
 def encode_bc7(rgba: np.ndarray) -> bytes:
     try:
         import bc7encoder
@@ -142,7 +176,7 @@ def encode_astc(rgba: np.ndarray, block: int = 4, quality: str = "medium") -> by
 def write_nat2(out_path: Path, probes_norm: np.ndarray, payload: bytes,
                Ht: int, Wt: int, atlas_format: int, kernel_type: int,
                uv_extent: float, sh_bias: float, res_bias: float,
-               atlas_scale: float, atlas_offset: float):
+               atlas_scale: float, atlas_offset: float, flags: int = 0):
     """NAT2 with the standard 64-byte header. Reuses existing slots:
 
       n_layers = 1, layer_h = Ht      -- single layer; 8192 <= maxTextureDimension2D
@@ -151,14 +185,22 @@ def write_nat2(out_path: Path, probes_norm: np.ndarray, payload: bytes,
       num_rects = N                   -- but the rects block is stride 6, not 4.
                                          atlas_format disambiguates.
       atlas_scale/offset (slots 12/13) -- dequant pair, already in the format
+      flags (the former _pad u32)      -- bit 0: WSR — rects stride is 7, the
+                                         7th float is the per-surfel occlusion
+                                         (sigmoid-activated, in [0,1]).
+                                         bits 8-15: mip_count (0/1 = no chain).
+                                         Payload is then levels concatenated
+                                         L0..Ln, each 16 B per 4x4 block.
     """
     N = probes_norm.shape[0]
+    stride = probes_norm.shape[1]
+    assert stride == (7 if (flags & 1) else 6), (stride, flags)
     hdr = struct.pack(
         "<IIIIIfII fffI ffII",
         Wt, Ht, 4, kernel_type,
         N, uv_extent, 0, atlas_format,
         sh_bias, res_bias, 1.0, Ht,          # compact_mult=1.0, layer_h
-        atlas_scale, atlas_offset, 1, 0,     # n_layers=1, _pad
+        atlas_scale, atlas_offset, 1, flags, # n_layers=1, flags (ex-_pad)
     )
     assert len(hdr) == 64, len(hdr)
 
@@ -167,13 +209,13 @@ def write_nat2(out_path: Path, probes_norm: np.ndarray, payload: bytes,
         f.write(hdr)
         # layer_cuts for the single layer: [0, Ht]
         f.write(struct.pack("<II", 0, Ht))
-        # probes, stride 6 fp32, ALREADY divided by tex_res
+        # probes, stride 6 (or 7 with WSR occ) fp32, affine ALREADY divided by tex_res
         f.write(probes_norm.astype(np.float32).tobytes())
         f.write(payload)
 
     mb = out_path.stat().st_size / 2**20
-    print(f"[nat2] {out_path}  {mb:.1f} MiB  ({Wt}x{Ht}, 1 layer, {N:,} probes stride 6, "
-          f"format {atlas_format})")
+    print(f"[nat2] {out_path}  {mb:.1f} MiB  ({Wt}x{Ht}, 1 layer, {N:,} probes stride {stride}, "
+          f"format {atlas_format}, flags {flags})")
 
 
 def main():
@@ -184,10 +226,20 @@ def main():
     ap.add_argument("--format", choices=["bc7", "astc"], default="bc7")
     ap.add_argument("--astc-block", type=int, default=4)
     ap.add_argument("--quality", default="medium")
+    ap.add_argument("--mips", action="store_true",
+                    help="build a mip chain (2x2 box filter on the FLOAT atlas, shared "
+                         "dequant pair). +33%% payload; enables trilinear minification "
+                         "in the viewer and smooths the low-pass pop.")
+    ap.add_argument("--mip-levels", type=int, default=0,
+                    help="cap the chain length (0 = down to 4x4)")
     ap.add_argument("--kernel", default="beta_scaled", choices=list(KERNEL_MAP))
     ap.add_argument("--uv-extent", type=float, default=4.0)
     ap.add_argument("--sh-bias", type=float, default=0.5)
     ap.add_argument("--res-bias", type=float, default=0.0)
+    ap.add_argument("--wsr-ply", type=Path, default=None,
+                    help="WSR finetune PLY (point_cloud.ply with the wsr_occ column). "
+                         "Appends sigmoid(wsr_occ) as a 7th float per probe record "
+                         "and sets header flag bit 0 (viewer ?wsr=1 mode).")
     args = ap.parse_args()
 
     ckpt = (args.model_path / args.ckpt) if args.ckpt else \
@@ -204,20 +256,51 @@ def main():
     probes_norm[:, [0, 1, 4]] /= float(Wt)   # A00, A01, t0  -> x / width
     probes_norm[:, [2, 3, 5]] /= float(Ht)   # A10, A11, t1  -> y / height
 
-    rgba, scale, offset = quantise_atlas(pixels)
-    del pixels
+    flags = 0
+    if args.wsr_ply is not None:
+        from plyfile import PlyData
+        ply = PlyData.read(str(args.wsr_ply))
+        el = ply.elements[0]
+        names = [p.name for p in el.properties]
+        if "wsr_occ" not in names:
+            raise SystemExit(f"{args.wsr_ply} has no wsr_occ column — not a WSR finetune PLY?")
+        occ_logit = np.asarray(el["wsr_occ"], dtype=np.float32)
+        if occ_logit.shape[0] != probes_norm.shape[0]:
+            raise SystemExit(f"wsr_occ count {occ_logit.shape[0]} != probes {probes_norm.shape[0]}")
+        occ = 1.0 / (1.0 + np.exp(-occ_logit))
+        probes_norm = np.concatenate([probes_norm, occ[:, None]], axis=1)  # stride 7
+        flags |= 1
+        print(f"[wsr] occ appended: mean {occ.mean():.4f}  p10 {np.percentile(occ,10):.4f} "
+              f"p90 {np.percentile(occ,90):.4f}")
 
-    if args.format == "bc7":
-        payload = encode_bc7(rgba)
-        fmt = ATLAS_FORMAT_PROBE_BC7
+    rgba, scale, offset = quantise_atlas(pixels)
+    enc = (lambda r: encode_bc7(r)) if args.format == "bc7" else \
+          (lambda r: encode_astc(r, args.astc_block, args.quality))
+    fmt = ATLAS_FORMAT_PROBE_BC7 if args.format == "bc7" else ATLAS_FORMAT_PROBE_ASTC
+
+    if args.mips:
+        levels = build_mip_pyramid(pixels, args.mip_levels)
+        del pixels
+        chunks = [enc(rgba)]                       # L0 reuses the already-quantised codes
+        del rgba
+        for lvl in levels[1:]:
+            chunks.append(enc(quantise_level(lvl, scale, offset)))
+        payload = b"".join(chunks)
+        mip_count = len(chunks)
+        print(f"[mip] {mip_count} levels, "
+              f"{' + '.join(f'{len(c)/2**20:.1f}' for c in chunks)} MiB "
+              f"= {len(payload)/2**20:.1f} MiB "
+              f"(+{100*(len(payload)/len(chunks[0])-1):.0f}% vs L0 alone)")
+        flags |= (mip_count & 0xFF) << 8
     else:
-        payload = encode_astc(rgba, args.astc_block, args.quality)
-        fmt = ATLAS_FORMAT_PROBE_ASTC
+        del pixels
+        payload = enc(rgba)
+        del rgba
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     write_nat2(args.output, probes_norm, payload, Ht, Wt, fmt,
                KERNEL_MAP[args.kernel], args.uv_extent,
-               args.sh_bias, args.res_bias, scale, offset)
+               args.sh_bias, args.res_bias, scale, offset, flags=flags)
 
 
 if __name__ == "__main__":

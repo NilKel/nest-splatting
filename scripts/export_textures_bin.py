@@ -68,6 +68,12 @@ ATLAS_FORMAT_RVQ_PAIRED     = 5   # paired-RVQ (L=4 → L=2, K²=65536), uint8 c
 ATLAS_FORMAT_RVQ_PAIRED_BC7 = 6   # paired-RVQ with BC7-compressed codebook texture
                                   # (typeB). Saves ~6 MB of GPU mem on codebook and lets the
                                   # mobile hw decode unit handle the per-fragment dequant.
+ATLAS_FORMAT_ASTC_CODEBOOK  = 8   # typeD-ASTC: ASTC 4x4 codebook + uint16 indices.
+                                  # Same K-means clustering as BC7 codebook (typeD),
+                                  # only the codeword encoding differs. Enables the
+                                  # ~7x download shrink for Adreno/Mali Android
+                                  # devices that natively decode ASTC but pay
+                                  # decode cost on BC7.
 ATLAS_FORMAT_BC7_CODEBOOK   = 7   # BC7 atlas, but the atlas is stored on disk as a small
                                   # codebook of unique BC7 blocks (K codewords, 16 B each)
                                   # + per-block uint16 index (typeD). Loader gathers the
@@ -571,8 +577,16 @@ def _export_rvq_paired(baked: Path, output_path: str | None, kernel_type: int,
 
 def _export_bc7_codebook(baked: Path, output_path: str | None, kernel_type: int,
                           meta: dict, atlas_rects_np: np.ndarray, N: int,
-                          legacy_natl: bool, K: int = 65536) -> None:
+                          legacy_natl: bool, K: int = 65536,
+                          codeword_format: str = "bc7") -> None:
     """typeD: BC7 codebook + uint16 per-block indices.
+
+    codeword_format:
+        "bc7"  → typeD BC7-codebook (atlas_format=7, sub-magic 'BCCB').
+        "astc" → typeD-ASTC-codebook (atlas_format=8, sub-magic 'ACCB').
+                 Same K-means, only the codeword encoding differs.
+                 Ships to Adreno/Mali Android devices that natively decode
+                 ASTC but pay a decode cost on BC7.
 
     Pipeline:
       1. Single-stage K-means on the atlas's 4×4 RGB blocks (~14.7M for room
@@ -595,13 +609,21 @@ def _export_bc7_codebook(baked: Path, output_path: str | None, kernel_type: int,
     PSNR cost (atlas-space): ~3 dB vs raw BC7 at K=65536 (38-39 dB).
     """
     if legacy_natl:
-        raise SystemExit("--legacy-natl is FP16 RGB only; not compatible with BC7-codebook.")
+        raise SystemExit("--legacy-natl is FP16 RGB only; not compatible with typeD-codebook.")
     if K > 65536:
-        raise SystemExit(f"--bc7-codebook-K must be ≤ 65536 (uint16 indices fit [0, 65535]); got K={K}")
-    try:
-        import bc7encoder
-    except ImportError:
-        raise SystemExit("bc7encoder not installed (build from submodules/bc7enc_lib).")
+        raise SystemExit(f"typeD codebook K must be ≤ 65536 (uint16 indices fit [0, 65535]); got K={K}")
+    if codeword_format not in ("bc7", "astc"):
+        raise SystemExit(f"codeword_format must be 'bc7' or 'astc'; got {codeword_format!r}")
+    if codeword_format == "bc7":
+        try:
+            import bc7encoder
+        except ImportError:
+            raise SystemExit("bc7encoder not installed (build from submodules/bc7enc_lib).")
+    else:
+        try:
+            import astc_encoder  # noqa: F401  (imported lazily in the encode step)
+        except ImportError:
+            raise SystemExit("astc-encoder-py not installed (pip install astc-encoder-py).")
     sys.path.insert(0, str(Path(__file__).parent))
     from vq_bake import kmeans_chunked
 
@@ -708,9 +730,9 @@ def _export_bc7_codebook(baked: Path, output_path: str | None, kernel_type: int,
     psnr = -10.0 * math.log10(max(se / (N_total * D), 1e-20))
     print(f"  assign done in {time.time()-t1:.1f}s; atlas-space PSNR = {psnr:.2f} dB")
 
-    # ---- BC7-encode the K codewords ----
+    # ---- Encode the K codewords (BC7 or ASTC 4×4; both = 16 B/codeword) ----
     # Quantize centroids back to uint8 RGB (re-applying the same scale/offset
-    # transform in reverse). bc7encoder wants HxWx4 RGBA; lay codewords out as
+    # transform in reverse). Encoder wants HxWx4 RGBA; lay codewords out as
     # K rows of 4 px (vertically stacked 4×4 blocks).
     cb_rgb_f = cb.clamp(a_off, a_off + a_scale)        # within atlas range
     cb_rgb_u8 = ((cb_rgb_f - a_off) / a_scale * 255.0 + 0.5).clamp(0, 255).byte()
@@ -720,12 +742,34 @@ def _export_bc7_codebook(baked: Path, output_path: str | None, kernel_type: int,
     cb_rgba_u8[..., 3] = 255
     # Reshape to a (K*B) × B × 4 image so each row block is one codeword.
     cb_image = cb_rgba_u8.reshape(K*B, B, 4)
-    print(f"[BC7-CB] BC7-encoding {K} codewords → {K*16/1024:.1f} KB…")
+    tag = codeword_format.upper()
+    print(f"[{tag}-CB] {tag}-encoding {K} codewords → {K*16/1024:.1f} KB…")
     t2 = time.time()
-    cb_bc7 = bc7encoder.encode_image_rgba(cb_image, uber_level=1, perceptual=False)
-    print(f"  encode done in {time.time()-t2:.1f}s ({len(cb_bc7)} bytes)")
-    if len(cb_bc7) != K * 16:
-        raise SystemExit(f"BC7 codebook size {len(cb_bc7)} != expected {K * 16}")
+    if codeword_format == "bc7":
+        cb_bytes = bc7encoder.encode_image_rgba(cb_image, uber_level=1, perceptual=False)
+    else:
+        # astc-encoder-py: 4x4 block, medium quality (matches encode_astc.py default).
+        # API mirrors scripts/encode_astc.py — positional args + explicit
+        # ASTCSwizzleComponentSelector; the kwarg-style API was rejected as
+        # invalid on the installed astc-encoder-py version.
+        import os as _os
+        from astc_encoder import (
+            ASTCConfig, ASTCContext, ASTCImage, ASTCProfile, ASTCType,
+            ASTCSwizzle, ASTCQualityPreset,
+            ASTCSwizzleComponentSelector as Sel,
+        )
+        Bx = 4  # block size (must match the 4×4 K-means block size B above)
+        cfg  = ASTCConfig(ASTCProfile.LDR, Bx, Bx, 1, ASTCQualityPreset.MEDIUM)
+        ctx  = ASTCContext(cfg, max(1, _os.cpu_count() or 4))
+        # cb_image is (K*B) × B × 4 uint8 RGBA. ASTCImage wants (W, H, D, bytes)
+        # — note the width/height order is opposite of numpy shape indexing.
+        H_img, W_img = cb_image.shape[:2]
+        src = ASTCImage(ASTCType.U8, W_img, H_img, 1, cb_image.tobytes())
+        sw  = ASTCSwizzle(Sel.R, Sel.G, Sel.B, Sel.A)
+        cb_bytes = bytes(ctx.compress(src, sw))
+    print(f"  encode done in {time.time()-t2:.1f}s ({len(cb_bytes)} bytes)")
+    if len(cb_bytes) != K * 16:
+        raise SystemExit(f"{tag} codebook size {len(cb_bytes)} != expected {K * 16}")
 
     # ---- Pack indices as uint16 row-major over blocks (block-row-major) ----
     indices_u16 = indices.to(torch.int32).cpu().numpy().astype(np.uint16)
@@ -749,27 +793,32 @@ def _export_bc7_codebook(baked: Path, output_path: str | None, kernel_type: int,
     # NAT2 header: previously the 16th word ("_pad") was reserved 0. Reuse
     # it to carry n_cols when sharding. Loaders that don't know about width
     # sharding read 0 ⇒ legacy single-column behavior.
+    atlas_format_id = ATLAS_FORMAT_BC7_CODEBOOK if codeword_format == "bc7" \
+                                                else ATLAS_FORMAT_ASTC_CODEBOOK
+    sub_magic       = b"BCCB" if codeword_format == "bc7" else b"ACCB"
     header = struct.pack(
         "<IIIIIfIIfffIffII",
         W, H, 4, kernel_type,
-        N, meta["uv_extent"], sb_number, ATLAS_FORMAT_BC7_CODEBOOK,
+        N, meta["uv_extent"], sb_number, atlas_format_id,
         meta["sh_bias"], meta["res_bias"], meta["compact_mult"], LAYER_H_BC7,
         meta["atlas_scale"], meta["atlas_offset"], n_layers,
         n_cols if n_cols > 1 else 0,
     )
     assert len(header) == 64
 
-    # BC7-CB sub-header (24 B; matches RVQP's 24 B header shape).
-    bccb_subheader = struct.pack(
+    # Sub-header (24 B; matches RVQP's 24 B header shape). Both BCCB and
+    # ACCB share the same fields — magic changes so the loader dispatches
+    # to the right texture format (BC7 vs ASTC 4×4).
+    subheader = struct.pack(
         "<4sIIIII",
-        b"BCCB",
+        sub_magic,
         1,                    # version
         K,
         Hb,                   # n_block_rows  (= H / 4)
         Wb,                   # n_block_cols  (= W / 4)
         N_total,              # sanity
     )
-    assert len(bccb_subheader) == 24
+    assert len(subheader) == 24
 
     with open(output_path, "wb") as f:
         f.write(b"NAT2")
@@ -781,8 +830,8 @@ def _export_bc7_codebook(baked: Path, output_path: str | None, kernel_type: int,
         if n_cols > 1:
             f.write(struct.pack(f"<{n_cols + 1}I", *col_cuts))
         f.write(atlas_rects_np.tobytes())
-        f.write(bccb_subheader)
-        f.write(cb_bc7)
+        f.write(subheader)
+        f.write(cb_bytes)
         f.write(indices_u16.tobytes())
         f.write(sb_bytes)
 
@@ -790,7 +839,7 @@ def _export_bc7_codebook(baked: Path, output_path: str | None, kernel_type: int,
     shard_info = f"{n_cols}×{n_layers} shards ({n_cols * n_layers} slices)" if n_cols > 1 else f"{n_layers} layers (1 col)"
     print(f"[NAT2 BC7-CODEBOOK] {W}x{H}, {shard_info}, {N} rects, "
           f"K={K}, N_blocks={N_total:,}, "
-          f"codebook {len(cb_bc7)/1024:.0f} KB, "
+          f"codebook {len(cb_bytes)/1024:.0f} KB, "
           f"indices {len(indices_u16.tobytes())/1024/1024:.1f} MB, "
           f"atlas-PSNR {psnr:.2f} dB → {output_path} ({size_mb:.1f} MB)")
 
@@ -895,7 +944,8 @@ def export_nat2(baked_dir: str, output_path: str | None = None,
                 kernel_type: int | None = None, legacy_natl: bool = False,
                 rvq: bool = False, rvq_paired: bool = False,
                 rvq_paired_bc7: bool = False, vq_subdir: str = "vq",
-                bc7_codebook: bool = False, bc7_codebook_K: int = 65536):
+                bc7_codebook: bool = False, bc7_codebook_K: int = 65536,
+                astc_codebook: bool = False):
     baked = Path(baked_dir)
 
     atlas_rects = torch.load(baked / "atlas_rects.pt", map_location="cpu")
@@ -910,11 +960,17 @@ def export_nat2(baked_dir: str, output_path: str | None = None,
 
     atlas_format_str = meta["atlas_format"]
 
-    # ---- BC7-CODEBOOK path: format=7 (typeD — single-stage VQ + BC7 gather) ----
-    if bc7_codebook:
-        return _export_bc7_codebook(baked, output_path, kernel_type, meta,
-                                     atlas_rects_np, N, legacy_natl,
-                                     K=bc7_codebook_K)
+    # ---- typeD codebook paths: format=7 (BC7) or format=8 (ASTC 4×4).
+    # Same K-means; only the codeword encoder + on-disk format ID differ.
+    if bc7_codebook or astc_codebook:
+        if bc7_codebook and astc_codebook:
+            raise SystemExit("--bc7-codebook and --astc-codebook are mutually exclusive")
+        return _export_bc7_codebook(
+            baked, output_path, kernel_type, meta,
+            atlas_rects_np, N, legacy_natl,
+            K=bc7_codebook_K,
+            codeword_format="astc" if astc_codebook else "bc7",
+        )
 
     # ---- RVQ-PAIRED path: format=5 (uint8 codebook) / format=6 (BC7) ----
     if rvq_paired or rvq_paired_bc7:
@@ -1050,7 +1106,13 @@ if __name__ == "__main__":
     parser.add_argument("--bc7-codebook-K", type=int, default=65536,
                         help="K-means K for --bc7-codebook (default 65536; must be ≤ 65535 "
                              "for uint16 indices — but K=65536 is allowed via the unsigned "
-                             "wraparound to index 0 in practice; use ≤ 65535 to be safe).")
+                             "wraparound to index 0 in practice; use ≤ 65535 to be safe). "
+                             "Applies to --astc-codebook too (same K, same clustering).")
+    parser.add_argument("--astc-codebook", action="store_true",
+                        help="Emit NAT2 with atlas_format=8 (typeD-ASTC — same K-means as "
+                             "--bc7-codebook but each centroid is ASTC 4×4-encoded instead of "
+                             "BC7). Loader gathers the ASTC byte stream at load; renderer uses "
+                             "the raw ASTC 4×4 path (1 hw bilinear / fragment on Adreno / Mali).")
     args = parser.parse_args()
     if args.bc7_codebook_K > 65536:
         raise SystemExit(f"--bc7-codebook-K must be ≤ 65536 (got {args.bc7_codebook_K})")
@@ -1058,4 +1120,5 @@ if __name__ == "__main__":
                 args.legacy_natl, args.rvq, args.rvq_paired, args.rvq_paired_bc7,
                 vq_subdir=args.vq_subdir,
                 bc7_codebook=args.bc7_codebook,
-                bc7_codebook_K=args.bc7_codebook_K)
+                bc7_codebook_K=args.bc7_codebook_K,
+                astc_codebook=args.astc_codebook)

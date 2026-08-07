@@ -117,6 +117,10 @@ class OptimizationParams(ParamGroup):
 
         self.lambda_floater = 0.0
         self.lambda_mask = 0.0
+        # SSIM mix for the alpha/mask loss (Niedermayr et al. 2024 use L1+SSIM
+        # on the alpha channel): mask_error = (1-mask_dssim)*L1 + mask_dssim*(1-SSIM).
+        # 0.0 keeps the historical pure-L1 behavior.
+        self.mask_dssim = 0.0
         
         self.densification_interval = 100
         self.opacity_reset_interval = 3000

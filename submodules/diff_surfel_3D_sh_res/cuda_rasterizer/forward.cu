@@ -18,6 +18,14 @@
 #include "modes/mode_3d_direct_fused.cu"
 namespace cg = cooperative_groups;
 
+// T_CROSSING is a compile-time float defining the T threshold at which
+// median_depth stops updating (median_depth ends as the depth of the surfel
+// just before T drops through T_CROSSING). Default 0.5 = "half-opacity"
+// crossing. Set via env T_CROSSING=<val> at build time; see setup.py.
+#ifndef T_CROSSING
+#define T_CROSSING 0.5f
+#endif
+
 // ============================================================================
 // MLP WEIGHTS IN GLOBAL DEVICE MEMORY (3D_SH_res: tiny residual MLP)
 // All weight matrices are [16×16] FP16 (single WMMA tile per layer)
@@ -106,6 +114,18 @@ __device__ float d_compact_mult = 1.0f;
 // surfels ADAPT to a tighter footprint during training (FastGS trained-in-mult idea);
 // beta support ends at k=3sigma, so the support edge is mult~0.9 from the 3.3 baseline.
 __device__ float d_beta_mult = 1.0f;
+
+// Per-pixel Z-cull proxy occluder. When d_occluder_depth != nullptr, the render
+// forward kernel (and the two backward kernels — std + MODE-5 collab-GEMM)
+// skip any fragment whose per-pixel ray-splat depth exceeds the mesh depth at
+// that pixel. Non-finite entries (+inf where the mesh missed) leave the pixel
+// untouched. Semantics match the bake_render implementation; installing via
+// set_occluder_depth from Python. Same map is used in both fwd and bwd so the
+// "list of contributing fragments" per pixel is identical → gradients match
+// the culled forward exactly.
+__device__ const float* d_occluder_depth = nullptr;
+__device__ int d_occluder_W = 0;
+__device__ int d_occluder_H = 0;
 
 // Host-side pointers for memory management
 static __half* h_mlp_W1 = nullptr;
@@ -1024,11 +1044,13 @@ renderCUDA(
 			if (alpha < 1.0f / 255.0f)
 				continue;
 			float test_T = T * (1 - alpha);
+#ifndef DISABLE_EARLY_EXIT
 			if (test_T < 0.0001f)
 			{
 				done = true;
 				continue;
 			}
+#endif
 
 			float w = alpha * T;
 
@@ -1049,11 +1071,19 @@ renderCUDA(
 			M1 += m * w;
 			M2 += m * m * w;
 
-			if (T > 0.5) {
+#ifdef LAST_DEPTH_MODE
+			// Proxy-mesh mode: median_depth carries the DEEPEST contributor
+			// depth (last surfel to survive the alpha cull). Every survived
+			// contributor overwrites; result is T-saturation frontier depth.
+			median_depth = depth;
+			median_contributor = contributor;
+#else
+			if (T > T_CROSSING) {
 				median_depth = depth;
 				// median_weight = w;
 				median_contributor = contributor;
 			}
+#endif
 			// Render normal map
 			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
 #endif
@@ -1459,7 +1489,9 @@ renderCUDAsurfelForward(
 				}
 
 				float test_T = T * (1 - my_alpha);
+#ifndef DISABLE_EARLY_EXIT
 				if (test_T < 0.0001f) { done = true; active = false; break; }
+#endif
 
 				my_w = my_alpha * T;
 				my_test_T = test_T;
@@ -1479,10 +1511,16 @@ renderCUDAsurfelForward(
 				D += my_depth * my_w;
 				M1 += m * my_w;
 				M2 += m * m * my_w;
-				if (T > 0.5) {
+#ifdef LAST_DEPTH_MODE
+				// Proxy-mesh mode: median_depth = deepest survivor of alpha cull.
+				median_depth = my_depth;
+				median_contributor = contributor;
+#else
+				if (T > T_CROSSING) {
 					median_depth = my_depth;
 					median_contributor = contributor;
 				}
+#endif
 				for (int ch = 0; ch < 3; ch++) N[ch] += my_normal[ch] * my_w;
 #endif
 			} while(0);
@@ -1661,8 +1699,15 @@ renderCUDAsurfelForward(
 			// compute intersection and depth
 			float rho = min(rho3d, rho2d);
 
-		float depth = (rho3d <= rho2d) ? (s.x * Tw.x + s.y * Tw.y) + Tw.z : Tw.z; 
+		float depth = (rho3d <= rho2d) ? (s.x * Tw.x + s.y * Tw.y) + Tw.z : Tw.z;
 		if (depth < near_n) continue;
+		// Per-pixel Z-cull: fragments behind the proxy occluder mesh get dropped.
+		// The same test runs in the backward kernel so contributing-fragment set
+		// matches (else grads leak through occluded rows).
+		if (d_occluder_depth != nullptr && pix.x < d_occluder_W && pix.y < d_occluder_H) {
+			float occ = d_occluder_depth[pix.y * d_occluder_W + pix.x];
+			if (isfinite(occ) && depth > occ) continue;
+		}
 		float4 nor_o = collected_normal_opacity[j];
 		float normal[3] = {nor_o.x, nor_o.y, nor_o.z};  // Already normalized in preprocessing
 		float opa = nor_o.w;
@@ -1800,11 +1845,13 @@ renderCUDAsurfelForward(
 		}
 
 		float test_T = T * (1 - alpha);
+#ifndef DISABLE_EARLY_EXIT
 		if (test_T < 0.0001f)
 		{
 			done = true;
 			continue;
 		}
+#endif
 
 		float w = alpha * T;
 
@@ -1849,11 +1896,19 @@ renderCUDAsurfelForward(
 			M1 += m * w;
 			M2 += m * m * w;
 
-			if (T > 0.5) {
+#ifdef LAST_DEPTH_MODE
+			// Proxy-mesh mode: median_depth carries the DEEPEST contributor
+			// depth (last surfel to survive the alpha cull). Every survived
+			// contributor overwrites; result is T-saturation frontier depth.
+			median_depth = depth;
+			median_contributor = contributor;
+#else
+			if (T > T_CROSSING) {
 				median_depth = depth;
 				// median_weight = w;
 				median_contributor = contributor;
 			}
+#endif
 
 			// Render normal map
 			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
@@ -2455,6 +2510,20 @@ void FORWARD::setWeightRegLambda(float val) {
 __global__ void setActivationBiasKernel(float sh, float res) { d_sh_bias = sh; d_res_bias = res; }
 void FORWARD::setActivationBias(float sh_bias, float res_bias) {
 	setActivationBiasKernel<<<1, 1>>>(sh_bias, res_bias);
+}
+
+// Per-pixel Z-cull proxy occluder (forward). `ptr` = CUDA fp32 [H*W] cam-Z
+// depth map (non-hit pixels = +inf); pass nullptr + zeros to clear.
+__global__ void setOccluderDepthFwdKernel(const float* ptr, int W, int H) {
+	d_occluder_depth = ptr;
+	d_occluder_W = W;
+	d_occluder_H = H;
+}
+void FORWARD::setOccluderDepth(const float* ptr, int W, int H) {
+	setOccluderDepthFwdKernel<<<1, 1>>>(ptr, W, H);
+}
+void FORWARD::clearOccluderDepth() {
+	setOccluderDepthFwdKernel<<<1, 1>>>(nullptr, 0, 0);
 }
 
 // Set residual activation mode (0 = 3D_SH_res stacked outer ReLU, 1 = 3D_SH_add separate ReLUs)

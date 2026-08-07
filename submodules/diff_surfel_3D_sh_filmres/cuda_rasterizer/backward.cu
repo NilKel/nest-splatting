@@ -41,22 +41,34 @@ __device__ int d_ste_relu = 0;
 // clamp direction wins). Mirrors forward.cu — host setter pair stays in sync.
 __device__ float d_lru_slope = 0.0f;
 // `--film_act` (0=identity, 1=gamma_relu, 2=beta_relu, 3=gamma_sigmoid,
-// 4=beta_sigmoid, 5=double_relu, 6=double_sigmoid). Mirrors forward.cu.
+// 4=beta_sigmoid, 5=double_relu, 6=double_sigmoid, 7=gamma_sigm_split — PER-LEVEL
+// sigmoid gamma: gamma_l for hash level l = i/l_dim; gamma_0 = film_gamma col 0,
+// gamma_1..3 = film_beta cols 21..23, staged in shared slots 16..18). Mirrors forward.cu.
 __device__ int d_film_gamma_act = 0;
 // `--lock_gamma X`: force gamma_eff = X + freeze gamma grad when > -1e29. Mirrors forward.cu.
+// Composes with mode 7: apply() returns X for ANY raw -> ALL levels locked, all gamma grads 0.
 __device__ float d_film_lock_gamma = -1e30f;
-// gamma activation: locked constant if set, else relu for modes {1,5}, sigmoid for {3,6}, else raw.
+// gamma activation: locked constant if set, else relu for modes {1,5}, sigmoid for {3,6,7}, else raw.
 __device__ __forceinline__ float film_gamma_apply(float g) {
 	if (d_film_lock_gamma > -1e29f) return d_film_lock_gamma;
 	if (d_film_gamma_act == 1 || d_film_gamma_act == 5) return fmaxf(0.0f, g);
-	if (d_film_gamma_act == 3 || d_film_gamma_act == 6) return 1.0f / (1.0f + __expf(-g));
+	if (d_film_gamma_act == 3 || d_film_gamma_act == 6 || d_film_gamma_act == 7) return 1.0f / (1.0f + __expf(-g));
 	return g;
 }
 __device__ __forceinline__ float film_gamma_apply_grad(float g) {
 	if (d_film_lock_gamma > -1e29f) return 0.0f;   // gamma frozen when locked
 	if (d_film_gamma_act == 1 || d_film_gamma_act == 5) return (g > 0.0f) ? 1.0f : 0.0f;
-	if (d_film_gamma_act == 3 || d_film_gamma_act == 6) { float s = 1.0f / (1.0f + __expf(-g)); return s * (1.0f - s); }
+	if (d_film_gamma_act == 3 || d_film_gamma_act == 6 || d_film_gamma_act == 7) { float s = 1.0f / (1.0f + __expf(-g)); return s * (1.0f - s); }
 	return 1.0f;
+}
+// gamma_sigm_split (mode 7) helpers — mirrors forward.cu. Shared stage layout:
+// collected_film_beta slots [0..15] = beta cols 0..15, slots [16..18] = beta cols 21..23.
+#define FILM_GAMMA_LVL_BASE 16
+#define FILM_BETA_STAGE_DIM 19
+__device__ __forceinline__ float film_gamma_raw_lvl(
+	const __half* coll_gamma, const __half* coll_beta, int j, int lvl) {
+	return (lvl == 0) ? __half2float(coll_gamma[j])
+	                  : __half2float(coll_beta[(FILM_GAMMA_LVL_BASE + lvl - 1) * BLOCK_SIZE + j]);
 }
 // beta activation: relu for modes {2,5}, sigmoid for {4,6}, else raw.
 __device__ __forceinline__ float film_beta_apply(float b) {
@@ -837,11 +849,13 @@ renderCUDAsurfelBackward(
 	__shared__ float3 collected_pk[BLOCK_SIZE];
 	__shared__ uint32_t collected_ap_level[BLOCK_SIZE];
 	__shared__ float2 collected_shapes[BLOCK_SIZE];  // Kernel shape: .x = primary, .y = nexel gamma_y
-	// FiLM (3D_SH_filmres): per-Gauss gamma/beta staged in shared as FP16 (8.5KB total;
+	// FiLM (3D_SH_filmres): per-Gauss gamma/beta staged in shared as FP16 (10KB total;
 	// fits the backward's tight static-shared budget alongside the collab GEMM tiles).
 	// Read by both the collab and scalar MLP backward paths; math in FP32 via __half2float.
+	// Stage layout [FILM_BETA_STAGE_DIM=19][BLOCK_SIZE]: slots 0..15 = beta cols 0..15,
+	// slots 16..18 = beta cols 21..23 = gamma_1..3 (--film_act gamma_sigm_split, mode 7).
 	__shared__ __half collected_film_gamma[BLOCK_SIZE];
-	__shared__ __half collected_film_beta[16 * BLOCK_SIZE];
+	__shared__ __half collected_film_beta[FILM_BETA_STAGE_DIM * BLOCK_SIZE];
 
 	// Per-tile MLP gradient accumulators for 3D_SH_res mode (render_mode=5, bias-free)
 	// All [16×16] = 256 floats each. Accumulate to shared memory first, flush to global once per tile
@@ -1114,12 +1128,16 @@ renderCUDAsurfelBackward(
 			}
 			}
 			// FiLM (3D_SH_filmres): stage per-Gauss gamma/beta into shared as FP16
-			// (beta stride 24 in global FP32; channel-major [16][BLOCK_SIZE] FP16 in shared).
+			// (beta stride 24 in global FP32; channel-major [19][BLOCK_SIZE] FP16 in shared).
 			if (film_gamma != nullptr) {
 				collected_film_gamma[block.thread_rank()] = __float2half(film_gamma[coll_id]);
 				#pragma unroll
 				for (int c = 0; c < 16; c++)
 					collected_film_beta[c * BLOCK_SIZE + block.thread_rank()] = __float2half(film_beta[coll_id * 24 + c]);
+				// gamma_sigm_split: stage the per-level gammas (beta cols 21..23) into slots 16..18.
+				#pragma unroll
+				for (int c = FILM_GAMMA_LVL_BASE; c < FILM_BETA_STAGE_DIM; c++)
+					collected_film_beta[c * BLOCK_SIZE + block.thread_rank()] = __float2half(film_beta[coll_id * 24 + (c + 5)]);
 			}
 
 		// NOTE: Per-Gaussian feature caching disabled due to shared memory limits
@@ -1318,12 +1336,19 @@ renderCUDAsurfelBackward(
 							query_feature<false, 16, 4>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 							                           appearance_level, hash_features, active_hashgrid_levels,
 							                           l_scale, Base, align_corners, interp, if_contract, false);
-						// FiLM (3D_SH_filmres): my_input = gamma*hash + beta (beta stride 24)
+						// FiLM (3D_SH_filmres): my_input = gamma*hash + beta (beta stride 24).
+						// Mode 7 (gamma_sigm_split): per-LEVEL gamma_l, l = i/l_dim (capped 3).
 						for (int i = 0; i < hash_dim_collab && i < TC_INPUT_DIM; i++) {
 							my_hash_raw[i] = hash_feat[i];
-							my_input[i] = (film_gamma != nullptr)
-								? (film_gamma_apply(__half2float(collected_film_gamma[j])) * hash_feat[i] + film_beta_apply(__half2float(collected_film_beta[i * BLOCK_SIZE + j])))
-								: hash_feat[i];
+							if (film_gamma != nullptr) {
+								const float g_raw = (d_film_gamma_act == 7)
+									? film_gamma_raw_lvl(collected_film_gamma, collected_film_beta, j, min(i / l_dim, 3))
+									: __half2float(collected_film_gamma[j]);
+								my_input[i] = film_gamma_apply(g_raw) * hash_feat[i]
+								            + film_beta_apply(__half2float(collected_film_beta[i * BLOCK_SIZE + j]));
+							} else {
+								my_input[i] = hash_feat[i];
+							}
 						}
 					} else if (!skip_hash && active_hashgrid_levels > 0 && l_dim == 2) {
 						// 2D per level — supports 1..8 hash levels (hash_dim ∈ {2,4,6,8,10,12,14,16}).
@@ -1361,12 +1386,19 @@ renderCUDAsurfelBackward(
 							query_feature<false, 16, 2>(hash_feat, xyz, voxel_min, voxel_max, collec_offsets,
 							                           appearance_level, hash_features, active_hashgrid_levels,
 							                           l_scale, Base, align_corners, interp, if_contract, false);
-						// FiLM (3D_SH_filmres): my_input = gamma*hash + beta (beta stride 24)
+						// FiLM (3D_SH_filmres): my_input = gamma*hash + beta (beta stride 24).
+						// Mode 7 (gamma_sigm_split): per-LEVEL gamma_l, l = i/l_dim (capped 3).
 						for (int i = 0; i < hash_dim_collab && i < TC_INPUT_DIM; i++) {
 							my_hash_raw[i] = hash_feat[i];
-							my_input[i] = (film_gamma != nullptr)
-								? (film_gamma_apply(__half2float(collected_film_gamma[j])) * hash_feat[i] + film_beta_apply(__half2float(collected_film_beta[i * BLOCK_SIZE + j])))
-								: hash_feat[i];
+							if (film_gamma != nullptr) {
+								const float g_raw = (d_film_gamma_act == 7)
+									? film_gamma_raw_lvl(collected_film_gamma, collected_film_beta, j, min(i / l_dim, 3))
+									: __half2float(collected_film_gamma[j]);
+								my_input[i] = film_gamma_apply(g_raw) * hash_feat[i]
+								            + film_beta_apply(__half2float(collected_film_beta[i * BLOCK_SIZE + j]));
+							} else {
+								my_input[i] = hash_feat[i];
+							}
 						}
 					}
 					// Remaining positions are zero (WMMA padding)
@@ -1505,15 +1537,36 @@ renderCUDAsurfelBackward(
 					// dL/dH = gamma*dL/dinput. global_id is block-uniform (one Gauss per GEMM batch),
 					// so the atomicAdds sum this Gauss's grad over all its pixels in this block.
 					if (film_gamma != nullptr && !d_skip_mlp_grad) {
-						const float g_raw_cb = __half2float(collected_film_gamma[j]);
-						const float fg_cb = film_gamma_apply(g_raw_cb);
-						float dgamma_cb = 0.0f;
-						for (int i = 0; i < hash_dim && i < TC_INPUT_DIM; i++) {
-							dgamma_cb += my_hash_raw[i] * my_dL_dinput[i];
-							atomicAdd(&(dL_dfilm_beta[global_id * 24 + i]), my_dL_dinput[i] * film_beta_apply_grad(__half2float(collected_film_beta[i * BLOCK_SIZE + j])));
-							my_dL_dinput[i] *= fg_cb;
+						if (d_film_gamma_act == 7) {
+							// gamma_sigm_split: per-LEVEL gamma. dL/dgamma_l =
+							// sigmoid'(g_l) * sum_{i in lvl l} hash[i]*dL/dinput[i];
+							// hash grad scaled by sigmoid(g_l) per dim; beta identity.
+							// gamma_0 -> dL_dfilm_gamma; gamma_1..3 -> dL_dfilm_beta cols 21..23.
+							float dgamma_lvl[4] = {0.f, 0.f, 0.f, 0.f};
+							for (int i = 0; i < hash_dim && i < TC_INPUT_DIM; i++) {
+								const int lvl = min(i / l_dim, 3);
+								dgamma_lvl[lvl] += my_hash_raw[i] * my_dL_dinput[i];
+								atomicAdd(&(dL_dfilm_beta[global_id * 24 + i]), my_dL_dinput[i]);  // beta_act = identity in mode 7
+								my_dL_dinput[i] *= film_gamma_apply(film_gamma_raw_lvl(collected_film_gamma, collected_film_beta, j, lvl));
+							}
+							const int n_lvl = min((min(hash_dim, TC_INPUT_DIM) + l_dim - 1) / l_dim, 4);
+							for (int lvl = 0; lvl < n_lvl; lvl++) {
+								const float g_raw = film_gamma_raw_lvl(collected_film_gamma, collected_film_beta, j, lvl);
+								const float dg = dgamma_lvl[lvl] * film_gamma_apply_grad(g_raw);
+								if (lvl == 0) atomicAdd(&(dL_dfilm_gamma[global_id]), dg);
+								else          atomicAdd(&(dL_dfilm_beta[global_id * 24 + 20 + lvl]), dg);
+							}
+						} else {
+							const float g_raw_cb = __half2float(collected_film_gamma[j]);
+							const float fg_cb = film_gamma_apply(g_raw_cb);
+							float dgamma_cb = 0.0f;
+							for (int i = 0; i < hash_dim && i < TC_INPUT_DIM; i++) {
+								dgamma_cb += my_hash_raw[i] * my_dL_dinput[i];
+								atomicAdd(&(dL_dfilm_beta[global_id * 24 + i]), my_dL_dinput[i] * film_beta_apply_grad(__half2float(collected_film_beta[i * BLOCK_SIZE + j])));
+								my_dL_dinput[i] *= fg_cb;
+							}
+							atomicAdd(&(dL_dfilm_gamma[global_id]), dgamma_cb * film_gamma_apply_grad(g_raw_cb));
 						}
-						atomicAdd(&(dL_dfilm_gamma[global_id]), dgamma_cb * film_gamma_apply_grad(g_raw_cb));
 					}
 
 					// Backprop to hash features - dL_dxyz flows to geometry.
@@ -2276,11 +2329,18 @@ renderCUDAsurfelBackward(
 				// 2. Build MLP input: [hash(hash_dim) | pad(16-hash_dim)] = 16D
 				float mlp_input[TC_INPUT_DIM];
 				for (int i = 0; i < TC_INPUT_DIM; i++) mlp_input[i] = 0.0f;
-				// FiLM: mlp_input = gamma*hash + beta (beta stride 24, first hash_dim<=16 used)
+				// FiLM: mlp_input = gamma*hash + beta (beta stride 24, first hash_dim<=16 used).
+				// Mode 7 (gamma_sigm_split): per-LEVEL gamma_l, l = i/l_dim (capped 3).
 				for (int i = 0; i < hash_dim_px && i < TC_INPUT_DIM; i++) {
-					mlp_input[i] = (film_gamma != nullptr)
-						? (film_gamma_apply(__half2float(collected_film_gamma[j])) * hash_feat[i] + film_beta_apply(__half2float(collected_film_beta[i * BLOCK_SIZE + j])))
-						: hash_feat[i];
+					if (film_gamma != nullptr) {
+						const float g_raw = (d_film_gamma_act == 7)
+							? film_gamma_raw_lvl(collected_film_gamma, collected_film_beta, j, min(i / l_dim, 3))
+							: __half2float(collected_film_gamma[j]);
+						mlp_input[i] = film_gamma_apply(g_raw) * hash_feat[i]
+						             + film_beta_apply(__half2float(collected_film_beta[i * BLOCK_SIZE + j]));
+					} else {
+						mlp_input[i] = hash_feat[i];
+					}
 				}
 
 				// 3. Recompute MLP forward → residual (identity, no sigmoid)
@@ -2358,15 +2418,36 @@ renderCUDAsurfelBackward(
 				// Then gamma-scale dL_dinput_full IN PLACE so the hash backward below
 				// (dL_dhash[i] = dL_dinput_full[i]) automatically sees dL/dH = gamma*dL/dinput.
 				if (film_gamma != nullptr) {
-					const float g_raw_bw = __half2float(collected_film_gamma[j]);
-					const float fg_bw = film_gamma_apply(g_raw_bw);
-					float dgamma_bw = 0.0f;
-					for (int i = 0; i < hash_dim_px && i < TC_INPUT_DIM; i++) {
-						dgamma_bw += hash_feat[i] * dL_dinput_full[i];
-						atomicAdd(&(dL_dfilm_beta[global_id * 24 + i]), dL_dinput_full[i] * film_beta_apply_grad(__half2float(collected_film_beta[i * BLOCK_SIZE + j])));
-						dL_dinput_full[i] *= fg_bw;
+					if (d_film_gamma_act == 7) {
+						// gamma_sigm_split: per-LEVEL gamma (mirrors the collab-GEMM site).
+						// dL/dgamma_l = sigmoid'(g_l) * sum_{i in lvl l} hash[i]*dL/dinput[i];
+						// hash grad scaled by sigmoid(g_l) per dim; beta identity.
+						// gamma_0 -> dL_dfilm_gamma; gamma_1..3 -> dL_dfilm_beta cols 21..23.
+						float dgamma_lvl[4] = {0.f, 0.f, 0.f, 0.f};
+						for (int i = 0; i < hash_dim_px && i < TC_INPUT_DIM; i++) {
+							const int lvl = min(i / l_dim, 3);
+							dgamma_lvl[lvl] += hash_feat[i] * dL_dinput_full[i];
+							atomicAdd(&(dL_dfilm_beta[global_id * 24 + i]), dL_dinput_full[i]);  // beta_act = identity in mode 7
+							dL_dinput_full[i] *= film_gamma_apply(film_gamma_raw_lvl(collected_film_gamma, collected_film_beta, j, lvl));
+						}
+						const int n_lvl = min((min(hash_dim_px, TC_INPUT_DIM) + l_dim - 1) / l_dim, 4);
+						for (int lvl = 0; lvl < n_lvl; lvl++) {
+							const float g_raw = film_gamma_raw_lvl(collected_film_gamma, collected_film_beta, j, lvl);
+							const float dg = dgamma_lvl[lvl] * film_gamma_apply_grad(g_raw);
+							if (lvl == 0) atomicAdd(&(dL_dfilm_gamma[global_id]), dg);
+							else          atomicAdd(&(dL_dfilm_beta[global_id * 24 + 20 + lvl]), dg);
+						}
+					} else {
+						const float g_raw_bw = __half2float(collected_film_gamma[j]);
+						const float fg_bw = film_gamma_apply(g_raw_bw);
+						float dgamma_bw = 0.0f;
+						for (int i = 0; i < hash_dim_px && i < TC_INPUT_DIM; i++) {
+							dgamma_bw += hash_feat[i] * dL_dinput_full[i];
+							atomicAdd(&(dL_dfilm_beta[global_id * 24 + i]), dL_dinput_full[i] * film_beta_apply_grad(__half2float(collected_film_beta[i * BLOCK_SIZE + j])));
+							dL_dinput_full[i] *= fg_bw;
+						}
+						atomicAdd(&(dL_dfilm_gamma[global_id]), dgamma_bw * film_gamma_apply_grad(g_raw_bw));
 					}
-					atomicAdd(&(dL_dfilm_gamma[global_id]), dgamma_bw * film_gamma_apply_grad(g_raw_bw));
 				}
 
 				// 7. Backprop to hash features (first hash_dim elements of dL_dinput)

@@ -692,6 +692,20 @@ def set_activation_bias(sh_bias=0.5, res_bias=0.5):
     Default: 0.5/0.5. For decomposition: sh_only uses res_bias=-999, tex_only uses sh_bias=-999."""
     _C.set_activation_bias(sh_bias, res_bias)
 
+
+def set_occluder_depth(depth):
+    """Per-pixel Z-cull. Pass a CUDA fp32 [H, W] cam-Z depth map (non-hits =
+    +inf); fragments with per-fragment ray-splat depth > occluder[pix] are
+    dropped in fwd AND bwd (both std + MODE-5 collab-GEMM paths). Caller must
+    keep the tensor alive across the render call — this stores a raw
+    device-side pointer."""
+    _C.set_occluder_depth(depth)
+
+
+def clear_occluder_depth():
+    """Disable the per-pixel Z-cull; fwd + bwd revert to byte-identical."""
+    _C.clear_occluder_depth()
+
 def set_residual_mode(mode=0):
     """Select residual activation:
        0 = 3D_SH_res (default): color = ReLU(ReLU(SH+sh_bias) + residual + res_bias)
