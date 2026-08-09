@@ -205,11 +205,32 @@ frames.
 | treehill | 175k | 181k | 22.29 | 22.51 | **+0.22** | 1105 | 1090 | −1.4% |
 | **mean** | **123k** | **151k** | **26.80** | **27.09** | **+0.29** | **1456** | **1373** | **−5.7%** |
 
+Perceptual metrics, same lanes (winner bold):
+
+| scene | 3DSH SSIM | paired SSIM | 3DSH LPIPS | paired LPIPS |
+|---|---:|---:|---:|---:|
+| bicycle  | 0.6768 | **0.6801** | **0.2866** | 0.2893 |
+| bonsai   | 0.9286 | **0.9331** | **0.2077** | 0.2084 |
+| counter  | 0.8869 | **0.8922** | 0.2211 | **0.2187** |
+| flowers  | 0.5415 | **0.5539** | 0.3505 | **0.3444** |
+| garden   | **0.8170** | 0.8153 | **0.1694** | 0.1705 |
+| kitchen  | 0.9024 | **0.9094** | 0.1585 | **0.1528** |
+| room     | 0.9049 | **0.9065** | **0.2341** | 0.2344 |
+| stump    | 0.7209 | **0.7269** | 0.2707 | **0.2662** |
+| treehill | 0.5837 | **0.5922** | **0.3417** | 0.3432 |
+| **mean** | 0.7736 | **0.7789** | 0.2489 | **0.2475** |
+
 Reading:
 
 - **Paired wins PSNR on 9/9 scenes, +0.29 dB mean**, carrying +22% more
   primitives (the untextured EWA half is nearly free capacity — no atlas
   bytes, no hash/MLP at train time, SV-only colour).
+- **SSIM follows PSNR (8/9 paired, +0.0053 mean; garden the lone −0.0017
+  exception). LPIPS is a wash** — 5/9 paired, −0.0014 mean, per-scene
+  deltas ≤0.006 either way. The extra EWA primitives buy structural
+  fidelity (PSNR/SSIM) but no perceptual-detail gain: high-frequency
+  texture lives in the atlas, and the atlas half is unchanged between the
+  two representations.
 - **The FPS cost is −5.7% mean**, and it is *not* uniform: it tracks the
   primitive-count gap, not the paired-branch tax. Garden/kitchen pay
   −14% carrying +26/+48% Gauss; treehill pays −1.4% at +3% Gauss. Stump
