@@ -773,6 +773,10 @@ void SetCompactMultBakeCUDA(float val) {
 	FORWARD::setCompactMult(val);
 }
 
+void SetUntexMultBakeCUDA(float val) {
+	FORWARD::setUntexMult(val);
+}
+
 void SetBetaMultBakeCUDA(float val) {
 	FORWARD::setBetaMult(val);
 }

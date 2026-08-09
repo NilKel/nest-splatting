@@ -23,6 +23,12 @@ __device__ float d_compact_mult = 1.0f;
 // Kept SEPARATE from d_compact_mult so existing beta bakes (which carry compact_mult
 // in bake_meta) render byte-identically.
 __device__ float d_beta_mult = 1.0f;
+// FastGS-style footprint mult for the UNTEXTURED EWA 3D half ONLY (t = mult·t,
+// verbatim FastGS Compact Box semantics). The textured 2D surfels carry the
+// atlas residual — cropping their footprint truncates visible texture — so
+// this knob is deliberately scoped to the EWA branch and nothing else.
+// 1.0 = off (byte-identical).
+__device__ float d_untex_mult = 1.0f;
 __device__ bool  d_drop_lowpass = false;
 // Mode-5/0/2 beta footprint: OPACITY-AWARE cutoff = max(r_beta, r_lp) (the 1/255 iso)
 // so AccuTile traces a tighter — but lossless — ellipse. DEFAULT true (verified ~1.34–1.35×
@@ -717,7 +723,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		// the textured path, but in the EWA conic's natural form).
 		float opa = opacities[idx];
 		if (opa < (1.0f / 255.0f)) return;
-		float t_cut = fmaxf(0.5f, 2.0f * logf(255.0f * opa));
+		float t_cut = fmaxf(0.5f, 2.0f * logf(255.0f * opa) * d_untex_mult);
 
 		// Per-axis tight rect AABB (fallback + AccuTile upper-bound).
 		// Σ = K⁻¹ where K = (a,b,c) is the inverse cov; det(K) = ac − b².
@@ -1435,6 +1441,11 @@ void FORWARD::setActivationBias(float sh_bias, float res_bias) {
 __global__ void setBakeCompactMultKernel(float val) { d_compact_mult = val; }
 void FORWARD::setCompactMult(float val) {
 	setBakeCompactMultKernel<<<1, 1>>>(val);
+}
+
+__global__ void setBakeUntexMultKernel(float val) { d_untex_mult = val; }
+void FORWARD::setUntexMult(float val) {
+	setBakeUntexMultKernel<<<1, 1>>>(val);
 }
 
 __global__ void setBakeBetaMultKernel(float val) { d_beta_mult = val; }

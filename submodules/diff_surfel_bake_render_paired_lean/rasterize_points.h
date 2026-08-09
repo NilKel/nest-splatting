@@ -68,6 +68,7 @@ RasterizeGaussiansCUDA(
 void SetActivationBiasBakeCUDA(float sh_bias, float res_bias);
 void SetCompactMultBakeCUDA(float val);
 void SetBetaMultBakeCUDA(float val);
+void SetUntexMultBakeCUDA(float val);
 void SetDropLowpassBakeCUDA(bool val);
 void SetOpacityAwareBetaBakeCUDA(bool val);
 void SetResidualModeBakeCUDA(int mode);

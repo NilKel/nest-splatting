@@ -8,6 +8,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_compact_mult", &SetCompactMultBakeCUDA);
   m.def("set_beta_mult", &SetBetaMultBakeCUDA,
         "EXPERIMENT: scale the beta_scaled footprint cutoff (1.0 = 4-sigma baseline).");
+  m.def("set_untex_mult", &SetUntexMultBakeCUDA,
+        "FastGS footprint mult for the untextured EWA 3D half ONLY (1.0 = off)");
   m.def("set_drop_lowpass", &SetDropLowpassBakeCUDA,
         "EXPERIMENT: drop the Gaussian low-pass (alpha max-pool + filter_r screen extension).");
   m.def("set_opacity_aware_beta", &SetOpacityAwareBetaBakeCUDA,

@@ -202,3 +202,21 @@ threads take the same side per Gaussian), so warp divergence is NOT a factor.
 Gating the staging by `is_textured` + unioning the shared slots is the first
 lever; expected recovery is a meaningful slice of the 7.4% on pure scenes and
 proportionally less on mixed ones.
+
+### FastGS footprint mult on the untextured EWA half — measured, no win
+
+Hypothesis: crop the untextured EWA 3D Gaussians' binning footprint FastGS-style
+(`t = mult·t`, mult 0.5) — scoped to the EWA half only, since the textured 2D
+surfels carry the atlas residual and must not be cropped. Implemented as
+`d_untex_mult` / `set_untex_mult` in `diff_surfel_bake_render_paired_lean`
+(EWA branch's `t_cut` only; 1.0 = byte-identical) + `BENCH_UNTEX_MULT` env in
+the bench harness (lean lane only).
+
+Result (garden / bicycle / treehill, 30/300 frames, vs the mult=1.0 CONIC
+baselines): FPS −0.3%…+0.8%, PSNR ±0.003 dB at both mult 0.5 and 0.7 — pure
+noise. **The opacity-aware EWA cutoff (`t_cut = max(0.5, 2·log(255·opa))`)
+already banks this win**: the untex half is low-opacity volumetric filler, so
+its 1/255-iso footprints are already small, and its binning share of frame time
+is evidently negligible. FastGS's mult pays off in FastGS because it applies to
+ALL primitives at 3–4× our primitive count; here there is nothing left to crop.
+No finetune warranted. The knob stays (default 1.0) for future A/Bs.

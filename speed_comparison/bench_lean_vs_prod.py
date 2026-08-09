@@ -302,6 +302,15 @@ def main():
     lean.set_activation_bias(0.5, 0.0)
     lean.set_compact_mult(_compact_mult_train)
     lean.set_beta_mult(_compact_mult_train)
+    # BENCH_UNTEX_MULT: inference-only FastGS footprint mult on the UNTEXTURED
+    # EWA 3D half ONLY (lean lane; prod stays the reference). The textured 2D
+    # surfels carry the atlas residual, so their footprint is never cropped
+    # here. Absent -> byte-identical.
+    import os as _os
+    _untex_mult = _os.environ.get("BENCH_UNTEX_MULT")
+    if _untex_mult and hasattr(lean, "set_untex_mult"):
+        lean.set_untex_mult(float(_untex_mult))
+        print(f"[bench] BENCH_UNTEX_MULT={_untex_mult} (untextured EWA half only, lean lane)")
     lean.set_residual_mode(_residual_mode)
     if hasattr(lean, "set_untex_kernel"):
         lean.set_untex_kernel(_untex_kernel)

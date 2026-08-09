@@ -108,6 +108,7 @@ namespace FORWARD
 	void setCompactMult(float val);
 	// EXPERIMENT: beta_scaled footprint mult + drop low-pass (alpha max-pool + filter_r).
 	void setBetaMult(float val);
+	void setUntexMult(float val);
 	void setDropLowpass(bool val);
 	void setOpacityAwareBeta(bool val);
 	// 0 = 3D_SH_res (default outer-ReLU). 1 = 3D_SH_add (separate ReLUs).
