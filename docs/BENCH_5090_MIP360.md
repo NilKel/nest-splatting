@@ -164,3 +164,41 @@ skipped because it would grow the `Splat2DGS` struct 80→96 bytes for
 ~1-3% expected fragment win (WGSL already L1-caches `atlas_rects` and
 constant-folds uniform divisors — see the analysis in
 [`project_lean_bake_render_wins.md`](../../.claude/projects/-home-nilkel-Projects-nest-splatting/memory/project_lean_bake_render_wins.md)).
+
+## res_3d_paired (BS2 i2fast) — CONIC paired renderer, 9 scenes
+
+Config: `fix_BS2_10S15kL01_SV_30thr_005w25gLP4lev_FRP5k10_N2F_Jac_5ksp_i2fast`
+(res_3d_paired, textured 2D beta_scaled surfels + untextured EWA 3D beta,
+59–73% textured). Baked 2026-08-09 (max_res 64, BC7); benched with
+`diff_surfel_bake_render_paired_lean` built `LEAN_FLAGS=CONIC`, 50/400
+cuda.Event frames, `speed_comparison/bs2_conic_bench/*.json`.
+
+| scene | nGauss | %tex | neural | baked PSNR | prod FPS | CONIC FPS | Δ |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| bicycle  | 170k | 73% | 24.17 | 24.16 |  766 | 1347 | +75.8% |
+| bonsai   | 129k | 69% | 32.40 | 32.34 |  724 | 1203 | +66.2% |
+| counter  | 102k | 59% | 29.15 | 29.11 |  870 | 1402 | +61.2% |
+| flowers  | 222k | 67% | 20.58 | 20.80 |  692 | 1192 | +72.3% |
+| garden   | 188k | 70% | 26.86 | 26.82 | 1025 | 1671 | +63.0% |
+| kitchen  | 177k | 62% | 31.20 | 31.11 |  794 | 1287 | +62.2% |
+| room     |  80k | —   | 31.15 | 31.10 | 1030 | 1652 | +60.3% |
+| stump    | 107k | —   | 25.77 | 25.86 |  913 | 1509 | +65.3% |
+| treehill | 181k | —   | 22.46 | 22.51 |  654 | 1090 | +66.7% |
+| **mean** | — | — | — | — | **830** | **1373** | **+65.4%** |
+
+PSNR prod vs CONIC bit-identical (max |Δ| 0.002 dB, kitchen). Bake loss vs
+neural ≈ 0 mean; flowers/stump/treehill *gain* (+0.22/+0.09/+0.05 dB) — no
+post-bake finetune headroom on this config.
+
+**Paired-branch tax, measured** (`BENCH_FORCE_PAIRED_LEAN=1` on the
+3D_SH_res room bake — zero untextured rows, so the delta is pure overhead of
+the paired code paths): prod matches the plain-lean run within 2% (1027 vs
+1049 → same run conditions), lean SH+atlas 1659 vs plain-lean's 1792 =
+**−7.4%**; SH-only 1922 vs 2012 = −4.5%. Attribution candidates, in order:
+dual staging (every Gauss stages BOTH the CONIC fields and the EWA
+conic/flag — dead global reads for the wrong type), +9 B/entry shared
+footprint, per-j flag test. The branch itself is block-uniform (all 256
+threads take the same side per Gaussian), so warp divergence is NOT a factor.
+Gating the staging by `is_textured` + unioning the shared slots is the first
+lever; expected recovery is a meaningful slice of the 7.4% on pure scenes and
+proportionally less on mixed ones.
