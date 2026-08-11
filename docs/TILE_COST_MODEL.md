@@ -213,3 +213,46 @@ Per-Gaussian *preprocess* is not the driver, contrary to a first guess:
    `w·|get_scaling|.mean()` — a mean, dominated by the small bulk, so it cannot
    reach the tail without uniformly shrinking everything.
    `w·relu(max_axis − τ)²` with τ ≈ `dense·extent` is the right shape.
+
+---
+
+## 7. Experiment: 8×8 tiles — decisively WORSE (−54%)
+
+Clone `diff_surfel_bake_render_lean_t8` (`BLOCK_X/Y = 8`, `LEAN_FLAGS=CONIC`),
+50/400 frames, idle GPU, PSNR bit-identical (22.29 / 21.95 unchanged):
+
+| | 16×16 | 8×8 | Δ |
+|---|---:|---:|---:|
+| RD | 995 | **459** | **−53.9%** |
+| BS3k | 728 | **332** | **−54.4%** |
+
+Both lose ~54%, so this is structural, not scene-specific.
+
+**Why, and it inverts §4's conclusion.** `BLOCK_SIZE = BLOCK_X·BLOCK_Y`, so 8×8
+also drops the block from **256 threads to 64**. That costs on two axes at once:
+
+- **Amortization**: the cooperative staging loads one Gaussian per thread per
+  batch, then every thread evaluates all of them. At 256 threads that's 256
+  global loads serving 256×256 = 65,536 evaluations. At 64 threads it is 64
+  loads serving 64×64 = 4,096 — **4× fewer evaluations per load**.
+- **Occupancy**: 64 threads is 2 warps per block; far less latency hiding, and
+  4× more blocks with their attendant launch and tile-range overhead.
+
+The 4× reduction in per-splat tile tax is real but is swamped by both.
+
+**So the "waste" in §4 is not a defect — it is the price of the amortization
+that makes this renderer fast.** The 12.9–22.3% useful-fraction figure reads
+like inefficiency, but buying it back by shrinking tiles costs more than it
+saves. Tile size is already at/near its optimum for this kernel.
+
+**Consequence for where to spend effort:** there is no renderer-side tiling
+lever here. The only way to move FPS is to change *what is drawn* — keep
+primitive counts down and footprints near tile-sized, i.e. reach garden's
+regime (§2). That makes the training-side items in §6 the whole remaining
+opportunity, not a secondary one.
+
+Untested opposite direction: 32×32 would be 1024 threads/block — exactly the
+CUDA maximum — and would quadruple the shared-memory staging footprint, very
+likely blowing the 48 KB static cap given the CONIC path already stages ~60 B
+per entry. Not obviously viable, and the amortization curve is already
+flattening at 256.
