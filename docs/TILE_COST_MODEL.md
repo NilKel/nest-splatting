@@ -256,3 +256,46 @@ CUDA maximum — and would quadruple the shared-memory staging footprint, very
 likely blowing the 48 KB static cap given the CONIC path already stages ~60 B
 per entry. Not obviously viable, and the amortization curve is already
 flattening at 256.
+
+## 8. Real instance counts (measured, replaces the AABB estimates)
+
+`Rasterizer::forward` already computes `num_rendered` and discarded it. Exposed
+via a host global + `get_last_num_rendered()` binding (no signature change, no
+device code) in the scratch clone; shipping `diff_surfel_bake_render_lean` is
+untouched.
+
+| | RD | BS3k | ratio |
+|---|---:|---:|---:|
+| **real instances/frame** | **2,290,384** | **3,373,473** | **1.473×** |
+| §4 AABB estimate | 510,807 | 757,094 | 1.482× |
+| frame-time ratio (CONIC) | — | — | 1.367× |
+| **cost per instance** | **0.452 ns** | **0.425 ns** | 0.94× |
+
+Two things to take from this:
+
+**The ratio held; the absolutes did not.** The AABB estimate got the ratio right
+to within 0.6% (1.482 vs 1.473) — so every *relative* claim in §4 stands. But it
+under-counted absolute instances by **4.5×** on both scenes, so the "evaluations"
+figures in §4 (130.8 M / 193.8 M) are ~4.5× too low and the "useful fraction"
+(22.3% / 12.9%) is correspondingly ~4.5× too *high*. True useful fraction is
+closer to **5%** and **2.9%**. The direction of every argument is unchanged and
+the waste is in fact larger than stated — which, given §7, is still the price of
+amortization rather than a defect.
+
+The under-count is expected in sign but not magnitude: the analytic model used a
+per-camera max over training views and a face-on 3σ footprint, whereas the real
+binner emits per rendered frame across all tiles a Gauss touches. It is a proxy
+for *relative* footprint, not an absolute instance count. Do not reuse it for
+absolute work estimates.
+
+**Cost per instance is nearly constant across the two scenes** (0.452 vs
+0.425 ns, within 6%) despite a 2.5× difference in primitive count and a 1.4×
+difference in mean surfel size. That is the strongest single piece of evidence
+for the model: **instances is the unit of work.** BS3k is marginally cheaper per
+instance because its smaller splats terminate the alpha cascade sooner within
+each tile.
+
+Residual 7.7% gap between the instance ratio (1.473×) and the frame-time ratio
+(1.367×) is the part that does *not* scale with instances — per-Gaussian
+preprocess (≈2%, §4) plus sort and cull terms that scale with N and with
+instances at different rates.
