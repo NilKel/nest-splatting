@@ -1190,6 +1190,9 @@ def main():
     parser.add_argument("--num_benchmark", type=int, default=100)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--skip_bake", action="store_true", help="Skip baking, use existing atlas")
+    parser.add_argument("--eval_split", choices=["test", "train"], default="test",
+                        help="Which camera split to score (stride 1 either way). 'train' writes "
+                             "renders to renders_train/ so the test outputs stay intact.")
     parser.add_argument("--rvq", action="store_true",
                         help="Use the RVQ atlas decoder. Loads "
                              "vq/{codebooks,indices,block_meta}.pt from the "
@@ -1309,7 +1312,35 @@ def main():
     # target so res_3d_paired bakes can evolve independently of mixed_3d_sep.
     # Alias via sys.modules so every `from diff_surfel_bake_render import X` inside
     # this script transparently resolves to the paired build.
-    if getattr(args, 'method', '') == 'res_3d_paired':
+    # ---- ALWAYS bench through the CONIC lean renderer ----
+    # The prod bake-render lanes are ~65% slower and no longer represent what
+    # ships, so reporting them alongside CONIC just invites the wrong number
+    # being quoted. Alias the lean CONIC build over `diff_surfel_bake_render`
+    # so every `from diff_surfel_bake_render import X` below resolves to it.
+    # The lean modules must be built with LEAN_FLAGS=CONIC; if the import
+    # fails or the build lacks CONIC we fall through to prod and say so
+    # loudly rather than silently reporting a slower number as if it were
+    # CONIC.  BENCH_PROD_RENDERER=1 forces the old behaviour for A/Bs.
+    import os as _os, sys as _sys
+    _want_conic = _os.environ.get("BENCH_PROD_RENDERER") != "1"
+    _is_paired  = getattr(args, 'method', '') in ('res_3d_paired', 'mixed_3d', 'mixed_3d_sep')
+    if _want_conic:
+        _lean_name = ('diff_surfel_bake_render_paired_lean' if _is_paired
+                      else 'diff_surfel_bake_render_lean')
+        try:
+            _lean_pkg = __import__(_lean_name)
+            _sys.modules['diff_surfel_bake_render'] = _lean_pkg
+            print(f"[CONFIG] Benchmarking through {_lean_name} (CONIC lean renderer).")
+            _conic_ok = True
+        except ImportError as _e:
+            print(f"[CONFIG] !! {_lean_name} not importable ({_e}) — falling back to "
+                  f"prod diff_surfel_bake_render. Reported FPS is NOT the CONIC number.")
+            _conic_ok = False
+    else:
+        print("[CONFIG] BENCH_PROD_RENDERER=1 — using prod diff_surfel_bake_render.")
+        _conic_ok = False
+
+    if (not _want_conic or not _conic_ok) and getattr(args, 'method', '') == 'res_3d_paired':
         # NOTE: diff_surfel_bake_render_paired was originally a separate clone
         # for paired-independent evolution, but it's now stale (missing
         # set_opacity_aware_beta / set_drop_lowpass / newer features).  Base
@@ -1723,10 +1754,16 @@ def main():
     # Load test cameras (Scene overwrites PLY, so reload after)
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
     test_cameras = scene.getTestCameras()
+    # --eval_split train: score the FULL train set instead (stride 1) — e.g. the
+    # full-train-set final eval of an --atlas_finetune bundle. Renders/metrics
+    # land in renders_train/ so a test-split run's outputs aren't clobbered.
+    if getattr(bargs, 'eval_split', 'test') == 'train':
+        test_cameras = scene.getTrainCameras()
+        print(f"[RENDER] --eval_split train: scoring the full TRAIN set")
     gaussians.load_ply(baked_ply)
     gaussians.active_sh_degree = 3
     gaussians.base_opacity = cfg.surfel.tg_base_alpha
-    print(f"[RENDER] {len(test_cameras)} test cameras")
+    print(f"[RENDER] {len(test_cameras)} cameras ({getattr(bargs, 'eval_split', 'test')} split)")
 
     # Activate the SV color path (Option A) when the trained feature_mode was
     # 'SV'. load_ply just round-tripped _sv_sites/_sv_colors/_sv_tau/_sv_dc;
@@ -1750,7 +1787,8 @@ def main():
     beta = cfg.surfel.tg_beta
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
-    render_dir = os.path.join(output_dir, "renders")
+    render_dir = os.path.join(
+        output_dir, "renders" if getattr(bargs, 'eval_split', 'test') == 'test' else "renders_train")
 
     # --- SH only ---
     sh_save_dir = os.path.join(render_dir, "sh_only")
@@ -1809,8 +1847,16 @@ def main():
         "neural": {**train_info, **test_info},
         "baked_sh_only": sh_metrics,
         "baked_sh_atlas": baked_metrics,
+        # Which rasterizer produced the FPS above. "conic_lean" is the shipping
+        # path; "prod" only appears under BENCH_PROD_RENDERER=1 or if the lean
+        # build was missing. Stamped so a stale json can never be mistaken for
+        # a CONIC measurement.
+        "renderer": ("conic_lean" if _conic_ok else "prod"),
+        "renderer_module": (_lean_name if _conic_ok else "diff_surfel_bake_render"),
     }
-    metrics_path = os.path.join(output_dir, "benchmark_results.json")
+    metrics_path = os.path.join(
+        output_dir, "benchmark_results.json"
+        if getattr(bargs, 'eval_split', 'test') == 'test' else "benchmark_results_train.json")
     with open(metrics_path, 'w') as f:
         json.dump(all_metrics, f, indent=2)
     print(f"\n  Saved to: {metrics_path}")

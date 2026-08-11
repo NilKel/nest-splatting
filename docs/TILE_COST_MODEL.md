@@ -1,0 +1,215 @@
+# What actually costs time in the baked tile rasterizer
+
+Written 2026-08-10 after the treehill blur-split investigation. The short
+version: **frame time tracks (primitive × tile) pairs, not primitives and not
+overdraw.** Both of the metrics we habitually quote are poor predictors, and
+one of them (overdraw) can move the *wrong way* while time gets worse.
+
+---
+
+## 1. The three candidate cost models
+
+| model | what it counts | correlation with FPS advantage (9-scene study) |
+|---|---|---|
+| primitive count | N Gaussians | r = **+0.72** |
+| surfel bloat | fraction with axis > 0.2 | r = **−0.63** |
+| overdraw | contributors per pixel | r = +0.22 |
+
+Overdraw is the metric everyone reaches for and the weakest of the three.
+See [MIP360_BOTTLENECK_ANALYSIS.md](../speed_comparison/MIP360_BOTTLENECK_ANALYSIS.md).
+
+Neither of the first two is the real quantity though — they are proxies that
+happen to correlate. The controlled comparisons below separate them.
+
+## 2. Two controlled comparisons that isolate each proxy
+
+**bonsai vs room (3D_SH_res, CONIC)** — near-identical resolution
+(1559×1039 vs 1557×1038) and near-identical surfel size distributions
+(mean axis 0.069 vs 0.055), so footprint is controlled and only count varies:
+
+| | bonsai | room | ratio |
+|---|---:|---:|---:|
+| Gaussians | 92,489 | 63,164 | 1.464× |
+| frame time | 0.793 ms | 0.558 ms | 1.421× |
+| overdraw | 17.26 | 15.37 | 1.125× |
+| **cost per Gaussian** | 7.73 ns | 7.87 ns | **0.971×** |
+
+Frame time tracks the count ratio to within 3%; the fragment ratio (1.125)
+mispredicts by 26%. bonsai is if anything marginally *more* efficient per
+primitive. There is no anomaly here — bonsai just carries 46% more Gauss.
+
+**garden vs the other outdoor scenes** — counts vary but footprints vary far
+more, and now count stops predicting: garden carries 55% MORE Gauss than
+stump yet renders 39% FASTER.
+
+| scene | Mpx | mean axis | p95 axis | >0.5 | ns/Gauss |
+|---|---:|---:|---:|---:|---:|
+| garden | 1.089 | 0.057 | 0.157 | 0.61% | **3.46** |
+| flowers | 1.040 | 0.142 | 0.410 | 3.80% | 4.19 |
+| bicycle | 1.017 | 0.096 | 0.294 | 1.74% | 4.49 |
+| treehill | 1.054 | 0.134 | 0.406 | 3.70% | 5.16 |
+| stump | 1.027 | 0.211 | 0.877 | 8.58% | **7.44** |
+
+corr(ns/Gauss, p95 axis) = **+0.97**; mean axis +0.91; frac>0.5 +0.95.
+
+Garden has *indoor-scene* surfel statistics (mean 0.057 ≈ room's 0.055) in an
+outdoor scene, and renders the most pixels of the group — so resolution works
+against it and it still wins. Garden is the existence proof that compact
+outdoor surfels are reachable.
+
+## 3. Screen footprint of the worst splats (measured)
+
+3σ compact support (beta_scaled has hard-zero alpha beyond ρ=3, so this is a
+bound not an estimate), AABB clipped to screen, maximised over all training
+cameras:
+
+| scene | screen px | p50 | p95 | p99.9 | max | >1% screen |
+|---|---:|---:|---:|---:|---:|---:|
+| garden | 1,089,480 | 456 | 3,928 | 46,442 | **246 K** | 1.28% |
+| bicycle | 1,016,814 | 667 | 5,610 | 97,951 | 970 K | 2.30% |
+| flowers | 1,039,968 | 757 | 8,871 | 126,530 | 1.04 M | 4.09% |
+| treehill | 1,054,144 | 661 | 9,798 | 97,221 | 1.05 M | 4.58% |
+| stump | 1,027,125 | 1,238 | 10,700 | 170,687 | 1.03 M | 5.26% |
+
+The largest splats cover **the entire screen** on four of five outdoor scenes.
+Garden's worst covers 23% of it. Median is 456–1,238 px (a ~21×21 to ~35×35
+splat) — so the distribution is heavy-tailed by a factor of 100–370× in area,
+which is exactly why a **mean** scale regularizer cannot touch it and why the
+p95 statistic correlates better than the mean.
+
+**Calibration note for `--blur_thresh`:** the default 5000 flags anything
+dominating more than `H·W/5000` ≈ **205 px** — *below the median splat* on
+every outdoor scene. To target genuine bloat the value wants to be ~10–100
+(flagging >10 K–100 K px), not 5000.
+
+## 4. The real cost model: (primitive × tile) pairs
+
+Every pixel in a tile evaluates **every** Gaussian binned to that tile,
+whether or not it contributes. So:
+
+```
+evaluations = 256 threads × Σ_tiles(list_length) = 256 × instances
+```
+
+`instances` = (Gaussian, tile) pairs = what `duplicateWithKeys` emits, what
+the radix sort orders, and what `identifyTileRanges` walks.
+
+This is NOT `contributors` (what overdraw measures) and NOT `N`.
+
+### treehill blur-split A/B — the case that breaks both proxies
+
+`RD_SV_30thr_005w25gLP_N2f_frz5k10` (no blur_split) vs
+`2D_SV_30thr_005w25gLP_N2F_Jac_BS3k` (`--blur_split --blur_thresh 3000`):
+
+| | RD | BS3k | ratio |
+|---|---:|---:|---:|
+| primitives | 175,459 | 442,643 | 2.52× |
+| **overdraw mean** | 27.72 | **23.69** | **0.855×** |
+| overdraw p95 | 53.8 | 48.9 | |
+| mean surfel axis | 0.1339 | 0.0978 | 0.73× |
+| p99 axis | 1.350 | 0.738 | 0.55× |
+| footprint p99.9 | 97,221 px | 26,409 px | 0.27× |
+| footprint >1% screen | 4.58% | 0.70% | 0.15× |
+| visible Gauss/view | 45,225 | 131,968 | 2.92× |
+| tiles per visible Gauss | 11.29 | 5.74 | 0.51× |
+| **instances/view** | 510,807 | **757,094** | **1.48×** |
+| evaluations (256×inst) | 130.8 M | 193.8 M | 1.48× |
+| contributions (overdraw×px) | 29.2 M | 25.0 M | 0.855× |
+| **useful fraction** | **22.3%** | **12.9%** | **0.58×** |
+| prod FPS | 651 | 354 | 0.54× |
+| **CONIC FPS** | **995** | **728** | **0.73×** |
+
+blur_split did exactly what it was asked to: **bloat is genuinely fixed** —
+p99 axis halved, p99.9 footprint down 73%, screen-hogging splats down 6.5×,
+and overdraw *dropped* 15%. And the result is **1.84× slower**.
+
+Because: each splat got 49% smaller in tile terms, but there are 2.52× as many,
+so **instances still rose 48%** — and each instance costs a full 256-thread
+tile walk. Efficiency fell 1.73× (22.3% → 12.9% of evaluated pairs producing a
+contribution).
+
+### CONIC confirms the model
+
+Re-benched both through `diff_surfel_bake_render_lean` `LEAN_FLAGS=CONIC`
+(50 warmup / 400 timed, idle GPU):
+
+| | prod FPS | CONIC FPS | CONIC gain | frame ms | baked PSNR |
+|---|---:|---:|---:|---:|---:|
+| RD | 651 | **995** | +52.9% | 1.005 | 22.29 |
+| BS3k | 354 | **728** | +105.6% | 1.374 | 21.95 |
+
+**BS3k gains twice as much from CONIC (+106% vs +53%)** — exactly what the
+model predicts. CONIC makes each *evaluation* cheaper (precomputed rational
+reconstruction replaces the per-fragment T-matrix cross-product ray-splat).
+BS3k performs 1.48× more evaluations, so a per-evaluation saving is worth
+proportionally more to it.
+
+And the ratio converges on the instance ratio:
+
+| ratio BS3k/RD | value |
+|---|---:|
+| primitives | 2.525× |
+| **instances (est)** | **1.482×** |
+| frame time, prod | 1.839× |
+| **frame time, CONIC** | **1.367×** |
+
+Under prod, expensive per-fragment work *amplified* the evaluation-count gap
+(1.84 > 1.48). Under CONIC the per-fragment term shrinks and the measured
+ratio lands within 8% of the pure instance ratio. That is the cost model
+falsifiable-and-confirmed: **once per-fragment cost is minimised, time tracks
+(primitive × tile) pairs almost exactly.**
+
+Note this also means CONIC disproportionately rescues over-split scenes — but
+BS3k is still 1.37× slower AND 0.34 dB worse than RD. CONIC narrows the
+penalty; it does not make blur_split free.
+
+### Why sub-tile splats are pathological
+
+A tile is 16×16 = **256 pixels**. A splat whose real footprint is ~400 px is
+binned into ~4 tiles (31% of BS3k's splats touch 3–4), so **1,024 threads
+evaluate it to shade ~400** — ≥60% waste by construction, monotonically worse
+as splats shrink toward and below tile size.
+
+Splitting a large splat into four small ones does **not** quarter the work.
+Each child pays a full tile tax wherever it lands, and straddling means it
+usually lands in more than one. BS3k's tile-count histogram shows 58% of
+visible splats touching ≤4 tiles — near the quantisation floor, where further
+splitting is pure cost.
+
+Per-Gaussian *preprocess* is not the driver, contrary to a first guess:
+~290 B/Gaussian × 441 K = 128 MB/frame ≈ **0.07 ms** at 1.8 TB/s, against a
+2.83 ms frame. ~2%.
+
+## 5. Consequences
+
+- **Stop quoting overdraw as the perf metric.** It can improve while time
+  regresses, as BS3k demonstrates.
+- **`--blur_split` at default thresholds is a perf regression**, even though it
+  fixes the geometry problem it was built for. It also cost 0.45 dB
+  (21.93 vs 22.38 neural).
+- **The wanted operating point is garden's**: few, compact, ~tile-sized
+  splats. Both "few large" (RD) and "many small" (BS3k) lose to it.
+
+## 6. Open experiments
+
+1. **Real instance counts.** All `instances` figures above are AABB-derived
+   upper bounds; the binner uses AccuTile (ellipse-tight), so true values are
+   lower. `Rasterizer::forward` already returns `num_rendered` but
+   `rasterize_points.cu` discards it — exposing it is a small binding change
+   and would firm up every ratio here.
+2. **8×8 tiles.** Cuts the per-splat tax 4× for sub-tile splats at the cost of
+   more instances and more sort work. Given how small our splats have become
+   this is the single most promising renderer-side change. Must be done in a
+   lean clone (CUDA isolation rule).
+3. **Size-floor in the split path.** Refuse to split when the projected
+   footprint is already < ~2 tiles. Would have prevented most of BS3k's
+   regression at zero quality cost.
+4. **Size-gated blur_split.** `split_mask | (esm & split_qualifiers)` — keeps
+   blur_split's gradient-independence (its one unique property: it is the only
+   mechanism in the pipeline not gated on photometric error, so it is the only
+   one that can reach bloated *well-reconstructed* background surfels) while
+   restricting it to genuinely world-large primitives.
+5. **Tail-targeted scale reg.** The existing `--scale_reg` is
+   `w·|get_scaling|.mean()` — a mean, dominated by the small bulk, so it cannot
+   reach the tail without uniformly shrinking everything.
+   `w·relu(max_axis − τ)²` with τ ≈ `dense·extent` is the right shape.
