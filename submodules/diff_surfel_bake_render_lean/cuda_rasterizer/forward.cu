@@ -973,23 +973,19 @@ renderBakedCUDA(
 	//   id 4  |  xy 8 (fp32)  |  opa 2 (fp16)  |  J⁻¹ 8 (half4)
 	//   uv₀ 4 (half2)  |  dw 8 (fp32)  |  shape 2 (fp16)
 	// + Atlas UV precompute (skip fetching atlas_rects per fragment + eliminate 2 divs):
-	//   auv_base 4 (half2 = au_base, av_base — mapped from pixel coords to fp16
-	//                by subtracting a per-Gauss offset then packing)... too fragile.
-	//   Use fp32 for atlas UV to keep pixel precision:
-	//   auv_base 8 (fp32 float2)  |  auv_scale 8 (fp32 float2)  |  auv_span 8 (fp32 float2)
-	// Total: 4+8+2+8+4+8+2 + 8+8+8 = 60 B/Gauss (was 36 → +24 B for atlas UV precomp).
-	__shared__ __half collected_opa[BLOCK_SIZE];
-	__shared__ __half collected_J_h[BLOCK_SIZE * 4];
-	__shared__ __half collected_uv0_h[BLOCK_SIZE * 2];
-	__shared__ float2 collected_dwdpxy[BLOCK_SIZE];
-	__shared__ __half collected_shapes_h[BLOCK_SIZE];
-	// Atlas UV precompute — per-fragment reduces to:
-	//   au = clamp(auv_base.x + auv_scale.x * s.x, auv_min.x, auv_max.x)
-	// Sentinel: auv_scale.x == 0 → zero-area atlas rect, skip the fetch.
-	__shared__ float2 collected_auv_base[BLOCK_SIZE];     // (au_base, av_base)  ← u0_px - 0.5 + u_span/2
-	__shared__ float2 collected_auv_scale[BLOCK_SIZE];    // (au_scale, av_scale)  ← span/(2·UV_EXTENT)
-	__shared__ float2 collected_auv_min[BLOCK_SIZE];      // (u0_px, v0_px)
-	__shared__ float2 collected_auv_max[BLOCK_SIZE];      // (u0_px+u_span-1.001, v0…)
+	//   Use fp32 for atlas UV to keep pixel precision.
+	// LDS.128 PACKING (TILE_COST_MODEL.md §13, +3.9% FPS, bit-exact): ncu showed
+	// the render kernel issue-bound with the LSU pipe hottest (65.6%) — many small
+	// LDS ops, not bandwidth. Pack the pre-cull fields into TWO 16-B vectors so
+	// the inner loop does 2 LDS.128 instead of ~5 scattered LDS:
+	//   collected_pack (uint4): uv0 half2 | J⁻¹.xy half2 | J⁻¹.zw half2 | (opa,shape) half2
+	//   collected_geom (float4): xy.x, xy.y, dw.x, dw.y            (fp32 kept)
+	// Atlas UV precomp (survivor-only path) folds 4×float2 → 2×float4.
+	// Sentinel: auv0.z == 0 → zero-area atlas rect, skip the fetch.
+	__shared__ uint4  collected_pack[BLOCK_SIZE];
+	__shared__ float4 collected_geom[BLOCK_SIZE];
+	__shared__ float4 collected_auv0[BLOCK_SIZE];   // base.x, base.y, scale.x, scale.y
+	__shared__ float4 collected_auv1[BLOCK_SIZE];   // min.x, min.y, max.x, max.y
 #else
 	#ifdef LEAN_T2
 	__shared__ __half collected_no_h[BLOCK_SIZE * 4];   // 8 B/Gauss  (normal + opacity)
@@ -1021,27 +1017,33 @@ renderBakedCUDA(
 			int coll_id = point_list[range.x + progress];
 			collected_id[t] = coll_id;
 			float2 xy_c = points_xy_image[coll_id];
-			// Under LEAN_CONIC, collected_xy will be overwritten with the disc
-			// origin below; leave the AABB-center default here for the non-CONIC path.
+#ifndef LEAN_CONIC
+			// Non-CONIC path stages the AABB center; CONIC carries xy in collected_geom.
 			collected_xy[t] = xy_c;
+#endif
 			float4 no = normal_opacity[coll_id];
 			float shape_v = (shapes != nullptr) ? shapes[coll_id] : 0.0f;
 #ifdef LEAN_CONIC
 			// Load precomputed (u₀, v₀, J⁻¹, dwdxr, dwdyr) from GLOBAL into SHARED.
 			// preprocessCUDA did the ray-splat + Jacobian + dw/dpix.  Just relay 8 fp32.
 			const float* cuv_g = conic_uv + coll_id * 8;
-			// Pack: opa/uv0/J⁻¹/shapes as fp16, dwdpxy stays fp32 for correction stability.
-			collected_opa[t]        = __float2half(no.w);              // drop normal.xyz
-			collected_uv0_h[t*2+0]  = __float2half(cuv_g[0]);
-			collected_uv0_h[t*2+1]  = __float2half(cuv_g[1]);
-			collected_J_h[t*4+0]    = __float2half(cuv_g[2]);
-			collected_J_h[t*4+1]    = __float2half(cuv_g[3]);
-			collected_J_h[t*4+2]    = __float2half(cuv_g[4]);
-			collected_J_h[t*4+3]    = __float2half(cuv_g[5]);
-			collected_dwdpxy[t]     = make_float2(cuv_g[6], cuv_g[7]); // FP32
-			collected_shapes_h[t]   = __float2half(shape_v);
+			// LDS.128 pack — identical values to the old scattered layout (same
+			// __float2half roundings, same fp32), vectorized. See §13.
+			{
+				__half2 uv0p = __floats2half2_rn(cuv_g[0], cuv_g[1]);
+				__half2 jxyp = __floats2half2_rn(cuv_g[2], cuv_g[3]);
+				__half2 jzwp = __floats2half2_rn(cuv_g[4], cuv_g[5]);
+				__half2 osp  = __floats2half2_rn(no.w, shape_v);
+				uint4 pk;
+				pk.x = *reinterpret_cast<const unsigned int*>(&uv0p);
+				pk.y = *reinterpret_cast<const unsigned int*>(&jxyp);
+				pk.z = *reinterpret_cast<const unsigned int*>(&jzwp);
+				pk.w = *reinterpret_cast<const unsigned int*>(&osp);
+				collected_pack[t] = pk;
+				collected_geom[t] = make_float4(xy_c.x, xy_c.y, cuv_g[6], cuv_g[7]);
+			}
 			// Atlas UV precomp (read atlas_rects once per Gauss at fetch, not per fragment).
-			// UV_EXTENT is a global constant (=4.0).  Sentinel: auv_scale.x == 0 means
+			// UV_EXTENT is a global constant (=4.0).  Sentinel: auv0.z == 0 means
 			// zero-area rect → skip the atlas fetch in the fragment.
 			if (atlas_rects != nullptr) {
 				float u0_px  = atlas_rects[coll_id * 4 + 0];
@@ -1051,14 +1053,14 @@ renderBakedCUDA(
 				const float inv_2E = 1.0f / (2.0f * UV_EXTENT);
 				float au_scale = (u_span > 0.0f) ? (u_span * inv_2E) : 0.0f;
 				float av_scale = (v_span > 0.0f) ? (v_span * inv_2E) : 0.0f;
-				collected_auv_scale[t] = make_float2(au_scale, av_scale);
-				collected_auv_base[t]  = make_float2(u0_px - 0.5f + u_span * 0.5f,
-				                                     v0_px - 0.5f + v_span * 0.5f);
-				collected_auv_min[t]   = make_float2(u0_px, v0_px);
-				collected_auv_max[t]   = make_float2(u0_px + u_span - 1.001f,
-				                                     v0_px + v_span - 1.001f);
+				collected_auv0[t] = make_float4(u0_px - 0.5f + u_span * 0.5f,
+				                                v0_px - 0.5f + v_span * 0.5f,
+				                                au_scale, av_scale);
+				collected_auv1[t] = make_float4(u0_px, v0_px,
+				                                u0_px + u_span - 1.001f,
+				                                v0_px + v_span - 1.001f);
 			} else {
-				collected_auv_scale[t] = make_float2(0.0f, 0.0f);  // sentinel: skip atlas
+				collected_auv0[t] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);  // .z==0 sentinel
 			}
 #else
 	#ifdef LEAN_T2
@@ -1085,7 +1087,19 @@ renderBakedCUDA(
 		{
 			// LEAN: mixed_3d EWA branch REMOVED.
 			// LEAN: kernel_type=1/2/3/4 branches REMOVED (hardcoded Gaussian).
+#ifdef LEAN_CONIC
+			// LDS.128: two vector loads carry everything up to the alpha test (§13).
+			const float4 gm = collected_geom[j];              // xy | dwdpxy
+			const uint4  pk = collected_pack[j];              // uv0 | J⁻¹ | (opa,shape)
+			const float2 xy = {gm.x, gm.y};
+			const __half2* ph = reinterpret_cast<const __half2*>(&pk);
+			const float2 uv0f = __half22float2(ph[0]);
+			const float2 jxyf = __half22float2(ph[1]);
+			const float2 jzwf = __half22float2(ph[2]);
+			const float2 osf  = __half22float2(ph[3]);        // (opa, shape)
+#else
 			const float2 xy = collected_xy[j];
+#endif
 			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
 			float2 s;
 			float rho3d;
@@ -1095,14 +1109,9 @@ renderBakedCUDA(
 			// Δu_linear = J⁻¹·Δpix, δw_ratio = (dwdxr, dwdyr)·Δpix, both linear in Δpix.
 			// Formula is EXACT (not linearized) because u = p.x/p.z with p.x, p.z
 			// each linear in pix → u is exactly a rational function of pix.
-			// FP16 unpack — u₀, v₀, J⁻¹ stored as half; dw stays fp32.
-			float2 uv0 = make_float2(__half2float(collected_uv0_h[j*2+0]),
-			                          __half2float(collected_uv0_h[j*2+1]));
-			float4 J = make_float4(__half2float(collected_J_h[j*4+0]),
-			                        __half2float(collected_J_h[j*4+1]),
-			                        __half2float(collected_J_h[j*4+2]),
-			                        __half2float(collected_J_h[j*4+3]));
-			float2 dw = collected_dwdpxy[j];
+			float2 uv0 = uv0f;
+			float4 J = make_float4(jxyf.x, jxyf.y, jzwf.x, jzwf.y);
+			float2 dw = {gm.z, gm.w};
 			float dx = (float)pix.x - xy.x;
 			float dy = (float)pix.y - xy.y;
 			float du_lin = J.x * dx + J.y * dy;
@@ -1150,7 +1159,7 @@ renderBakedCUDA(
 			if (depth < near_n) continue;
 #endif
 #ifdef LEAN_CONIC
-			float opa = __half2float(collected_opa[j]);
+			float opa = osf.x;                      // from collected_pack (§13)
 #else
 	#ifdef LEAN_T2
 			float opa = __half2float(collected_no_h[j*4+3]);
@@ -1180,7 +1189,9 @@ renderBakedCUDA(
 				float kernel_val = fmaxf(alpha_beta, alpha_lp);
 				alpha = fminf(0.99f, opa * kernel_val);
 #else
-#if defined(LEAN_CONIC) || defined(LEAN_T2)
+#if defined(LEAN_CONIC)
+				float shape = osf.y;               // from collected_pack (§13)
+#elif defined(LEAN_T2)
 				float shape = __half2float(collected_shapes_h[j]);
 #else
 				float shape = collected_shapes[j];
@@ -1224,13 +1235,11 @@ renderBakedCUDA(
 			if (HAS_ATLAS_EFF && atlas_tex_obj != 0) {
 				// PRECOMPUTED atlas UV — atlas_rects fetch, divisions, and base
 				// math all moved to fetch block.  Per-fragment: 2 fmadd + 4 clamp.
-				float2 auv_scale = collected_auv_scale[j];
-				if (auv_scale.x > 0.0f) {                       // sentinel: >0 → valid
-					float2 auv_base = collected_auv_base[j];
-					float2 auv_min  = collected_auv_min[j];
-					float2 auv_max  = collected_auv_max[j];
-					float au = fmaxf(auv_min.x, fminf(auv_max.x, auv_base.x + auv_scale.x * s.x));
-					float av = fmaxf(auv_min.y, fminf(auv_max.y, auv_base.y + auv_scale.y * s.y));
+				float4 a0 = collected_auv0[j];                  // base.xy, scale.xy (LDS.128)
+				if (a0.z > 0.0f) {                              // sentinel: >0 → valid
+					float4 a1 = collected_auv1[j];              // min.xy, max.xy (LDS.128)
+					float au = fmaxf(a1.x, fminf(a1.z, a0.x + a0.z * s.x));
+					float av = fmaxf(a1.y, fminf(a1.w, a0.y + a0.w * s.y));
 					float4 rgba = tex2D<float4>(atlas_tex_obj, au + 0.5f, av + 0.5f);
 					feat[0] += rgba.x * atlas_scale + atlas_offset;
 					feat[1] += rgba.y * atlas_scale + atlas_offset;
