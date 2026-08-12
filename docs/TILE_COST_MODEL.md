@@ -299,3 +299,51 @@ Residual 7.7% gap between the instance ratio (1.473×) and the frame-time ratio
 (1.367×) is the part that does *not* scale with instances — per-Gaussian
 preprocess (≈2%, §4) plus sort and cull terms that scale with N and with
 instances at different rates.
+
+## 9. Late saturation — measured, only 3–4% (not a lever)
+
+Question: the block only retires when **all** 256 pixels have saturated
+(`__syncthreads_count(done) == BLOCK_SIZE`). Does one stubborn pixel — say one
+seeing through foliage into distant sky — hold the whole tile hostage?
+
+Counters added to the scratch clone (`reset_sat_counters` /
+`read_sat_counters`):
+
+* `thread_rounds_run` — Σ over threads of rounds the BLOCK executed
+* `thread_rounds_needed` — Σ over threads of rounds until THAT thread saturated
+
+| | thread-rounds run | needed | **waste** |
+|---|---:|---:|---:|
+| RD | 133,705,216 | 129,301,450 | **3.3%** |
+| BS3k | 178,950,656 | 171,798,402 | **4.0%** |
+
+**Only 3–4%, so per-block exit is a non-issue.** The reason it is this small is
+the inner-loop guard:
+
+```cuda
+for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+```
+
+A saturated thread **exits its inner loop immediately** — it does not
+re-evaluate the tile's surfels. It costs only its share of the shared-memory
+staging (`if (range.x + progress < range.y) { ...stage... }`, which is NOT
+gated on `done`) plus barrier participation. So the cost is a few extra global
+loads, not 256 wasted evaluations.
+
+BS3k's waste is marginally higher (4.0% vs 3.3%) — consistent with its many
+weak splats decaying `T` more slowly, so pixels saturate later and blocks run
+slightly longer past the point of usefulness. But the effect is ~0.7 pp, far
+too small to explain a 1.37× frame-time gap.
+
+**Conclusion: the tile walk itself is near-optimal.** Between this, the 8×8
+result (§7) and the near-constant cost per instance (§8), all three
+renderer-side hypotheses are now closed. Gating the staging on `!done`, or a
+per-warp exit, would be chasing ~3–4% at best.
+
+### Correction to an earlier claim in this doc
+
+Section 4's "1,024 threads evaluate it to shade ~400" overstates the case: it
+is true of the *binning*, but saturated threads skip the evaluation. The waste
+is memory traffic for staging, not compute. §7's conclusion (waste is the price
+of 256-wide amortization) is unaffected and is if anything strengthened — the
+kernel is even tighter than §4 implied.
