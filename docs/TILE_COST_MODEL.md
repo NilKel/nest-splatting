@@ -606,3 +606,39 @@ staging-time geometric mask:
 Code stays in the t8 scratch clone behind default-off build flags
 (`LEAN_FLAGS=CONIC,STRIP[,SATC]`); the shipped `diff_surfel_bake_render_lean`
 is untouched.
+
+---
+
+## 13. LDS.128 packing: +3.9% on both — accepted
+
+§11 consequence 2, implemented in the t8 clone behind `LEAN_PACK` (requires
+CONIC). Same bytes, vector loads:
+
+- `collected_pack` (uint4, one LDS.128): uv0 half2 | J⁻¹ 2×half2 | (opa,shape)
+  half2 — exactly 16 B.
+- `collected_geom` (float4, one LDS.128): xy + dwdpxy, fp32 kept.
+- Atlas UV precomp (survivor-only): 4×float2 → 2×float4.
+
+The inner loop's pre-cull reads drop from ~5 scattered LDS (float2 + 2×half-
+indexed + float2 + half + half) to TWO LDS.128. Values are identical (same
+`__float2half` roundings, same fp32) → output bit-exact: metrics match to 4
+decimals on both checkpoints.
+
+| treehill FPS | control (t8 CONIC) | +PACK | net |
+|---|---:|---:|---:|
+| RD | 1265.4 | **1315.0** | **+3.9%** |
+| BS3k | 932.1 | **968.1** | **+3.9%** |
+
+(Control ≡ shipped `diff_surfel_bake_render_lean` — 1265.5/927.4 — confirming
+the t8 clone with counters compiled out is the shipped kernel.)
+
+The uniform +3.9% is the expected signature of a fixed per-iteration saving:
+−30 µs on a 790 µs frame ≈ −7% render kernel, matching ~3 LDS removed from a
+~36-instruction body with LSU at 65.6% of peak (§11). Bounded exactly as
+predicted — FMA (41%) and the remaining issue mix are the next ceiling, and
+the kernel is ~52% of the frame.
+
+Scoreboard for the renderer-side campaign: CONIC +53–106% (earlier), PACK
++3.9%, everything else measured and dead (§7, §12, §11 dead-ends). To ship
+PACK, port the same edit to `diff_surfel_bake_render_lean` (+ `_paired_lean`
+for res_3d_paired bakes) — mechanical, the t8 diff is the reference.
