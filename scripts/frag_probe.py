@@ -39,10 +39,14 @@ import atexit
 @atexit.register
 def _report():
     try:
-        run, need, evals, blended = _C.read_sat_counters()
+        vals = _C.read_sat_counters()
     except Exception as e:
         print(f"[FRAG] read failed: {e}")
         return
+    run, need, evals, blended = vals[0], vals[1], vals[2], vals[3]
+    w_iters = vals[4] if len(vals) > 4 else 0
+    w_live  = vals[5] if len(vals) > 5 else 0
+    w_skip  = vals[6] if len(vals) > 6 else 0
     n = max(1, _calls['n'])
     try:
         inst = _C.get_last_num_rendered()
@@ -59,6 +63,12 @@ def _report():
     if evals:
         print(f"[FRAG] blend survival = {100.0*blended/evals:.1f}%  "
               f"(culled {100.0*(evals-blended)/evals:.1f}%)")
+    if w_iters:
+        ideal = w_iters - w_live
+        print(f"[STRIP] warp_iters={w_iters:,} live={w_live:,} skipped={w_skip:,}")
+        print(f"[STRIP] realized skip = {100.0*w_skip/w_iters:.1f}%  "
+              f"ideal ceiling = {100.0*ideal/w_iters:.1f}%  "
+              f"mask efficiency = {100.0*w_skip/max(1,ideal):.1f}%")
 
 
 sys.argv = ["benchmark_baked.py"] + sys.argv[1:]

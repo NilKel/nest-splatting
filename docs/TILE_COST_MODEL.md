@@ -540,3 +540,69 @@ irrelevant" to a real (if bounded) second target.
 4. NOT worth it: powf/expf tricks (XU 9.6%), occupancy tuning (not-selected
    dominant), atlas fetch optimization (TEX 0%), shared-bandwidth reduction
    (28%).
+
+---
+
+## 12. Warp-strip skip: built, measured, REJECTED (−9% FPS)
+
+§11's top-ranked idea, implemented in the t8 scratch clone and killed by its own
+numbers. Kept here as the definitive negative result.
+
+**Implementation** (`LEAN_STRIP` build flag, t8 clone only): the CONIC uv is
+exactly rational in pixel coords, so the support boundary `u²+v² = k²` is an
+exact conic `Q(d) = dᵀMd + 2gᵀd + c < 0`. The staging thread computes its exact
+y-extent (k² at the α=1/255 iso, shape-tightened for beta_scaled, unioned with
+the low-pass disc band), and writes an 8-bit mask — bit s = support may touch
+rows 2s..2s+1 of the tile. Threads of one warp are exactly one 16×2 strip, so
+the inner-loop test is warp-uniform: 1 broadcast LDS + bit test. Degeneracies
+fall back to 0xFF — conservative by construction, and verified: PSNR/SSIM/LPIPS
+**identical to 4 decimals** on both checkpoints.
+
+**Counters** (`LEAN_SATC`): warp-level iterations, iterations with ≥1 blend
+survivor ("live"), and mask-skipped iterations.
+
+| per warp-iteration | RD | BS3k |
+|---|---:|---:|
+| ideal skip ceiling (zero-survivor iters) | 88.0% | 90.4% |
+| realized by the y-band mask | 4.4% | 6.8% |
+| mask efficiency | 5.0% | 7.6% |
+
+**FPS (clean STRIP build, no counters)**: RD 1265.5 → 1151.9 (−9.0%),
+BS3k 927.4 → 848.4 (−8.5%). The test costs ~3 issue slots — including a
+dependent LDS at the head of a ~36-instruction loop — on the ~93–95% of
+iterations it fails to skip. Net loss on both checkpoints.
+
+### Why the ceiling is unreachable by geometry
+
+Warp-live is only 12%/9.6% — if the waste were strip-band-shaped (survivors
+clustered in 2–3 of 8 strips), live would be ~25–35%. It isn't: most
+zero-survivor iterations are **wholesale** — the surfel contributes nothing to
+any still-active lane in the whole tile. Three causes, none visible to a
+staging-time geometric mask:
+
+1. **Saturation mismatch**: the lanes the surfel covers are already `done`; the
+   warp iterates for other lanes it doesn't reach. Only occlusion knowledge
+   (which pixels saturated, at what depth) could skip these — that information
+   does not exist before the walk reaches the surfel.
+2. **Alpha-tail / pixel-center quantization**: the 1/255 iso clips the tile but
+   no pixel center falls inside the sliver. AccuTile (already opacity-aware)
+   emitted the instance correctly; it is simply empty at pixel resolution.
+3. **x-extent misses**: strips span the full 16-pixel tile width, so a mask
+   over 16×2 strips has zero x-discrimination. Fixable only by remapping warps
+   to 8×4 quads — but with the same per-iteration test overhead that just cost
+   9%, and (1)+(2) untouched, the capture would have to jump ~4× to break even.
+   Not pursued.
+
+### Standing conclusions
+
+- The ~90% zero-survivor warp-iteration ceiling is real but is NOT harvestable
+  at the renderer: it requires post-hoc knowledge (survivorship), not geometry.
+- Renderer-side, the remaining mechanical win is §11's LDS.128 packing (fewer
+  instructions on every iteration, no bet on skippability).
+- The durable lever stays training-side: fewer, fatter instances — score
+  candidate fixes on coverage per instance (§10), which raises survival and
+  shrinks the wholesale-zero population at its source.
+
+Code stays in the t8 scratch clone behind default-off build flags
+(`LEAN_FLAGS=CONIC,STRIP[,SATC]`); the shipped `diff_surfel_bake_render_lean`
+is untouched.
