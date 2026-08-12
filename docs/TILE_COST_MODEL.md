@@ -667,3 +667,45 @@ not just by construction.
 Note the stored `benchmark_results.json` for the two TnT scenes predated the
 CONIC default (no `renderer` key, 1361/1281 FPS); the BEFORE column here is a
 fresh same-session CONIC measurement, not those stale numbers.
+
+### §13 addendum 2 — mip-360 9-scene finetuned bakes (`aftp_shres`)
+
+Same protocol as the TnT/DB addendum, idle GPU, no rebuild between halves
+(BEFORE = t8 clone at the pre-pack CONIC layout, AFTER = shipped
+`diff_surfel_bake_render_lean` with the port).
+
+| scene | before | after | Δ | N (Gauss) |
+|---|---:|---:|---:|---:|
+| bicycle | 1462.3 | 1518.8 | +3.86% | 160,097 |
+| bonsai | 1274.8 | 1328.0 | +4.17% | 92,281 |
+| counter | 1519.5 | 1580.7 | +4.03% | 68,394 |
+| flowers | 1248.5 | 1304.8 | +4.51% | 184,511 |
+| garden | 1891.3 | 1959.2 | +3.59% | 148,658 |
+| kitchen | 1310.8 | 1387.0 | +5.81% | 119,462 |
+| room | 1922.1 | 1989.1 | +3.49% | 62,947 |
+| stump | 1387.9 | 1442.0 | +3.90% | 96,365 |
+| treehill | 1265.5 | 1308.8 | +3.42% | 174,744 |
+| **mean** | **1475.9** | **1535.4** | **+4.03%** | |
+
+PSNR/SSIM/LPIPS byte-identical on all nine (each scene's triple matches to 4
+decimals across the two halves). Spread is tight: +3.42% to +5.81%, per-scene
+mean +4.09%.
+
+**Cross-dataset summary of the LDS.128 port** (13 finetuned scenes):
+
+| dataset | scenes | mean Δ |
+|---|---:|---:|
+| mip-360 | 9 | +4.03% |
+| Deep Blending | 2 | +3.95% |
+| Tanks & Temples | 2 | +3.30% |
+| **all** | **13** | **≈ +3.9%** |
+
+The effect is uniform across scene content, primitive count (63K–185K), and
+absolute speed (1.2K–2.4K FPS) — the signature of a fixed per-iteration saving
+rather than anything scene-dependent, exactly as the §11 instruction-count
+model predicts. kitchen (+5.81%) is the only mild outlier.
+
+Practical note for the paper: this shifts the mip-360 baked mean from ~1476 to
+~1535 FPS on these checkpoints. It is an implementation detail, not a
+contribution — worth at most a clause in implementation details ("fp16-packed,
+vectorized shared-memory staging"), not a section.
