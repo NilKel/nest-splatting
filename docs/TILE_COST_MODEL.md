@@ -442,3 +442,101 @@ divergence — is **not** separable by this arithmetic. That needs `ncu`.
 Instrumentation cost: the counted build reads 650/582 FPS vs 783/621
 uninstrumented, compressing the gap to 1.12× from 1.26×. Count ratios are
 unaffected; do not read frame times off this build.
+
+---
+
+## 11. ncu + nsys: issue-bound on the LSU pipe; frame-level split
+
+Nsight Compute (`--set full`, 6 launches of `renderBakedCUDA` per checkpoint,
+clean CONIC lean build, treehill) plus an Nsight Systems timeline. Reports:
+`/tmp/ncu_{rd,bs3k}.ncu-rep`, `/tmp/nsys_{rd,bs3k}.nsys-rep`.
+
+### Inside the render kernel: instruction-issue-bound, LSU on top
+
+| metric | RD | BS3k |
+|---|---:|---:|
+| kernel duration (mean) | 494 µs | 701 µs |
+| issue slots busy | 79.6% | ~79% |
+| executed IPC (of 4.0 max) | 3.18 | ~3.1 |
+| **LSU pipe** (load/store instr.) | **65.6%** | **~66%** |
+| FMA pipe (fp32+int, incl. fp16 21.3%) | 41.0% | ~41% |
+| ALU pipe | 18.1% | ~18% |
+| **XU pipe (MUFU: powf/expf/rcp)** | **9.6%** | **8.1%** |
+| TEX pipe (atlas fetch) | 0.0% | 0.0% |
+| DRAM | 1.2% | ~1% |
+| L2 hit | 94.7% | ~95% |
+| shared wavefronts (of peak) | 28.4% | — |
+| shared bank conflicts | 0.1% | — |
+| executed warp-instructions / launch | 474.4 M | 697.2 M |
+
+The stall picture confirms throughput-bound, not latency-bound: the largest
+"stall" is **not-selected** (4.0 of 11.7 cycles between issues, 34%) — warps
+are eligible and waiting for the scheduler, which is saturated. Long-scoreboard
+(global-latency) is only 0.73 cycles; occupancy is 78% with the top stall
+saying more warps would not help.
+
+Three hypotheses die here:
+
+- **MUFU/SFU (special function unit) is NOT the wall** — XU at 9.6%,
+  math-pipe-throttle stall 2.5%. `powf`/`expf` micro-opts (LOCK_SHAPE) are
+  not worth it on desktop.
+- **Shared/L1 bandwidth is NOT the wall** (§10's arithmetic confirmed in
+  hardware: 28% of peak wavefronts, negligible bank conflicts). The LSU number
+  is *instruction slots*, not bytes — many small LDS ops, each a cheap load of
+  a wide free bus.
+- **Atlas texture fetches are FREE** — TEX pipe 0.0%. The HW-bilinear path
+  costs nothing measurable; only 4.5–7.6% of fragments reach it.
+
+What remains is arithmetic identity: instructions scale 1.47× RD→BS3k, evals
+1.42×, kernel duration 1.42×. Per inner-loop iteration the kernel executes a
+measured **~36 warp-instructions** (474.4 M / (386.6 M evals ÷ 29.1 active
+threads/warp)) — §10's "~208 instruction-slots" estimate was ~6× high; the
+culled path is ~36 instructions of which ~6 are LDS, and the machine retires
+them at a fixed ~3.2 IPC. **Frame kernel time = iterations × 36 / issue rate.**
+The only lever with real range is *fewer iterations* — i.e. the §10 coverage
+lever — with instruction-count reduction per iteration (fewer LDS via packing)
+a bounded second.
+
+### Frame-level split (nsys per-launch means × clean frame time)
+
+Clean untraced re-bench on idle GPU: RD **1265.5 FPS** (790 µs), BS3k
+**927.4 FPS** (1078 µs). (nsys-traced FPS was within 2% — 1243.7/921.0. The
+782.6/621.0 previously stored in `benchmark_results.json` were depressed ~1.6×:
+they were written by the counter-instrumented t8 runs of §9. Rewritten clean.
+All same-build ratios in §7–§10 are unaffected; absolutes from instrumented
+builds are not benchmarks.)
+
+| per frame | RD (µs) | RD % | BS3k (µs) | BS3k % | Δ (µs) |
+|---|---:|---:|---:|---:|---:|
+| renderBakedCUDA | 413.5 | 52% | 589.3 | 55% | **+175.8** |
+| duplicateWithKeys | 117.1 | 15% | 139.8 | 13% | +22.7 |
+| radix sort (6 onesweep + hist) | 110.4 | 14% | 143.7 | 13% | +33.3 |
+| preprocessCUDA | 27.8 | 3.5% | 78.5 | 7% | +50.7 |
+| identifyTileRanges | ~5 | 0.6% | 5.9 | 0.5% | +0.9 |
+| residual (launch gaps, misc ops) | ~116 | 15% | ~121 | 11% | +5 |
+| **frame** | **790** | | **1078** | | **+288** |
+
+So the BS3k slowdown is 61% render kernel, 18% preprocess (linear in the 2.5×
+primitive count), 20% binning+sort (linear in the 1.5× instance count). And
+structurally: the render kernel is **~52–55%** of the frame; **binning+sort is
+~28%** — which upgrades GS-TG-style sort-granularity ideas from "probably
+irrelevant" to a real (if bounded) second target.
+
+### Consequences, ranked by measured headroom
+
+1. **Warp-strip mask** (GS-TG §IV bitmask, repurposed sub-tile): at binning,
+   emit an 8-bit mask per instance — one bit per 16×2-pixel warp strip the
+   ellipse overlaps. Inner loop: warp-uniform 1-bit test replaces the
+   ~36-instruction eval for empty strips. Attacks the issue bound exactly
+   where §10 localized the waste. Ceiling measurable first: count strips with
+   nonzero coverage per instance in the t8 clone.
+2. **LDS packing**: `uv0_h(4B) + J_h(8B) + opa(2B) + shape(2B) = 16 B` — one
+   LDS.128 instead of four loads; `dwdpxy` a fifth as LDS.64. Cuts the top
+   pipe (LSU 65.6%) roughly in half; bounded by FMA at 41% becoming the next
+   ceiling.
+3. **Binning+sort** (~28% of frame): fewer keys (coarser sort granularity à la
+   GS-TG, or instance-count reduction from training-side coverage fixes) —
+   every instance removed also saves its dup+sort+render cost.
+4. NOT worth it: powf/expf tricks (XU 9.6%), occupancy tuning (not-selected
+   dominant), atlas fetch optimization (TEX 0%), shared-bandwidth reduction
+   (28%).
