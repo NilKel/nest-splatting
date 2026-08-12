@@ -347,3 +347,98 @@ is true of the *binning*, but saturated threads skip the evaluation. The waste
 is memory traffic for staging, not compute. §7's conclusion (waste is the price
 of 256-wide amortization) is unaffected and is if anything strengthened — the
 kernel is even tighter than §4 implied.
+
+---
+
+## 10. Fragment counters: the bottleneck is sub-tile coverage
+
+§7–§9 closed every renderer-side hypothesis without ever saying what the frame
+time *is* spent on. Counting instances answered "how many units of work"; it did
+not answer "what does a unit cost, and how much of it is useful". So the inner
+loop was instrumented directly:
+
+- `d_frag_evals`   — inner-loop iterations entered = a thread reading a staged
+  Gauss out of shared and reconstructing its fragment.
+- `d_frag_blended` — iterations surviving every cull (denom, `rho3d >= k²`,
+  `alpha < 1/255`) to reach the atlas fetch + blend recurrence.
+
+Both are per-thread locals atomically folded once at kernel exit. The driver
+(`/tmp/frag_probe.py`) wraps `_C.rasterize_gaussians` to count invocations, so
+these are **per-frame** figures — unlike §9's absolutes, which were cumulative
+over the whole benchmark (that ratio was still valid; the absolutes were not).
+
+treehill, CONIC lean, `--aabb_mode 3`, 256 render calls:
+
+| per frame | RD | BS3k |
+|---|---:|---:|
+| instances (Gauss × tile) | 1,519,354 | 2,286,897 |
+| fragment evaluations | 386,610,493 | 549,914,425 |
+| fragments reaching a blend | 29,289,117 | 24,849,121 |
+| **blend survival** | **7.6%** | **4.5%** |
+
+### Shared-memory bandwidth is NOT the wall
+
+The prior hypothesis — that the 256× read amplification on staged data saturates
+shared bandwidth — is refuted. The always-read prefix before the first cull is
+~28 B (xy 8 + u₀v₀ 4 + J⁻¹ 8 + dw 8); the wider fields (`auv_*`, `collected_id`,
+32+ B) are read only by the ~5–8% that blend. That gives
+
+    386.6M × 28 B = 10.8 GB/frame ÷ 1.537 ms ≈ 7.0 TB/s
+
+against a ~39–52 TB/s aggregate shared ceiling: **~15–18% utilised**. Both
+factors in the earlier 90% estimate were wrong (60 B assumed vs 28 B real,
+582M evals assumed vs 387M real).
+
+### What the numbers do say
+
+Normalising per instance:
+
+| per instance (Gauss × tile) | RD | BS3k |
+|---|---:|---:|
+| threads evaluating it | 254.5 | 240.5 |
+| pixels actually blending | 19.3 | 10.9 |
+| **tile coverage** | **7.5%** | **4.2%** |
+
+254.5 ≈ 256 confirms there is effectively **no intra-round early termination**:
+every thread evaluates every staged surfel. And of those 256 evaluations, ~19
+produce a pixel. **92.4% of all per-fragment work is discarded** (95.5% on BS3k).
+
+This is *with* ellipse-tight binning already on — `--aabb_mode 3` is
+rect + AdR + AccuTile SnugBox, the tightest available (mode 5 is an alias for the
+weaker mode 2). AccuTile guarantees the ellipse *intersects* the tile; it cannot
+constrain how much of the tile the ellipse *fills*. The waste lives strictly
+below tile granularity.
+
+### This resolves the BS3k paradox
+
+BS3k genuinely has **lower overdraw** — 24.8M blends vs RD's 29.3M — and is still
+slower, because overdraw counts *survivors* while frame time is paid by
+*candidates*. BS3k burns 42% more fragment evaluations (550M vs 387M) to produce
+15% fewer blends. Its survival rate is 1.7× worse.
+
+blur_split moves the two in opposite directions: splitting makes each splat
+weaker (fewer fragments clear `alpha ≥ 1/255`) while spreading it across more
+tiles it merely grazes (more fragments evaluated). Coverage drops 7.5% → 4.2%.
+"Lower overdraw" was never evidence of a cheaper frame.
+
+### Consequence
+
+The lever is **coverage per instance**, not count. A splat is cheap when it fills
+the tiles it touches. This is the quantitative case against indiscriminate
+blur_split, and the metric any training-side fix should be scored on — coverage,
+not primitive count and not overdraw.
+
+Renderer-side, the remaining idea is sub-tile rejection (e.g. a per-warp or
+per-quad bound test before the full reconstruct), which §7's 8×8 result suggests
+must not come at the cost of staging amortization.
+
+### Not measured
+
+What the surviving ~208 instruction-slots per evaluation actually stall on —
+MUFU throughput (`powf` + `expf` + the `1/denom` reciprocal are up to 4 SFU ops
+per fragment, and SFU runs at 1/32 the FP32 lane rate), LSU latency, or branch
+divergence — is **not** separable by this arithmetic. That needs `ncu`.
+
+Instrumentation cost: the counted build reads 650/582 FPS vs 783/621
+uninstrumented, compressing the gap to 1.12× from 1.26×. Count ratios are
+unaffected; do not read frame times off this build.
