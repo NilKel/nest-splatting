@@ -642,3 +642,28 @@ Scoreboard for the renderer-side campaign: CONIC +53–106% (earlier), PACK
 +3.9%, everything else measured and dead (§7, §12, §11 dead-ends). To ship
 PACK, port the same edit to `diff_surfel_bake_render_lean` (+ `_paired_lean`
 for res_3d_paired bakes) — mechanical, the t8 diff is the reference.
+
+### §13 addendum — TnT + DB finetuned bakes (`aftp_shres`)
+
+Same-session A/B, idle GPU, `--skip_bake`, all four finetuned checkpoints.
+BEFORE = t8 clone rebuilt at the pre-pack CONIC layout; AFTER = the shipped
+`diff_surfel_bake_render_lean` carrying the port (commit `bca3e72`).
+
+| scene | before | after | Δ | PSNR / SSIM / LPIPS |
+|---|---:|---:|---:|---|
+| tnt/truck | 2324.1 | 2394.1 | **+3.0%** | 25.60 / 0.8784 / 0.1169 (unchanged) |
+| tnt/train | 1957.6 | 2028.0 | **+3.6%** | 22.58 / 0.8232 / 0.1727 (unchanged) |
+| db/drjohnson | 2099.1 | 2183.9 | **+4.0%** | 29.57 / 0.8910 / 0.2317 (unchanged) |
+| db/playroom | 1805.9 | 1878.2 | **+3.9%** | 30.39 / 0.8928 / 0.2082 (unchanged) |
+| **mean** | | | **+3.6%** | bit-exact throughout |
+
+Consistent with treehill (+3.9/+4.1%) and with the fixed-per-iteration model:
+the gain is bounded by the render kernel's share of the frame, so the two
+fastest scenes (truck at 2394 FPS, where non-kernel frame cost is
+proportionally larger) show the smallest relative gain. Every metric is
+identical before/after on all four scenes — the port is bit-exact in practice,
+not just by construction.
+
+Note the stored `benchmark_results.json` for the two TnT scenes predated the
+CONIC default (no `renderer` key, 1361/1281 FPS); the BEFORE column here is a
+fresh same-session CONIC measurement, not those stale numbers.
