@@ -155,7 +155,7 @@ set before the parameter count doubles.
 Trained 35k with the config above, baked to a shelf-packed BC7 atlas
 (`max_res 64`), rendered with the CONIC paired lean renderer
 (`diff_surfel_bake_render_paired_lean`, `LEAN_FLAGS=CONIC`). Full bench:
-[`BENCH_5090_MIP360.md`](BENCH_5090_MIP360.md) §res_3d_paired.
+[`BITYMI_RESULTS_3D_SH_RES.md`](BITYMI_RESULTS_3D_SH_RES.md) §6.
 
 | scene | nGauss | %tex | neural PSNR | baked PSNR | CONIC FPS |
 |---|---:|---:|---:|---:|---:|
@@ -188,7 +188,7 @@ Takeaways:
 
 3D_SH_res column = the `RD_SV_30thr_005w25gLP_N2f_frz5k10` bakes through
 `diff_surfel_bake_render_lean` `LEAN_FLAGS=CONIC`
-([BENCH_5090_MIP360.md](BENCH_5090_MIP360.md) full-picture table); paired
+([BITYMI_RESULTS_3D_SH_RES.md](BITYMI_RESULTS_3D_SH_RES.md) full-picture table); paired
 column = the table above. Both are baked SH+atlas lanes, 50/400 cuda.Event
 frames.
 

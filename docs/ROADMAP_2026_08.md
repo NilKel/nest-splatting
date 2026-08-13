@@ -175,7 +175,7 @@ finetune = freeze geometry, learn vᵢ + SV-opacity.
 ## 4. P3 — write corrected benchmarks into the docs
 
 Stale docs carrying pre-correction numbers:
-- `docs/BENCH_5090_MIP360.md` — FastGS column (1183 → 1215 corrected; mean
+- `docs/BITYMI_RESULTS_3D_SH_RES.md` — FastGS column (1183 → 1215 corrected; mean
   advantage 1.23× → 1.20×; treehill 1221 → 1286, and 1314 for the
   images_4-retrained checkpoint).
 - `speed_comparison/MIP360_BOTTLENECK_ANALYSIS.md` — §1 table + §6's

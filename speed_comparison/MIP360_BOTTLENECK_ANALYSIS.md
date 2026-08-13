@@ -8,7 +8,7 @@ FPS on the RTX 5090, and where the deltas vs FastGS come from.
   `RD_SV_30thr_005w25gLP_N2f_frz5k10`, HD BC7 atlas at `max_res 64`,
   rendered through `diff_surfel_bake_render_lean` built with
   `LEAN_FLAGS="CONIC"` (CONIC linearization + fp16 pack + atlas UV
-  precompute). See [BENCH_5090_MIP360.md](../docs/BENCH_5090_MIP360.md).
+  precompute). See [BITYMI_RESULTS_3D_SH_RES.md](../docs/BITYMI_RESULTS_3D_SH_RES.md).
 - FastGS: `iter_30000` checkpoints trained locally on the 5090; timing
   via `FastGS/bench_fps.py --num_warmup 10 --num_benchmark 200`.
 - Overdraw: per-pixel contributor counts from

@@ -2,8 +2,8 @@
 
 Chronological account of the three baked-render submodules for 2DGS
 surfels + BC7 atlas residual, and what changed at each step. Numbers
-throughout are from [`BENCH_5090_MIP360.md`](BENCH_5090_MIP360.md)
-(same RTX 5090, same test cameras, same bakes).
+throughout are from [`BITYMI_RESULTS_3D_SH_RES.md`](BITYMI_RESULTS_3D_SH_RES.md) §6
+(same RTX 5090, same test cameras, same `RD_SV_…_frz5k10` bakes).
 
 | stage | submodule | LEAN_FLAGS | mean FPS (SH+atlas) | vs prod | quality |
 |---|---|---|---:|---:|---|
@@ -242,7 +242,7 @@ the ray-splat *is* nearly 100% of frame time.
   [`submodules/diff_surfel_bake_render_lean`](../submodules/diff_surfel_bake_render_lean/)
 - LEAN_FLAGS listed in [`submodules/diff_surfel_bake_render_lean/setup.py`](../submodules/diff_surfel_bake_render_lean/setup.py):
   `T2, CTG, CONIC, DEBUG, FP16_UVJ, FP16_OPASHAPE`
-- Full FPS numbers + reproduction commands: [`BENCH_5090_MIP360.md`](BENCH_5090_MIP360.md)
+- Full FPS numbers + reproduction commands: [`BITYMI_RESULTS_3D_SH_RES.md`](BITYMI_RESULTS_3D_SH_RES.md)
 - Plateau analysis for what's *not* worth chasing further:
   `memory/project_lean_bake_render_wins.md`
 - Deployed WebGPU viewer already ships a matching CONIC fragment shader

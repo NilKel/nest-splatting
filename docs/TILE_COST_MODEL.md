@@ -484,8 +484,13 @@ Three hypotheses die here:
   hardware: 28% of peak wavefronts, negligible bank conflicts). The LSU number
   is *instruction slots*, not bytes — many small LDS ops, each a cheap load of
   a wide free bus.
-- **Atlas texture fetches are FREE** — TEX pipe 0.0%. The HW-bilinear path
-  costs nothing measurable; only 4.5–7.6% of fragments reach it.
+- **The atlas is not TEX-bound** — TEX pipe 0.0%. The hardware-bilinear
+  fetch never approaches texture-unit throughput; only 4.5–7.6% of fragments
+  reach it. **Corrected 2026-08-12:** an earlier revision of this line said
+  atlas fetches are "FREE", which overstates it. The SH-only ablation
+  (`BITYMI_RESULTS_3D_SH_RES.md` §3) prices the whole atlas path — per-Gauss
+  UV staging, fetch, dequant — at **8–19% of frame rate**. Not a bottleneck
+  pipe, but not free either; the cost is issue slots and staging.
 
 What remains is arithmetic identity: instructions scale 1.47× RD→BS3k, evals
 1.42×, kernel duration 1.42×. Per inner-loop iteration the kernel executes a
@@ -538,7 +543,7 @@ irrelevant" to a real (if bounded) second target.
    GS-TG, or instance-count reduction from training-side coverage fixes) —
    every instance removed also saves its dup+sort+render cost.
 4. NOT worth it: powf/expf tricks (XU 9.6%), occupancy tuning (not-selected
-   dominant), atlas fetch optimization (TEX 0%), shared-bandwidth reduction
+   dominant), atlas *fetch* micro-optimization (TEX 0%), shared-bandwidth reduction
    (28%).
 
 ---

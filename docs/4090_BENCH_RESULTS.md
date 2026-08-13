@@ -1,8 +1,8 @@
 # 4090 Baked-Atlas Bench Results
 
-Companion to [`5090_BENCH_RESULTS.md`](5090_BENCH_RESULTS.md) (the 5090
-equivalent of this file; the exhaustive per-config 5090 sweep is in
-[`MIP360_BENCH_RESULTS.md`](MIP360_BENCH_RESULTS.md)). All
+Companion to [`BITYMI_RESULTS_3D_SH_RES.md`](BITYMI_RESULTS_3D_SH_RES.md) — the consolidated
+5090 results file (the two prod-era per-config sweeps this doc used to pair
+with were retired into it on 2026-08-12). All
 numbers here come from the `bench_minimal.py` pipeline run remotely on
 `neel@10.176.128.69` (RTX 4090, driver 570.195.03, CUDA 12.0 build of
 `diff_surfel_bake_render`, BC7 atlas + fused SV path).
