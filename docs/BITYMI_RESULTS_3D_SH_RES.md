@@ -228,3 +228,57 @@ speed-ups should not be quoted to three digits until FastGS is re-benched
 same-session. (2) `--skip_bake` does not evaluate the neural teacher, so the
 "13×" in §2 and the neural column in §6 come from earlier full runs.
 (3) §6 uses a different checkpoint set from §4–5.
+
+---
+
+## 9. typeD codebook compression — measured quality cost
+
+`atlas_format=7` stores the atlas as a K-means codebook of BC7 blocks (K=65536,
+16 B each = 1 MB) plus a uint16 index per 4×4 block, and the loader gathers the
+full BC7 byte stream at load. The renderer is therefore **bit-identical to the
+raw-BC7 path** — one hardware bilinear fetch per fragment, no per-fragment
+decode. It is a *download*-size optimisation, and the K-means step is lossy.
+
+Measured by reconstructing each atlas through the codebook and re-benchmarking
+(`scripts/…` probe + `benchmark_baked.py --skip_bake`), all 9 mip-360
+`aftp_shres` scenes, RTX 5090, 2026-08-18:
+
+| scene | PSNR raw → typeD | LPIPS raw → typeD | ΔPSNR | ΔLPIPS | atlas-space PSNR | atlas MB → typeD MB |
+|---|---|---|---:|---:|---:|---|
+| bicycle | 24.44 → 24.34 | 0.2383 → 0.2650 | −0.10 | +0.0267 | 34.92 | 546.0 → 69.3 |
+| bonsai | 32.62 → 32.30 | 0.1704 → 0.1890 | −0.32 | +0.0186 | 33.95 | 243.4 → 31.5 |
+| counter | 29.32 → 29.11 | 0.1833 → 0.2039 | −0.21 | +0.0206 | 34.07 | 176.2 → 23.1 |
+| flowers | 20.78 → 20.78 | 0.3200 → 0.3399 | +0.00 | +0.0199 | 31.79 | 642.9 → 81.4 |
+| garden | 27.03 → 26.80 | 0.1288 → 0.1609 | −0.23 | +0.0321 | 31.18 | 506.6 → 64.4 |
+| kitchen | 31.47 → 31.03 | 0.1233 → 0.1412 | −0.44 | +0.0179 | 32.26 | 197.1 → 25.7 |
+| room | 31.56 → 31.32 | 0.1891 → 0.2084 | −0.24 | +0.0193 | 34.80 | 199.0 → 25.9 |
+| stump | 25.76 → 25.74 | 0.2632 → 0.2801 | −0.02 | +0.0169 | 31.27 | 333.1 → 42.7 |
+| treehill | 22.56 → 22.55 | 0.2937 → 0.3183 | −0.01 | +0.0246 | 30.98 | 645.6 → 81.8 |
+| **mean** | | | **−0.174** | **+0.0218** | | **387.8 → 49.5 (7.8×)** |
+
+SSIM falls by 0.0112 mean. **FPS is unchanged** (room 2007.3 → 2007.2), as the
+format implies.
+
+**Reading it.** PSNR is a poor guide here — it ranges from −0.44 (kitchen) to
++0.00 (flowers). **LPIPS is the stable signal: +0.017 to +0.032 on every scene,
+mean +0.0218.** K-means discards exactly the high-frequency texel detail that
+PSNR under-weights and a perceptual metric does not. For context that is ~59% of
+the +0.0367 LPIPS the finetune earns on mip-360 (§2) — so typeD hands back
+roughly half the finetune's perceptual gain in exchange for a 7.8× smaller
+download. A real trade, not a free win, and it should be reported as one.
+
+**Atlas-space PSNR does not predict render damage.** flowers has the 2nd-worst
+codebook fit (31.79 dB) yet the *best* render ΔPSNR (+0.00); kitchen has a
+better fit (32.26 dB) and the worst ΔPSNR (−0.44). What matters is whether the
+degraded texels land on visible, high-contribution surfels — so the exporter's
+atlas-PSNR readout should not be used as a quality proxy.
+
+**Draft paper text** (implementation/compression subsection):
+
+> For deployment we optionally store the atlas as a codebook of BC7 blocks: the
+> 4×4 blocks are clustered with K-means (K = 65536), each centroid is encoded as
+> a single BC7 block (16 B), and every block stores a 16-bit index. At load time
+> the byte stream is gathered back into a standard BC7 texture, so rendering is
+> unchanged — one hardware bilinear fetch per fragment. Across the nine
+> Mip-NeRF 360 scenes this reduces the atlas from 388 MB to 50 MB on average
+> (7.8×) at a cost of 0.17 dB PSNR and 0.022 LPIPS, with no change in frame rate.
