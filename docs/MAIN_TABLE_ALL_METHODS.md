@@ -20,6 +20,20 @@ the board and is recorded per-scene in
 `speed_comparison/fastgs_big_2026-08/`. Size is `--` because these checkpoints were
 not packaged for deployment.
 
+*BITYMI (no w_lambda)* drops the error-guided weight-squared regulariser
+(`--w_lambda 0.005 --w_lambda_gamma 25`) from the production recipe, keeping
+`beta_scaled` and every other flag. Also an **ablation**: it gains +0.26–0.37 dB
+and 0.003–0.008 LPIPS but runs at **0.61–0.69×** the frame rate, because the
+regulariser is what consolidates primitives (mip-360: 168 K without it vs 123 K
+with). The three configurations form a monotonic quality/speed frontier —
+production → no-w_lambda → Gaussian — with quality rising and FPS falling in the
+same order on 12 of 13 scenes (treehill is the exception: the Gaussian kernel
+gains nothing there, 22.53 vs 22.56, while still costing 58% of the frame rate).
+**Only the production row stays above FastGS on speed**: at 962 FPS (mip-360)
+no-w_lambda falls below FastGS base (1215), and at 705 the Gaussian row falls
+below FastGS Big (890), so both alternatives forfeit the throughput claim
+without overtaking FastGS Big on quality.
+
 *BITYMI (Gaussian kernel)* is our own pipeline trained with `--kernel gaussian`
 instead of the production `beta_scaled`, otherwise identical flags, then baked and
 atlas-finetuned the same way. It is an **ablation, not the shipped configuration**:
@@ -48,6 +62,7 @@ default for exactly this reason.
 | NeST (--method baseline) | 26.39 | 0.7734 | 0.2257 | 961,163 | 224 | **23.7** | 9 |
 | BITYMI (ours) | 27.23 | 0.7892 | 0.2114 | 123,051 | 445 | **1538.1** | 9 |
 | BITYMI (Gaussian kernel) | 27.88 | 0.8070 | 0.1981 | 248,341 | 839 | **705.5** | 9 |
+| BITYMI (no w_lambda) | 27.65 | 0.8015 | 0.2048 | 168,017 | 596 | **961.6** | 9 |
 
 ## Tanks & Temples
 
@@ -69,6 +84,7 @@ default for exactly this reason.
 | NeST (--method baseline) | 22.54 | 0.8178 | 0.1866 | 378,448 | 90 | **48.4** | 2 |
 | BITYMI (ours) | 24.10 | 0.8507 | 0.1447 | 86,746 | 325 | **2217.2** | 2 |
 | BITYMI (Gaussian kernel) | 24.50 | 0.8598 | 0.1392 | 149,681 | 539 | **1161.4** | 2 |
+| BITYMI (no w_lambda) | 24.36 | 0.8578 | 0.1415 | 107,428 | 397 | **1523.8** | 2 |
 
 ## Deep Blending
 
@@ -90,6 +106,7 @@ default for exactly this reason.
 | NeST (--method baseline) | 28.86 | 0.9021 | 0.2273 | 478,000 | 113 | **37.7** | 2 |
 | BITYMI (ours) | 29.87 | 0.8902 | 0.2176 | 66,622 | 259 | **2013.9** | 2 |
 | BITYMI (Gaussian kernel) | 30.28 | 0.9000 | 0.2095 | 133,095 | 498 | **961.0** | 2 |
+| BITYMI (no w_lambda) | 30.25 | 0.9008 | 0.2117 | 93,813 | 366 | **1236.9** | 2 |
 
 **Size** is the payload as each method stores it, so the column mixes compressed and uncompressed formats and is not a like-for-like codec comparison. BITYMI ships a BC7-compressed atlas (its uncompressed 1.6 GB `atlas_texture.pt` intermediate is excluded, as it is not deployed); Content-Aware Texturing and Textured Gaussians store fp32 textures with no compressed variant in their pipelines — Textured Gaussians' 3.8 GB is `textures[N,50,50,4]` in fp32, genuine model weight, not optimizer state.
 
@@ -116,6 +133,7 @@ default for exactly this reason.
 | NeST (--method baseline) | 9/9 | 2/2 | 2/2 | yes |
 | BITYMI (ours) | 9/9 | 2/2 | 2/2 | yes |
 | BITYMI (Gaussian kernel) | 9/9 | 2/2 | 2/2 | yes |
+| BITYMI (no w_lambda) | 9/9 | 2/2 | 2/2 | yes |
 
 Folded 858 cluster-computed quality/size values.
 
@@ -147,6 +165,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 24.36 | 0.7284 | 0.2364 | 2,093,136 | 487 | 14.7 |
 | BITYMI (ours) | 24.41 | 0.7132 | 0.2383 | 160,097 | 620 | 1519.7 |
 | BITYMI (Gaussian kernel) | 24.77 | 0.7363 | 0.2163 | 338,883 | 1,162 | 646.6 |
+| BITYMI (no w_lambda) | 24.66 | 0.7265 | 0.2277 | 214,672 | 791 | 930.8 |
 
 ### mip_360/flowers
 
@@ -168,6 +187,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 19.42 | 0.5104 | 0.3548 | 1,441,901 | 336 | 15.9 |
 | BITYMI (ours) | 20.78 | 0.5581 | 0.3202 | 184,511 | 728 | 1300.9 |
 | BITYMI (Gaussian kernel) | 21.17 | 0.5894 | 0.2996 | 378,264 | 1,368 | 472.0 |
+| BITYMI (no w_lambda) | 20.93 | 0.5723 | 0.3121 | 244,929 | 944 | 720.9 |
 
 ### mip_360/garden
 
@@ -189,6 +209,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 26.59 | 0.8430 | 0.1291 | 1,518,233 | 353 | 17.2 |
 | BITYMI (ours) | 27.02 | 0.8373 | 0.1288 | 148,658 | 576 | 1954.3 |
 | BITYMI (Gaussian kernel) | 27.49 | 0.8522 | 0.1159 | 294,102 | 1,073 | 882.7 |
+| BITYMI (no w_lambda) | 27.41 | 0.8501 | 0.1188 | 207,593 | 794 | 1169.3 |
 
 ### mip_360/stump
 
@@ -210,6 +231,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 24.52 | 0.6765 | 0.2886 | 797,235 | 186 | 21.1 |
 | BITYMI (ours) | 25.66 | 0.7225 | 0.2632 | 96,365 | 378 | 1433.3 |
 | BITYMI (Gaussian kernel) | 26.25 | 0.7518 | 0.2336 | 178,732 | 641 | 612.8 |
+| BITYMI (no w_lambda) | 26.11 | 0.7448 | 0.2398 | 125,780 | 482 | 897.5 |
 
 ### mip_360/treehill
 
@@ -231,6 +253,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 21.09 | 0.5652 | 0.3240 | 1,416,800 | 330 | 16.1 |
 | BITYMI (ours) | 22.55 | 0.6015 | 0.2939 | 174,744 | 727 | 1319.8 |
 | BITYMI (Gaussian kernel) | 22.53 | 0.6146 | 0.2915 | 367,958 | 1,389 | 556.3 |
+| BITYMI (no w_lambda) | 22.57 | 0.6118 | 0.2935 | 236,674 | 932 | 759.5 |
 
 ### mip_360/bonsai
 
@@ -252,6 +275,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 31.91 | 0.9268 | 0.1754 | 336,335 | 78 | 31.1 |
 | BITYMI (ours) | 32.53 | 0.9364 | 0.1669 | 92,281 | 286 | 1330.0 |
 | BITYMI (Gaussian kernel) | 33.73 | 0.9471 | 0.1632 | 173,710 | 527 | 659.7 |
+| BITYMI (no w_lambda) | 33.30 | 0.9453 | 0.1697 | 130,225 | 404 | 880.8 |
 
 ### mip_360/counter
 
@@ -273,6 +297,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 28.32 | 0.8861 | 0.2009 | 281,078 | 65 | 30.9 |
 | BITYMI (ours) | 29.29 | 0.8994 | 0.1819 | 68,394 | 208 | 1594.2 |
 | BITYMI (Gaussian kernel) | 30.01 | 0.9128 | 0.1709 | 128,313 | 387 | 830.4 |
+| BITYMI (no w_lambda) | 29.75 | 0.9099 | 0.1774 | 92,179 | 291 | 1083.3 |
 
 ### mip_360/kitchen
 
@@ -294,6 +319,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 30.29 | 0.9159 | 0.1257 | 425,441 | 99 | 33.2 |
 | BITYMI (ours) | 31.39 | 0.9181 | 0.1224 | 119,462 | 253 | 1384.1 |
 | BITYMI (Gaussian kernel) | 32.46 | 0.9305 | 0.1110 | 242,266 | 521 | 736.2 |
+| BITYMI (no w_lambda) | 32.07 | 0.9277 | 0.1164 | 169,911 | 393 | 937.2 |
 
 ### mip_360/room
 
@@ -315,6 +341,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 30.98 | 0.9080 | 0.1963 | 340,305 | 79 | 33.4 |
 | BITYMI (ours) | 31.48 | 0.9164 | 0.1866 | 62,947 | 228 | 2006.7 |
 | BITYMI (Gaussian kernel) | 32.54 | 0.9280 | 0.1807 | 132,841 | 485 | 952.7 |
+| BITYMI (no w_lambda) | 32.02 | 0.9249 | 0.1873 | 90,193 | 337 | 1275.0 |
 
 ## Tanks & Temples
 
@@ -338,6 +365,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 20.54 | 0.7730 | 0.2302 | 258,456 | 61 | 52.8 |
 | BITYMI (ours) | 22.59 | 0.8233 | 0.1724 | 88,080 | 324 | 2035.2 |
 | BITYMI (Gaussian kernel) | 22.95 | 0.8330 | 0.1689 | 145,773 | 507 | 1113.5 |
+| BITYMI (no w_lambda) | 22.85 | 0.8299 | 0.1717 | 104,171 | 379 | 1497.9 |
 
 ### tnt/truck
 
@@ -359,6 +387,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 24.55 | 0.8626 | 0.1430 | 498,441 | 118 | 44.0 |
 | BITYMI (ours) | 25.61 | 0.8781 | 0.1169 | 85,413 | 326 | 2399.2 |
 | BITYMI (Gaussian kernel) | 26.05 | 0.8866 | 0.1095 | 153,590 | 571 | 1209.2 |
+| BITYMI (no w_lambda) | 25.87 | 0.8858 | 0.1114 | 110,685 | 416 | 1549.7 |
 
 ## Deep Blending
 
@@ -382,6 +411,7 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 29.27 | 0.9026 | 0.2363 | 615,908 | 146 | 28.1 |
 | BITYMI (ours) | 29.50 | 0.8898 | 0.2302 | 66,087 | 247 | 2174.8 |
 | BITYMI (Gaussian kernel) | 29.85 | 0.8981 | 0.2203 | 142,098 | 502 | 1051.7 |
+| BITYMI (no w_lambda) | 29.81 | 0.8987 | 0.2238 | 92,849 | 347 | 1375.4 |
 
 ### db/playroom
 
@@ -403,4 +433,5 @@ Every method, every scene. `--` means not measured (not a zero). FPS is RTX 5090
 | NeST (--method baseline) | 28.44 | 0.9017 | 0.2183 | 340,093 | 80 | 47.2 |
 | BITYMI (ours) | 30.24 | 0.8907 | 0.2051 | 67,156 | 270 | 1853.1 |
 | BITYMI (Gaussian kernel) | 30.71 | 0.9019 | 0.1988 | 124,092 | 494 | 870.2 |
+| BITYMI (no w_lambda) | 30.68 | 0.9029 | 0.1996 | 94,777 | 385 | 1098.5 |
 
