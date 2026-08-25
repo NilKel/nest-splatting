@@ -167,6 +167,7 @@ Bound in group 1 of every pipeline. Mutable at runtime via the Tweakpane UI (top
 | `OAC` (Opacity-Aware Culling) | Drop surfels whose opacity falls below a screen-space pixel-coverage threshold. |
 | `SPR` (Splatting Pixel Reorder) | Reorder surfel records by tile coverage prior to raster to improve locality. |
 | `BFC` (Backface Cull) | Drop surfels whose normal points away from camera (`(pos − cam)·n > 0`). |
+| _(removed 2026-08-25)_ | The WSR sort-free, hybrid-transparency (`?ht=`) and proxy-mesh Z-cull paths were experiment scaffolding for other scenes and are gone from the renderer — along with `mesh_depth.wgsl` / `mesh_overlay.wgsl` / `ht_composite.wgsl` / `mesh-loader.ts`, accel bits 3–8, and the 15 demo cards that drove them (their bundles remain on HF). `render_2dgs.wgsl` went 961 → 559 lines and `surfel_cull.wgsl` 931 → 775; the sorted-path output is unchanged (verified offline: room SH-only 20.339 dB, garden with the real atlas 24.1677 dB, both identical pre/post). |
 | `sh_bias` | Additive bias on the SH eval before clamp (default `0.5`). |
 | `res_bias` | Additive bias on the residual sample after dequant (default `0.0`). |
 | Surfel scale | Multiplier on f16-unpacked scale_xy. Useful for shrinking surfels for debugging. |
@@ -178,10 +179,12 @@ findings — `docs/VULKAN_HW_RASTER.md`; fixed at renderer construction, URL-sel
 
 | URL param | default | What it does |
 |---|---|---|
-| `?byid=0` | fetch-by-id ON | `FETCH_BY_ID`: the vertex stage emits only the compacted splat slot (one flat `u32`); the fragment re-reads `Splat2DGS[slot]` from the storage buffer instead of receiving 13 flat varyings. Bit-identical output (verified offline). |
+| `?byid=0` / `?byid=1` | ON on desktop, **OFF on handhelds** | `FETCH_BY_ID`: the vertex stage emits only the compacted splat slot (one flat `u32`); the fragment re-reads `Splat2DGS[slot]` from the storage buffer instead of receiving 13 flat varyings. Bit-identical output, pure perf — and the winner is **device-dependent**: a lot faster on an Apple Silicon MacBook and ~6 % faster on an RTX 5090, but **~2× slower on an Android phone** (a dependent per-fragment storage read goes to memory; flat varyings live in on-chip parameter storage). Note TBDR is *not* the discriminator — the MacBook is TBDR too. Both interfaces are pre-built pipelines switched per frame; the UI toggle flips it live and **remembers the choice per device** in `localStorage`. Precedence: `?byid=` > remembered > UA heuristic. |
 | `?oct=1` | quad | `OCT`: 8-vertex triangle-strip octagon tangent to the exact cutoff ellipse (rebuilt in the vertex shader from the CONIC coefficients + the cull's OAC cutoff), ∪ the low-pass disc. **23–26 % fewer fragment invocations** than the quad on room/garden/bicycle, and it covers ≥ the quad's surviving fragments. 2× the vertex invocations — an earlier corner-cut octagon was reported a net loss on some GPUs, so it is opt-in until A/B'd on phones. |
 | `?acc16=1` | off | Sorted path blends into an `rgba16float` target + fullscreen resolve instead of the 8-bit swapchain. The 8-bit blend rounds each over-step to 1/255: offline it measured ≈1.1 % rms vs the fp16 composite (≈39 dB-equivalent) — small next to the ~20–31 dB scene error, and the resolve costs a full-screen write+read, so off by default. |
 | `?hyp_legacy=1` | guard ON | accel bit 9. Default: when SnugBox fails and `compute_aabb` returns a rect wider than 2× the viewport (camera-plane-crossing surfel — pure discard work) the surfel is culled. Legacy restores the unguarded fallback. Culls nothing on any mip-360 test camera tried; safety net for close-up navigation. |
+
+The bound margin, by contrast, is cheap: it costs only **+2.0 %** (room) / **+3.6 %** (garden) fragment invocations, so it is never the reason a device got slower.
 
 Two precision fixes landed with these (both unconditional): `Splat2DGS.pos` is
 now an exact ¼-px `i16` grid (f16 had 1 px spacing beyond x = 1024, shifting every
