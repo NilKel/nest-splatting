@@ -106,7 +106,7 @@ static void writeBufDesc(VkDescriptorSet set, uint32_t binding, VkDescriptorType
 // ------------------------------------------------------------------ main
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: vk_raster <bundle_dir> [--warmup N] [--bench N] [--dump first.ppm]\n"); return 1; }
-    std::string bundle = argv[1]; int warmup = 300, bench = 400; std::string dump; bool fp16 = false, byid = false, stats = false, percam = false; int elems = 4; std::string dumpprep; float pad = 1.0f; int lpmode = 0;
+    std::string bundle = argv[1]; int warmup = 300, bench = 400; std::string dump; bool fp16 = false, byid = false, stats = false, percam = false; int elems = 4; std::string dumpprep, dumpall; float pad = 1.0f; int lpmode = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--warmup")) warmup = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bench")) bench = atoi(argv[++i]);
@@ -115,6 +115,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--percam")) percam = true;
         else if (!strcmp(argv[i], "--elems")) elems = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dumpprep")) dumpprep = argv[++i];
+        else if (!strcmp(argv[i], "--dumpall")) dumpall = argv[++i];
         else if (!strcmp(argv[i], "--byid")) byid = true;
         else if (!strcmp(argv[i], "--stats")) stats = true;
         else if (!strcmp(argv[i], "--pad")) pad = (float)atof(argv[++i]);
@@ -386,6 +387,11 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < npx; i++) for (int ch = 0; ch < 3; ch++) { double d = (double)img[i * 4 + ch] - gt[(size_t)ch * npx + i] / 255.0; mse[ch] += d * d; }
         double ps = 0; for (int ch = 0; ch < 3; ch++) ps += 20.0 * log10(1.0 / sqrt(mse[ch] / npx)); ps /= 3.0;   // benchmark_baked: per-channel PSNR, mean
         psnr_sum += ps;
+        if (!dumpall.empty()) {   // raw fp32 RGB, row-major, for scripts/eval_vk_renders.py
+            char nm[512]; snprintf(nm, sizeof(nm), "%s/%03zu.f32", dumpall.c_str(), ci); FILE* f = fopen(nm, "wb");
+            std::vector<float> rgb((size_t)W * H * 3); for (size_t i = 0; i < npx; i++) for (int ch = 0; ch < 3; ch++) rgb[i * 3 + ch] = img[i * 4 + ch];
+            fwrite(rgb.data(), 4, rgb.size(), f); fclose(f);
+        }
         if (ci == 0 && !dumpprep.empty()) {
             Buf hb = createBuf(bPrep.size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
             VkCommandBuffer cb = beginOneShot(); VkBufferCopy c{0, 0, bPrep.size}; vkCmdCopyBuffer(cb, bPrep.buf, hb.buf, 1, &c); endOneShot(cb);

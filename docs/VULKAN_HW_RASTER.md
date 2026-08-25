@@ -132,16 +132,115 @@ tile walk evaluates every pixel of every touched 16×16 tile (SW: 149 M evaluati
 (32–39 %); it is a straightforward 4×8-bit LSD implementation and has obvious headroom
 (3 passes over the top 24 bits, or a onesweep).
 
-## 5. Results (same session, RTX 5090, warm, 400 timed frames cycling the test set)
+## 5. Results — all 13 scenes (RTX 5090, one session, `aftp_shres` bakes)
 
-| scene | N | CUDA CONIC ms / FPS | Vulkan HW ms / FPS | speed-up | PSNR CUDA / VK |
-|---|---:|---:|---:|---:|---|
-| room | 62,947 | 0.503 / 1986 | **0.297 / 3368** | **1.70×** | 31.56 / 31.559 |
-| garden | 148,658 | 0.510 / 1962 | **0.366 / 2733** | **1.39×** | 27.03 / 27.033 |
+Protocol, identical for both renderers: warm GPU, 400 timed frames cycling the scene's
+test cameras, GPU time only (Vulkan timestamp queries in one batched submission /
+`cuda.Event` pairs in `benchmark_baked.py`), same `baked.ply` + BC7 atlas, `--byid --fp16
+--lp 1 --pad 0.1`. Quality is the mean over the test set of the *dumped* HW renders
+scored by `scripts/eval_vk_renders.py` with the repo's own PSNR/SSIM/LPIPS functions
+(`--dumpall`), against the same GT the CUDA numbers use. Raw data:
+`vk_raster/results_2026-08-25.csv` (timing) + `vk_raster/metrics_2026-08-25.csv`.
 
-(13-scene sweep: `vk_raster/results_2026-08-25.csv`, appended below when complete.)
+| Scene | test cams | CUDA CONIC ms / FPS | Vulkan HW ms / FPS | speed-up | PSNR CUDA / VK | SSIM CUDA / VK | LPIPS CUDA / VK | VK pre / sort / raster ms |
+|---|---:|---:|---:|---:|---|---|---|---|
+| mip_360/bicycle | 25 | 0.6603 / 1514 | **0.3554 / 2814** | **1.86×** | 24.44 / 24.44 | 0.7137 / 0.7137 | 0.2383 / 0.2382 | 0.0348 / 0.1399 / 0.1806 |
+| mip_360/bonsai | 37 | 0.7586 / 1318 | **0.3794 / 2636** | **2.00×** | 32.62 / 32.62 | 0.9380 / 0.9380 | 0.1704 / 0.1701 | 0.0258 / 0.1165 / 0.2371 |
+| mip_360/counter | 30 | 0.6299 / 1588 | **0.4519 / 2213** | **1.39×** | 29.32 / 29.32 | 0.9010 / 0.9009 | 0.1833 / 0.1832 | 0.0218 / 0.1145 / 0.3156 |
+| mip_360/flowers | 22 | 0.7759 / 1289 | **0.4477 / 2234** | **1.73×** | 20.78 / 20.78 | 0.5578 / 0.5577 | 0.3200 / 0.3199 | 0.0424 / 0.1425 / 0.2628 |
+| mip_360/garden | 24 | 0.5077 / 1970 | **0.3693 / 2708** | **1.37×** | 27.03 / 27.03 | 0.8376 / 0.8376 | 0.1288 / 0.1288 | 0.0395 / 0.1460 / 0.1838 |
+| mip_360/kitchen | 35 | 0.7188 / 1391 | **0.5846 / 1710** | **1.23×** | 31.47 / 31.47 | 0.9190 / 0.9189 | 0.1233 / 0.1232 | 0.0422 / 0.1592 / 0.3832 |
+| mip_360/room | 39 | 0.5001 / 2000 | **0.3085 / 3242** | **1.62×** | 31.56 / 31.56 | 0.9193 / 0.9193 | 0.1891 / 0.1890 | 0.0261 / 0.0950 / 0.1874 |
+| mip_360/stump | 16 | 0.6950 / 1439 | **0.3115 / 3210** | **2.23×** | 25.76 / 25.76 | 0.7228 / 0.7228 | 0.2632 / 0.2632 | 0.0246 / 0.1197 / 0.1672 |
+| mip_360/treehill | 18 | 0.7585 / 1318 | **0.4077 / 2453** | **1.86×** | 22.56 / 22.56 | 0.6015 / 0.6015 | 0.2937 / 0.2937 | 0.0308 / 0.1374 / 0.2394 |
+| tnt/train | 38 | 0.4902 / 2040 | **0.3645 / 2744** | **1.34×** | 22.58 / 22.53 | 0.8232 / 0.8226 | 0.1727 / 0.1734 | 0.0279 / 0.1230 / 0.2136 |
+| tnt/truck | 32 | 0.4176 / 2395 | **0.3067 / 3260** | **1.36×** | 25.60 / 25.56 | 0.8784 / 0.8781 | 0.1169 / 0.1171 | 0.0244 / 0.1162 / 0.1662 |
+| db/drjohnson | 33 | 0.4598 / 2175 | **0.2344 / 4265** | **1.96×** | 29.57 / 29.59 | 0.8910 / 0.8910 | 0.2317 / 0.2314 | 0.0124 / 0.0862 / 0.1359 |
+| db/playroom | 29 | 0.5367 / 1863 | **0.2267 / 4410** | **2.37×** | 30.39 / 30.41 | 0.8928 / 0.8926 | 0.2082 / 0.2080 | 0.0123 / 0.0818 / 0.1327 |
+| **mean (13)** | | 0.608 / 1715 | **0.365 / 2915** | **1.72×** | 27.21 / 27.20 | 0.8151 / 0.8150 | 0.2030 / 0.2030 | 0.028 / 0.121 / 0.216 |
 
-## 6. Running it
+* **Quality is parity**: max |ΔPSNR| 0.05 dB, |ΔSSIM| 0.0006, |ΔLPIPS| 0.0007 across the
+  13 scenes — the differences are fp16 blending + the octagon's slightly different
+  fragment coverage, not a change of math.
+* **Speed-up 1.23–2.37×, mean 1.72×**, largest where the CUDA tile walk is slowest
+  (bonsai, stump, playroom — many small primitives per tile); smallest on kitchen, where
+  the 3.5 M-fragment raster stage dominates for both.
+* Inside the Vulkan frame the raster is 50–70 % and the **sort 25–40 %**; preprocess is
+  ≤ 10 %. The sort is the obvious next target (3 passes over 24 bits, or a onesweep).
+
+## 6. Implementation details
+
+**Bundle** (`scripts/export_vk_bundle.py` → `<ckpt>/vk_bundle/`): `meta.txt` (key=value),
+raw little-endian fp32 arrays `means[N,3] scales[N,2] rots[N,4] opac[N] shapes[N]
+sv_sites[N,K,3] sv_tau[N,K] sv_colors[N,K,3] atlas_params[N,12]`, `atlas.bc7` (symlink
+to the bake's file), `cams.bin` (count; per cam `W H view[16] proj[16] campos[3] tanfx
+tanfy` + GT as u8 `[3,H,W]` — exact, since the loader's images are u8/255). Matrices are
+written in the contiguous torch order, which is exactly the `matrix[0..15]` indexing the
+CUDA kernel uses (`transformPoint4x3`: `m[0]x+m[4]y+m[8]z+m[12]`).
+
+**Atlas params** (per Gauss, 3×vec4): `a0 = (u0−½+w/2, v0ℓ−½+h/2, w/2E, h/2E)`,
+`a1 = (u0, v0ℓ, u0+w−1.001, v0ℓ+h−1.001)`, `a2.x = layer` — the CUDA fetch block's
+precompute with `v` in layer-local coordinates; `a0.z == 0` is the "no atlas rect"
+sentinel. Layer cuts: greedy largest multiple-of-4 row ≤ `cut+16384` that no rect
+straddles (`inside[]` mask). Sampler: linear, clamp-to-edge, normalized coords
+(unnormalized coords are illegal on array views), `(au+½)/W_atlas, (av+½)/layerH`.
+
+**Uniform** (std140 `vec4 v[16]`, indexed as flat floats, one 256 B slot per frame,
+`UNIFORM_BUFFER_DYNAMIC`): 0–15 view, 16–31 proj, 32–34 campos, 35 W, 36 H, 37–38
+tanfov, 39 N, 40 K, 41 kernel_type, 42 sh_bias, 43 res_bias, 44 compact_mult,
+45 opacity_aware_beta, 46 beta_mult, 47 drop_lowpass, 48 scale_mod, 49 atlas_scale,
+50 atlas_offset, 51 W_atlas, 52 layerH, 53 nLayers, 54 pad, 55 lpmode.
+
+**Preprocess record** (8×vec4 = 128 B per Gauss, std430 SSBO):
+`P0=(xy, u₀, v₀)  P1=J⁻¹  P2=(dwdxr, dwdyr, opa, shape)  P3=(rgb, valid)
+P4=tight conic (A,B,E,t)  P5=(filter_r, rx, ry, r_lp_px)  P6=ellipse(3) conic  P7.x=bound level`.
+`compute_transmat` is ported by expanding the glm products explicitly:
+`T = Aᵀ·W2N·N2P` with `A` rows `(L0,0),(L1,0),(p,1)`, `W2N(r,c)=proj[4r+c]`,
+`N2P` the `W/2,(W−1)/2` pixel map; `Tu/Tv/Tw` are the *columns* of the result (glm
+`T[0..2]`). The quaternion is consumed as the CUDA code does — `(quat.x, .y, .z, .w)`
+read as `(w, x, y, z)`.
+
+**Sort** (`radix_hist / radix_scan / radix_scatter`, 4 passes × 8 bits, LSD):
+keys = `floatBitsToUint(p_view.z)` (positive → monotonic); block = 256 threads ×
+ELEMS (`--elems`, 4 for ~60 K keys, 8 for ~150 K). Histogram: shared atomics → global
+`hist[digit·numBlocks + block]` (digit-major). Scan: one 1024-thread workgroup,
+subgroup exclusive scans + 32 partials, chunked. Scatter: block-local **stable** sort by
+8 successive 1-bit splits (per-thread counts → workgroup scan → stable positions), then
+`dst = hist[digit,block] + (pos − digitStart[digit])`. Only visible primitives are in the
+list: preprocess `atomicAdd`s a slot; `sort_args.comp` turns the count into
+`vkCmdDispatchIndirect` / `vkCmdDrawIndirect` arguments, so nothing on the host knows M.
+
+**Bound polygon** (`splat.vert`): support function of the ellipse `{d : dᵀMd ≤ t}` is
+`h(n) = √(t·nᵀM⁻¹n)`; eight supports at 45° give the circumscribing octagon (corners =
+adjacent edge-line intersections). For `beta_scaled` the frag tests `ρ ≥ 9` *before*
+the low-pass term, so `h = min(h_ell3, max(h_ell_rβ, r_lp))`; for `gaussian`
+`h = max(h_ell_iso, r_lp)`. The rational's validity half-plane `(−dw)·d ≤ 0.9` is then
+applied by Sutherland–Hodgman (≤ 9 vertices, emitted as a 10-vertex triangle fan). Pad
+0.1 px: pixel `i` is sampled at index coordinate `i` in both paths (vertex NDC =
+`(px+½)/W·2−1`, fragment `floor(gl_FragCoord)`), so only fp edge cases need slack.
+Bound level: 2 = SW conic elliptic, 1 = only the k=3 conic elliptic (exact: support ⊆
+ellipse(3)), 0 = degenerate → not drawn.
+
+**Fragment** (`splat.frag`): the CUDA inner loop verbatim — `dx = pix − xy`, rational
+`u = u₀ + (J⁻¹·Δ)/(1+dw·Δ)` with `denom < 0.1 → discard`, `ρ2d = 2|d|²`, beta:
+`ρ ≥ 9 → discard`, `α = min(.99, opa·max((1−ρ/9)^shape, e^{−ρ2d/2}))`; gaussian:
+`α = min(.99, opa·e^{−ρ/2})`; `α < 1/255 → discard`; atlas fetch with the clamped
+affine UV; `feat = max(0, feat + res_bias)`; output `(feat·α, α)`. Blend:
+`src·DST_ALPHA + dst·ONE` / `dst·(1−src_α)` with the target cleared to `(0,0,0,1)`, i.e.
+`C += T·α·feat`, `T *= 1−α` — the front-to-back "under" operator with T in dst alpha.
+`FETCH_BY_ID` passes only the Gaussian index and reads P0–P3 + atlas params in the
+fragment shader (faster than 7 flat vec4 varyings on NVIDIA, and it removed a bimodal
+stall). `STATS` builds add per-cull-reason atomic counters.
+
+**Timing**: `VK_QUERY_TYPE_TIMESTAMP` ×4 per frame slot (start / after preprocess /
+after sort / after draw), all `warmup+bench` frames recorded into one command buffer
+and one `vkQueueSubmit`; a `SHADER_READ → SHADER_WRITE` barrier between frames because
+frame i+1's preprocess rewrites what frame i's draw read. Quality pass runs per frame
+with a readback (RGBA32F or RGBA16F decoded on the host). Requires the discrete GPU
+with `pipelineStatisticsQuery`, `dynamicRendering` (Vulkan 1.3 core), subgroup
+arithmetic; no window, no validation layers.
+
+## 7. Running it
 
 ```bash
 # once per checkpoint

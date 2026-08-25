@@ -295,6 +295,26 @@ Goal: bake the MLP residual into static per-Gaussian SH textures for fast infere
 - **SH layout**: MLP outputs channel-first `[R0..R15, G0..G15, B0..B15]`; PLY stores interleaved `[N, 16, 3]`.
 - **Default budget clamps resolution**: `--atlas_budget_mb 2048` (default) silently clamps `max_res` from 128 down to 16 on large scenes. Bump to 8192 for full-res bakes (`--max_res 64 --atlas_budget_mb 8192` is the path-2 standard).
 
+## Vulkan hardware rasterizer (`vk_raster/`)
+
+Standalone headless Vulkan port of the CONIC baked renderer — full reference:
+[`docs/VULKAN_HW_RASTER.md`](../../docs/VULKAN_HW_RASTER.md). Same bakes, same math
+(preprocess.comp is a line-by-line port of `preprocessCUDA`; splat.frag is the
+inner-loop body), quality matches CUDA to the reported digits, and it is **1.4–1.7×
+faster** than the CUDA CONIC tile walk (room 3368 vs 1986 FPS). Workflow:
+`scripts/export_vk_bundle.py --model_path <ck>` (dumps params + SV state + atlas UV
+precompute + test cams; atlas is symlinked) → `vk_raster/build.sh` (glslc from the
+conda env) → `vk_raster/vk_raster <ck>/vk_bundle --lp 1 --pad 0.1 --byid --fp16`
+(`--dumpall <dir>` + `scripts/eval_vk_renders.py` for SSIM/LPIPS; 13-scene sweep in
+`vk_raster/results_2026-08-25.csv`, mean 1.72× over CONIC, metrics within 0.05 dB).
+Scope: `--feature SV`, `beta_scaled`/`gaussian`, `residual_mode 0`; `res_3d_paired`
+NOT ported. The same `vk_bundle` also feeds the **WebGPU viewer's offline harness**
+(`../Halloumi-WS/tools/offline_harness/`, wgpu-py: compiles/links/diffs/fragment-counts
+the real WGSL without a browser — see `docs/HALLOUMI_WS_VIEWER.md` §8). Pitfalls already paid for (see doc §3): fp32 render target is the ROP
+wall (use fp16); the conic ellipse includes the behind-camera mirror region (clip by
+`dw·d ≥ −0.9`); hyperbolic-conic surfels get garbage `compute_aabb` extents (use the
+k=3 conic or cull); per-frame fence waits downclock the GPU (batch timed frames).
+
 ## Key Files
 
 - `gaussian_renderer/__init__.py` — `render()` dispatch
