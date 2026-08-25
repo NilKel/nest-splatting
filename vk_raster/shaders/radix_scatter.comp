@@ -1,0 +1,80 @@
+#version 450
+#include "sort_common.glsl"
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) readonly buffer K  { uint keysIn[]; };
+layout(std430, set = 0, binding = 1) readonly buffer V  { uint valsIn[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer KO { uint keysOut[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer VO { uint valsOut[]; };
+layout(std430, set = 0, binding = 4) readonly buffer H  { uint hist[]; };   // exclusive-scanned
+shared uint sk[BLOCK], sv[BLOCK], tk[BLOCK], tv[BLOCK];
+shared uint dstart[256];
+shared uint sg[8];
+shared uint sg_total;
+
+// exclusive scan of one uint per thread across the 256-thread workgroup
+uint wg_scan(uint v, out uint total) {
+    uint pre = subgroupExclusiveAdd(v);
+    uint ssum = subgroupAdd(v);
+    if (gl_SubgroupInvocationID == 0u) sg[gl_SubgroupID] = ssum;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        uint s = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sg[gl_SubgroupInvocationID] : 0u;
+        uint ex = subgroupExclusiveAdd(s);
+        uint tot = subgroupAdd(s);
+        if (gl_SubgroupInvocationID < gl_NumSubgroups) sg[gl_SubgroupInvocationID] = ex;
+        if (gl_SubgroupInvocationID == 0u) sg_total = tot;
+    }
+    barrier();
+    uint r = sg[gl_SubgroupID] + pre;
+    total = sg_total;
+    barrier();
+    return r;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x, b = gl_WorkGroupID.x;
+    for (uint e = 0u; e < ELEMS; e++) {
+        uint li = t * ELEMS + e, i = b * BLOCK + li;
+        bool ok = i < PC_N;
+        sk[li] = ok ? keysIn[i] : 0xFFFFFFFFu;
+        sv[li] = ok ? valsIn[i] : 0xFFFFFFFFu;
+    }
+    barrier();
+    // stable local sort by the 8-bit digit: 8 bit-splits
+    for (uint bit = 0u; bit < 8u; bit++) {
+        uint sh = PC_SHIFT + bit;
+        uint kk[ELEMS], vv[ELEMS], bb[ELEMS]; uint c1 = 0u;
+        for (uint e = 0u; e < ELEMS; e++) {
+            kk[e] = sk[t*ELEMS + e]; vv[e] = sv[t*ELEMS + e];
+            bb[e] = (kk[e] >> sh) & 1u; c1 += bb[e];
+        }
+        uint total_ones; uint ones_before = wg_scan(c1, total_ones);
+        uint zeros_before = t * ELEMS - ones_before;
+        uint total_zeros = BLOCK - total_ones;
+        uint lz = 0u, lo = 0u;
+        for (uint e = 0u; e < ELEMS; e++) {
+            uint pos = (bb[e] == 1u) ? (total_zeros + ones_before + lo) : (zeros_before + lz);
+            if (bb[e] == 1u) lo++; else lz++;
+            tk[pos] = kk[e]; tv[pos] = vv[e];
+        }
+        barrier();
+        for (uint e = 0u; e < ELEMS; e++) { sk[t*ELEMS + e] = tk[t*ELEMS + e]; sv[t*ELEMS + e] = tv[t*ELEMS + e]; }
+        barrier();
+    }
+    // digit start positions within the block
+    for (uint e = 0u; e < ELEMS; e++) {
+        uint p = t * ELEMS + e;
+        uint dg = (sk[p] >> PC_SHIFT) & 255u;
+        uint pv = (p > 0u) ? ((sk[p - 1u] >> PC_SHIFT) & 255u) : 0xFFFFu;
+        if (dg != pv) dstart[dg] = p;
+    }
+    barrier();
+    for (uint e = 0u; e < ELEMS; e++) {
+        uint p = t * ELEMS + e;
+        uint key = sk[p], val = sv[p];
+        if (val == 0xFFFFFFFFu) continue;       // padding
+        uint dg = (key >> PC_SHIFT) & 255u;
+        uint dst = hist[dg * PC_NB + b] + (p - dstart[dg]);
+        keysOut[dst] = key; valsOut[dst] = val;
+    }
+}

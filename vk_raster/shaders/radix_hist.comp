@@ -1,0 +1,17 @@
+#version 450
+#include "sort_common.glsl"
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) readonly buffer K { uint keysIn[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer H { uint hist[]; };
+shared uint lh[256];
+void main() {
+    uint t = gl_LocalInvocationID.x, b = gl_WorkGroupID.x;
+    lh[t] = 0u;
+    barrier();
+    for (uint e = 0u; e < ELEMS; e++) {
+        uint i = b * BLOCK + t * ELEMS + e;
+        if (i < PC_N) atomicAdd(lh[(keysIn[i] >> PC_SHIFT) & 255u], 1u);
+    }
+    barrier();
+    hist[t * PC_NB + b] = lh[t];      // digit-major
+}

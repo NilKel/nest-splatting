@@ -1,0 +1,218 @@
+#version 450
+// Port of diff_surfel_bake_render_lean::preprocessCUDA (LEAN_CONIC, SV color,
+// aabb_mode 3 = AdR + SnugBox). One thread per Gaussian. Emits the per-Gauss
+// CONIC record the fragment shader needs, plus a depth sort key.
+layout(local_size_x = 256) in;
+#include "common.glsl"
+layout(std430, set = 0, binding = 1) readonly buffer B1 { float means[]; };
+layout(std430, set = 0, binding = 2) readonly buffer B2 { float scales[]; };
+layout(std430, set = 0, binding = 3) readonly buffer B3 { float rots[]; };
+layout(std430, set = 0, binding = 4) readonly buffer B4 { float opac[]; };
+layout(std430, set = 0, binding = 5) readonly buffer B5 { float shapes[]; };
+layout(std430, set = 0, binding = 6) readonly buffer B6 { float sv_sites[]; };
+layout(std430, set = 0, binding = 7) readonly buffer B7 { float sv_tau[]; };
+layout(std430, set = 0, binding = 8) readonly buffer B8 { float sv_colors[]; };
+layout(std430, set = 0, binding = 9)  writeonly buffer B9  { vec4 prep[]; };   // 6 vec4 / Gauss
+layout(std430, set = 0, binding = 10) writeonly buffer B10 { uint keys[]; };
+layout(std430, set = 0, binding = 11) writeonly buffer B11 { uint vals[]; };
+layout(std430, set = 0, binding = 12) buffer B12 { uint visCount; uint M; uint numBlocks; uint pad0; uint dispatchX, dispatchY, dispatchZ, pad1; uint drawVerts, drawInst, drawFirstV, drawFirstI; } args;
+
+// glm::mat3 T column c = (T(0,c),T(1,c),T(2,c)); Tu = col0, Tv = col1, Tw = col2.
+void compute_transmat(vec3 p, vec2 sc, float mod, vec4 q, out vec3 Tu, out vec3 Tv, out vec3 Tw) {
+    // quat_to_rotmat: CUDA takes (quat.x, quat.y, quat.z, quat.w) as (w, x, y, z)
+    float s = inversesqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
+    float w = q.x*s, x = q.y*s, y = q.z*s, z = q.w*s;
+    // glm::mat3 columns (matches the CUDA constructor argument order)
+    vec3 R0 = vec3(1.0 - 2.0*(y*y + z*z), 2.0*(x*y + w*z),       2.0*(x*z - w*y));
+    vec3 R1 = vec3(2.0*(x*y - w*z),       1.0 - 2.0*(x*x + z*z), 2.0*(y*z + w*x));
+    vec3 L0 = R0 * (mod * sc.x);
+    vec3 L1 = R1 * (mod * sc.y);
+    // A = transpose(splat2world): rows (L0,0), (L1,0), (p,1)   [3x4]
+    // W2N(r,c) = projmatrix[4r + c]                             [4x4]
+    // N2P: 4x3 with N2P(0,0)=W/2, N2P(3,0)=(W-1)/2, N2P(1,1)=H/2, N2P(3,1)=(H-1)/2, N2P(3,2)=1
+    vec4 A0 = vec4(L0, 0.0), A1 = vec4(L1, 0.0), A2 = vec4(p, 1.0);
+    // M = A * W2N   (3x4)
+    vec4 M0, M1, M2;
+    for (int c = 0; c < 4; c++) {
+        vec4 col = vec4(U_PROJ(0*4 + c), U_PROJ(1*4 + c), U_PROJ(2*4 + c), U_PROJ(3*4 + c));
+        M0[c] = dot(A0, col); M1[c] = dot(A1, col); M2[c] = dot(A2, col);
+    }
+    float W = U_W, H = U_H;
+    vec3 n2p_c0 = vec3(W * 0.5, 0.0, 0.0);      // (rows 0..2) col 0, row 3 = (W-1)/2
+    // T(r,c) = sum_m M_r[m] * N2P(m,c)
+    #define TRC(Mr, c) ((c)==0 ? (Mr[0]*(W*0.5) + Mr[3]*((W-1.0)*0.5)) : ((c)==1 ? (Mr[1]*(H*0.5) + Mr[3]*((H-1.0)*0.5)) : Mr[3]))
+    Tu = vec3(TRC(M0,0), TRC(M1,0), TRC(M2,0));
+    Tv = vec3(TRC(M0,1), TRC(M1,1), TRC(M2,1));
+    Tw = vec3(TRC(M0,2), TRC(M1,2), TRC(M2,2));
+}
+
+bool compute_aabb(vec3 Tu, vec3 Tv, vec3 Tw, float cutoff, out vec2 pimg, out vec2 extent) {
+    vec3 t = vec3(cutoff*cutoff, cutoff*cutoff, -1.0);
+    float d = dot(t, Tw*Tw);
+    if (d == 0.0) return false;
+    vec3 f = (1.0 / d) * t;
+    vec2 p = vec2(dot(f, Tu*Tw), dot(f, Tv*Tw));
+    vec2 h0 = p*p - vec2(dot(f, Tu*Tu), dot(f, Tv*Tv));
+    vec2 h = sqrt(max(vec2(1e-4), h0));
+    pimg = p; extent = h;
+    return true;
+}
+
+bool compute_conic(vec3 Tu, vec3 Tv, vec3 Tw, float cutoff, out float A, out float B, out float E, out float t, out vec2 p) {
+    float k_sq = cutoff*cutoff;
+    vec3 n0 = cross(Tv, Tw), n1 = cross(Tw, Tu), n2 = cross(Tu, Tv);
+    float A_ = n0.x*n0.x + n0.y*n0.y - k_sq*n0.z*n0.z;
+    float B_ = n0.x*n1.x + n0.y*n1.y - k_sq*n0.z*n1.z;
+    float E_ = n1.x*n1.x + n1.y*n1.y - k_sq*n1.z*n1.z;
+    float D_ = n0.x*n2.x + n0.y*n2.y - k_sq*n0.z*n2.z;
+    float F_ = n1.x*n2.x + n1.y*n2.y - k_sq*n1.z*n2.z;
+    float det = A_*E_ - B_*B_;
+    if (!(det > 0.0) || !(A_ > 0.0) || !(E_ > 0.0)) return false;
+    p.x = (B_*F_ - E_*D_) / det;
+    p.y = (B_*D_ - A_*F_) / det;
+    float cx = p.x*n0.x + p.y*n1.x + n2.x;
+    float cy = p.x*n0.y + p.y*n1.y + n2.y;
+    float cz = p.x*n0.z + p.y*n1.z + n2.z;
+    float t_ = -(cx*cx + cy*cy - k_sq*cz*cz);
+    if (!(t_ > 0.0)) return false;
+    A = A_; B = B_; E = E_; t = t_;
+    return true;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    int N = U_N;
+    if (idx >= uint(N)) return;
+    prep[idx*8 + 3] = vec4(0.0);        // .w = valid flag
+
+    vec3 p = vec3(means[idx*3+0], means[idx*3+1], means[idx*3+2]);
+    // in_frustum: p_view = view * p (CUDA index arithmetic)
+    float pvz = U_VIEW(2)*p.x + U_VIEW(6)*p.y + U_VIEW(10)*p.z + U_VIEW(14);
+    if (pvz <= 0.2) return;
+
+    vec2 sc = vec2(scales[idx*2+0], scales[idx*2+1]);
+    vec4 q  = vec4(rots[idx*4+0], rots[idx*4+1], rots[idx*4+2], rots[idx*4+3]);
+    vec3 Tu, Tv, Tw;
+    compute_transmat(p, sc, U_SCALEMOD, q, Tu, Tv, Tw);
+
+    // ---- cutoff (aabb_mode 3: AdR) ----
+    float opa = opac[idx];
+    float shape = shapes[idx];
+    int kt = U_KT;
+    float cutoff;
+    if (kt == 4) {
+        if (opa < 1.0/255.0) return;
+        float k = 3.0;
+        float ratio = 1.0 / (255.0 * opa);
+        float thr = pow(ratio, 1.0 / shape);
+        float r_beta = (thr < 1.0) ? k * sqrt(1.0 - thr) : 0.0;
+        float lt = log(255.0 * opa);
+        float r_lp = (lt > 0.0) ? sqrt(2.0 * lt) : 0.0;
+        cutoff = min(max(r_beta, r_lp), k + 2.0);
+    } else {
+        if (opa < 1.0/255.0) return;
+        float lt = log(255.0 * opa);
+        cutoff = (lt > 0.0) ? sqrt(2.0 * lt * U_COMPACT) : 0.1;
+        cutoff = min(cutoff, 4.0);
+    }
+
+    vec2 pimg, extent;
+    if (!compute_aabb(Tu, Tv, Tw, cutoff, pimg, extent)) return;
+    float filter_r = U_DROPLP ? 0.0 : cutoff * FilterSize;
+    float rx = ceil(max(extent.x, filter_r));
+    float ry = ceil(max(extent.y, filter_r));
+    // getRectXY -> rect_tiles == 0 means fully offscreen
+    float W = U_W, H = U_H;
+    if (pimg.x + rx < 0.0 || pimg.x - rx > W || pimg.y + ry < 0.0 || pimg.y - ry > H) return;
+
+    // SnugBox conic (center override on success, as in CUDA)
+    float A, B, E, t; vec2 pc;
+    bool conic_ok = compute_conic(Tu, Tv, Tw, cutoff, A, B, E, t, pc);
+    if (conic_ok) { pimg = pc; }
+    else { A = 1.0; B = 0.0; E = 1.0; t = rx*rx + ry*ry; }   // conservative circle fallback
+    // Tight support for the octagon (lpmode 1): the beta term's EXACT 1/255 iso is
+    // rho3d <= r_beta^2 (cutoff above unions in the uv-space r_lp proxy, which for
+    // beta_scaled overshoots the compact support rho<9 entirely); the pixel-space
+    // low-pass disc is added separately in the vertex shader from p5.w.
+    // Second conic for the octagon bound (lpmode 1):
+    //   beta_scaled: the frag culls rho3d >= 9 BEFORE the low-pass term, so the support is
+    //     ellipse(3) ∩ (ellipse(r_beta) ∪ disc(r_lp_px)).  P4 = ellipse(r_beta), P6 = ellipse(3).
+    //   gaussian:    support = ellipse(sqrt(2ln(255a))) ∪ disc(sqrt(ln(255a))); cutoff is that
+    //     iso already, so P4 = P6 = the SW conic.
+    float A6 = A, B6 = B, E6 = E, t6 = t;
+    // bound level: 2 = SW conic elliptic, 1 = only the k=3 conic elliptic (support is
+    // still inside ellipse(3), exact), 0 = neither -> numerically degenerate surfel whose
+    // compute_aabb extent is garbage (measured: 755 px median, 765k px max on room; every
+    // fragment culled) -> the vertex shader drops it.
+    float level = conic_ok ? 2.0 : 0.0;
+    if (U_LPMODE > 0.5 && kt == 4) {
+        float ratio = 1.0 / (255.0 * opa);
+        float thr = pow(ratio, 1.0 / shape);
+        float r_beta = (thr < 1.0) ? 3.0 * sqrt(1.0 - thr) : 0.0;
+        float A2, B2, E2, t2; vec2 pc2;
+        bool ok3 = compute_conic(Tu, Tv, Tw, 3.0, A2, B2, E2, t2, pc2);
+        if (ok3) { A6 = A2; B6 = B2; E6 = E2; t6 = t2; if (!conic_ok) { A = A2; B = B2; E = E2; t = t2; level = 1.0; } }
+        bool okb = (r_beta > 0.0) && compute_conic(Tu, Tv, Tw, r_beta, A2, B2, E2, t2, pc2);
+        if (okb) { A = A2; B = B2; E = E2; t = t2; if (!conic_ok && !ok3) { A6 = A2; B6 = B2; E6 = E2; t6 = t2; level = 1.0; } }
+    }
+
+    // ---- SV color (computeColorFromVoronoi) ----
+    int K = U_K;
+    vec3 dir = p - U_CAMPOS;
+    dir = dir * (1.0 / length(dir));
+    uint sb = idx * uint(K);
+    float max_logit = -1e30;
+    for (uint k = 0u; k < uint(K); k++) {
+        vec3 s = vec3(sv_sites[(sb+k)*3+0], sv_sites[(sb+k)*3+1], sv_sites[(sb+k)*3+2]);
+        vec3 d = s - dir;
+        float logit = -sv_tau[sb+k] * sqrt(dot(d, d));
+        max_logit = max(max_logit, logit);
+    }
+    float sum_exp = 0.0;
+    for (uint k = 0u; k < uint(K); k++) {
+        vec3 s = vec3(sv_sites[(sb+k)*3+0], sv_sites[(sb+k)*3+1], sv_sites[(sb+k)*3+2]);
+        vec3 d = s - dir;
+        sum_exp += exp(-sv_tau[sb+k] * sqrt(dot(d, d)) - max_logit);
+    }
+    float inv_sum = 1.0 / sum_exp;
+    vec3 feat = vec3(0.0);
+    for (uint k = 0u; k < uint(K); k++) {
+        vec3 s = vec3(sv_sites[(sb+k)*3+0], sv_sites[(sb+k)*3+1], sv_sites[(sb+k)*3+2]);
+        vec3 d = s - dir;
+        float wgt = exp(-sv_tau[sb+k] * sqrt(dot(d, d)) - max_logit) * inv_sum;
+        feat += wgt * vec3(sv_colors[(sb+k)*3+0], sv_colors[(sb+k)*3+1], sv_colors[(sb+k)*3+2]);
+    }
+    vec3 rgb = max(feat + U_SHBIAS, vec3(0.0));
+
+    // ---- CONIC precompute at the (possibly overridden) center ----
+    vec3 k_c = vec3(pimg.x*Tw.x - Tu.x, pimg.x*Tw.y - Tu.y, pimg.x*Tw.z - Tu.z);
+    vec3 l_c = vec3(pimg.y*Tw.x - Tv.x, pimg.y*Tw.y - Tv.y, pimg.y*Tw.z - Tv.z);
+    vec3 p_c = cross(k_c, l_c);
+    float u0 = 1e10, v0 = 1e10, J00 = 0.0, J01 = 0.0, J10 = 0.0, J11 = 0.0, dwdxr = 0.0, dwdyr = 0.0;
+    if (abs(p_c.z) > 1e-12) {
+        u0 = p_c.x / p_c.z; v0 = p_c.y / p_c.z;
+        float w_c = Tw.x*u0 + Tw.y*v0 + Tw.z;
+        float det_kl = k_c.x*l_c.y - k_c.y*l_c.x;
+        if (abs(det_kl) > 1e-12 && abs(w_c) > 1e-8) {
+            float scl = w_c / det_kl;
+            J00 = -l_c.y*scl; J01 = k_c.y*scl; J10 = l_c.x*scl; J11 = -k_c.x*scl;
+            float dpz_dpx = Tw.y*Tv.x - Tw.x*Tv.y;
+            float dpz_dpy = Tu.y*Tw.x - Tu.x*Tw.y;
+            dwdxr = dpz_dpx / p_c.z; dwdyr = dpz_dpy / p_c.z;
+        } else { u0 = 1e10; v0 = 1e10; }
+    }
+
+    prep[idx*8 + 0] = vec4(pimg, u0, v0);
+    prep[idx*8 + 1] = vec4(J00, J01, J10, J11);
+    prep[idx*8 + 2] = vec4(dwdxr, dwdyr, opa, shape);
+    prep[idx*8 + 3] = vec4(rgb, 1.0);
+    prep[idx*8 + 4] = vec4(A, B, E, t);
+    prep[idx*8 + 6] = vec4(A6, B6, E6, t6);
+    prep[idx*8 + 7] = vec4(level, 0.0, 0.0, 0.0);   // .x: bound level (see above)
+    float lt_lp = log(255.0 * opa);
+    float r_lp_px = (lt_lp > 0.0) ? sqrt(lt_lp) : 0.0;     // alpha_lp*opa >= 1/255  <=>  |d|^2 <= ln(255*opa)
+    prep[idx*8 + 5] = vec4(filter_r, rx, ry, r_lp_px);
+    uint slot = atomicAdd(args.visCount, 1u);   // compact: only visible primitives enter the sort
+    keys[slot] = floatBitsToUint(pvz);           // pvz > 0 -> monotonic in uint
+    vals[slot] = idx;
+}

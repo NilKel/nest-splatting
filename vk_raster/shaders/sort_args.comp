@@ -1,0 +1,10 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(push_constant) uniform PC { uint blockElems; } pc;
+layout(std430, set = 0, binding = 5) buffer A { uint visCount; uint M; uint numBlocks; uint pad0; uint dispatchX, dispatchY, dispatchZ, pad1; uint drawVerts, drawInst, drawFirstV, drawFirstI; } args;
+void main() {
+    uint m = args.visCount; args.M = m;
+    uint nb = (m + pc.blockElems - 1u) / pc.blockElems; args.numBlocks = nb;
+    args.dispatchX = max(nb, 1u); args.dispatchY = 1u; args.dispatchZ = 1u;
+    args.drawVerts = 10u; args.drawInst = m; args.drawFirstV = 0u; args.drawFirstI = 0u;
+}

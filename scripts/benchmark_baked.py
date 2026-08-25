@@ -1153,6 +1153,8 @@ def evaluate_baked(test_cameras, gaussians, bg_color, beta, kernel_type,
         torch.cuda.synchronize()
         # elapsed_time returns ms; convert to seconds for parity with old API.
         times_ms = [starts[i].elapsed_time(ends[i]) for i in range(num_benchmark)]
+        # distribution, for like-for-like comparison with the Vulkan HW-raster bench
+        _s = sorted(times_ms); print(f"[FPS-DIST] mean {sum(_s)/len(_s):.4f} ms  median {_s[len(_s)//2]:.4f}  p95 {_s[int(len(_s)*0.95)]:.4f}  max {_s[-1]:.4f}  (n={len(_s)})")
         mean_ms = float(np.mean(times_ms))
 
     return {
@@ -1305,6 +1307,21 @@ def main():
         args = pickle.load(f)
     args.model_path = model_path
     args.eval = True
+
+    # `--method 3D_SH_add` is a train.py-only ALIAS: train.py sets args._residual_mode = 1
+    # and then rewrites args.method -> "3D_SH_res" BEFORE the INGP is built. args.pkl is
+    # pickled earlier (in prepare_output_and_logger, so the run folder keeps its own
+    # 3D_SH_add/ name), so it still carries the PRE-alias value. INGP has no branch for
+    # "3D_SH_add" at all, so replaying the flip here is mandatory -- without it INGP
+    # builds the wrong architecture (no mlp_fused, hybrid_levels ignored -> 6 hash levels
+    # instead of 4) and load_model dies on a state_dict shape mismatch.
+    # Keep the ORIGINAL name around: the bake_meta residual_mode logic below keys off it.
+    args._method_orig = getattr(args, 'method', '')
+    if args._method_orig == "3D_SH_add":
+        args.method = "3D_SH_res"
+        args._residual_mode = 1
+        print("[BAKE] --method 3D_SH_add -> aliased to 3D_SH_res for INGP construction "
+              "(residual_mode=1 preserved for bake_meta).")
 
     # `--method res_3d_paired`: bake + render through diff_surfel_bake_render_paired
     # (a clone of diff_surfel_bake_render). Functionally identical to mixed_3d_sep's
@@ -1483,7 +1500,10 @@ def main():
         #   everything else, incl. plain
         #     3D_SH_res / mixed / mixed_3d → 0  (per-Gauss outer ReLU in the
         #                                         kernel; NO per-pixel ReLU)
-        _method_train = getattr(args, 'method', '')
+        # Use the PRE-alias method (see the 3D_SH_add note above): args.method has
+        # already been rewritten to "3D_SH_res" for the INGP build, which would
+        # otherwise silently record residual_mode 0 for an additive bake.
+        _method_train = getattr(args, '_method_orig', '') or getattr(args, 'method', '')
         if _method_train == "3D_SH_add":
             _rm = 1
         elif _method_train in ("mixed_sep", "mixed_3d_sep",

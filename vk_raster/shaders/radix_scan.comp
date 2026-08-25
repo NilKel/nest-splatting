@@ -1,0 +1,30 @@
+#version 450
+#include "sort_common.glsl"
+layout(local_size_x = 1024) in;
+layout(std430, set = 0, binding = 4) buffer H { uint hist[]; };
+shared uint sg[32];
+shared uint sg_total;
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint M = 256u * PC_NB;
+    uint carry = 0u;
+    for (uint base = 0u; base < M; base += 1024u) {
+        uint i = base + t;
+        uint v = (i < M) ? hist[i] : 0u;
+        uint pre = subgroupExclusiveAdd(v);
+        uint ssum = subgroupAdd(v);
+        if (gl_SubgroupInvocationID == 0u) sg[gl_SubgroupID] = ssum;
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            uint s = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sg[gl_SubgroupInvocationID] : 0u;
+            uint ex = subgroupExclusiveAdd(s);
+            uint tot = subgroupAdd(s);
+            if (gl_SubgroupInvocationID < gl_NumSubgroups) sg[gl_SubgroupInvocationID] = ex;
+            if (gl_SubgroupInvocationID == 0u) sg_total = tot;
+        }
+        barrier();
+        if (i < M) hist[i] = carry + sg[gl_SubgroupID] + pre;
+        carry += sg_total;
+        barrier();
+    }
+}
