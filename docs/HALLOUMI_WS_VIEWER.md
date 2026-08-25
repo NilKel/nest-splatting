@@ -173,6 +173,32 @@ Bound in group 1 of every pipeline. Mutable at runtime via the Tweakpane UI (top
 
 Atlas toggle is separate (a button in the panel). When OFF, the renderer uses SH-only; bake-residual atlas is skipped entirely.
 
+**Build-time render variants** (2026-08-25, ported from the Vulkan HW rasterizer
+findings — `docs/VULKAN_HW_RASTER.md`; fixed at renderer construction, URL-selected):
+
+| URL param | default | What it does |
+|---|---|---|
+| `?byid=0` | fetch-by-id ON | `FETCH_BY_ID`: the vertex stage emits only the compacted splat slot (one flat `u32`); the fragment re-reads `Splat2DGS[slot]` from the storage buffer instead of receiving 13 flat varyings. Bit-identical output (verified offline). |
+| `?oct=1` | quad | `OCT`: 8-vertex triangle-strip octagon tangent to the exact cutoff ellipse (rebuilt in the vertex shader from the CONIC coefficients + the cull's OAC cutoff), ∪ the low-pass disc. **23–26 % fewer fragment invocations** than the quad on room/garden/bicycle, and it covers ≥ the quad's surviving fragments. 2× the vertex invocations — an earlier corner-cut octagon was reported a net loss on some GPUs, so it is opt-in until A/B'd on phones. |
+| `?acc16=1` | off | Sorted path blends into an `rgba16float` target + fullscreen resolve instead of the 8-bit swapchain. The 8-bit blend rounds each over-step to 1/255: offline it measured ≈1.1 % rms vs the fp16 composite (≈39 dB-equivalent) — small next to the ~20–31 dB scene error, and the resolve costs a full-screen write+read, so off by default. |
+| `?hyp_legacy=1` | guard ON | accel bit 9. Default: when SnugBox fails and `compute_aabb` returns a rect wider than 2× the viewport (camera-plane-crossing surfel — pure discard work) the surfel is culled. Legacy restores the unguarded fallback. Culls nothing on any mip-360 test camera tried; safety net for close-up navigation. |
+
+Two precision fixes landed with these (both unconditional): `Splat2DGS.pos` is
+now an exact ¼-px `i16` grid (f16 had 1 px spacing beyond x = 1024, shifting every
+splat on the right/bottom of a retina canvas by up to 0.5 px), and the cull quantises
+the centre *before* deriving the CONIC so `u₀/v₀/J⁻¹/∇w` are exact for the centre the
+fragment subtracts; the vertex quad/octagon carries a 0.25 px + 0.1 % margin because
+the bare tight bbox clipped fully-visible edge fragments of hard-edged (shape → 0)
+surfels (~100 px/frame, |Δ| up to 46/255 on room). Variants are selected by a tiny
+line preprocessor in `gaussian-renderer.ts` (`//#if NAME` / `//#else` / `//#endif`
+in `render_2dgs.wgsl`) — `shade()` takes a `SplatIn` struct that either path fills.
+
+**Offline harness** (`tools/offline_harness/`, README there): runs the real cull →
+preprocess → render WGSL through `wgpu-native` on a `vk_bundle` export, so shader
+changes get compiled, linked against every fragment entry point, diffed
+variant-vs-variant, fragment-counted (atomic counters in a `fs_count` entry) and
+PSNR'd against GT (SH-only ≈ the CUDA SH-only ablation) without a browser.
+
 ---
 
 ## 9. Differences vs. upstream WebSplatter
@@ -195,6 +221,8 @@ Atlas toggle is separate (a button in the panel). When OFF, the renderer uses SH
 
 - **Atlas layering** (corrected 2026-05-15 — the old "6-layer hard cap" claim was wrong): WebGPU on Adreno/Mali exposes `max_texture_dimension_2d = 8192`, so the NAT2 packer slices the atlas into ≤8192-row stripes (one `texture_2d_array` layer each; viewer reads `n_layers` + `layer_cuts` from the NAT2 header and binary-searches per pixel — see `Nat2Parser.ts` / Rust `pointcloud.rs`). There is **no hard layer-count limit in the viewer**: the only constraints are per-layer height ≤ `max_texture_dimension_2d` (8192) and total layers ≤ `maxTextureArrayLayers` (WebGPU guaranteed minimum **256**). "6 layers" was a *typical bake-config output*, never a viewer ceiling — `brain_blursplit` ships a working 7-layer (6784×55424) atlas. The real cost of more layers is **download size**, not a render failure. So `atlas_height` up to `8192 × 256` ≈ 2M rows is technically renderable; bandwidth bites long before the texture-array limit does.
 - **BC7 vs. ASTC capability**: `device.features.has('texture-compression-bc')` for BC7, `'texture-compression-astc'` for ASTC. Desktop browsers usually have BC7; Android Adreno/Mali have ASTC only. The bundle format determines what's loaded — ship both `_astc` and BC7 variants for full coverage (see `BITYMI_BUNDLES.md`).
+- **SnugBox "failures" are thin surfels, not hyperbolic ones**: on room cam 0, 99 alive surfels (depth 3–10 m, ≤ 81 px, opacity up to 1.0) fail `compute_aabb_snugbox` because `det = A·E − B²` is ~1e-6·A·E in fp32 — the centre/`t` test is cancellation noise. `compute_aabb` recovers them and they are visible (370 px). Never cull on SnugBox failure alone; the guard only rejects garbage-sized rects.
+- **Don't pack screen coordinates as f16**: 1 px spacing beyond 1024, 0.5 beyond 512. `Splat2DGS.pos` uses `pack_center` / `unpack_center` (¼-px `i16`); `extent` stays f16 (relative error only, padded in the vertex).
 - **Half-precision quaternion drift**: f16 round-trip can knock `|q|` away from 1 by a few percent. `pickGaussAt` renormalizes defensively; `surfel_cull.wgsl::quat_to_rotmat` also does `q * inverseSqrt(dot(q,q))`. Don't assume f16-packed quats are unit.
 - **`cameras.json` missing**: bundle loaders return `camerasBuffer = null` if absent. App falls back to a bbox-default camera pose (`bbox_center − r/2 · (1,1,1)`, looking back at origin). Without cameras, the "Next / Prev view" buttons are hidden.
 - **Preset transition doesn't run `pickAtCenter` mid-animation**: the orbit pivot stays stale until the transition reaches `t = 1`, then both `resetToCamera()` and `pickAtCenter()` run in one frame. If you cut a transition short by dragging, the controller cancels and uses whatever pivot the last update wrote — usually the bbox-ray pivot.
